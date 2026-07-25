@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-07-24
+## [0.4.0] - 2026-07-25
 
 Memory optimization arrives: a Memory SSA-backed pass doing store-to-load
 forwarding, redundant load elimination, and dead store elimination, together
