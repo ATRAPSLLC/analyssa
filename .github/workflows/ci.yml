@@ -83,28 +83,15 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  fuzz:
-    name: Fuzz smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      # Pinned to @v2 with an explicit `tool:` rather than the @cargo-fuzz tag:
-      # that tag stopped carrying a default tool, so the install silently became
-      # a no-op and `cargo fuzz` failed with "no such command".
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-      # A short campaign per target, not an exhaustive one: this is a smoke
-      # gate that the targets still build and that no shallow crash has been
-      # introduced. Longer campaigns belong in a scheduled job.
-      #
-      # These targets feed deliberately malformed IR — dangling branch targets,
-      # phi operands naming non-existent predecessors, uses of variables nothing
-      # defines. That is what a hostile or misread binary produces, and it is
-      # what the verifier and passes must report rather than crash on.
-      - run: cargo fuzz run validate -- -max_total_time=60 -rss_limit_mb=2048
-      - run: cargo fuzz run pipeline -- -max_total_time=60 -rss_limit_mb=2048
+  # Fuzzing is deliberately not a CI job. Coverage-guided fuzzing only pays off
+  # with an accumulated corpus, and a runner starts from an empty one every
+  # time — a cold 60s campaign is little more than random input, at the cost of
+  # a full ASan build per push. Fuzz locally instead:
+  #
+  #   cargo +nightly fuzz run --target x86_64-unknown-linux-gnu <validate|pipeline>
+  #
+  # --target is explicit because cargo-fuzz defaults to the triple it was itself
+  # built for rather than the host, which breaks under a musl-built cargo-fuzz.
 
   coverage:
     name: Coverage
