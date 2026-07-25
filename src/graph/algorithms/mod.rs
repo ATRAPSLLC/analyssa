@@ -93,7 +93,7 @@ mod traversal;
 pub use cycles::{find_cycle, has_cycle};
 #[allow(unused_imports)]
 pub use dominators::{
-    compute_dominance_frontiers, compute_dominators, compute_dominators_rooted, DominatorTree,
+    DominatorTree, compute_dominance_frontiers, compute_dominators, compute_dominators_rooted,
 };
 pub use scc::{condensation, strongly_connected_components};
 pub use topological::topological_sort;

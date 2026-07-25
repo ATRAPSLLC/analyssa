@@ -141,7 +141,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::graph::{algorithms::topological::topological_sort, DirectedGraph, NodeId};
+    use crate::graph::{DirectedGraph, NodeId, algorithms::topological::topological_sort};
 
     #[test]
     fn test_topological_sort_empty_graph() {

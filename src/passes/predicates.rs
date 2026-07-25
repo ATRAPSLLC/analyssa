@@ -40,7 +40,7 @@
 //! jump B1
 //! ```
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use crate::{
     analysis::{defuse::DefUseIndex, evaluator::SsaEvaluator, range::ValueRange},
@@ -134,9 +134,27 @@ struct DefinitionCache<T: Target> {
     /// Computed [`ValueRange`]s for each variable. Constants get exact
     /// ranges, array lengths get non-negative ranges.
     ranges: BTreeMap<SsaVarId, ValueRange>,
+    /// Variables whose declared type is floating point, or unknown.
+    ///
+    /// Self-cancelling identities do not hold for floats: `x == x` is *false*
+    /// when `x` is NaN, and `x - x` is NaN rather than zero. `Ceq` and `Sub`
+    /// carry no float discriminator — `ConstValue` folds `F32`/`F64` pairs for
+    /// both — so the declared type is the only way to tell. An unknown type is
+    /// treated as possibly-float.
+    ///
+    /// (`Xor` is deliberately *not* gated on this: `x ^ x` compares bit patterns,
+    /// and a value's bits equal themselves even when they encode NaN.)
+    maybe_float: BitSet,
 }
 
 impl<T: Target> DefinitionCache<T> {
+    /// Returns `true` when `var` may hold a floating-point value.
+    ///
+    /// Self-cancelling identities (`x == x`, `x - x`) are unsound for floats.
+    fn maybe_float(&self, var: SsaVarId) -> bool {
+        self.maybe_float.contains_checked(var.index())
+    }
+
     /// Builds the definition cache from an SSA function.
     ///
     /// Performs a single pass over all blocks to populate:
@@ -163,6 +181,13 @@ impl<T: Target> DefinitionCache<T> {
         let mut phi_defs = BitSet::new(var_count);
         let mut non_null_vars = BitSet::new(var_count);
         let mut ranges = BTreeMap::new();
+        let mut maybe_float = BitSet::new(var_count);
+        for var in ssa.variables() {
+            let ty = var.var_type();
+            if T::is_floating(ty) || T::is_unknown(ty) {
+                maybe_float.insert_checked(var.id().index());
+            }
+        }
 
         for (_block_idx, block) in ssa.iter_blocks() {
             // Process phi nodes (not covered by DefUseIndex)
@@ -202,6 +227,7 @@ impl<T: Target> DefinitionCache<T> {
             phi_defs,
             non_null_vars,
             ranges,
+            maybe_float,
         }
     }
 
@@ -236,7 +262,7 @@ impl<T: Target> DefinitionCache<T> {
 ///
 /// Generic over [`Target`]; the inner `PhantomData` lets the same struct
 /// host all analysis methods without holding runtime state.
-pub struct OpaquePredicatePass<T: Target>(std::marker::PhantomData<T>);
+pub struct OpaquePredicatePass<T: Target>(PhantomData<T>);
 
 impl<T: Target> Default for OpaquePredicatePass<T> {
     fn default() -> Self {
@@ -248,7 +274,7 @@ impl<T: Target> OpaquePredicatePass<T> {
     /// Creates a new opaque predicate pass.
     #[must_use]
     pub fn new() -> Self {
-        Self(std::marker::PhantomData)
+        Self(PhantomData)
     }
 
     /// Maximum recursion depth for nested predicate analysis.
@@ -295,7 +321,9 @@ impl<T: Target> OpaquePredicatePass<T> {
         match op {
             // Self-comparison patterns
             SsaOp::Ceq { left, right, .. } => {
-                if left == right {
+                // `x == x` is *false* when `x` is NaN, so this identity needs the
+                // operand to be provably non-float.
+                if left == right && !cache.maybe_float(*left) {
                     return PredicateResult::AlwaysTrue;
                 }
                 Self::analyze_equality(*left, *right, cache, depth)
@@ -388,14 +416,11 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: xr,
             ..
         }) = left_def
+            && xl == xr
+            && let Some(r) = right_def
+            && Self::is_zero_constant(r)
         {
-            if xl == xr {
-                if let Some(r) = right_def {
-                    if Self::is_zero_constant(r) {
-                        return PredicateResult::AlwaysTrue;
-                    }
-                }
-            }
+            return PredicateResult::AlwaysTrue;
         }
 
         // Symmetric check
@@ -404,14 +429,11 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: xr,
             ..
         }) = right_def
+            && xl == xr
+            && let Some(l) = left_def
+            && Self::is_zero_constant(l)
         {
-            if xl == xr {
-                if let Some(l) = left_def {
-                    if Self::is_zero_constant(l) {
-                        return PredicateResult::AlwaysTrue;
-                    }
-                }
-            }
+            return PredicateResult::AlwaysTrue;
         }
 
         // Check for (x - x) == 0 pattern
@@ -420,14 +442,11 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: sr,
             ..
         }) = left_def
+            && sl == sr
+            && let Some(r) = right_def
+            && Self::is_zero_constant(r)
         {
-            if sl == sr {
-                if let Some(r) = right_def {
-                    if Self::is_zero_constant(r) {
-                        return PredicateResult::AlwaysTrue;
-                    }
-                }
-            }
+            return PredicateResult::AlwaysTrue;
         }
 
         // Symmetric check
@@ -436,105 +455,94 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: sr,
             ..
         }) = right_def
+            && sl == sr
+            && let Some(l) = left_def
+            && Self::is_zero_constant(l)
         {
-            if sl == sr {
-                if let Some(l) = left_def {
-                    if Self::is_zero_constant(l) {
-                        return PredicateResult::AlwaysTrue;
-                    }
-                }
-            }
+            return PredicateResult::AlwaysTrue;
         }
 
         // Check for (x * 0) == 0 pattern
-        if Self::is_zero_producing_mul(left_def, cache) {
-            if let Some(r) = right_def {
-                if Self::is_zero_constant(r) {
-                    return PredicateResult::AlwaysTrue;
-                }
-            }
+        if Self::is_zero_producing_mul(left_def, cache)
+            && let Some(r) = right_def
+            && Self::is_zero_constant(r)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         // Symmetric check
-        if Self::is_zero_producing_mul(right_def, cache) {
-            if let Some(l) = left_def {
-                if Self::is_zero_constant(l) {
-                    return PredicateResult::AlwaysTrue;
-                }
-            }
+        if Self::is_zero_producing_mul(right_def, cache)
+            && let Some(l) = left_def
+            && Self::is_zero_constant(l)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         // Check for (x & 0) == 0 pattern
-        if Self::is_zero_producing_and(left_def, cache) {
-            if let Some(r) = right_def {
-                if Self::is_zero_constant(r) {
-                    return PredicateResult::AlwaysTrue;
-                }
-            }
+        if Self::is_zero_producing_and(left_def, cache)
+            && let Some(r) = right_def
+            && Self::is_zero_constant(r)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         // Symmetric check
-        if Self::is_zero_producing_and(right_def, cache) {
-            if let Some(l) = left_def {
-                if Self::is_zero_constant(l) {
-                    return PredicateResult::AlwaysTrue;
-                }
-            }
+        if Self::is_zero_producing_and(right_def, cache)
+            && let Some(l) = left_def
+            && Self::is_zero_constant(l)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         // Check for number-theoretic predicates that always evaluate to zero:
         //   (x * (x + 1)) % 2 == 0    — consecutive integer product is always even
         //   (x * x - x) % 2 == 0      — x²-x = x(x-1), consecutive product factored
-        if Self::is_always_even_expression(left_def, cache) {
-            if let Some(r) = right_def {
-                if Self::is_zero_constant(r) {
-                    return PredicateResult::AlwaysTrue;
-                }
-            }
+        if Self::is_always_even_expression(left_def, cache)
+            && let Some(r) = right_def
+            && Self::is_zero_constant(r)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         // Check constant equality
         if let (Some(SsaOp::Const { value: lval, .. }), Some(SsaOp::Const { value: rval, .. })) =
             (left_def, right_def)
+            && let (Some(l), Some(r)) = (lval.as_i64(), rval.as_i64())
         {
-            if let (Some(l), Some(r)) = (lval.as_i64(), rval.as_i64()) {
-                return if l == r {
-                    PredicateResult::AlwaysTrue
-                } else {
-                    PredicateResult::AlwaysFalse
-                };
-            }
+            return if l == r {
+                PredicateResult::AlwaysTrue
+            } else {
+                PredicateResult::AlwaysFalse
+            };
         }
 
         // Check non-null equality with null
-        if cache.is_non_null(left) {
-            if let Some(r) = right_def {
-                if Self::is_null_constant(r) {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
+        if cache.is_non_null(left)
+            && let Some(r) = right_def
+            && Self::is_null_constant(r)
+        {
+            return PredicateResult::AlwaysFalse;
         }
 
-        if cache.is_non_null(right) {
-            if let Some(l) = left_def {
-                if Self::is_null_constant(l) {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
+        if cache.is_non_null(right)
+            && let Some(l) = left_def
+            && Self::is_null_constant(l)
+        {
+            return PredicateResult::AlwaysFalse;
         }
 
         // Nested analysis
         if let Some(left_op) = left_def {
             let left_result =
                 Self::analyze_predicate_with_cache(left_op, cache, depth.saturating_add(1));
-            if left_result != PredicateResult::Unknown {
-                if let Some(r) = right_def {
-                    if Self::is_one_constant(r) {
-                        return left_result;
-                    }
-                    if Self::is_zero_constant(r) {
-                        return left_result.negate();
-                    }
+            if left_result != PredicateResult::Unknown
+                && let Some(r) = right_def
+            {
+                if Self::is_one_constant(r) {
+                    return left_result;
+                }
+                if Self::is_zero_constant(r) {
+                    return left_result.negate();
                 }
             }
         }
@@ -601,51 +609,47 @@ impl<T: Target> OpaquePredicatePass<T> {
         if let Some(left_range) = cache.get_range(left) {
             if let Some(right_range) = cache.get_range(right) {
                 // left.max < right.min => always true
-                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min()) {
-                    if l_max < r_min {
-                        return PredicateResult::AlwaysTrue;
-                    }
+                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
+                    && l_max < r_min
+                {
+                    return PredicateResult::AlwaysTrue;
                 }
                 // left.min >= right.max => always false
-                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max()) {
-                    if l_min >= r_max {
-                        return PredicateResult::AlwaysFalse;
-                    }
+                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
+                    && l_min >= r_max
+                {
+                    return PredicateResult::AlwaysFalse;
                 }
             }
 
             // Check if left < constant
-            if let Some(SsaOp::Const { value: rval, .. }) = right_def {
-                if let Some(r) = rval.as_i64() {
-                    if let Some(result) = left_range.always_less_than(r) {
-                        return if result {
-                            PredicateResult::AlwaysTrue
-                        } else {
-                            PredicateResult::AlwaysFalse
-                        };
-                    }
-                }
+            if let Some(SsaOp::Const { value: rval, .. }) = right_def
+                && let Some(r) = rval.as_i64()
+                && let Some(result) = left_range.always_less_than(r)
+            {
+                return if result {
+                    PredicateResult::AlwaysTrue
+                } else {
+                    PredicateResult::AlwaysFalse
+                };
             }
         }
 
         // Unsigned comparison: x < 0 is always false
-        if unsigned {
-            if let Some(SsaOp::Const { value: rval, .. }) = right_def {
-                if rval.as_u64() == Some(0) {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
+        if unsigned
+            && let Some(SsaOp::Const { value: rval, .. }) = right_def
+            && rval.as_u64() == Some(0)
+        {
+            return PredicateResult::AlwaysFalse;
         }
 
         // Non-negative < 0 is always false
-        if let Some(left_range) = cache.get_range(left) {
-            if left_range.is_always_non_negative() {
-                if let Some(SsaOp::Const { value: rval, .. }) = right_def {
-                    if rval.as_i64() == Some(0) {
-                        return PredicateResult::AlwaysFalse;
-                    }
-                }
-            }
+        if let Some(left_range) = cache.get_range(left)
+            && left_range.is_always_non_negative()
+            && let Some(SsaOp::Const { value: rval, .. }) = right_def
+            && rval.as_i64() == Some(0)
+        {
+            return PredicateResult::AlwaysFalse;
         }
 
         PredicateResult::Unknown
@@ -710,51 +714,47 @@ impl<T: Target> OpaquePredicatePass<T> {
         if let Some(left_range) = cache.get_range(left) {
             if let Some(right_range) = cache.get_range(right) {
                 // left.min > right.max => always true
-                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max()) {
-                    if l_min > r_max {
-                        return PredicateResult::AlwaysTrue;
-                    }
+                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
+                    && l_min > r_max
+                {
+                    return PredicateResult::AlwaysTrue;
                 }
                 // left.max <= right.min => always false
-                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min()) {
-                    if l_max <= r_min {
-                        return PredicateResult::AlwaysFalse;
-                    }
+                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
+                    && l_max <= r_min
+                {
+                    return PredicateResult::AlwaysFalse;
                 }
             }
 
             // Check if left > constant
-            if let Some(SsaOp::Const { value: rval, .. }) = right_def {
-                if let Some(r) = rval.as_i64() {
-                    if let Some(result) = left_range.always_greater_than(r) {
-                        return if result {
-                            PredicateResult::AlwaysTrue
-                        } else {
-                            PredicateResult::AlwaysFalse
-                        };
-                    }
-                }
+            if let Some(SsaOp::Const { value: rval, .. }) = right_def
+                && let Some(r) = rval.as_i64()
+                && let Some(result) = left_range.always_greater_than(r)
+            {
+                return if result {
+                    PredicateResult::AlwaysTrue
+                } else {
+                    PredicateResult::AlwaysFalse
+                };
             }
         }
 
         // Unsigned: 0 > x is always false
-        if unsigned {
-            if let Some(SsaOp::Const { value: lval, .. }) = left_def {
-                if lval.as_u64() == Some(0) {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
+        if unsigned
+            && let Some(SsaOp::Const { value: lval, .. }) = left_def
+            && lval.as_u64() == Some(0)
+        {
+            return PredicateResult::AlwaysFalse;
         }
 
         // Non-negative value >= 0 is always true (x > -1 equivalent)
-        if let Some(left_range) = cache.get_range(left) {
-            if left_range.is_always_non_negative() {
-                if let Some(SsaOp::Const { value: rval, .. }) = right_def {
-                    if rval.as_i64().is_some_and(|r| r < 0) {
-                        return PredicateResult::AlwaysTrue;
-                    }
-                }
-            }
+        if let Some(left_range) = cache.get_range(left)
+            && left_range.is_always_non_negative()
+            && let Some(SsaOp::Const { value: rval, .. }) = right_def
+            && rval.as_i64().is_some_and(|r| r < 0)
+        {
+            return PredicateResult::AlwaysTrue;
         }
 
         PredicateResult::Unknown
@@ -783,11 +783,11 @@ impl<T: Target> OpaquePredicatePass<T> {
         _depth: usize,
     ) -> PredicateResult {
         // x % 1 == 0 is always true
-        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right) {
-            if rval.as_i64() == Some(1) {
-                // Result is always 0
-                return PredicateResult::Unknown; // Handled when compared to 0
-            }
+        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right)
+            && rval.as_i64() == Some(1)
+        {
+            // Result is always 0
+            return PredicateResult::Unknown; // Handled when compared to 0
         }
         PredicateResult::Unknown
     }
@@ -815,15 +815,15 @@ impl<T: Target> OpaquePredicatePass<T> {
         _depth: usize,
     ) -> PredicateResult {
         // x * 0 = 0
-        if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(left) {
-            if lval.is_zero() {
-                return PredicateResult::Unknown; // Result is 0
-            }
+        if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(left)
+            && lval.is_zero()
+        {
+            return PredicateResult::Unknown; // Result is 0
         }
-        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right) {
-            if rval.is_zero() {
-                return PredicateResult::Unknown; // Result is 0
-            }
+        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right)
+            && rval.is_zero()
+        {
+            return PredicateResult::Unknown; // Result is 0
         }
         PredicateResult::Unknown
     }
@@ -851,15 +851,15 @@ impl<T: Target> OpaquePredicatePass<T> {
         _depth: usize,
     ) -> PredicateResult {
         // x & 0 = 0
-        if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(left) {
-            if lval.is_zero() {
-                return PredicateResult::Unknown;
-            }
+        if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(left)
+            && lval.is_zero()
+        {
+            return PredicateResult::Unknown;
         }
-        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right) {
-            if rval.is_zero() {
-                return PredicateResult::Unknown;
-            }
+        if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(right)
+            && rval.is_zero()
+        {
+            return PredicateResult::Unknown;
         }
         PredicateResult::Unknown
     }
@@ -896,15 +896,15 @@ impl<T: Target> OpaquePredicatePass<T> {
     /// `true` if `op` is a `Mul` with at least one constant-zero operand, `false` otherwise.
     fn is_zero_producing_mul(op: Option<&SsaOp<T>>, cache: &DefinitionCache<T>) -> bool {
         if let Some(SsaOp::Mul { left, right, .. }) = op {
-            if let Some(l) = cache.get_definition(*left) {
-                if Self::is_zero_constant(l) {
-                    return true;
-                }
+            if let Some(l) = cache.get_definition(*left)
+                && Self::is_zero_constant(l)
+            {
+                return true;
             }
-            if let Some(r) = cache.get_definition(*right) {
-                if Self::is_zero_constant(r) {
-                    return true;
-                }
+            if let Some(r) = cache.get_definition(*right)
+                && Self::is_zero_constant(r)
+            {
+                return true;
             }
         }
         false
@@ -922,15 +922,15 @@ impl<T: Target> OpaquePredicatePass<T> {
     /// `true` if `op` is an `And` with at least one constant-zero operand, `false` otherwise.
     fn is_zero_producing_and(op: Option<&SsaOp<T>>, cache: &DefinitionCache<T>) -> bool {
         if let Some(SsaOp::And { left, right, .. }) = op {
-            if let Some(l) = cache.get_definition(*left) {
-                if Self::is_zero_constant(l) {
-                    return true;
-                }
+            if let Some(l) = cache.get_definition(*left)
+                && Self::is_zero_constant(l)
+            {
+                return true;
             }
-            if let Some(r) = cache.get_definition(*right) {
-                if Self::is_zero_constant(r) {
-                    return true;
-                }
+            if let Some(r) = cache.get_definition(*right)
+                && Self::is_zero_constant(r)
+            {
+                return true;
             }
         }
         false
@@ -980,10 +980,9 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: mul_right,
             ..
         }) = dividend_def
+            && Self::is_consecutive_pair(*mul_left, *mul_right, cache)
         {
-            if Self::is_consecutive_pair(*mul_left, *mul_right, cache) {
-                return true;
-            }
+            return true;
         }
 
         // Pattern 2: (x * x) -/+ x — factored consecutive product
@@ -998,12 +997,10 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: op_right,
             ..
         }) = dividend_def
+            && (Self::is_self_square(*op_left, *op_right, cache)
+                || Self::is_self_square(*op_right, *op_left, cache))
         {
-            if Self::is_self_square(*op_left, *op_right, cache)
-                || Self::is_self_square(*op_right, *op_left, cache)
-            {
-                return true;
-            }
+            return true;
         }
 
         false
@@ -1051,19 +1048,17 @@ impl<T: Target> OpaquePredicatePass<T> {
             ..
         }) = cache.get_definition(b)
         {
-            if *add_left == a {
-                if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*add_right) {
-                    if rval.as_i64() == Some(1) {
-                        return true;
-                    }
-                }
+            if *add_left == a
+                && let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*add_right)
+                && rval.as_i64() == Some(1)
+            {
+                return true;
             }
-            if *add_right == a {
-                if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(*add_left) {
-                    if lval.as_i64() == Some(1) {
-                        return true;
-                    }
-                }
+            if *add_right == a
+                && let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(*add_left)
+                && lval.as_i64() == Some(1)
+            {
+                return true;
             }
         }
 
@@ -1074,19 +1069,17 @@ impl<T: Target> OpaquePredicatePass<T> {
             ..
         }) = cache.get_definition(a)
         {
-            if *add_left == b {
-                if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*add_right) {
-                    if rval.as_i64() == Some(1) {
-                        return true;
-                    }
-                }
+            if *add_left == b
+                && let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*add_right)
+                && rval.as_i64() == Some(1)
+            {
+                return true;
             }
-            if *add_right == b {
-                if let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(*add_left) {
-                    if lval.as_i64() == Some(1) {
-                        return true;
-                    }
-                }
+            if *add_right == b
+                && let Some(SsaOp::Const { value: lval, .. }) = cache.get_definition(*add_left)
+                && lval.as_i64() == Some(1)
+            {
+                return true;
             }
         }
 
@@ -1096,14 +1089,11 @@ impl<T: Target> OpaquePredicatePass<T> {
             right: sub_right,
             ..
         }) = cache.get_definition(b)
+            && *sub_left == a
+            && let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*sub_right)
+            && rval.as_i64() == Some(-1)
         {
-            if *sub_left == a {
-                if let Some(SsaOp::Const { value: rval, .. }) = cache.get_definition(*sub_right) {
-                    if rval.as_i64() == Some(-1) {
-                        return true;
-                    }
-                }
-            }
+            return true;
         }
 
         false
@@ -1149,14 +1139,14 @@ impl<T: Target> OpaquePredicatePass<T> {
                 if cache.is_phi_defined(current) {
                     // For phi nodes, we'd need to check if all operands lead to the same result
                     // This is complex, so we return Unknown for now unless we have range info
-                    if let Some(range) = cache.get_range(current) {
-                        if let Some(result) = range.always_equal_to(0) {
-                            return if result {
-                                PredicateResult::AlwaysFalse
-                            } else {
-                                PredicateResult::AlwaysTrue
-                            };
-                        }
+                    if let Some(range) = cache.get_range(current)
+                        && let Some(result) = range.always_equal_to(0)
+                    {
+                        return if result {
+                            PredicateResult::AlwaysFalse
+                        } else {
+                            PredicateResult::AlwaysTrue
+                        };
                     }
                 }
                 return PredicateResult::Unknown;
@@ -1205,8 +1195,11 @@ impl<T: Target> OpaquePredicatePass<T> {
             // x ^ x = 0, so brtrue on this result never jumps
             SsaOp::Xor { left, right, .. } if left == right => PredicateResult::AlwaysFalse,
 
-            // x - x = 0, so brtrue on this result never jumps
-            SsaOp::Sub { left, right, .. } if left == right => PredicateResult::AlwaysFalse,
+            // x - x = 0, so brtrue on this result never jumps — unless `x` is a
+            // float, where `NaN - NaN` is NaN and therefore branches as true.
+            SsaOp::Sub { left, right, .. } if left == right && !cache.maybe_float(*left) => {
+                PredicateResult::AlwaysFalse
+            }
 
             // x & 0 = 0, x * 0 = 0
             SsaOp::And { left, right, .. } | SsaOp::Mul { left, right, .. } => {
@@ -1345,46 +1338,44 @@ impl<T: Target> OpaquePredicatePass<T> {
             (left, false)
         };
 
-        if is_comparing_to_zero {
-            if let Some(def_op) = cache.get_definition(other_var) {
-                // Pattern: (x - y) == 0 → x == y
-                if let SsaOp::Sub {
-                    left: sub_left,
-                    right: sub_right,
-                    ..
-                } = def_op
-                {
-                    // Skip self-subtraction - that's handled by PredicateResult (always true)
-                    if sub_left != sub_right {
-                        return Some(ComparisonSimplification::SimplerOp {
-                            new_op: SsaOp::Ceq {
-                                dest,
-                                left: *sub_left,
-                                right: *sub_right,
-                            },
-                            reason: "(x - y) == 0 simplified to x == y",
-                        });
-                    }
+        if is_comparing_to_zero && let Some(def_op) = cache.get_definition(other_var) {
+            // Pattern: (x - y) == 0 → x == y
+            if let SsaOp::Sub {
+                left: sub_left,
+                right: sub_right,
+                ..
+            } = def_op
+            {
+                // Skip self-subtraction - that's handled by PredicateResult (always true)
+                if sub_left != sub_right {
+                    return Some(ComparisonSimplification::SimplerOp {
+                        new_op: SsaOp::Ceq {
+                            dest,
+                            left: *sub_left,
+                            right: *sub_right,
+                        },
+                        reason: "(x - y) == 0 simplified to x == y",
+                    });
                 }
+            }
 
-                // Pattern: (x ^ y) == 0 → x == y
-                if let SsaOp::Xor {
-                    left: xor_left,
-                    right: xor_right,
-                    ..
-                } = def_op
-                {
-                    // Skip self-XOR - that's handled by PredicateResult (always true)
-                    if xor_left != xor_right {
-                        return Some(ComparisonSimplification::SimplerOp {
-                            new_op: SsaOp::Ceq {
-                                dest,
-                                left: *xor_left,
-                                right: *xor_right,
-                            },
-                            reason: "(x ^ y) == 0 simplified to x == y",
-                        });
-                    }
+            // Pattern: (x ^ y) == 0 → x == y
+            if let SsaOp::Xor {
+                left: xor_left,
+                right: xor_right,
+                ..
+            } = def_op
+            {
+                // Skip self-XOR - that's handled by PredicateResult (always true)
+                if xor_left != xor_right {
+                    return Some(ComparisonSimplification::SimplerOp {
+                        new_op: SsaOp::Ceq {
+                            dest,
+                            left: *xor_left,
+                            right: *xor_right,
+                        },
+                        reason: "(x ^ y) == 0 simplified to x == y",
+                    });
                 }
             }
         }
@@ -1398,19 +1389,17 @@ impl<T: Target> OpaquePredicatePass<T> {
             (left, false)
         };
 
-        if is_comparing_to_one {
-            if let Some(def_op) = cache.get_definition(other_var) {
-                // Pattern: (cmp) == 1 → copy cmp
-                if matches!(
-                    def_op,
-                    SsaOp::Ceq { .. } | SsaOp::Clt { .. } | SsaOp::Cgt { .. }
-                ) {
-                    return Some(ComparisonSimplification::Copy {
-                        dest,
-                        src: other_var,
-                        reason: "(cmp) == 1 simplified to cmp",
-                    });
-                }
+        if is_comparing_to_one && let Some(def_op) = cache.get_definition(other_var) {
+            // Pattern: (cmp) == 1 → copy cmp
+            if matches!(
+                def_op,
+                SsaOp::Ceq { .. } | SsaOp::Clt { .. } | SsaOp::Cgt { .. }
+            ) {
+                return Some(ComparisonSimplification::Copy {
+                    dest,
+                    src: other_var,
+                    reason: "(cmp) == 1 simplified to cmp",
+                });
             }
         }
 
@@ -1448,25 +1437,24 @@ impl<T: Target> OpaquePredicatePass<T> {
         }
 
         // Pattern: (x - y) < 0 → x < y
-        if Self::is_zero_var(right, cache) {
-            if let Some(SsaOp::Sub {
+        if Self::is_zero_var(right, cache)
+            && let Some(SsaOp::Sub {
                 left: sub_left,
                 right: sub_right,
                 ..
             }) = cache.get_definition(left)
-            {
-                // Skip self-subtraction - that's handled by PredicateResult (always false)
-                if sub_left != sub_right {
-                    return Some(ComparisonSimplification::SimplerOp {
-                        new_op: SsaOp::Clt {
-                            dest,
-                            left: *sub_left,
-                            right: *sub_right,
-                            unsigned,
-                        },
-                        reason: "(x - y) < 0 simplified to x < y",
-                    });
-                }
+        {
+            // Skip self-subtraction - that's handled by PredicateResult (always false)
+            if sub_left != sub_right {
+                return Some(ComparisonSimplification::SimplerOp {
+                    new_op: SsaOp::Clt {
+                        dest,
+                        left: *sub_left,
+                        right: *sub_right,
+                        unsigned,
+                    },
+                    reason: "(x - y) < 0 simplified to x < y",
+                });
             }
         }
 
@@ -1503,25 +1491,24 @@ impl<T: Target> OpaquePredicatePass<T> {
         }
 
         // Pattern: (x - y) > 0 → x > y
-        if Self::is_zero_var(right, cache) {
-            if let Some(SsaOp::Sub {
+        if Self::is_zero_var(right, cache)
+            && let Some(SsaOp::Sub {
                 left: sub_left,
                 right: sub_right,
                 ..
             }) = cache.get_definition(left)
-            {
-                // Skip self-subtraction - that's handled by PredicateResult (always false)
-                if sub_left != sub_right {
-                    return Some(ComparisonSimplification::SimplerOp {
-                        new_op: SsaOp::Cgt {
-                            dest,
-                            left: *sub_left,
-                            right: *sub_right,
-                            unsigned,
-                        },
-                        reason: "(x - y) > 0 simplified to x > y",
-                    });
-                }
+        {
+            // Skip self-subtraction - that's handled by PredicateResult (always false)
+            if sub_left != sub_right {
+                return Some(ComparisonSimplification::SimplerOp {
+                    new_op: SsaOp::Cgt {
+                        dest,
+                        left: *sub_left,
+                        right: *sub_right,
+                        unsigned,
+                    },
+                    reason: "(x - y) > 0 simplified to x > y",
+                });
             }
         }
 
@@ -1555,40 +1542,46 @@ impl<T: Target> OpaquePredicatePass<T> {
         for block in ssa.blocks() {
             for phi in block.phi_nodes() {
                 let operands: Vec<_> = phi.operands().iter().collect();
-                let Some(first_operand) = operands.first() else {
+                if operands.is_empty() {
                     continue;
-                };
+                }
 
-                // Check if all operands come from the same constant
-                let first_val = first_operand.value();
+                // The phi is constant only if *every* incoming edge carries the
+                // same constant. Two operand kinds are acceptable:
+                //
+                // * a `Const` definition equal to every other one seen, and
+                // * the phi's own result, which is how a loop phi names the
+                //   value it already had — `p = phi(c@entry, p@latch)` is `c` on
+                //   entry and `p` thereafter, so it is `c` throughout.
+                //
+                // Everything else makes the value unknown on that edge. That
+                // explicitly includes an operand with no defining *instruction*:
+                // `DefUseIndex::def_op` returns `None` for a phi-defined
+                // variable, whose value is exactly what is not known here.
                 let mut all_same_const = true;
                 let mut const_value = None;
 
                 for operand in &operands {
                     let var = operand.value();
-                    // Look up the defining operation via the index.
-                    if let Some(op) = index.def_op(var) {
-                        if let SsaOp::Const { value, .. } = op {
-                            if const_value.is_none() {
-                                const_value = Some(value.clone());
-                            } else if const_value.as_ref() != Some(value) {
-                                all_same_const = false;
-                                break;
-                            }
-                        } else {
+                    if var == phi.result() {
+                        continue;
+                    }
+                    let Some(SsaOp::Const { value, .. }) = index.def_op(var) else {
+                        all_same_const = false;
+                        break;
+                    };
+                    match const_value.as_ref() {
+                        None => const_value = Some(value.clone()),
+                        Some(seen) if seen == value => {}
+                        Some(_) => {
                             all_same_const = false;
                             break;
                         }
-                    } else if var != first_val {
-                        all_same_const = false;
-                        break;
                     }
                 }
 
-                if all_same_const {
-                    if let Some(value) = const_value {
-                        phi_constants.insert(phi.result(), value);
-                    }
+                if all_same_const && let Some(value) = const_value {
+                    phi_constants.insert(phi.result(), value);
                 }
             }
         }
@@ -1669,11 +1662,10 @@ impl<T: Target> OpaquePredicatePass<T> {
         let mut phi_replacements: Vec<(usize, usize, SsaVarId, ConstValue<T>)> = Vec::new();
 
         // Symbolic evaluator for branch conditions, built lazily and evaluated
-        // over every block exactly once. Previously each unresolved branch built
-        // a fresh evaluator and re-evaluated blocks `0..=block_idx`, which was
-        // O(branches * blocks); a single forward pass is sufficient because SSA
-        // values are single-assignment (evaluating later blocks never changes an
-        // earlier branch condition's value).
+        // over every block exactly once. A fresh evaluator per unresolved branch,
+        // re-evaluating blocks `0..=block_idx`, would be O(branches * blocks);
+        // one forward pass suffices because SSA values are single-assignment, so
+        // evaluating later blocks never changes an earlier branch condition.
         let mut branch_evaluator = None;
 
         // Analyze each block
@@ -1737,11 +1729,11 @@ impl<T: Target> OpaquePredicatePass<T> {
                 let op = instr.op();
                 // First check for opaque predicates (constant true/false)
                 let result = Self::analyze_predicate_with_cache(op, &cache, 0);
-                if let Some(value) = result.as_bool() {
-                    if let Some(dest) = op.dest() {
-                        comparison_replacements.push((block_idx, instr_idx, dest, value));
-                        continue; // Don't also check for simplification
-                    }
+                if let Some(value) = result.as_bool()
+                    && let Some(dest) = op.dest()
+                {
+                    comparison_replacements.push((block_idx, instr_idx, dest, value));
+                    continue; // Don't also check for simplification
                 }
 
                 // Then check for algebraic simplifications
@@ -1780,15 +1772,12 @@ impl<T: Target> OpaquePredicatePass<T> {
             |editor| {
                 // Apply branch simplifications
                 for (block_idx, target, is_true) in branch_simplifications {
-                    let Some(last_idx) = editor
-                        .function()
-                        .block(block_idx)
-                        .and_then(|block| block.instructions().len().checked_sub(1))
-                    else {
+                    let Some(_) = editor.function().block(block_idx) else {
                         continue;
                     };
-                    editor.replace_instruction_op(block_idx, last_idx, SsaOp::Jump { target })?;
-                    editor.mark_cfg_changed();
+                    // See `ranges`: an edge removal cannot require a new phi, so
+                    // the cheap repair suffices.
+                    editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
                     changes
                         .record(EventKind::OpaquePredicateRemoved)
                         .at(method_token.clone(), block_idx)
@@ -1946,7 +1935,7 @@ mod tests {
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         pointer::PointerSize,
-        testing::{run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, run_mock_pass_boundary},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -2317,6 +2306,108 @@ mod tests {
         assert!(
             constants.contains_key(&phi_var),
             "phi with same constants should be resolved"
+        );
+    }
+
+    /// A phi is only constant when *every* incoming edge carries that constant.
+    /// An operand defined by another phi has no defining instruction, so its
+    /// value is unknown here — it must disqualify the fold regardless of which
+    /// operand slot it occupies.
+    ///
+    /// `B0: a = Const 99; jump B1`
+    /// `B1: p1 = phi(a@B0); jump B3`
+    /// `B2: c = Const 7; jump B3`
+    /// `B3: p2 = phi(p1@B1, c@B2); return p2`
+    ///
+    /// `p2` is 99 on the `B1` edge and 7 on the `B2` edge, so it is not
+    /// constant. Folding it to 7 rewrites the phi and, when such a phi feeds a
+    /// `Branch`, deletes the entire opposite arm.
+    #[test]
+    fn phi_with_a_phi_defined_operand_is_not_constant() {
+        let mut ssa = SsaFunction::new(0, 4);
+        let a = local_at(&mut ssa, 0, 0, 0);
+        let c = local_at(&mut ssa, 1, 2, 0);
+        let p1 = ssa.create_variable(VariableOrigin::Local(2), 0, DefSite::phi(1), MockType::I32);
+        let p2 = ssa.create_variable(VariableOrigin::Local(3), 0, DefSite::phi(3), MockType::I32);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: a,
+            value: ConstValue::I32(99),
+        }));
+        b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        let mut phi1 = PhiNode::new(p1, VariableOrigin::Local(2));
+        phi1.add_operand(PhiOperand::new(a, 0));
+        b1.add_phi(phi1);
+        b1.add_instruction(instr(SsaOp::Jump { target: 3 }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(instr(SsaOp::Const {
+            dest: c,
+            value: ConstValue::I32(7),
+        }));
+        b2.add_instruction(instr(SsaOp::Jump { target: 3 }));
+        ssa.add_block(b2);
+
+        let mut b3 = SsaBlock::new(3);
+        // `p1` first, `c` second — the order that hides the undefined operand.
+        let mut phi2 = PhiNode::new(p2, VariableOrigin::Local(3));
+        phi2.add_operand(PhiOperand::new(p1, 1));
+        phi2.add_operand(PhiOperand::new(c, 2));
+        b3.add_phi(phi2);
+        b3.add_instruction(instr(SsaOp::Return { value: Some(p2) }));
+        ssa.add_block(b3);
+        ssa.recompute_uses();
+
+        let constants = OpaquePredicatePass::<MockTarget>::analyze_phi_constants(&ssa);
+
+        assert!(
+            !constants.contains_key(&p2),
+            "p2 merges 99 and 7 — it must not be folded to a constant (got {:?})",
+            constants.get(&p2)
+        );
+    }
+
+    /// The self-referential loop phi `p = phi(c@entry, p@latch)` really is
+    /// constant `c`, and must keep folding — the fix above must not throw this
+    /// away along with the unsound case.
+    #[test]
+    fn self_referential_loop_phi_is_still_constant() {
+        let mut ssa = SsaFunction::new(0, 3);
+        let c = local_at(&mut ssa, 0, 0, 0);
+        let p = ssa.create_variable(VariableOrigin::Local(1), 0, DefSite::phi(1), MockType::I32);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: c,
+            value: ConstValue::I32(5),
+        }));
+        b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        let mut phi = PhiNode::new(p, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(c, 0));
+        phi.add_operand(PhiOperand::new(p, 1));
+        b1.add_phi(phi);
+        b1.add_instruction(instr(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(instr(SsaOp::Return { value: Some(p) }));
+        ssa.add_block(b2);
+        ssa.recompute_uses();
+
+        let constants = OpaquePredicatePass::<MockTarget>::analyze_phi_constants(&ssa);
+
+        assert_eq!(
+            constants.get(&p),
+            Some(&ConstValue::I32(5)),
+            "a loop phi whose only non-self operand is a constant is that constant"
         );
     }
 

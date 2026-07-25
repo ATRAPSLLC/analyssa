@@ -30,10 +30,10 @@ use std::{
 };
 
 use crate::{
+    PointerSize,
     analysis::symbolic::ops::SymbolicOp,
     ir::{value::ConstValue, variable::SsaVarId},
     target::Target,
-    PointerSize,
 };
 
 /// A symbolic expression that can contain variables, constants, and operations.
@@ -71,6 +71,20 @@ pub enum SymbolicExpr<T: Target> {
 }
 
 const MAX_RECURSIVE_EXPR_DEPTH: usize = 512;
+
+/// Maximum node count before an expression is replaced by an opaque variable.
+///
+/// Depth alone does not bound an expression. `v = x op x` clones both operand
+/// trees, so it *doubles* the node count while adding exactly 1 to the depth — a
+/// straight-line run of such instructions reaches 2^n nodes at depth n. The depth
+/// cap of 512 is therefore unreachable in practice: 2^512 nodes cannot exist,
+/// but 2^30 can, and memory is gone long before depth 30. `simplify` does not
+/// collapse `x + x`, so nothing shrinks the tree either.
+///
+/// A few thousand nodes is far past anything a real dispatch expression needs,
+/// and stopping there degrades precision (the value becomes an opaque variable)
+/// rather than exhausting memory.
+const MAX_EXPR_NODES: usize = 4096;
 
 enum CloneTask<'a, T: Target> {
     Visit(&'a SymbolicExpr<T>),
@@ -261,6 +275,38 @@ impl<T: Target> SymbolicExpr<T> {
 
     pub(crate) fn reaches_recursive_depth_limit(&self) -> bool {
         self.depth() >= MAX_RECURSIVE_EXPR_DEPTH
+    }
+
+    /// Returns the number of nodes in this expression tree.
+    ///
+    /// Counts every constant, variable, and operator node. Iterative, so a deep
+    /// tree cannot overflow the stack.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(expr) = stack.pop() {
+            count = count.saturating_add(1);
+            match expr {
+                Self::Constant(_) | Self::Variable(_) | Self::NamedVar(_) => {}
+                Self::Unary { operand, .. } => stack.push(operand),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
+        }
+        count
+    }
+
+    /// Returns `true` when combining `left` and `right` would exceed the node
+    /// budget, so the caller should substitute an opaque variable instead.
+    ///
+    /// Checked on the operands rather than the result, so the oversized tree is
+    /// never built. See [`MAX_EXPR_NODES`] for why depth is not a sufficient
+    /// bound on its own.
+    pub(crate) fn combining_reaches_size_limit(left: &Self, right: &Self) -> bool {
+        left.node_count().saturating_add(right.node_count()) >= MAX_EXPR_NODES
     }
 
     /// Creates a constant expression from a typed `ConstValue`.
@@ -734,10 +780,10 @@ impl<T: Target> SymbolicExpr<T> {
                 let simplified = operand.simplify(ptr_size);
 
                 // Constant folding using typed operations
-                if let Self::Constant(v) = &simplified {
-                    if let Some(result) = evaluate_unary_typed(*op, v, ptr_size) {
-                        return Self::Constant(result);
-                    }
+                if let Self::Constant(v) = &simplified
+                    && let Some(result) = evaluate_unary_typed(*op, v, ptr_size)
+                {
+                    return Self::Constant(result);
                 }
 
                 // Double operation cancellation: --x = x, ~~x = x
@@ -745,15 +791,14 @@ impl<T: Target> SymbolicExpr<T> {
                     op: inner_op,
                     operand: inner_operand,
                 } = &simplified
+                    && op == inner_op
                 {
-                    if op == inner_op {
-                        match op {
-                            // --x = x (double negation)
-                            SymbolicOp::Neg => return inner_operand.clone_iterative(),
-                            // ~~x = x (double NOT)
-                            SymbolicOp::Not => return inner_operand.clone_iterative(),
-                            _ => {}
-                        }
+                    match op {
+                        // --x = x (double negation)
+                        SymbolicOp::Neg => return inner_operand.clone_iterative(),
+                        // ~~x = x (double NOT)
+                        SymbolicOp::Not => return inner_operand.clone_iterative(),
+                        _ => {}
                     }
                 }
 
@@ -767,10 +812,10 @@ impl<T: Target> SymbolicExpr<T> {
                 let right_simp = right.simplify(ptr_size);
 
                 // Both constants - evaluate using typed operations
-                if let (Self::Constant(l), Self::Constant(r)) = (&left_simp, &right_simp) {
-                    if let Some(result) = evaluate_binary_typed(*op, l, r, ptr_size) {
-                        return Self::Constant(result);
-                    }
+                if let (Self::Constant(l), Self::Constant(r)) = (&left_simp, &right_simp)
+                    && let Some(result) = evaluate_binary_typed(*op, l, r, ptr_size)
+                {
+                    return Self::Constant(result);
                 }
 
                 // Self-cancellation patterns (when left == right)
@@ -791,47 +836,45 @@ impl<T: Target> SymbolicExpr<T> {
                 // XOR constant cancellation: (x ^ c) ^ c = x
                 // This is critical for deobfuscation - many obfuscators use XOR with same constant
                 if *op == SymbolicOp::Xor {
-                    if let Self::Constant(c1) = &right_simp {
-                        if let Self::Binary {
+                    if let Self::Constant(c1) = &right_simp
+                        && let Self::Binary {
                             op: SymbolicOp::Xor,
                             left: inner_left,
                             right: inner_right,
                         } = &left_simp
+                    {
+                        // (x ^ c1) ^ c1 = x
+                        if let Self::Constant(c2) = inner_right.as_ref()
+                            && c1 == c2
                         {
-                            // (x ^ c1) ^ c1 = x
-                            if let Self::Constant(c2) = inner_right.as_ref() {
-                                if c1 == c2 {
-                                    return (**inner_left).clone();
-                                }
-                            }
-                            // (c1 ^ x) ^ c1 = x
-                            if let Self::Constant(c2) = inner_left.as_ref() {
-                                if c1 == c2 {
-                                    return (**inner_right).clone();
-                                }
-                            }
+                            return (**inner_left).clone();
+                        }
+                        // (c1 ^ x) ^ c1 = x
+                        if let Self::Constant(c2) = inner_left.as_ref()
+                            && c1 == c2
+                        {
+                            return (**inner_right).clone();
                         }
                     }
                     // Also handle c ^ (x ^ c) = x
-                    if let Self::Constant(c1) = &left_simp {
-                        if let Self::Binary {
+                    if let Self::Constant(c1) = &left_simp
+                        && let Self::Binary {
                             op: SymbolicOp::Xor,
                             left: inner_left,
                             right: inner_right,
                         } = &right_simp
+                    {
+                        // c1 ^ (x ^ c1) = x
+                        if let Self::Constant(c2) = inner_right.as_ref()
+                            && c1 == c2
                         {
-                            // c1 ^ (x ^ c1) = x
-                            if let Self::Constant(c2) = inner_right.as_ref() {
-                                if c1 == c2 {
-                                    return (**inner_left).clone();
-                                }
-                            }
-                            // c1 ^ (c1 ^ x) = x
-                            if let Self::Constant(c2) = inner_left.as_ref() {
-                                if c1 == c2 {
-                                    return (**inner_right).clone();
-                                }
-                            }
+                            return (**inner_left).clone();
+                        }
+                        // c1 ^ (c1 ^ x) = x
+                        if let Self::Constant(c2) = inner_left.as_ref()
+                            && c1 == c2
+                        {
+                            return (**inner_right).clone();
                         }
                     }
                 }
@@ -854,7 +897,7 @@ impl<T: Target> SymbolicExpr<T> {
                         match op {
                             // x * 1 = x, x / 1 = x
                             SymbolicOp::Mul | SymbolicOp::DivS | SymbolicOp::DivU => {
-                                return left_simp
+                                return left_simp;
                             }
                             _ => {}
                         }
@@ -869,7 +912,7 @@ impl<T: Target> SymbolicExpr<T> {
                                 return Self::Unary {
                                     op: SymbolicOp::Not,
                                     operand: Box::new(left_simp),
-                                }
+                                };
                             }
                             _ => {}
                         }
@@ -886,7 +929,7 @@ impl<T: Target> SymbolicExpr<T> {
                                 return Self::Unary {
                                     op: SymbolicOp::Neg,
                                     operand: Box::new(right_simp),
-                                }
+                                };
                             }
                             // 0 * x = 0
                             SymbolicOp::Mul => return Self::Constant(ConstValue::I32(0)),
@@ -912,7 +955,7 @@ impl<T: Target> SymbolicExpr<T> {
                                 return Self::Unary {
                                     op: SymbolicOp::Not,
                                     operand: Box::new(right_simp),
-                                }
+                                };
                             }
                             _ => {}
                         }
@@ -1132,10 +1175,10 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
+        PointerSize,
         analysis::symbolic::{expr::SymbolicExpr, ops::SymbolicOp},
         ir::{value::ConstValue, variable::SsaVarId},
         testing::MockTarget,
-        PointerSize,
     };
 
     fn deep_named_add_chain(depth: usize) -> SymbolicExpr<MockTarget> {
@@ -1176,5 +1219,44 @@ mod tests {
         let simplified = expr.simplify(PointerSize::Bit64);
 
         assert_eq!(simplified.depth(), 1_024);
+    }
+
+    /// Depth is not a bound on size. Each `x + x` step clones both operand trees,
+    /// so the node count doubles while the depth grows by one — 30 steps is a
+    /// billion nodes at depth 30, far below the depth cap of 512. This is why the
+    /// evaluators check `node_count` as well.
+    #[test]
+    fn self_doubling_grows_node_count_exponentially_at_shallow_depth() {
+        let mut expr: SymbolicExpr<MockTarget> = SymbolicExpr::named("x");
+        for step in 1..=12u32 {
+            expr = SymbolicExpr::binary(SymbolicOp::Add, expr.clone(), expr);
+            assert_eq!(expr.depth(), step as usize, "one step adds one level");
+        }
+
+        // 2^13 - 1 nodes at depth 12: the depth cap of 512 is nowhere near.
+        assert_eq!(expr.node_count(), (1usize << 13) - 1);
+        assert!(
+            !expr.reaches_recursive_depth_limit(),
+            "the depth guard cannot see this"
+        );
+        assert!(
+            SymbolicExpr::combining_reaches_size_limit(&expr, &SymbolicExpr::named("y")),
+            "but the size guard must, or memory is the only limit"
+        );
+    }
+
+    #[test]
+    fn node_count_counts_every_node() {
+        let leaf: SymbolicExpr<MockTarget> = SymbolicExpr::named("a");
+        assert_eq!(leaf.node_count(), 1);
+
+        let unary = SymbolicExpr::unary(SymbolicOp::Neg, leaf.clone());
+        assert_eq!(unary.node_count(), 2);
+
+        let binary = SymbolicExpr::binary(SymbolicOp::Add, leaf.clone(), leaf);
+        assert_eq!(binary.node_count(), 3);
+        assert!(!SymbolicExpr::combining_reaches_size_limit(
+            &binary, &binary
+        ));
     }
 }

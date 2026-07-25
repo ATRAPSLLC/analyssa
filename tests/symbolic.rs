@@ -1,6 +1,7 @@
 //! Symbolic expression evaluation tests.
 
 use analyssa::{
+    PointerSize,
     analysis::{
         evaluator::SsaEvaluator,
         symbolic::{SymbolicEvaluator, SymbolicExpr, SymbolicOp},
@@ -14,7 +15,6 @@ use analyssa::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     testing::{MockTarget, MockType},
-    PointerSize,
 };
 
 fn some_or_abort<T>(value: Option<T>) -> T {

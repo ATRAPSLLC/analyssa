@@ -10,12 +10,12 @@
 use std::borrow::Cow;
 
 use crate::{
+    Error, Result,
     graph::{
         edge::EdgeId,
         node::NodeId,
         traits::{GraphBase, Predecessors, Successors},
     },
-    Error, Result,
 };
 
 /// Internal storage for edge data and endpoints.
@@ -1228,7 +1228,7 @@ mod tests {
         let outgoing: Vec<(EdgeId, &i32)> = graph.outgoing_edges(a).collect();
         assert_eq!(outgoing.len(), 2);
 
-        let weights: Vec<i32> = outgoing.iter().map(|(_, &w)| w).collect();
+        let weights: Vec<i32> = outgoing.iter().map(|(_, w)| **w).collect();
         assert!(weights.contains(&10));
         assert!(weights.contains(&20));
     }

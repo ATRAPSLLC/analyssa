@@ -2,6 +2,7 @@
 //! path tracing, constraint solving, loop fixpoint evaluation.
 
 use analyssa::{
+    PointerSize,
     analysis::evaluator::{ControlFlow, SsaEvaluator},
     ir::{
         block::SsaBlock,
@@ -13,7 +14,6 @@ use analyssa::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     testing::{MockTarget, MockType},
-    PointerSize,
 };
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {

@@ -34,7 +34,9 @@
 mod capability;
 mod pass;
 mod scheduler;
+mod transaction;
 
 pub use capability::DeobfuscationCapability;
 pub use pass::{ModificationScope, SsaPass, SsaPassHost};
 pub use scheduler::{PassScheduler, PipelineConfig};
+pub use transaction::{GroupOutcome, PassTransaction};

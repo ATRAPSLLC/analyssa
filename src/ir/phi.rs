@@ -102,6 +102,15 @@ impl PhiOperand {
     ///
     /// Used when block merging redirects edges, requiring phi operands
     /// to reference the new predecessor instead of the eliminated trampoline.
+    ///
+    /// **Unchecked**: a `PhiOperand` cannot see its siblings, so this cannot
+    /// tell whether the target edge already has an operand. Retargeting onto an
+    /// occupied edge produces a phi with two operands for one predecessor, which
+    /// the verifier rejects as
+    /// [`VerifierError::DuplicatePhiOperand`](crate::analysis::verifier::VerifierError::DuplicatePhiOperand).
+    /// Prefer
+    /// [`SsaEditor::replace_phi_predecessor`](crate::ir::function::SsaEditor::replace_phi_predecessor),
+    /// which checks for the collision and reconciles it.
     pub fn set_predecessor(&mut self, predecessor: usize) {
         self.predecessor = predecessor as u32;
     }
@@ -139,7 +148,7 @@ impl fmt::Display for PhiOperand {
 /// assert_eq!(phi.result(), result);
 /// assert_eq!(phi.operand_count(), 2);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhiNode {
     /// The SSA variable that this phi node defines (its result).
@@ -155,6 +164,45 @@ pub struct PhiNode {
     /// Operands, one per predecessor block, each linking a predecessor
     /// to the SSA variable providing the value along that edge.
     operands: Vec<PhiOperand>,
+}
+
+impl Clone for PhiNode {
+    fn clone(&self) -> Self {
+        let Self {
+            result,
+            origin,
+            operands,
+        } = self;
+        Self {
+            result: *result,
+            origin: *origin,
+            operands: operands.clone(),
+        }
+    }
+
+    /// Overwrites `self` from `source`, **reusing the existing `operands`
+    /// allocation**.
+    ///
+    /// Hand-written for the same reason as
+    /// [`SsaFunction::clone_from`](crate::ir::function::SsaFunction): the
+    /// derived `Clone` supplies only the default `clone_from`
+    /// (`*self = source.clone()`), which drops and reallocates the operand
+    /// vector on every call. Specializing here lets a whole-function snapshot's
+    /// capacity reuse reach each phi's operand list rather than stopping at the
+    /// owning block's `phi_nodes` spine.
+    ///
+    /// The exhaustive destructure is deliberate: adding a field makes this fail
+    /// to compile rather than silently producing a stale-in-one-field clone.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            result,
+            origin,
+            operands,
+        } = source;
+        self.result = *result;
+        self.origin = *origin;
+        self.operands.clone_from(operands);
+    }
 }
 
 impl PhiNode {
@@ -230,6 +278,18 @@ impl PhiNode {
     }
 
     /// Adds an operand to this phi node.
+    ///
+    /// **Unchecked**: this does not verify that the operand's predecessor is a
+    /// real CFG predecessor, nor that no operand already names it. A phi with two
+    /// operands on one edge has no defined meaning — [`Self::operand_from`]
+    /// returns the first and discards the rest, while SCCP meets them all and
+    /// yields Bottom — and the verifier reports it as
+    /// [`VerifierError::DuplicatePhiOperand`]. Callers redirecting an existing
+    /// edge should use
+    /// [`SsaEditor::replace_phi_predecessor`](crate::ir::function::SsaEditor::replace_phi_predecessor),
+    /// which reconciles the collision instead of creating one.
+    ///
+    /// [`VerifierError::DuplicatePhiOperand`]: crate::analysis::verifier::VerifierError::DuplicatePhiOperand
     ///
     /// # Arguments
     ///

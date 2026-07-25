@@ -44,7 +44,11 @@ use std::{
     mem,
 };
 
-use crate::{ir::variable::SsaVarId, target::Endianness, target::Target, PointerSize};
+use crate::{
+    PointerSize,
+    ir::variable::SsaVarId,
+    target::{Endianness, Target},
+};
 
 /// Compile-time constant values tracked through SSA analysis.
 ///
@@ -447,11 +451,7 @@ impl<T: Target> ConstValue<T> {
     /// Creates a boolean constant from a bool value.
     #[must_use]
     pub const fn from_bool(value: bool) -> Self {
-        if value {
-            Self::True
-        } else {
-            Self::False
-        }
+        if value { Self::True } else { Self::False }
     }
 
     /// Returns the string content if this is a `DecryptedString`.
@@ -538,6 +538,44 @@ impl<T: Target> ConstValue<T> {
                 | Self::U64(u64::MAX)
                 | Self::NativeUInt(u64::MAX)
         )
+    }
+
+    /// Returns `value` as a constant of this constant's own integer type.
+    ///
+    /// Returns `None` when `self` is not an integer, or when `value` does not
+    /// fit the target variant. Use this when a rewrite must materialise a new
+    /// constant *alongside* an existing one — a mask, a shift amount — so the
+    /// replacement keeps the width the surrounding IR declares. Hard-coding
+    /// [`Self::I32`] there silently narrows the type, and mixed-width folds
+    /// then sign-extend the narrowed operand rather than using the value meant.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use analyssa::{ir::ConstValue, testing::MockTarget};
+    ///
+    /// let wide: ConstValue<MockTarget> = ConstValue::I64(1 << 32);
+    /// assert_eq!(wide.integer_of_same_type(255), Some(ConstValue::I64(255)));
+    ///
+    /// // A value that does not fit the variant is rejected rather than wrapped.
+    /// let narrow: ConstValue<MockTarget> = ConstValue::I8(1);
+    /// assert_eq!(narrow.integer_of_same_type(1 << 20), None);
+    /// ```
+    #[must_use]
+    pub fn integer_of_same_type(&self, value: i64) -> Option<Self> {
+        Some(match self {
+            Self::I8(_) => Self::I8(i8::try_from(value).ok()?),
+            Self::I16(_) => Self::I16(i16::try_from(value).ok()?),
+            Self::I32(_) => Self::I32(i32::try_from(value).ok()?),
+            Self::I64(_) => Self::I64(value),
+            Self::U8(_) => Self::U8(u8::try_from(value).ok()?),
+            Self::U16(_) => Self::U16(u16::try_from(value).ok()?),
+            Self::U32(_) => Self::U32(u32::try_from(value).ok()?),
+            Self::U64(_) => Self::U64(u64::try_from(value).ok()?),
+            Self::NativeInt(_) => Self::NativeInt(value),
+            Self::NativeUInt(_) => Self::NativeUInt(u64::try_from(value).ok()?),
+            _ => return None,
+        })
     }
 
     /// Returns a zero constant of the same type as this constant.
@@ -719,14 +757,52 @@ impl<T: Target> ConstValue<T> {
         .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to shift left.
+    /// Returns this constant's bit width, for the integer arms.
+    ///
+    /// `NativeInt`/`NativeUInt` report the target's pointer width; everything
+    /// non-integral reports `None`.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)] // Shift amounts are non-negative by convention
+    fn integer_bits(&self, ptr_size: PointerSize) -> Option<u32> {
+        Some(match self {
+            Self::I8(_) | Self::U8(_) => 8,
+            Self::I16(_) | Self::U16(_) => 16,
+            Self::I32(_) | Self::U32(_) => 32,
+            Self::I64(_) | Self::U64(_) => 64,
+            Self::NativeInt(_) | Self::NativeUInt(_) => ptr_size.bits(),
+            _ => return None,
+        })
+    }
+
+    /// Returns the shift distance if it is representable and in range for a
+    /// value of `bits` width, or `None` to decline the fold.
+    ///
+    /// `SsaOp::Shl`/`Shr` document only `dest = value << amount` and define no
+    /// out-of-range behaviour, and real ISAs disagree about it — x86 masks the
+    /// count by 31 (63 with REX.W) *regardless of the destination's sub-register
+    /// width*, while AArch64 and RISC-V mask by the register width. Rust's
+    /// `wrapping_shl` masks by the value's own type, so an `I8` arm masked by 7:
+    /// `shl bl, 8` is 0 on hardware, but folding `U8(0x81) << 8` returned
+    /// `U8(0x81)` — a third semantics that matches neither.
+    ///
+    /// Declining to fold is sound under every convention, so an out-of-range or
+    /// negative count is simply not folded.
+    fn shift_distance(amount: &Self, bits: u32) -> Option<u32> {
+        let raw = amount.as_i32()?;
+        let distance = u32::try_from(raw).ok()?;
+        (distance < bits).then_some(distance)
+    }
+
+    /// Attempts to shift left.
+    ///
+    /// Returns `None` when the shift distance is negative or at least the
+    /// value's own width — see [`Self::shift_distance`] for why declining is the
+    /// only convention-independent answer.
+    #[must_use]
     pub fn shl(&self, amount: &Self, ptr_size: PointerSize) -> Option<Self> {
         if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
             return Self::zip_lanes(a, b, |x, y| x.shl(y, ptr_size));
         }
-        let shift = amount.as_i32()? as u32;
+        let shift = Self::shift_distance(amount, self.integer_bits(ptr_size)?)?;
         match self {
             Self::I8(v) => Some(Self::I8(v.wrapping_shl(shift))),
             Self::I16(v) => Some(Self::I16(v.wrapping_shl(shift))),
@@ -744,6 +820,9 @@ impl<T: Target> ConstValue<T> {
     }
 
     /// Attempts to shift right (arithmetic for signed, logical for unsigned).
+    ///
+    /// Returns `None` when the shift distance is negative or at least the
+    /// value's own width — see [`Self::shift_distance`].
     #[must_use]
     #[allow(clippy::cast_sign_loss)] // Shift amounts and unsigned shifts use intentional casts
     #[allow(clippy::cast_possible_wrap)] // Wrapping is expected for logical shift operations
@@ -751,7 +830,7 @@ impl<T: Target> ConstValue<T> {
         if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
             return Self::zip_lanes(a, b, |x, y| x.shr(y, unsigned, ptr_size));
         }
-        let shift = amount.as_i32()? as u32;
+        let shift = Self::shift_distance(amount, self.integer_bits(ptr_size)?)?;
         match self {
             Self::I8(v) => {
                 if unsigned {
@@ -1243,16 +1322,21 @@ impl<T: Target> ConstValue<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use analyssa::{ir::value::ConstValue, target::Endianness, MockTarget};
+    /// use analyssa::{ir::value::ConstValue, target::Endianness, MockTarget, PointerSize};
     ///
     /// let val = ConstValue::<MockTarget>::U32(0x01020304);
-    /// let le = val.to_bytes(Endianness::Little).unwrap();
-    /// let be = val.to_bytes(Endianness::Big).unwrap();
+    /// let le = val.to_bytes(Endianness::Little, PointerSize::Bit64).unwrap();
+    /// let be = val.to_bytes(Endianness::Big, PointerSize::Bit64).unwrap();
     /// assert_eq!(le, vec![0x04, 0x03, 0x02, 0x01]);
     /// assert_eq!(be, vec![0x01, 0x02, 0x03, 0x04]);
+    ///
+    /// // A native-width value follows the target's pointer size, not `u64`.
+    /// let native = ConstValue::<MockTarget>::NativeUInt(0x0102_0304);
+    /// assert_eq!(native.to_bytes(Endianness::Little, PointerSize::Bit32).unwrap().len(), 4);
+    /// assert_eq!(native.to_bytes(Endianness::Little, PointerSize::Bit64).unwrap().len(), 8);
     /// ```
     #[must_use]
-    pub fn to_bytes(&self, endianness: Endianness) -> Option<Vec<u8>> {
+    pub fn to_bytes(&self, endianness: Endianness, ptr_size: PointerSize) -> Option<Vec<u8>> {
         match *self {
             Self::I8(v) => Some(vec![v as u8]),
             Self::U8(v) => Some(vec![v]),
@@ -1262,8 +1346,10 @@ impl<T: Target> ConstValue<T> {
             Self::U32(v) => Some(endianness.bytes_of_u32(v).to_vec()),
             Self::I64(v) => Some(endianness.bytes_of_u64(v as u64).to_vec()),
             Self::U64(v) => Some(endianness.bytes_of_u64(v).to_vec()),
-            Self::NativeInt(v) => Some(endianness.bytes_of_u64(v as u64).to_vec()),
-            Self::NativeUInt(v) => Some(endianness.bytes_of_u64(v).to_vec()),
+            // A native int is pointer-width by definition, so emitting eight
+            // bytes on a 32-bit target writes four bytes of a neighbouring cell.
+            Self::NativeInt(v) => Some(endianness.bytes_of_ptr_sized(v as u64, ptr_size)),
+            Self::NativeUInt(v) => Some(endianness.bytes_of_ptr_sized(v, ptr_size)),
             _ => None,
         }
     }
@@ -1619,10 +1705,10 @@ impl ComputedValue {
     pub fn normalized(self) -> Self {
         if self.op.is_commutative() && self.operands.len() == 2 {
             let mut ops = self.operands;
-            if let (Some(a), Some(b)) = (ops.first(), ops.get(1)) {
-                if a.index() > b.index() {
-                    ops.swap(0, 1);
-                }
+            if let (Some(a), Some(b)) = (ops.first(), ops.get(1))
+                && a.index() > b.index()
+            {
+                ops.swap(0, 1);
             }
             Self {
                 op: self.op,
@@ -1778,7 +1864,6 @@ impl fmt::Display for ComputedOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::testing::{MockTarget, MockType};
 
     type Cv = ConstValue<MockTarget>;
@@ -1787,6 +1872,58 @@ mod tests {
     /// `ConstValue`'s `Eq`/`Hash` model structural constant identity, which is
     /// what lets GVN use an op (and therefore its constants) as a hash-map key.
     /// The float arms must compare bitwise or `Eq` would not be reflexive.
+    /// Rust's `wrapping_shl` masks the distance by the *value's own* type width,
+    /// so the `I8` arm masked by 7: `U8(0x81) << 8` folded to `U8(0x81)`, leaving
+    /// the value unchanged. No ISA does that — x86 masks by 31/63 regardless of
+    /// the destination sub-register, AArch64 and RISC-V by the register width —
+    /// and `SsaOp::Shl` defines no out-of-range behaviour at all. Declining to
+    /// fold is sound under every convention.
+    #[test]
+    fn shifts_decline_rather_than_wrap_the_distance() {
+        type Cv = ConstValue<MockTarget>;
+        let ptr = PointerSize::Bit64;
+
+        for (value, distance) in [
+            (Cv::U8(0x81), 8i32),
+            (Cv::I8(-1), 8),
+            (Cv::U16(0x8001), 16),
+            (Cv::I32(1), 32),
+            (Cv::I64(1), 64),
+        ] {
+            assert_eq!(
+                value.shl(&Cv::I32(distance), ptr),
+                None,
+                "{value:?} << {distance} is out of range and must not fold"
+            );
+            assert_eq!(
+                value.shr(&Cv::I32(distance), false, ptr),
+                None,
+                "{value:?} >> {distance} is out of range and must not fold"
+            );
+        }
+
+        // A negative distance is meaningless and must not be reinterpreted as a
+        // huge unsigned one.
+        assert_eq!(Cv::I32(1).shl(&Cv::I32(-1), ptr), None);
+        assert_eq!(Cv::I32(1).shr(&Cv::I32(-1), false, ptr), None);
+    }
+
+    /// In-range shifts must still fold, at every width.
+    #[test]
+    fn in_range_shifts_still_fold() {
+        type Cv = ConstValue<MockTarget>;
+        let ptr = PointerSize::Bit64;
+
+        assert_eq!(Cv::U8(0x01).shl(&Cv::I32(7), ptr), Some(Cv::U8(0x80)));
+        assert_eq!(Cv::I32(1).shl(&Cv::I32(31), ptr), Some(Cv::I32(i32::MIN)));
+        assert_eq!(Cv::I64(1).shl(&Cv::I32(63), ptr), Some(Cv::I64(i64::MIN)));
+        assert_eq!(Cv::I32(-8).shr(&Cv::I32(1), false, ptr), Some(Cv::I32(-4)));
+        assert_eq!(
+            Cv::U32(0x8000_0000).shr(&Cv::I32(31), true, ptr),
+            Some(Cv::U32(1))
+        );
+    }
+
     #[test]
     fn const_value_equality_is_structural_and_reflexive_for_floats() {
         use std::collections::hash_map::DefaultHasher;
@@ -2058,11 +2195,48 @@ mod tests {
     // ConstValue::to_bytes — all integer widths, both endianness values
     // -----------------------------------------------------------------------
 
+    /// A native int is pointer-width by definition. Emitting eight bytes on a
+    /// 32-bit target writes four bytes past the value — into a neighbouring cell
+    /// for any caller laying out memory from these.
+    #[test]
+    fn native_ints_serialise_at_the_target_pointer_width() {
+        let value = Cv::NativeUInt(0x0102_0304);
+        assert_eq!(
+            value.to_bytes(Endianness::Little, PointerSize::Bit32),
+            Some(vec![0x04, 0x03, 0x02, 0x01])
+        );
+        assert_eq!(
+            value.to_bytes(Endianness::Little, PointerSize::Bit64),
+            Some(vec![0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00])
+        );
+        assert_eq!(
+            value.to_bytes(Endianness::Big, PointerSize::Bit32),
+            Some(vec![0x01, 0x02, 0x03, 0x04])
+        );
+
+        // A signed native int follows the same width.
+        assert_eq!(
+            Cv::NativeInt(-1)
+                .to_bytes(Endianness::Little, PointerSize::Bit16)
+                .map(|b| b.len()),
+            Some(2)
+        );
+
+        // Fixed-width variants ignore the pointer size entirely.
+        assert_eq!(
+            Cv::U32(1).to_bytes(Endianness::Little, PointerSize::Bit16),
+            Cv::U32(1).to_bytes(Endianness::Little, PointerSize::Bit64)
+        );
+    }
+
     #[test]
     fn to_bytes_i8_is_one_byte_regardless_of_endianness() {
         let val = Cv::I8(-1);
         for endianness in [Endianness::Little, Endianness::Big] {
-            assert_eq!(val.to_bytes(endianness), Some(vec![0xFF]));
+            assert_eq!(
+                val.to_bytes(endianness, PointerSize::Bit64),
+                Some(vec![0xFF])
+            );
         }
     }
 
@@ -2070,26 +2244,35 @@ mod tests {
     fn to_bytes_u8_is_one_byte_regardless_of_endianness() {
         let val = Cv::U8(0xAB);
         for endianness in [Endianness::Little, Endianness::Big] {
-            assert_eq!(val.to_bytes(endianness), Some(vec![0xAB]));
+            assert_eq!(
+                val.to_bytes(endianness, PointerSize::Bit64),
+                Some(vec![0xAB])
+            );
         }
     }
 
     #[test]
     fn to_bytes_i16_depends_on_endianness() {
         let val = Cv::I16(0x0102);
-        assert_eq!(val.to_bytes(Endianness::Little), Some(vec![0x02, 0x01]),);
-        assert_eq!(val.to_bytes(Endianness::Big), Some(vec![0x01, 0x02]),);
+        assert_eq!(
+            val.to_bytes(Endianness::Little, PointerSize::Bit64),
+            Some(vec![0x02, 0x01]),
+        );
+        assert_eq!(
+            val.to_bytes(Endianness::Big, PointerSize::Bit64),
+            Some(vec![0x01, 0x02]),
+        );
     }
 
     #[test]
     fn to_bytes_u32_depends_on_endianness() {
         let val = Cv::U32(0x01020304);
         assert_eq!(
-            val.to_bytes(Endianness::Little),
+            val.to_bytes(Endianness::Little, PointerSize::Bit64),
             Some(vec![0x04, 0x03, 0x02, 0x01]),
         );
         assert_eq!(
-            val.to_bytes(Endianness::Big),
+            val.to_bytes(Endianness::Big, PointerSize::Bit64),
             Some(vec![0x01, 0x02, 0x03, 0x04]),
         );
     }
@@ -2098,11 +2281,11 @@ mod tests {
     fn to_bytes_i64_depends_on_endianness() {
         let val = Cv::I64(0x0102030405060708);
         assert_eq!(
-            val.to_bytes(Endianness::Little),
+            val.to_bytes(Endianness::Little, PointerSize::Bit64),
             Some(vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]),
         );
         assert_eq!(
-            val.to_bytes(Endianness::Big),
+            val.to_bytes(Endianness::Big, PointerSize::Bit64),
             Some(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
         );
     }
@@ -2111,11 +2294,11 @@ mod tests {
     fn to_bytes_native_uint_depends_on_endianness() {
         let val = Cv::NativeUInt(0x0102030405060708);
         assert_eq!(
-            val.to_bytes(Endianness::Little),
+            val.to_bytes(Endianness::Little, PointerSize::Bit64),
             Some(vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]),
         );
         assert_eq!(
-            val.to_bytes(Endianness::Big),
+            val.to_bytes(Endianness::Big, PointerSize::Bit64),
             Some(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
         );
     }
@@ -2124,24 +2307,39 @@ mod tests {
     fn to_bytes_native_int_depends_on_endianness() {
         let val = Cv::NativeInt(0x0102030405060708);
         assert_eq!(
-            val.to_bytes(Endianness::Little),
+            val.to_bytes(Endianness::Little, PointerSize::Bit64),
             Some(vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]),
         );
         assert_eq!(
-            val.to_bytes(Endianness::Big),
+            val.to_bytes(Endianness::Big, PointerSize::Bit64),
             Some(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
         );
     }
 
     #[test]
     fn to_bytes_returns_none_for_non_integer_variants() {
-        assert_eq!(Cv::F32(1.0).to_bytes(Endianness::Little), None);
-        assert_eq!(Cv::F64(1.0).to_bytes(Endianness::Little), None);
-        assert_eq!(Cv::Null.to_bytes(Endianness::Little), None);
-        assert_eq!(Cv::True.to_bytes(Endianness::Little), None);
-        assert_eq!(Cv::False.to_bytes(Endianness::Little), None);
         assert_eq!(
-            Cv::DecryptedString("hello".into()).to_bytes(Endianness::Little),
+            Cv::F32(1.0).to_bytes(Endianness::Little, PointerSize::Bit64),
+            None
+        );
+        assert_eq!(
+            Cv::F64(1.0).to_bytes(Endianness::Little, PointerSize::Bit64),
+            None
+        );
+        assert_eq!(
+            Cv::Null.to_bytes(Endianness::Little, PointerSize::Bit64),
+            None
+        );
+        assert_eq!(
+            Cv::True.to_bytes(Endianness::Little, PointerSize::Bit64),
+            None
+        );
+        assert_eq!(
+            Cv::False.to_bytes(Endianness::Little, PointerSize::Bit64),
+            None
+        );
+        assert_eq!(
+            Cv::DecryptedString("hello".into()).to_bytes(Endianness::Little, PointerSize::Bit64),
             None,
         );
     }
@@ -2221,7 +2419,7 @@ mod tests {
 
         for endianness in [Endianness::Little, Endianness::Big] {
             for (original, expected) in &test_values {
-                let bytes = original.to_bytes(endianness).unwrap();
+                let bytes = original.to_bytes(endianness, PointerSize::Bit64).unwrap();
                 let restored = Cv::from_bytes(&bytes, endianness).unwrap();
                 assert_eq!(
                     restored, *expected,

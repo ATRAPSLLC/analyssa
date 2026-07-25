@@ -23,7 +23,9 @@
 //! sets; this mirrors the shape that lets `EventLog::record(&self)` work for
 //! parallel passes.
 
-use crate::target::Target;
+use std::hash::Hash;
+
+use crate::{interproc::CallGraph, target::Target};
 
 /// Minimal interprocedural view used by analyssa global passes.
 pub trait World<T: Target> {
@@ -48,16 +50,24 @@ pub trait World<T: Target> {
     /// share the world by reference.
     fn mark_dead(&self, method: &T::MethodRef);
 
-    /// Methods in reverse topological order of the call graph (callees
-    /// before callers). Used by the analyssa pass scheduler to process
-    /// callees before callers so interprocedural results propagate
-    /// upward in the same iteration.
+    /// Strongly-connected components of the call graph in reverse
+    /// topological order — callees before callers — each component holding
+    /// the methods that are mutually recursive.
     ///
-    /// Default implementation falls back to [`all_methods`](Self::all_methods)
-    /// (no ordering guarantee). Hosts with a real call graph should
-    /// override to return a topological ordering; recursion-induced
-    /// cycles can be broken arbitrarily.
-    fn methods_reverse_topological(&self) -> Vec<T::MethodRef> {
-        self.all_methods()
+    /// The grouping is load-bearing, not decoration: a component of one
+    /// non-self-recursive method converges in a single visit, while a
+    /// recursive component needs a bounded fixpoint. A flat method list cannot
+    /// express that difference, so an interprocedural driver given one would
+    /// have to iterate every method as though it were recursive.
+    ///
+    /// The default derives this from [`callees`](Self::callees) and
+    /// [`all_methods`](Self::all_methods) via
+    /// [`crate::interproc::CallGraph`], which is correct for any host; override
+    /// only to supply a cheaper pre-computed order.
+    fn methods_reverse_topological(&self) -> Vec<Vec<T::MethodRef>>
+    where
+        T::MethodRef: Hash + Eq + Clone,
+    {
+        CallGraph::from_world(self).components_callee_first()
     }
 }

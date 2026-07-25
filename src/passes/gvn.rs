@@ -47,13 +47,13 @@ use std::collections::HashMap;
 
 use crate::{
     analysis::cfg::SsaCfg,
-    bitset::BitSet,
     events::{EventKind, EventListener},
-    graph::{algorithms::compute_dominators, RootedGraph},
+    graph::{RootedGraph, algorithms::compute_dominators},
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         ops::{BinaryOpKind, OperandRole, SsaOp, UnaryOpKind},
         variable::SsaVarId,
+        varstore::VarSet,
     },
     target::Target,
 };
@@ -163,8 +163,15 @@ impl<T: Target> ValueKey<T> {
         // `effects().is_pure()` excludes everything that reads/writes memory, is
         // atomic, may throw (overflow-checked arithmetic, `Ckfinite`), or is a
         // carry-coupled rotate (`Rcl`/`Rcr`, which carry a hidden flag
-        // dependence). The single-def gate excludes flag-producing and wide
-        // multi-result ops whose secondary definitions GVN cannot remap.
+        // dependence). The single-def gate below excludes wide multi-result ops
+        // whose secondary definitions GVN cannot remap.
+        //
+        // Note this gate is *not* what protects flag-producing ops: the binary
+        // fast path above returns before reaching it, so a flag-setting `Add`
+        // does get value-numbered. That is deliberate and sound — its `dest` is
+        // the same function of the same operands whether or not it also writes
+        // flags — but it makes the removal step in `run_gvn` responsible for
+        // checking every definition before deleting an instruction.
         //
         // Purity alone is not sufficient: the ops below are pure yet are still
         // not a function of their SSA operands, so the generic key cannot
@@ -285,11 +292,25 @@ where
             }
 
             // Decide removals in a single pass over the post-replacement
-            // function instead of rescanning the whole function per redundant
-            // variable (which was O(redundant * instructions)).
+            // function. Rescanning per redundant variable would be
+            // O(redundant * instructions).
             let used = collect_used_vars(editor.function());
-            for (redundant_var, _original_var, block_idx, instr_idx) in &redundant {
-                if !used.contains(redundant_var.index()) {
+            for (_redundant_var, _original_var, block_idx, instr_idx) in &redundant {
+                // Check *every* definition, not just the primary result. A
+                // flag-producing `Add` defines both `dest` and `flags`, and
+                // `BinaryOpInfo::value_key()` does not include `flags`, so two
+                // adds that differ only in their flags destination key
+                // identically. Forwarding the redundant `dest` is still sound —
+                // the arithmetic result is the same function of the same
+                // operands — but the instruction may only be removed once every
+                // definition it makes is dead. Removing it on the strength of a
+                // dead `dest` alone leaves a live `flags` use dangling.
+                let all_defs_dead = editor
+                    .function()
+                    .block(*block_idx)
+                    .and_then(|block| block.instruction(*instr_idx))
+                    .is_some_and(|instr| instr.op().defs().all(|def| !used.contains(def)));
+                if all_defs_dead {
                     removals.push((*block_idx, *instr_idx));
                 }
             }
@@ -310,17 +331,17 @@ where
 
 /// Collects, in a single pass, the set of variables still referenced by any
 /// instruction operand or phi operand (indexed by `SsaVarId::index()`).
-fn collect_used_vars<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
-    let mut used = BitSet::new(ssa.var_id_capacity());
+fn collect_used_vars<T: Target>(ssa: &SsaFunction<T>) -> VarSet {
+    let mut used = VarSet::new(ssa.var_id_bound());
     for block in ssa.blocks() {
         for instr in block.instructions() {
             instr.op().for_each_use(|v| {
-                used.insert(v.index());
+                used.insert(v);
             });
         }
         for phi in block.phi_nodes() {
             for operand in phi.operands() {
-                used.insert(operand.value().index());
+                used.insert(operand.value());
             }
         }
     }
@@ -330,20 +351,118 @@ fn collect_used_vars<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         events::EventLog,
         ir::{
+            FlagCondition,
             block::SsaBlock,
             instruction::SsaInstruction,
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
         testing::{
-            assert_mock_valid_full, mock_op_at, run_mock_pass_repaired_boundary, MockTarget,
-            MockType,
+            MockTarget, MockType, assert_mock_valid_full, mock_op_at,
+            run_mock_pass_repaired_boundary,
         },
     };
+
+    /// Two identical flag-setting adds followed by a `BranchFlags` reading the
+    /// *second* one's flags — the shape any lifter emits for a repeated
+    /// `add eax, ebx` with a later conditional jump.
+    ///
+    /// `BinaryOpInfo::value_key()` does not include `flags`, so both adds key
+    /// identically and GVN forwards the second `dest` to the first. That part is
+    /// sound: the arithmetic result is the same function of the same operands.
+    /// What is *not* sound is then deleting the instruction, because its `flags`
+    /// definition is still live.
+    fn two_flag_setting_adds_with_a_flags_consumer() -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+
+        let mut mk = |origin, block, instr| {
+            ssa.create_variable(
+                VariableOrigin::Local(origin),
+                0,
+                DefSite::instruction(block, instr),
+                MockType::I32,
+            )
+        };
+        let v0 = mk(0, 0, 0);
+        let v1 = mk(1, 0, 1);
+        let sum1 = mk(2, 0, 2);
+        let flags1 = mk(3, 0, 2);
+        let sum2 = mk(4, 0, 3);
+        let flags2 = mk(5, 0, 3);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: v0,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: v1,
+            value: ConstValue::I32(2),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: sum1,
+            left: v0,
+            right: v1,
+            flags: Some(flags1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: sum2,
+            left: v0,
+            right: v1,
+            flags: Some(flags2),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::BranchFlags {
+            flags: flags2,
+            condition: FlagCondition::Zero,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(sum1),
+        }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(sum2),
+        }));
+        ssa.add_block(b2);
+
+        ssa.recompute_uses();
+        ssa
+    }
+
+    /// GVN may forward the redundant *value*, but it must not delete an
+    /// instruction that still has a live secondary definition. Deleting it
+    /// leaves `BranchFlags` reading a variable that nothing defines.
+    #[test]
+    fn gvn_keeps_a_redundant_add_whose_flags_are_still_live() {
+        let mut ssa = two_flag_setting_adds_with_a_flags_consumer();
+        let events: EventLog<MockTarget> = EventLog::new();
+
+        run_gvn(&mut ssa, &0u32, &events);
+
+        // The flags definition must survive somewhere in the function.
+        let flags2 = SsaVarId::from_index(5);
+        let defines_flags2 = ssa.blocks().iter().any(|block| {
+            block
+                .instructions()
+                .iter()
+                .any(|instr| instr.op().defs().any(|d| d == flags2))
+        });
+        assert!(
+            defines_flags2,
+            "GVN removed the redundant add but its `flags` definition is still \
+             read by BranchFlags — the branch now reads an undefined variable"
+        );
+        assert_mock_valid_full(&ssa, "after GVN over flag-setting adds");
+    }
 
     #[test]
     fn value_key_binary_commutative() {

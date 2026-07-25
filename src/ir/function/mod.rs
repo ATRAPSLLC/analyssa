@@ -9,7 +9,6 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | `canonical` | Final cleanup: strip nops, remove empty blocks, compact indices |
-//! | `duplication` | Block cloning with fresh variable allocation |
 //! | `queries` | Read-only analysis: return info, purity, variable tracing |
 //! | `rebuild` | Full SSA reconstruction (Cytron et al. algorithm) after CFG changes |
 //! | `repair` | Lightweight SSA repair for instruction-only passes |
@@ -51,13 +50,17 @@
 
 mod builder;
 mod canonical;
-mod duplication;
 mod editor;
 mod kind;
 mod queries;
 mod rebuild;
 mod repair;
 mod transforms;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 pub use builder::{
     AtomicCmpXchgSpec, AtomicLockRmwSpec, SsaBlockBuilder, SsaDefSpec, SsaFunctionBuilder,
@@ -70,11 +73,6 @@ pub use editor::{
 pub use kind::FunctionKind;
 pub use queries::{MethodPurity, ReturnInfo};
 pub use transforms::{CopyPropagationResult, TrivialPhiOptions};
-
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
 
 use crate::{
     analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
@@ -144,7 +142,7 @@ mod map_as_pairs {
 ///     println!("Variable: {}", var);
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
@@ -245,6 +243,85 @@ pub struct SsaFunction<T: Target> {
     /// Defaults to [`FunctionKind::Normal`]. Set during SSA construction by
     /// frontends that need to mark functions as interrupt service routines.
     kind: FunctionKind,
+}
+
+impl<T: Target> Clone for SsaFunction<T> {
+    fn clone(&self) -> Self {
+        let Self {
+            blocks,
+            variables,
+            var_allocator,
+            origin_versions,
+            origin_types,
+            num_args,
+            num_locals,
+            original_num_locals,
+            preserved_dispatch_vars,
+            original_local_types,
+            exception_handlers,
+            rename_groups,
+            kind,
+        } = self;
+        Self {
+            blocks: blocks.clone(),
+            variables: variables.clone(),
+            var_allocator: var_allocator.clone(),
+            origin_versions: origin_versions.clone(),
+            origin_types: origin_types.clone(),
+            num_args: *num_args,
+            num_locals: *num_locals,
+            original_num_locals: *original_num_locals,
+            preserved_dispatch_vars: preserved_dispatch_vars.clone(),
+            original_local_types: original_local_types.clone(),
+            exception_handlers: exception_handlers.clone(),
+            rename_groups: rename_groups.clone(),
+            kind: *kind,
+        }
+    }
+
+    /// Overwrites `self` from `source`, **reusing existing allocations**.
+    ///
+    /// The derived `Clone` provides only the default `clone_from`
+    /// (`*self = source.clone()`), which frees and reallocates every `Vec` and
+    /// `BTreeMap` on every call. Callers that snapshot repeatedly into the same
+    /// buffer — the optimization pipeline's per-pass-group rollback point being
+    /// the motivating one — reuse capacity instead.
+    ///
+    /// The exhaustive destructure is deliberate: adding a field to
+    /// [`SsaFunction`] makes this fail to compile rather than silently
+    /// producing a snapshot that is stale in exactly one field, which would be
+    /// a rollback that quietly loses data.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            blocks,
+            variables,
+            var_allocator,
+            origin_versions,
+            origin_types,
+            num_args,
+            num_locals,
+            original_num_locals,
+            preserved_dispatch_vars,
+            original_local_types,
+            exception_handlers,
+            rename_groups,
+            kind,
+        } = source;
+        self.blocks.clone_from(blocks);
+        self.variables.clone_from(variables);
+        self.var_allocator.clone_from(var_allocator);
+        self.origin_versions.clone_from(origin_versions);
+        self.origin_types.clone_from(origin_types);
+        self.num_args = *num_args;
+        self.num_locals = *num_locals;
+        self.original_num_locals = *original_num_locals;
+        self.preserved_dispatch_vars
+            .clone_from(preserved_dispatch_vars);
+        self.original_local_types.clone_from(original_local_types);
+        self.exception_handlers.clone_from(exception_handlers);
+        self.rename_groups.clone_from(rename_groups);
+        self.kind = *kind;
+    }
 }
 
 impl<T: Target> SsaFunction<T> {
@@ -543,34 +620,72 @@ impl<T: Target> SsaFunction<T> {
         self.variables.len()
     }
 
-    /// Returns the minimum BitSet capacity needed to index all variable IDs
-    /// that appear in this function (in the variables vec, block instructions,
-    /// and phi nodes).
+    /// Returns an O(1) upper bound on every variable id this function has
+    /// allocated — the size to use for [`VarSet`](crate::ir::VarSet) and
+    /// [`VarMap`](crate::ir::VarMap).
     ///
-    /// This handles cases where variable IDs don't match their position in
-    /// the variables vector (e.g., in test code using `SsaVarId::from_index`
-    /// without registering via `create_variable`).
+    /// This is the allocator's high-water mark, so it covers ids that were
+    /// allocated but never registered in `variables` (or were removed from it
+    /// without compaction) as well as every registered id.
+    ///
+    /// Prefer this over [`Self::var_id_capacity`], which walks every block,
+    /// instruction, phi and operand to find the exact maximum. That scan is
+    /// O(function) and several passes size a set per loop, which on a
+    /// 27,384-block function with 3,633 loops meant thousands of whole-function
+    /// walks just to pick a capacity.
+    ///
+    /// The only ids this does not cover are ones built directly with
+    /// [`SsaVarId::from_index`] outside the allocator's range, which
+    /// `VarSet`/`VarMap` ignore rather than mis-index.
+    #[must_use]
+    pub fn var_id_bound(&self) -> usize {
+        self.variables.len().max(self.var_allocator.count())
+    }
+
+    /// Returns the exact minimum capacity needed to index all variable IDs that
+    /// appear in this function (in the variables vec, block instructions, and
+    /// phi nodes).
+    ///
+    /// Walks the whole function, so it is O(function). Use
+    /// [`Self::var_id_bound`] to size storage; this exists for the cases that
+    /// need the true maximum, including ids built with
+    /// [`SsaVarId::from_index`] outside the allocator's range.
     #[must_use]
     pub fn var_id_capacity(&self) -> usize {
         // Single allocation-free fold over every referenced variable id. Floored
         // at `variables.len()` since IDs are normally dense.
+        //
+        // `SsaVarId::PLACEHOLDER` is excluded: it is a sentinel for "no id
+        // assigned yet", not a variable, and its index is `u32::MAX - 1`.
+        // Folding it in would make this return ~4.29 billion, so every caller
+        // that sizes storage from it — eleven `BitSet`s across the passes, plus
+        // the verifier's maps — would allocate 512 MB or more the moment a
+        // function held an unrenamed phi. Placeholders are legitimately present
+        // between phi placement and renaming, so this is reachable rather than
+        // hypothetical. `VarSet` and `VarMap` apply the same rule on the
+        // storage side.
         let mut max_idx = self.variables.len();
+        let widen = |id: SsaVarId, max_idx: &mut usize| {
+            if !id.is_placeholder() {
+                *max_idx = (*max_idx).max(id.index().saturating_add(1));
+            }
+        };
         for v in &self.variables {
-            max_idx = max_idx.max(v.id().index().saturating_add(1));
+            widen(v.id(), &mut max_idx);
         }
         for b in &self.blocks {
             for p in b.phi_nodes() {
-                max_idx = max_idx.max(p.result().index().saturating_add(1));
+                widen(p.result(), &mut max_idx);
                 for op in p.operands() {
-                    max_idx = max_idx.max(op.value().index().saturating_add(1));
+                    widen(op.value(), &mut max_idx);
                 }
             }
             for i in b.instructions() {
                 for d in i.op().defs() {
-                    max_idx = max_idx.max(d.index().saturating_add(1));
+                    widen(d, &mut max_idx);
                 }
                 i.op().for_each_use(|u| {
-                    max_idx = max_idx.max(u.index().saturating_add(1));
+                    widen(u, &mut max_idx);
                 });
             }
         }
@@ -792,10 +907,10 @@ impl<T: Target> SsaFunction<T> {
             let old_id = var.id();
             let new_id = SsaVarId::from_index(index);
             // Carry over the rename group from the old position
-            if let Some(&old_group) = old_groups.get(old_id.index()) {
-                if let Some(slot) = new_groups.get_mut(index) {
-                    *slot = old_group;
-                }
+            if let Some(&old_group) = old_groups.get(old_id.index())
+                && let Some(slot) = new_groups.get_mut(index)
+            {
+                *slot = old_group;
             }
             if old_id != new_id {
                 remap.insert(old_id, new_id);
@@ -1043,19 +1158,18 @@ impl<T: Target> SsaFunction<T> {
                     // Phi operand — only meaningful if the phi result has a known type.
                     // If the phi result is also Unknown, this is just Unknown feeding
                     // Unknown (e.g., uninitialized locals in a loop), not a real error.
-                    if let Some(block) = self.block(use_site.block) {
-                        if let Some(phi) = block.phi(use_site.instruction) {
-                            if let Some(result_var) = self.variable(phi.result()) {
-                                return !T::is_unknown(result_var.var_type());
-                            }
-                        }
+                    if let Some(block) = self.block(use_site.block)
+                        && let Some(phi) = block.phi(use_site.instruction)
+                        && let Some(result_var) = self.variable(phi.result())
+                    {
+                        return !T::is_unknown(result_var.var_type());
                     }
                     return false;
                 }
-                if let Some(block) = self.block(use_site.block) {
-                    if let Some(instr) = block.instruction(use_site.instruction) {
-                        return !matches!(instr.op(), SsaOp::Pop { .. });
-                    }
+                if let Some(block) = self.block(use_site.block)
+                    && let Some(instr) = block.instruction(use_site.instruction)
+                {
+                    return !matches!(instr.op(), SsaOp::Pop { .. });
                 }
                 true // Conservative: assume meaningful if we can't check
             });
@@ -1069,15 +1183,15 @@ impl<T: Target> SsaFunction<T> {
                         if use_site.is_phi_operand {
                             return format!("phi in block {}", use_site.block);
                         }
-                        if let Some(block) = self.block(use_site.block) {
-                            if let Some(instr) = block.instruction(use_site.instruction) {
-                                return format!(
-                                    "block {} instr {}: {:?}",
-                                    use_site.block,
-                                    use_site.instruction,
-                                    instr.op()
-                                );
-                            }
+                        if let Some(block) = self.block(use_site.block)
+                            && let Some(instr) = block.instruction(use_site.instruction)
+                        {
+                            return format!(
+                                "block {} instr {}: {:?}",
+                                use_site.block,
+                                use_site.instruction,
+                                instr.op()
+                            );
                         }
                         format!(
                             "block {} instr {}: <unknown>",
@@ -1192,5 +1306,59 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod var_id_capacity_tests {
+    use crate::{
+        ir::{
+            block::SsaBlock,
+            function::SsaFunction,
+            phi::PhiNode,
+            variable::{SsaVarId, VariableOrigin},
+        },
+        testing::MockTarget,
+    };
+
+    /// A function holding an unrenamed placeholder phi must still report a
+    /// capacity proportional to its real variables.
+    ///
+    /// `SsaVarId::PLACEHOLDER` encodes index `u32::MAX - 1`. Folding it into
+    /// the capacity made this return ~4.29 billion, and every caller that sizes
+    /// storage from it — eleven `BitSet`s across the passes, plus the verifier's
+    /// maps — then allocated 512 MB or more. Placeholder phis exist between phi
+    /// placement and renaming, so this was reachable on real input, not just in
+    /// hand-built IR.
+    #[test]
+    fn placeholder_does_not_inflate_capacity() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let mut block = SsaBlock::new(0);
+        block.add_phi(PhiNode::new(
+            SsaVarId::PLACEHOLDER,
+            VariableOrigin::Local(0),
+        ));
+        ssa.add_block(block);
+
+        let capacity = ssa.var_id_capacity();
+        assert!(
+            capacity < 1024,
+            "placeholder inflated var_id_capacity to {capacity}"
+        );
+    }
+
+    /// The capacity still covers a real id that appears only inside a block,
+    /// which is the case the fold exists for.
+    #[test]
+    fn capacity_covers_block_only_ids() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let mut block = SsaBlock::new(0);
+        block.add_phi(PhiNode::new(
+            SsaVarId::from_index(42),
+            VariableOrigin::Local(0),
+        ));
+        ssa.add_block(block);
+
+        assert!(ssa.var_id_capacity() > 42, "must cover id 42");
     }
 }

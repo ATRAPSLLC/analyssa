@@ -1,6 +1,7 @@
 //! Dataflow analysis tests: SCCP, liveness, reaching definitions.
 
 use analyssa::{
+    PointerSize,
     analysis::{
         cfg::SsaCfg,
         dataflow::{
@@ -20,7 +21,6 @@ use analyssa::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     testing::{MockTarget, MockType},
-    PointerSize,
 };
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
@@ -223,18 +223,34 @@ fn sccp_propagates_through_phi_in_diamond() {
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
-    // All blocks may be executable (SCCP may not prune based on branch
-    // conditions alone). At minimum the constants are propagated.
+    // The entry block branches on the constant 1, so only the true arm is
+    // executable — that is the whole point of *conditional* constant
+    // propagation. B2 is never entered, so `right` is never evaluated.
     assert!(result.executable_blocks().any(|b| b == 0));
+    assert!(
+        result.executable_blocks().any(|b| b == 1),
+        "the taken arm must be executable"
+    );
+    assert!(
+        !result.executable_blocks().any(|b| b == 2),
+        "a constant-true branch must leave the false arm unreachable"
+    );
+
     assert!(result.is_constant(left));
-    assert!(result.is_constant(right));
     assert_eq!(
         result.constant_value(left).and_then(|c| c.as_i64()),
         Some(10)
     );
+    assert!(
+        !result.is_constant(right),
+        "`right` is defined in the pruned arm and is never evaluated"
+    );
+
+    // With one executable incoming edge, the merge resolves to that operand.
     assert_eq!(
-        result.constant_value(right).and_then(|c| c.as_i64()),
-        Some(20)
+        result.constant_value(merged).and_then(|c| c.as_i64()),
+        Some(10),
+        "the phi has a single executable operand, so it is that constant"
     );
 }
 

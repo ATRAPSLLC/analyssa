@@ -49,9 +49,10 @@ pub mod ops;
 pub mod phi;
 pub mod value;
 pub mod variable;
+pub mod varstore;
 
 pub use block::{ReplaceResult, SsaBlock};
-pub use exception::{native_is_filter_handler, NativeExceptionKind, SsaExceptionHandler};
+pub use exception::{NativeExceptionKind, SsaExceptionHandler, native_is_filter_handler};
 pub use function::{
     CheckedReplaceResult, FunctionKind, MethodPurity, ReplacementSkipReason, ReturnInfo,
     SkippedReplacement, SsaBlockBuilder, SsaDefSpec, SsaEditOptions, SsaEditReport, SsaEditScope,
@@ -64,3 +65,4 @@ pub use ops::{
 pub use phi::{PhiNode, PhiOperand};
 pub use value::{AbstractValue, ComputedOp, ComputedValue, ConstValue};
 pub use variable::{DefSite, FunctionVarAllocator, SsaVarId, SsaVariable, UseSite, VariableOrigin};
+pub use varstore::{VarMap, VarSet};

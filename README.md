@@ -18,11 +18,14 @@ optimization passes, and scheduler integration.
 - `ir` — SSA IR core: blocks, instructions, phi nodes, variables,
   ops, values, exception handlers, functions.
 - `analysis` — SSA-level analyses: CFG, constants, evaluator, liveness,
-  memory SSA, patterns, phi placement, resolver, verifier, symbolic execution,
-  and dataflow.
+  memory SSA, points-to and address analysis, patterns, phi placement,
+  resolver, verifier, symbolic execution, and dataflow.
 - `passes` — reusable optimization and deobfuscation pass bodies.
+- `interproc` — call graph plus an SCC-ordered summary solver for
+  interprocedural analyses built on caller-supplied transfer functions.
 - `scheduling` / `host` / `world` — traits and scheduler glue for host crates
-  that own method storage, dirty tracking, and interprocedural traversal.
+  that own method storage, dirty tracking, and interprocedural traversal,
+  including transactional pass-group execution with rollback.
 - `target` — `Target` trait + `MockTarget` for unit testing without a
   concrete instruction-set host.
 - `pointer` — `PointerSize` for hosts to communicate target pointer
@@ -57,12 +60,15 @@ implementation for tests and examples that do not need host-specific metadata.
 ## Development
 
 ```bash
-cargo fmt --check
+# Nightly: rustfmt.toml uses `group_imports` / `imports_granularity`, which
+# stable rustfmt silently ignores. Formatting only — the crate builds on stable.
+cargo +nightly fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --doc --all-features
 cargo llvm-cov --all-targets --all-features --summary-only
 RUSTDOCFLAGS="-D warnings -D missing-docs" cargo doc --no-deps --all-features --document-private-items
+cargo bench --bench ssa_repair   # SSA maintenance costs; see benches/
 ```
 
 The CI workflow runs these checks on pull requests and pushes to `main`.

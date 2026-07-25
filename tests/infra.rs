@@ -2,10 +2,11 @@
 //! functions, and pointer size.
 
 use analyssa::{
+    PointerSize,
     analysis::{ConstEvaluator, DefUseIndex, SsaCfg, ValueResolver},
     bitset::BitSet,
     events::{EventKind, EventLog},
-    graph::{algorithms, DirectedGraph, EdgeId, NodeId},
+    graph::{DirectedGraph, EdgeId, NodeId, algorithms},
     ir::{
         block::SsaBlock,
         function::SsaFunction,
@@ -16,7 +17,6 @@ use analyssa::{
     },
     passes::utils,
     testing::{MockTarget, MockType},
-    PointerSize,
 };
 
 fn some_or_abort<T>(value: Option<T>) -> T {

@@ -130,9 +130,8 @@ pub fn compute_live_in_blocks(
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::BitSet;
-
     use super::compute_live_in_blocks;
+    use crate::BitSet;
 
     fn bitset_from(cap: usize, indices: &[usize]) -> BitSet {
         let mut bs = BitSet::new(cap);

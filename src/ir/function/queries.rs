@@ -1,6 +1,6 @@
 //! Read-only query and analysis methods for SSA functions.
 //!
-//! These methods analyze an [`SsaFunction`](super::SsaFunction) without modifying it,
+//! These methods analyze an [`SsaFunction`] without modifying it,
 //! providing information about variables, control flow, return behavior, and purity.
 //!
 //! # Query Categories
@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    BitSet,
     ir::{
         block::SsaBlock,
         function::SsaFunction,
@@ -32,9 +33,9 @@ use crate::{
         phi::PhiNode,
         value::ConstValue,
         variable::{SsaVarId, SsaVariable, VariableOrigin},
+        varstore::VarSet,
     },
     target::Target,
-    BitSet,
 };
 
 /// Classification of a method's return behavior.
@@ -389,16 +390,31 @@ impl<T: Target> SsaFunction<T> {
         // Fast path: O(1) via the variable's DefSite
         if let Some(variable) = self.variable(var) {
             let def = variable.def_site();
-            if let Some(instr_idx) = def.instruction {
-                if let Some(block) = self.block(def.block) {
-                    if let Some(instr) = block.instructions().get(instr_idx) {
-                        let op = instr.op();
-                        if op.defs().any(|def| def == var) {
-                            return Some(op);
-                        }
-                    }
+            if let Some(instr_idx) = def.instruction
+                && let Some(block) = self.block(def.block)
+                && let Some(instr) = block.instructions().get(instr_idx)
+            {
+                let op = instr.op();
+                if op.defs().any(|def| def == var) {
+                    return Some(op);
                 }
             }
+        }
+
+        // A variable whose recorded definition really is a phi has no defining
+        // *instruction*, so there is nothing for the scan below to find. Confirm
+        // the phi actually exists before short-circuiting — an absent
+        // instruction index can also mean a stale def site, which is exactly
+        // what the scan recovers from. Without this, every lookup of a
+        // phi-defined variable walked the whole function to return `None`, and
+        // callers such as the memory pass do that per value in a loop.
+        if let Some(def) = self.variable(var).map(SsaVariable::def_site)
+            && def.is_phi()
+            && self
+                .block(def.block)
+                .is_some_and(|block| block.phi_nodes().iter().any(|phi| phi.result() == var))
+        {
+            return None;
         }
 
         // Slow path: O(n) scan (DefSite may be stale after transforms or from builder)
@@ -432,16 +448,26 @@ impl<T: Target> SsaFunction<T> {
         // Fast path: O(1) via the variable's DefSite
         if let Some(variable) = self.variable(var) {
             let def = variable.def_site();
-            if let Some(instr_idx) = def.instruction {
-                if let Some(block) = self.block(def.block) {
-                    if let Some(instr) = block.instructions().get(instr_idx) {
-                        let op = instr.op();
-                        if op.defs().any(|def| def == var) {
-                            return Some(instr);
-                        }
-                    }
+            if let Some(instr_idx) = def.instruction
+                && let Some(block) = self.block(def.block)
+                && let Some(instr) = block.instructions().get(instr_idx)
+            {
+                let op = instr.op();
+                if op.defs().any(|def| def == var) {
+                    return Some(instr);
                 }
             }
+        }
+
+        // See `get_definition`: a confirmed phi definition has no defining
+        // instruction, so the scan cannot find one and is pure cost.
+        if let Some(def) = self.variable(var).map(SsaVariable::def_site)
+            && def.is_phi()
+            && self
+                .block(def.block)
+                .is_some_and(|block| block.phi_nodes().iter().any(|phi| phi.result() == var))
+        {
+            return None;
         }
 
         // Slow path: O(n) scan (DefSite may be stale after transforms or from builder)
@@ -494,10 +520,10 @@ impl<T: Target> SsaFunction<T> {
         var_def_block: &BTreeMap<SsaVarId, usize>,
         reachable: &BitSet,
     ) -> bool {
-        if let Some(&def_block) = var_def_block.get(&source) {
-            if reachable.contains(def_block) {
-                return self.would_create_self_reference(source, result);
-            }
+        if let Some(&def_block) = var_def_block.get(&source)
+            && reachable.contains(def_block)
+        {
+            return self.would_create_self_reference(source, result);
         }
         false
     }
@@ -635,19 +661,34 @@ impl<T: Target> SsaFunction<T> {
     /// The PHI variable that is the ultimate source, or `None` if no PHI is found.
     #[must_use]
     pub fn trace_to_phi(&self, var: SsaVarId, target_block: Option<usize>) -> Option<SsaVarId> {
-        self.trace_to_phi_impl(var, target_block, 0)
+        let mut visited = VarSet::new(self.var_id_bound());
+        self.trace_to_phi_impl(var, target_block, 0, &mut visited)
     }
 
     /// Internal implementation with depth limit to prevent infinite recursion.
+    ///
+    /// `visited` memoises variables already explored and found not to reach a
+    /// phi. The binary arms (`Xor`, `Mul`, `Add`, `Sub`) each recurse into *both*
+    /// operands, so without it a chain of `n` such ops costs `2^n` traversals —
+    /// the depth cap of 20 bounds that at ~2^20 rather than at anything useful.
+    /// A variable's trace result does not depend on the path taken to reach it,
+    /// so memoising preserves the answer exactly and makes the walk linear in
+    /// the number of distinct variables reached.
     fn trace_to_phi_impl(
         &self,
         var: SsaVarId,
         target_block: Option<usize>,
         depth: usize,
+        visited: &mut VarSet,
     ) -> Option<SsaVarId> {
         // Prevent infinite recursion
         const MAX_DEPTH: usize = 20;
         if depth > MAX_DEPTH {
+            return None;
+        }
+        // `insert` returns false when already present: this variable was explored
+        // and did not reach a phi, so exploring it again cannot change that.
+        if !visited.insert(var) {
             return None;
         }
 
@@ -670,19 +711,19 @@ impl<T: Target> SsaFunction<T> {
 
             // Remainder (state % N) or bitwise AND (state & mask): trace left operand
             SsaOp::Rem { left, .. } | SsaOp::And { left, .. } => {
-                self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1), visited)
             }
 
             // XOR operation (e.g., state ^ key): try both operands
             SsaOp::Xor { left, right, .. } => {
                 // Try left first
                 if let Some(phi) =
-                    self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1))
+                    self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1), visited)
                 {
                     return Some(phi);
                 }
                 // Then try right (XOR is commutative)
-                self.trace_to_phi_impl(*right, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*right, target_block, depth.saturating_add(1), visited)
             }
 
             // Arithmetic operations (ConfuserEx uses mul/add/sub for state transformation)
@@ -692,17 +733,17 @@ impl<T: Target> SsaFunction<T> {
             | SsaOp::Sub { left, right, .. } => {
                 // Try left first (usually where the state variable is)
                 if let Some(phi) =
-                    self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1))
+                    self.trace_to_phi_impl(*left, target_block, depth.saturating_add(1), visited)
                 {
                     return Some(phi);
                 }
                 // Then try right
-                self.trace_to_phi_impl(*right, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*right, target_block, depth.saturating_add(1), visited)
             }
 
             // Shift operations: trace the value operand
             SsaOp::Shr { value, .. } | SsaOp::Shl { value, .. } => {
-                self.trace_to_phi_impl(*value, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*value, target_block, depth.saturating_add(1), visited)
             }
 
             // Unary state transforms and conversions: trace through the operand.
@@ -714,12 +755,12 @@ impl<T: Target> SsaFunction<T> {
             | SsaOp::IntToFloat { operand, .. }
             | SsaOp::FloatToInt { operand, .. }
             | SsaOp::FloatConv { operand, .. } => {
-                self.trace_to_phi_impl(*operand, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*operand, target_block, depth.saturating_add(1), visited)
             }
 
             // Copy: trace through to source
             SsaOp::Copy { src, .. } => {
-                self.trace_to_phi_impl(*src, target_block, depth.saturating_add(1))
+                self.trace_to_phi_impl(*src, target_block, depth.saturating_add(1), visited)
             }
 
             // For other operations (including constants), the variable cannot be traced to a PHI
@@ -781,12 +822,12 @@ impl<T: Target> SsaFunction<T> {
         // This matches SsaCfg::from_ssa() which also adds these edges so that
         // handler blocks appear connected in the CFG.
         for handler in self.exception_handlers() {
-            if handler.handler_start_block == Some(block_idx) {
-                if let Some(try_start) = handler.try_start_block {
-                    if try_start < self.blocks.len() && !preds.contains(&try_start) {
-                        preds.push(try_start);
-                    }
-                }
+            if handler.handler_start_block == Some(block_idx)
+                && let Some(try_start) = handler.try_start_block
+                && try_start < self.blocks.len()
+                && !preds.contains(&try_start)
+            {
+                preds.push(try_start);
             }
         }
 
@@ -808,24 +849,21 @@ impl<T: Target> SsaFunction<T> {
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); block_count];
         for (idx, block) in self.iter_blocks() {
             block.for_each_successor(|succ| {
-                if let Some(slot) = preds.get_mut(succ) {
-                    if !slot.contains(&idx) {
-                        slot.push(idx);
-                    }
+                if let Some(slot) = preds.get_mut(succ)
+                    && !slot.contains(&idx)
+                {
+                    slot.push(idx);
                 }
             });
         }
         for handler in self.exception_handlers() {
             if let (Some(handler_start), Some(try_start)) =
                 (handler.handler_start_block, handler.try_start_block)
+                && try_start < block_count
+                && let Some(slot) = preds.get_mut(handler_start)
+                && !slot.contains(&try_start)
             {
-                if try_start < block_count {
-                    if let Some(slot) = preds.get_mut(handler_start) {
-                        if !slot.contains(&try_start) {
-                            slot.push(try_start);
-                        }
-                    }
-                }
+                slot.push(try_start);
             }
         }
         preds
@@ -855,12 +893,12 @@ impl<T: Target> SsaFunction<T> {
         // This matches SsaCfg::from_ssa() which also adds these edges so that
         // handler blocks appear connected in the CFG.
         for handler in self.exception_handlers() {
-            if handler.try_start_block == Some(block_idx) {
-                if let Some(handler_start) = handler.handler_start_block {
-                    if handler_start < self.blocks.len() && !succs.contains(&handler_start) {
-                        succs.push(handler_start);
-                    }
-                }
+            if handler.try_start_block == Some(block_idx)
+                && let Some(handler_start) = handler.handler_start_block
+                && handler_start < self.blocks.len()
+                && !succs.contains(&handler_start)
+            {
+                succs.push(handler_start);
             }
         }
 
@@ -1142,22 +1180,20 @@ impl<T: Target> SsaFunction<T> {
         }
 
         // If all returns are the same constant
-        if constants_found.iter().all(Option::is_some) {
-            if let Some(first) = constants_found.first() {
-                if constants_found.iter().all(|c| c == first) {
-                    if let Some(const_val) = first {
-                        return ReturnInfo::Constant(const_val.clone());
-                    }
-                }
-            }
+        if constants_found.iter().all(Option::is_some)
+            && let Some(first) = constants_found.first()
+            && constants_found.iter().all(|c| c == first)
+            && let Some(const_val) = first
+        {
+            return ReturnInfo::Constant(const_val.clone());
         }
 
         // Check if returns a specific parameter (pass-through)
         for &ret_var in &non_void_returns {
-            if let Some(param_idx) = self.is_parameter_variable(ret_var) {
-                if non_void_returns.len() == 1 {
-                    return ReturnInfo::PassThrough(param_idx);
-                }
+            if let Some(param_idx) = self.is_parameter_variable(ret_var)
+                && non_void_returns.len() == 1
+            {
+                return ReturnInfo::PassThrough(param_idx);
             }
         }
 
@@ -1278,5 +1314,88 @@ impl<T: Target> SsaFunction<T> {
         }
 
         MethodPurity::Pure
+    }
+}
+
+#[cfg(test)]
+mod definition_lookup_tests {
+    use crate::{
+        ir::{
+            block::SsaBlock,
+            function::SsaFunction,
+            instruction::SsaInstruction,
+            ops::SsaOp,
+            phi::PhiNode,
+            value::ConstValue,
+            variable::{DefSite, SsaVarId, VariableOrigin},
+        },
+        testing::{MockTarget, MockType},
+    };
+
+    /// A phi-defined variable has no defining instruction, so both lookups must
+    /// answer `None` — and must do so without walking the function.
+    ///
+    /// Before the short-circuit these fell through to a whole-function scan that
+    /// could only ever return `None`, and callers such as the memory pass run
+    /// that per value in a loop.
+    #[test]
+    fn phi_defined_variable_resolves_without_scanning() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let phi_var =
+            ssa.create_variable(VariableOrigin::Local(0), 0, DefSite::phi(1), MockType::I32);
+
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::new((), SsaOp::Jump { target: 1 }));
+        ssa.add_block(entry);
+
+        let mut merge = SsaBlock::new(1);
+        merge.add_phi(PhiNode::new(phi_var, VariableOrigin::Local(0)));
+        merge.add_instruction(SsaInstruction::new((), SsaOp::Return { value: None }));
+        ssa.add_block(merge);
+
+        assert!(ssa.get_definition(phi_var).is_none());
+        assert!(ssa.get_definition_instruction(phi_var).is_none());
+    }
+
+    /// A variable whose recorded def site is stale must still be found by the
+    /// recovery scan.
+    ///
+    /// The short-circuit above keys on a *confirmed* phi, not merely on an
+    /// absent instruction index — an absent index also describes a stale def
+    /// site, and skipping the scan for those would silently lose definitions.
+    #[test]
+    fn stale_def_site_still_recovers_by_scanning() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        // Claims a phi definition in block 0, but is actually defined by a real
+        // instruction there and block 0 has no phi at all.
+        let var = ssa.create_variable(VariableOrigin::Local(0), 0, DefSite::phi(0), MockType::I32);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::new(
+            (),
+            SsaOp::Const {
+                dest: var,
+                value: ConstValue::I32(5),
+            },
+        ));
+        block.add_instruction(SsaInstruction::new((), SsaOp::Return { value: None }));
+        ssa.add_block(block);
+
+        assert!(
+            ssa.get_definition(var).is_some(),
+            "stale def site must fall through to the recovery scan"
+        );
+        assert!(ssa.get_definition_instruction(var).is_some());
+    }
+
+    /// An unknown variable is absent from both lookups.
+    #[test]
+    fn unknown_variable_has_no_definition() {
+        let ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        assert!(ssa.get_definition(SsaVarId::from_index(7)).is_none());
+        assert!(
+            ssa.get_definition_instruction(SsaVarId::from_index(7))
+                .is_none()
+        );
     }
 }

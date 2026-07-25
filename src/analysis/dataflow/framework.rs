@@ -97,6 +97,29 @@ pub trait DataFlowAnalysis<T: Target> {
         ssa: &SsaFunction<T>,
     ) -> Self::Lattice;
 
+    /// Widens `next` against the value a block previously held, once it has
+    /// been revisited enough times to look loop-carried.
+    ///
+    /// The solver has no iteration cap: it drains its worklist and relies on
+    /// the lattice having finite height. A lattice of unbounded height — an
+    /// interval domain, most obviously — does not, and would iterate once per
+    /// loop trip. Widening trades precision on the unstable bound for
+    /// termination in a bounded number of steps.
+    ///
+    /// `visit` is how many times this block has been transferred so far, so an
+    /// implementation can stay exact for the first few passes and only widen
+    /// afterwards. The default returns `next` unchanged, which is correct for
+    /// any finite-height lattice and leaves existing analyses untouched.
+    fn widen(
+        &self,
+        _block_id: usize,
+        _previous: &Self::Lattice,
+        next: Self::Lattice,
+        _visit: usize,
+    ) -> Self::Lattice {
+        next
+    }
+
     /// Called when analysis is complete. Default: no post-processing.
     fn finalize(
         &mut self,

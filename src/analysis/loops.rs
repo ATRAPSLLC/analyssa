@@ -122,7 +122,7 @@ use std::collections::HashMap;
 
 use crate::{
     bitset::BitSet,
-    graph::{algorithms::DominatorTree, GraphBase, NodeId, Predecessors, Successors},
+    graph::{GraphBase, NodeId, Predecessors, Successors, algorithms::DominatorTree},
     ir::{function::SsaFunction, ops::SsaOp, variable::SsaVarId},
     target::Target,
 };
@@ -366,10 +366,10 @@ impl LoopInfo {
     #[must_use]
     pub fn find_condition_in_body<T: Target>(&self, ssa: &SsaFunction<T>) -> Option<NodeId> {
         for block_idx in self.body.iter() {
-            if let Some(block) = ssa.block(block_idx) {
-                if matches!(block.terminator_op(), Some(SsaOp::Branch { .. })) {
-                    return Some(NodeId::new(block_idx));
-                }
+            if let Some(block) = ssa.block(block_idx)
+                && matches!(block.terminator_op(), Some(SsaOp::Branch { .. }))
+            {
+                return Some(NodeId::new(block_idx));
             }
         }
         None
@@ -789,7 +789,7 @@ where
         if loop_info.body.insert(node.index()) {
             // Node wasn't in body yet, add its predecessors
             for pred in graph.predecessors(node) {
-                if pred != loop_info.header && !loop_info.body.contains(pred.index()) {
+                if pred != loop_info.header && !loop_info.body.contains_checked(pred.index()) {
                     worklist.push(pred);
                 }
             }
@@ -808,7 +808,7 @@ where
     let mut non_loop_preds: Vec<NodeId> = Vec::new();
 
     for pred in graph.predecessors(loop_info.header) {
-        if !loop_info.body.contains(pred.index()) {
+        if !loop_info.body.contains_checked(pred.index()) {
             non_loop_preds.push(pred);
         }
     }
@@ -833,7 +833,7 @@ where
     for body_block_idx in loop_info.body.iter() {
         let body_block = NodeId::new(body_block_idx);
         for succ in graph.successors(body_block) {
-            if !loop_info.body.contains(succ.index()) {
+            if !loop_info.body.contains_checked(succ.index()) {
                 loop_info.exits.push(LoopExit {
                     exiting_block: body_block,
                     exit_block: succ,
@@ -897,29 +897,31 @@ fn compute_nesting(loops: &mut [LoopInfo]) {
         .map(|(i, l)| (l.header, i))
         .collect();
 
+    // `LoopInfo::size` is a `BitSet` popcount over the whole loop body, and the
+    // sort below called it once per comparison — O(L log L) popcounts per loop,
+    // O(L² log L) overall. Computed once here instead: L popcounts total.
+    let sizes: Vec<usize> = loops.iter().map(LoopInfo::size).collect();
+
     // For each loop, find its parent (smallest enclosing loop)
     for i in 0..n {
         let Some(header) = loops.get(i).map(|l| l.header) else {
             continue;
         };
 
-        // Find all loops that contain this loop's header (except itself)
-        let mut candidates: Vec<usize> = (0..n)
+        // The parent is the *minimum* containing loop, so a full sort was never
+        // needed — one linear scan finds it. The `j` tiebreak preserves the
+        // previous behaviour for equally-sized candidates, which matters because
+        // the downstream similarity pipeline requires a deterministic result.
+        let parent_idx = (0..n)
             .filter(|&j| {
                 j != i
                     && loops
                         .get(j)
                         .is_some_and(|l| l.body.contains(header.index()))
             })
-            .collect();
+            .min_by_key(|&j| (sizes.get(j).copied().unwrap_or(usize::MAX), j));
 
-        // Parent is the smallest containing loop
-        if !candidates.is_empty() {
-            candidates.sort_by_key(|&j| loops.get(j).map_or(usize::MAX, LoopInfo::size));
-            let parent_idx = match candidates.first().copied() {
-                Some(p) => p,
-                None => continue,
-            };
+        if let Some(parent_idx) = parent_idx {
             let parent_header = match loops.get(parent_idx).map(|l| l.header) {
                 Some(h) => h,
                 None => continue,
@@ -940,10 +942,10 @@ fn compute_nesting(loops: &mut [LoopInfo]) {
             Some(h) => h,
             None => continue,
         };
-        if let Some(&parent_idx) = header_to_idx.get(&parent_header) {
-            if let Some(parent) = loops.get_mut(parent_idx) {
-                parent.children.push(header_i);
-            }
+        if let Some(&parent_idx) = header_to_idx.get(&parent_header)
+            && let Some(parent) = loops.get_mut(parent_idx)
+        {
+            parent.children.push(header_i);
         }
     }
 

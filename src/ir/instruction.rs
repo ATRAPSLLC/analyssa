@@ -315,7 +315,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         ir::{ops::SsaOp, value::ConstValue},
         testing::{MockTarget, MockType},

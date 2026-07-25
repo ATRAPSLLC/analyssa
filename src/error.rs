@@ -1,6 +1,6 @@
 //! Error and result types used throughout the analyssa codebase.
 //!
-//! This module defines the primary error type [`Error`], which wraps a
+//! This module defines the primary error type [`struct@Error`], which wraps a
 //! free-form message string. All analyssa APIs that can fail return
 //! [`Result<T>`] (aliased from `std::result::Result<T, Error>`), keeping
 //! the error surface minimal so hosts can wrap it in their own error enum
@@ -14,7 +14,7 @@
 //!
 //! # Aliases
 //!
-//! [`GraphError`] is a type alias for [`Error`] used specifically in graph
+//! [`GraphError`] is a type alias for [`struct@Error`] used specifically in graph
 //! algorithm contexts, providing semantic clarity without introducing a
 //! separate type.
 

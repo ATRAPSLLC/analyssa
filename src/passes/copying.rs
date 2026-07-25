@@ -48,6 +48,7 @@ use crate::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         ops::SsaOp,
         variable::SsaVarId,
+        varstore::VarSet,
     },
     passes::utils::resolve_chain,
     target::Target,
@@ -157,14 +158,15 @@ where
     // `source_defs` depends only on `ssa`, so build it once and reuse it for
     // both ordering-protection passes below instead of rebuilding per call.
     let source_defs = build_source_defs(ssa);
-    protect_same_block_ordering_with(ssa, &source_defs, &mut copies);
+    let first_uses = build_first_uses(ssa);
+    protect_same_block_ordering_with(&first_uses, &source_defs, &mut copies);
 
     let resolved: BTreeMap<SsaVarId, SsaVarId> = copies
         .iter()
         .map(|(&dest, &src)| (dest, resolve_chain(&copies, src)))
         .collect();
     let mut resolved = resolved;
-    protect_same_block_ordering_with(ssa, &source_defs, &mut resolved);
+    protect_same_block_ordering_with(&first_uses, &source_defs, &mut resolved);
 
     on_resolved(ssa, &resolved);
 
@@ -275,7 +277,7 @@ pub fn protect_sole_local_defs<T: Target>(
         }
     }
 
-    let mut protected = BitSet::new(ssa.var_id_capacity());
+    let mut protected = VarSet::new(ssa.var_id_bound());
     for (&dest, &src) in copies.iter() {
         let dest_group = ssa.rename_group(dest);
         if dest_group >= real_local_limit {
@@ -288,12 +290,12 @@ pub fn protect_sole_local_defs<T: Target>(
         if address_taken_groups.contains(dest_group as usize)
             || (def_count <= 1 && groups_in_phis.contains(dest_group as usize))
         {
-            protected.insert(dest.index());
+            protected.insert(dest);
         }
     }
 
     if !protected.is_empty() {
-        copies.retain(|dest, _| !protected.contains(dest.index()));
+        copies.retain(|dest, _| !protected.contains(*dest));
     }
 }
 
@@ -313,7 +315,8 @@ pub fn protect_same_block_ordering<T: Target>(
     copies: &mut BTreeMap<SsaVarId, SsaVarId>,
 ) {
     let source_defs = build_source_defs(ssa);
-    protect_same_block_ordering_with(ssa, &source_defs, copies);
+    let first_uses = build_first_uses(ssa);
+    protect_same_block_ordering_with(&first_uses, &source_defs, copies);
 }
 
 /// Builds a `def-variable -> (block, instruction)` index in a single pass.
@@ -333,10 +336,28 @@ fn build_source_defs<T: Target>(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, (usi
     source_defs
 }
 
-/// Like [`protect_same_block_ordering`] but reuses a prebuilt `source_defs`
-/// index (see [`build_source_defs`]) instead of recomputing it.
-fn protect_same_block_ordering_with<T: Target>(
-    ssa: &SsaFunction<T>,
+/// Earliest `(block, instruction)` at which each variable is *used*.
+///
+/// Built in one sweep so the ordering guard below is an O(1) comparison. Scanning
+/// the source block's instructions per copy instead made the guard
+/// O(block_length x copies), and copy propagation runs to a fixpoint.
+fn build_first_uses<T: Target>(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, (usize, usize)> {
+    let mut first_uses: BTreeMap<SsaVarId, (usize, usize)> = BTreeMap::new();
+    for (block_idx, block) in ssa.blocks().iter().enumerate() {
+        for (instr_idx, instr) in block.instructions().iter().enumerate() {
+            instr.op().for_each_use(|used| {
+                first_uses.entry(used).or_insert((block_idx, instr_idx));
+            });
+        }
+    }
+    first_uses
+}
+
+/// Like [`protect_same_block_ordering`] but reuses prebuilt `source_defs` and
+/// `first_uses` indexes (see [`build_source_defs`], [`build_first_uses`])
+/// instead of recomputing them.
+fn protect_same_block_ordering_with(
+    first_uses: &BTreeMap<SsaVarId, (usize, usize)>,
     source_defs: &BTreeMap<SsaVarId, (usize, usize)>,
     copies: &mut BTreeMap<SsaVarId, SsaVarId>,
 ) {
@@ -344,20 +365,14 @@ fn protect_same_block_ordering_with<T: Target>(
         let Some((src_block, src_instr)) = source_defs.get(src).copied() else {
             return true;
         };
-        let Some(block) = ssa.block(src_block) else {
+        // Reject when `dest` is already read earlier in the block that defines
+        // `src`: substituting `src` there would move the use above its own
+        // definition. One map lookup, rather than a scan of the block prefix per
+        // copy.
+        let Some(&(use_block, use_instr)) = first_uses.get(dest) else {
             return true;
         };
-
-        for (instr_idx, instr) in block.instructions().iter().enumerate() {
-            if instr_idx >= src_instr {
-                break;
-            }
-            if instr.op().uses_var(*dest) {
-                return false;
-            }
-        }
-
-        true
+        !(use_block == src_block && use_instr < src_instr)
     });
 }
 
@@ -373,8 +388,8 @@ mod tests {
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         testing::{
-            assert_mock_valid_full, mock_terminator_at, run_mock_pass_boundary, MockTarget,
-            MockType,
+            MockTarget, MockType, assert_mock_valid_full, mock_terminator_at,
+            run_mock_pass_boundary,
         },
     };
 
@@ -649,8 +664,9 @@ mod tests {
             "orphan-free copy propagation",
             |ssa| run(ssa, &method, &log, 10)
         ));
-        assert!(!ssa
-            .iter_instructions()
-            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Copy { .. })));
+        assert!(
+            !ssa.iter_instructions()
+                .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Copy { .. }))
+        );
     }
 }

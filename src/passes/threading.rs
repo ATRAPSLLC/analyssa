@@ -272,9 +272,15 @@ where
             {
                 return false;
             }
-            push(events, EventKind::BranchSimplified, method, pred_block, format!(
-                "branch threaded: B{pred_block} condition on {condition:?} resolved to B{new_target} (eliminated B{old_target})"
-            ));
+            push(
+                events,
+                EventKind::BranchSimplified,
+                method,
+                pred_block,
+                format!(
+                    "branch threaded: B{pred_block} condition on {condition:?} resolved to B{new_target} (eliminated B{old_target})"
+                ),
+            );
             true
         }
         SsaOp::Leave { target } if target != new_target => {
@@ -318,6 +324,7 @@ where
 mod tests {
     use super::*;
     use crate::{
+        PointerSize,
         events::EventLog,
         ir::{
             block::SsaBlock,
@@ -326,8 +333,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{run_mock_pass_boundary, MockTarget, MockType},
-        PointerSize,
+        testing::{MockTarget, MockType, run_mock_pass_boundary},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {

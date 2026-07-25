@@ -32,8 +32,8 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -51,7 +51,8 @@ use crate::{
         AlgebraicSimplificationPass, BlockMergingPass, ControlFlowSimplificationPass,
         CopyPropagationPass, DeadCodeEliminationPass, DeadMethodEliminationPass,
         GlobalValueNumberingPass, JumpThreadingPass, LicmPass, LoopCanonicalizationPass,
-        OpaquePredicatePass, ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
+        MemoryOptimizationPass, OpaquePredicatePass, ReassociationPass, StrengthReductionPass,
+        ValueRangePropagationPass,
     },
     scheduling::pass::{ModificationScope, SsaPass, SsaPassHost},
     target::Target,
@@ -216,6 +217,9 @@ where
         )));
         scheduler.add(Box::new(OpaquePredicatePass::<T>::new()));
         scheduler.add(Box::new(LicmPass::new()));
+        // Runs after the value passes: forwarding a store to a load exposes the
+        // stored value to constant folding and GVN on the next iteration.
+        scheduler.add(Box::new(MemoryOptimizationPass));
 
         scheduler
     }
@@ -571,8 +575,7 @@ where
             pass.initialize(host)?;
         }
 
-        let all_methods = Self::method_order(host, false);
-        let dirty_methods = Self::method_order(host, true);
+        let (all_methods, dirty_methods) = Self::method_orders(host);
         let any_changed = AtomicBool::new(false);
 
         for pass in passes.iter() {
@@ -622,8 +625,7 @@ where
             pass_entry.0.initialize(host)?;
         }
 
-        let all_methods = Self::method_order(host, false);
-        let dirty_methods = Self::method_order(host, true);
+        let (all_methods, dirty_methods) = Self::method_orders(host);
         let any_changed = AtomicBool::new(false);
 
         for &idx in indices {
@@ -669,33 +671,46 @@ where
         Ok(any_changed.load(Ordering::Relaxed))
     }
 
-    /// Determine method processing order.
+    /// Determine the two method processing orders in one pass.
     ///
-    /// When `dirty_only` is true, returns only methods in the host's
-    /// dirty set; otherwise returns all methods with SSA. In both cases,
-    /// ordering follows reverse topological order if the host supplies
-    /// one, or falls back to `host.iter_methods()`.
-    fn method_order(host: &H, dirty_only: bool) -> Vec<T::MethodRef> {
-        let topo = host.methods_reverse_topological();
+    /// Returns `(all_methods, dirty_methods)`. Both derive from the same
+    /// traversal order, so the call graph behind
+    /// [`SsaPassHost::methods_reverse_topological`] is built **once** per pass
+    /// batch rather than once per list — and the batch itself sits inside the
+    /// scheduler's fixpoint, so a per-list rebuild is paid on every iteration.
+    ///
+    /// Ordering follows reverse topological order if the host supplies one, or
+    /// falls back to `host.iter_methods()`.
+    fn method_orders(host: &H) -> (Vec<T::MethodRef>, Vec<T::MethodRef>) {
+        // Components arrive callee-first and grouped by mutual recursion.
+        // Flattening discards the grouping, which is correct here: this order
+        // only decides *membership and sequence* for a per-method pass, and
+        // `run_single_pass` dispatches those in parallel anyway. An analysis
+        // that genuinely needs callee-before-caller must be a global pass and
+        // drive `interproc::solve`, which consumes the components ungrouped.
+        let topo: Vec<T::MethodRef> = host
+            .methods_reverse_topological()
+            .into_iter()
+            .flatten()
+            .collect();
         let order: Vec<_> = if topo.is_empty() {
             host.iter_methods()
         } else {
             topo
         };
 
+        let all: Vec<T::MethodRef> = order.into_iter().filter(|m| host.contains(m)).collect();
+
         // Build the dirty set as a HashSet so membership is O(1); a `Vec`
         // made the per-method filter below O(methods * dirty).
-        let dirty_set: Option<HashSet<T::MethodRef>> = if dirty_only {
-            Some(host.dirty_snapshot().into_iter().collect())
-        } else {
-            None
-        };
+        let dirty_set: HashSet<T::MethodRef> = host.dirty_snapshot().into_iter().collect();
+        let dirty: Vec<T::MethodRef> = all
+            .iter()
+            .filter(|m| dirty_set.contains(*m))
+            .cloned()
+            .collect();
 
-        order
-            .into_iter()
-            .filter(|m| host.contains(m))
-            .filter(|m| dirty_set.as_ref().is_none_or(|d| d.contains(m)))
-            .collect()
+        (all, dirty)
     }
 
     /// Execute a single pass across all eligible methods in parallel.
@@ -711,7 +726,7 @@ where
         iteration_modified: &DashSet<T::MethodRef>,
         verify_hard: bool,
     ) -> Result<()> {
-        let event_snapshot = host.events().len();
+        let event_snapshot = host.events().recorded_count();
         let pass_change_count = AtomicUsize::new(0);
         let errors = Mutex::new(Vec::<String>::new());
 
@@ -738,7 +753,36 @@ where
             };
 
             let original = if verify_hard { Some(ssa.clone()) } else { None };
-            let result = pass.run_on_method(&mut ssa, method, host);
+            // The SSA was *taken* from the store, so an unwind through this call
+            // skips every `insert_ssa` below and the method loses its body
+            // permanently — a panicking pass would silently delete code rather
+            // than fail. Catching it turns that into a reported error with the
+            // function restored, matching how a returned `Err` is handled.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pass.run_on_method(&mut ssa, method, host)
+            }));
+            let result = match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    if let Some(snapshot) = original {
+                        ssa = snapshot;
+                    }
+                    host.insert_ssa(method.clone(), ssa);
+                    if let Ok(mut guard) = errors.lock() {
+                        guard.push(format!(
+                            "pass '{}' panicked for method {:?}: {detail}",
+                            pass.name(),
+                            method,
+                        ));
+                    }
+                    return;
+                }
+            };
             let changed = match result {
                 Ok(changed) => changed,
                 Err(error) => {

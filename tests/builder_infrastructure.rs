@@ -1,24 +1,24 @@
 //! Builder-backed fixture infrastructure tests.
 
 use analyssa::{
+    PointerSize,
     analysis::{
-        memory::MemorySsa, DefUseIndex, LoopAnalyzer, SsaCfg, SsaVerifier, VerifierError,
-        VerifyLevel,
+        DefUseIndex, LoopAnalyzer, SsaCfg, SsaVerifier, VerifierError, VerifyLevel,
+        memory::MemorySsa,
     },
     events::EventLog,
     graph::NodeId,
     ir::{
+        SsaVarId,
         function::{SsaDefSpec, SsaFunctionBuilder},
         ops::{SsaEffectKind, SsaOp},
-        SsaVarId,
     },
     passes,
     testing::{
-        diamond_phi_fixture, loop_counter_fixture, memory_effect_fixture, mock_i32, mock_mask4,
-        mock_ptr, mock_ref, mock_v4i32, native_effect_fixture, scalar_rewrite_fixture,
-        vector_simd_fixture, MockTarget, MockType,
+        MockTarget, MockType, diamond_phi_fixture, loop_counter_fixture, memory_effect_fixture,
+        mock_i32, mock_mask4, mock_ptr, mock_ref, mock_v4i32, native_effect_fixture,
+        scalar_rewrite_fixture, vector_simd_fixture,
     },
-    PointerSize,
 };
 
 fn assert_valid(ssa: &analyssa::ir::SsaFunction<MockTarget>, level: VerifyLevel) {
@@ -95,7 +95,7 @@ fn memory_fixture_feeds_memory_ssa_and_effect_queries() {
     assert_valid(&ssa, VerifyLevel::Full);
 
     let cfg = SsaCfg::from_ssa(&ssa);
-    let memory = MemorySsa::build(&ssa, &cfg);
+    let memory = MemorySsa::build(&ssa, &cfg, PointerSize::Bit64);
     let stats = memory.stats();
     assert!(
         stats.store_count >= 2,
@@ -262,7 +262,9 @@ fn verifier_reports_builder_fixture_corruption_clearly() {
     });
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::PlaceholderVariable { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::PlaceholderVariable { .. }))
+    );
 }

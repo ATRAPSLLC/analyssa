@@ -86,6 +86,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    BitSet,
     analysis::consts::ConstEvaluator,
     graph::NodeId,
     ir::{
@@ -97,7 +98,6 @@ use crate::{
         variable::{SsaVarId, VariableOrigin},
     },
     target::Target,
-    BitSet,
 };
 
 /// Analyzes PHI nodes for various patterns.
@@ -480,7 +480,12 @@ pub fn place_pruned_phis<T: Target>(
             let node_id = NodeId::new(block_idx);
             if let Some(frontier) = dominance_frontiers.get(node_id.index()) {
                 for frontier_idx in frontier.iter() {
-                    let is_reachable = reachable.is_none_or(|r| r.contains(frontier_idx));
+                    // `contains_checked`, not `contains`: the bounds guard on the
+                    // next line does not protect this, because `is_reachable` is
+                    // evaluated first. A dominance-frontier index can exceed the
+                    // reachable set's capacity on malformed IR, and `contains`
+                    // asserts rather than answering.
+                    let is_reachable = reachable.is_none_or(|r| r.contains_checked(frontier_idx));
                     if frontier_idx < block_count && is_reachable && phi_blocks.insert(frontier_idx)
                     {
                         worklist.push(frontier_idx);
@@ -489,12 +494,14 @@ pub fn place_pruned_phis<T: Target>(
             }
 
             // For exception handler blocks, use Leave targets as phi placement points
-            if let Some(leave_fn) = leave_target_fn {
-                if let Some(target) = leave_fn(block_idx, blocks) {
-                    let is_reachable = reachable.is_none_or(|r| r.contains(target));
-                    if target < block_count && is_reachable && phi_blocks.insert(target) {
-                        worklist.push(target);
-                    }
+            if let Some(leave_fn) = leave_target_fn
+                && let Some(target) = leave_fn(block_idx, blocks)
+            {
+                // Same reasoning: a `Leave` target comes from the IR and may name
+                // a block that was never recovered.
+                let is_reachable = reachable.is_none_or(|r| r.contains_checked(target));
+                if target < block_count && is_reachable && phi_blocks.insert(target) {
+                    worklist.push(target);
                 }
             }
         }
@@ -505,10 +512,10 @@ pub fn place_pruned_phis<T: Target>(
         let group_live_in = live_in.get(&group);
 
         for phi_block_idx in phi_blocks.iter() {
-            if let Some(live_set) = group_live_in {
-                if !live_set.contains(phi_block_idx) {
-                    continue;
-                }
+            if let Some(live_set) = group_live_in
+                && !live_set.contains(phi_block_idx)
+            {
+                continue;
             }
 
             if let Some(block) = blocks.get_mut(phi_block_idx) {
@@ -527,10 +534,9 @@ pub fn place_pruned_phis<T: Target>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::BTreeSet;
 
+    use super::*;
     use crate::{
         ir::{
             block::SsaBlock,

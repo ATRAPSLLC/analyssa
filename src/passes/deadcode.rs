@@ -44,12 +44,13 @@ use crate::{
     analysis::{cfg::SsaCfg, phis::PhiAnalyzer},
     bitset::BitSet,
     events::{EventKind, EventListener},
-    graph::{algorithms, NodeId},
+    graph::{NodeId, algorithms},
     ir::{
         function::{SsaEditOptions, SsaFunction},
         ops::SsaOp,
         phi::PhiNode,
         variable::{SsaVarId, VariableOrigin},
+        varstore::{VarMap, VarSet},
     },
     target::Target,
     world::World,
@@ -175,8 +176,16 @@ where
         total_changes.saturating_add(simplify_trivial_phis(ssa, &trivial_phis, method, events));
 
     // Step 7+8: recompute reachability after phi simplification, then compute
-    // liveness. Steps 1-6 do not modify any terminator, so a single CFG built
-    // here serves both the reachability sweep and the RPO traversal.
+    // liveness. One CFG built here serves both the reachability sweep and the
+    // RPO traversal.
+    //
+    // This CFG must be rebuilt rather than reusing step 1's: step 2 clears
+    // unreachable blocks, and `SsaBlock::clear` removes their instructions —
+    // terminators included — so their outgoing edges disappear. Forward
+    // traversals from entry happen not to observe the difference, since the
+    // cleared blocks were already unreachable, but the CFG object itself is
+    // genuinely stale and reusing it would rest on that coincidence rather than
+    // on an invariant.
     let cfg = SsaCfg::from_ssa(ssa);
     let reachable = find_reachable_blocks_with_cfg(ssa, &cfg);
     let rpo = compute_reverse_postorder(ssa, &reachable, &cfg);
@@ -193,14 +202,14 @@ where
     // and *then* consulting `live` for dead definitions would index the old
     // numbering with new ids and delete definitions that are still live.
     let dead_phis = find_dead_phis(ssa, &reachable, &live);
-    let mut dead_phi_results = BitSet::new(ssa.var_id_capacity());
+    let mut dead_phi_results = VarSet::new(ssa.var_id_bound());
     for &(block_idx, phi_idx) in &dead_phis {
         if let Some(result) = ssa
             .block(block_idx)
             .and_then(|b| b.phi_nodes().get(phi_idx))
             .map(PhiNode::result)
         {
-            dead_phi_results.insert(result.index());
+            dead_phi_results.insert(result);
         }
     }
     let dead_defs = find_dead_definitions(ssa, &reachable, &live, &dead_phi_results);
@@ -235,15 +244,15 @@ fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<
 
     let mut exception_roots = BitSet::new(ssa.block_count());
     for handler in ssa.exception_handlers() {
-        if let Some(handler_block) = handler.handler_start_block {
-            if !reachable.contains(handler_block) {
-                exception_roots.insert(handler_block);
-            }
+        if let Some(handler_block) = handler.handler_start_block
+            && !reachable.contains(handler_block)
+        {
+            exception_roots.insert(handler_block);
         }
-        if let Some(filter_block) = handler.filter_start_block {
-            if !reachable.contains(filter_block) {
-                exception_roots.insert(filter_block);
-            }
+        if let Some(filter_block) = handler.filter_start_block
+            && !reachable.contains(filter_block)
+        {
+            exception_roots.insert(filter_block);
         }
     }
 
@@ -252,10 +261,10 @@ fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<
         if reachable.contains(block_idx) || exception_roots.contains(block_idx) {
             continue;
         }
-        if let Some(first_instr) = block.instructions().first() {
-            if matches!(first_instr.op(), SsaOp::EndFinally | SsaOp::Rethrow) {
-                exception_roots.insert(block_idx);
-            }
+        if let Some(first_instr) = block.instructions().first()
+            && matches!(first_instr.op(), SsaOp::EndFinally | SsaOp::Rethrow)
+        {
+            exception_roots.insert(block_idx);
         }
     }
 
@@ -313,8 +322,8 @@ fn compute_live_variables<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
     rpo: &[usize],
-) -> BitSet {
-    let mut live = BitSet::new(ssa.var_id_capacity());
+) -> VarSet {
+    let mut live = VarSet::new(ssa.var_id_bound());
     let mut worklist = VecDeque::new();
 
     // Phase 1: roots — operands of side-effectful ops, return values, throws.
@@ -327,30 +336,35 @@ fn compute_live_variables<T: Target>(
                 let op = instr.op();
                 if !op.effects().is_pure() {
                     op.for_each_use(|var| {
-                        if live.insert(var.index()) {
+                        if live.insert(var) {
                             worklist.push_back(var);
                         }
                     });
                 }
-                if let SsaOp::Return { value: Some(v) } = op {
-                    if live.insert(v.index()) {
-                        worklist.push_back(*v);
-                    }
+                if let SsaOp::Return { value: Some(v) } = op
+                    && live.insert(*v)
+                {
+                    worklist.push_back(*v);
                 }
-                if let SsaOp::Throw { exception } = op {
-                    if live.insert(exception.index()) {
-                        worklist.push_back(*exception);
-                    }
+                if let SsaOp::Throw { exception } = op
+                    && live.insert(*exception)
+                {
+                    worklist.push_back(*exception);
                 }
             }
         }
     }
 
     // Phase 2: backward propagation.
-    let mut def_uses: BTreeMap<SsaVarId, Vec<SsaVarId>> = BTreeMap::new();
+    // Dense, indexed by variable id: this is rebuilt on every DCE iteration and
+    // probed once per worklist pop, so a `BTreeMap` paid an O(log n) comparison
+    // chain on every access for no benefit — variable ids are dense by
+    // construction.
+    let mut def_uses: VarMap<Vec<SsaVarId>> = VarMap::new(ssa.var_id_bound());
 
     let mut origin_defs: BTreeMap<VariableOrigin, Vec<SsaVarId>> = BTreeMap::new();
     let mut load_local_info: Vec<(SsaVarId, VariableOrigin)> = Vec::new();
+    let mut use_buf: Vec<SsaVarId> = Vec::new();
 
     for &block_idx in rpo {
         if !reachable.contains(block_idx) {
@@ -360,7 +374,10 @@ fn compute_live_variables<T: Target>(
             for phi in block.phi_nodes() {
                 let def = phi.result();
                 for operand in phi.operands() {
-                    def_uses.entry(def).or_default().push(operand.value());
+                    def_uses.or_insert(def, Vec::new());
+                    if let Some(slot) = def_uses.get_mut(def) {
+                        slot.push(operand.value());
+                    }
                 }
                 let origin = phi.origin();
                 if matches!(
@@ -374,10 +391,16 @@ fn compute_live_variables<T: Target>(
             for instr in block.instructions() {
                 let op = instr.op();
                 let defs: Vec<SsaVarId> = op.defs().collect();
+                // Walked once per instruction, not once per definition: an op
+                // with a `flags` output has two defs, and re-walking its operands
+                // for each of them is pure duplication.
+                use_buf.clear();
+                op.for_each_use(|use_var| use_buf.push(use_var));
                 for &def in &defs {
-                    op.for_each_use(|use_var| {
-                        def_uses.entry(def).or_default().push(use_var);
-                    });
+                    def_uses.or_insert(def, Vec::new());
+                    if let Some(slot) = def_uses.get_mut(def) {
+                        slot.extend_from_slice(&use_buf);
+                    }
                     if let Some(var) = ssa.variable(def) {
                         let origin = var.origin();
                         if matches!(
@@ -406,9 +429,9 @@ fn compute_live_variables<T: Target>(
     }
 
     while let Some(var) = worklist.pop_front() {
-        if let Some(uses) = def_uses.get(&var) {
+        if let Some(uses) = def_uses.get(var) {
             for &use_var in uses {
-                if live.insert(use_var.index()) {
+                if live.insert(use_var) {
                     worklist.push_back(use_var);
                 }
             }
@@ -421,12 +444,12 @@ fn compute_live_variables<T: Target>(
     loop {
         let mut newly_live = false;
         for (dest, origin) in &load_local_info {
-            if !live.contains(dest.index()) {
+            if !live.contains(*dest) {
                 continue;
             }
             if let Some(defs) = origin_defs.get(origin) {
                 for &def_var in defs {
-                    if live.insert(def_var.index()) {
+                    if live.insert(def_var) {
                         worklist.push_back(def_var);
                         newly_live = true;
                     }
@@ -434,9 +457,9 @@ fn compute_live_variables<T: Target>(
             }
         }
         while let Some(var) = worklist.pop_front() {
-            if let Some(uses) = def_uses.get(&var) {
+            if let Some(uses) = def_uses.get(var) {
                 for &use_var in uses {
-                    if live.insert(use_var.index()) {
+                    if live.insert(use_var) {
                         worklist.push_back(use_var);
                     }
                 }
@@ -453,10 +476,10 @@ fn compute_live_variables<T: Target>(
 fn find_dead_definitions<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
-    live: &BitSet,
-    dead_phi_results: &BitSet,
+    live: &VarSet,
+    dead_phi_results: &VarSet,
 ) -> Vec<(usize, usize)> {
-    let mut dead_vars = BitSet::new(ssa.var_id_capacity());
+    let mut dead_vars = VarSet::new(ssa.var_id_bound());
     let mut dead = Vec::new();
 
     for block_idx in reachable.iter() {
@@ -472,10 +495,10 @@ fn find_dead_definitions<T: Target>(
                 let defs: Vec<SsaVarId> = op.defs().collect();
                 if defs.is_empty() {
                     dead.push((block_idx, instr_idx));
-                } else if defs.iter().all(|def| !live.contains(def.index())) {
+                } else if defs.iter().all(|def| !live.contains(*def)) {
                     dead.push((block_idx, instr_idx));
                     for def in defs {
-                        dead_vars.insert(def.index());
+                        dead_vars.insert(def);
                     }
                 }
             }
@@ -487,8 +510,8 @@ fn find_dead_definitions<T: Target>(
         if let Some(block) = ssa.block(block_idx) {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
                 if let SsaOp::Pop { value } = instr.op() {
-                    let instr_definer_dead = dead_vars.contains(value.index());
-                    let phi_definer_dead = dead_phi_results.contains(value.index());
+                    let instr_definer_dead = dead_vars.contains(*value);
+                    let phi_definer_dead = dead_phi_results.contains(*value);
                     if instr_definer_dead || phi_definer_dead {
                         dead.push((block_idx, instr_idx));
                     }
@@ -503,13 +526,13 @@ fn find_dead_definitions<T: Target>(
 fn find_dead_phis<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
-    live: &BitSet,
+    live: &VarSet,
 ) -> Vec<(usize, usize)> {
     let mut dead = Vec::new();
     for block_idx in reachable.iter() {
         if let Some(block) = ssa.block(block_idx) {
             for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-                if !live.contains(phi.result().index()) {
+                if !live.contains(phi.result()) {
                     dead.push((block_idx, phi_idx));
                 }
             }
@@ -879,7 +902,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         events::EventLog,
         ir::{
@@ -890,8 +912,8 @@ mod tests {
             variable::{DefSite, VariableOrigin},
         },
         testing::{
-            assert_mock_valid_full, run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
-            MockTarget, MockType, MockWorld,
+            MockTarget, MockType, MockWorld, assert_mock_valid_full,
+            run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
         },
     };
 
@@ -1032,11 +1054,12 @@ mod tests {
             });
         assert!(changed, "self-referential phi should be removed");
         // The trivial phi should have been removed.
-        assert!(ssa
-            .block(0)
-            .expect("entry block should remain")
-            .phi_nodes()
-            .is_empty());
+        assert!(
+            ssa.block(0)
+                .expect("entry block should remain")
+                .phi_nodes()
+                .is_empty()
+        );
     }
 
     #[test]

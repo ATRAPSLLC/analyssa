@@ -42,8 +42,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    BitSet,
     analysis::cfg::SsaCfg,
-    graph::{algorithms::compute_dominators, RootedGraph},
+    graph::{RootedGraph, algorithms::compute_dominators},
     ir::{
         block::ReplaceResult,
         function::SsaFunction,
@@ -53,7 +54,6 @@ use crate::{
         variable::{DefSite, SsaVarId, UseSite, VariableOrigin},
     },
     target::Target,
-    BitSet,
 };
 
 /// Options for trivial phi elimination.
@@ -199,7 +199,7 @@ impl<T: Target> SsaFunction<T> {
 
         // Build the dominator tree once: rewriting instruction uses never
         // changes any terminator, so it stays valid across every replacement
-        // below (previously each copy rebuilt the CFG + dominators).
+        // below; rebuilding it per copy would repeat the whole CFG walk.
         let dominators = if self.block_count() > 0 {
             let cfg = SsaCfg::from_ssa(self);
             Some(compute_dominators(&cfg, cfg.entry()))
@@ -243,11 +243,11 @@ impl<T: Target> SsaFunction<T> {
     pub(in crate::ir::function) fn nop_copy_defining(&mut self, dest: SsaVarId) -> bool {
         for block in &mut self.blocks {
             for instr in block.instructions_mut() {
-                if let SsaOp::Copy { dest: d, .. } = instr.op() {
-                    if *d == dest {
-                        instr.set_op(SsaOp::Nop);
-                        return true;
-                    }
+                if let SsaOp::Copy { dest: d, .. } = instr.op()
+                    && *d == dest
+                {
+                    instr.set_op(SsaOp::Nop);
+                    return true;
                 }
             }
         }
@@ -258,45 +258,23 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// After block removal or CFG changes, phi nodes may reference predecessors
     /// that no longer exist or are unreachable. This method removes those stale
-    /// operands, ensuring phi nodes only reference valid predecessors with
-    /// defined values.
+    /// operands, ensuring phi nodes reference exactly the block's real
+    /// predecessors.
+    ///
+    /// Pruning is deliberately **structural only**: an operand is dropped solely
+    /// because its predecessor edge is gone, never because its *value* looks
+    /// undefined. A phi's operand list is a per-incoming-edge mapping, so
+    /// dropping the operand for a live edge breaks the phi/CFG invariant that
+    /// [`MissingPhiOperand`](crate::analysis::VerifierError::MissingPhiOperand)
+    /// guards — and, worse, can leave a
+    /// two-operand phi with a single operand, which trivial-phi simplification
+    /// then collapses into a plain copy of the surviving value. That silently
+    /// discards one of the merged values. An operand naming a variable with no
+    /// reachable definition is an upstream defect to fix at its source; keeping
+    /// it is strictly safer than deleting a live edge to hide it.
     ///
     /// Returns the number of operands pruned.
     pub fn prune_phi_operands(&mut self, reachable: &BitSet) -> usize {
-        let variable_count = self.var_id_capacity();
-
-        // Build a set of all defined variables in reachable blocks
-        let mut defined_vars = BitSet::new(variable_count);
-
-        for block_idx in reachable.iter() {
-            if let Some(block) = self.block(block_idx) {
-                for phi in block.phi_nodes() {
-                    let idx = phi.result().index();
-                    if idx < variable_count {
-                        defined_vars.insert(idx);
-                    }
-                }
-                for instr in block.instructions() {
-                    for def in instr.defs() {
-                        let idx = def.index();
-                        if idx < variable_count {
-                            defined_vars.insert(idx);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include argument variables (implicitly defined at function entry)
-        for var in &self.variables {
-            if var.origin().is_argument() {
-                let idx = var.id().index();
-                if idx < variable_count {
-                    defined_vars.insert(idx);
-                }
-            }
-        }
-
         // Compute actual predecessors from the CFG
         let block_count = self.blocks.len();
         let mut actual_predecessors: BTreeMap<usize, BitSet> = BTreeMap::new();
@@ -329,11 +307,7 @@ impl<T: Target> SsaFunction<T> {
                     // materializing a per-phi `Vec<bool>`.
                     let keeps = |op: &PhiOperand| -> bool {
                         let pred = op.predecessor();
-                        let value = op.value();
-                        let pred_ok = pred < block_count && preds.is_some_and(|p| p.contains(pred));
-                        let val_ok =
-                            value.index() < variable_count && defined_vars.contains(value.index());
-                        pred_ok && val_ok
+                        pred < block_count && preds.is_some_and(|p| p.contains(pred))
                     };
 
                     // Never leave a PHI completely empty.
@@ -397,11 +371,11 @@ impl<T: Target> SsaFunction<T> {
         instr_idx: usize,
         new_op: SsaOp<T>,
     ) -> bool {
-        if let Some(block) = self.blocks.get_mut(block_idx) {
-            if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                instr.set_op_preserving_type(new_op);
-                return true;
-            }
+        if let Some(block) = self.blocks.get_mut(block_idx)
+            && let Some(instr) = block.instructions_mut().get_mut(instr_idx)
+        {
+            instr.set_op_preserving_type(new_op);
+            return true;
         }
         false
     }
@@ -449,11 +423,11 @@ impl<T: Target> SsaFunction<T> {
 
     /// Removes a phi node by index without any validation.
     pub fn remove_phi_unchecked(&mut self, block_idx: usize, phi_idx: usize) -> bool {
-        if let Some(block) = self.blocks.get_mut(block_idx) {
-            if phi_idx < block.phi_nodes().len() {
-                block.phi_nodes_mut().remove(phi_idx);
-                return true;
-            }
+        if let Some(block) = self.blocks.get_mut(block_idx)
+            && phi_idx < block.phi_nodes().len()
+        {
+            block.phi_nodes_mut().remove(phi_idx);
+            return true;
         }
         false
     }
@@ -566,42 +540,42 @@ impl<T: Target> SsaFunction<T> {
 
                     // Reachable-only second pass: filter out operands from
                     // unreachable predecessors and check triviality again
-                    if unique_sources.len() > 1 {
-                        if let Some(rpreds) = block_reachable_preds {
-                            let unique_reachable: BTreeSet<SsaVarId> = phi
-                                .operands()
-                                .iter()
-                                .filter(|op| {
-                                    let pred = op.predecessor();
-                                    pred < block_count && rpreds.contains(pred)
-                                })
-                                .map(|op| op.value())
-                                .filter(|&v| v != result)
-                                .collect();
+                    if unique_sources.len() > 1
+                        && let Some(rpreds) = block_reachable_preds
+                    {
+                        let unique_reachable: BTreeSet<SsaVarId> = phi
+                            .operands()
+                            .iter()
+                            .filter(|op| {
+                                let pred = op.predecessor();
+                                pred < block_count && rpreds.contains(pred)
+                            })
+                            .map(|op| op.value())
+                            .filter(|&v| v != result)
+                            .collect();
 
-                            if let Some(&source) = unique_reachable
-                                .iter()
-                                .next()
-                                .filter(|_| unique_reachable.len() == 1)
-                            {
-                                let is_self_ref = match (&var_def_block, options.reachable) {
-                                    (Some(vdb), Some(reachable)) => self
-                                        .would_create_self_reference_reachable(
-                                            source, result, vdb, reachable,
-                                        ),
-                                    _ => self.would_create_self_reference(source, result),
-                                };
-                                if !is_self_ref {
-                                    trivial_phis.push((result, source));
-                                }
-                            } else if unique_reachable.is_empty()
-                                && phi.operands().iter().any(|op| {
-                                    let pred = op.predecessor();
-                                    pred < block_count && rpreds.contains(pred)
-                                })
-                            {
-                                trivial_phis.push((result, result));
+                        if let Some(&source) = unique_reachable
+                            .iter()
+                            .next()
+                            .filter(|_| unique_reachable.len() == 1)
+                        {
+                            let is_self_ref = match (&var_def_block, options.reachable) {
+                                (Some(vdb), Some(reachable)) => self
+                                    .would_create_self_reference_reachable(
+                                        source, result, vdb, reachable,
+                                    ),
+                                _ => self.would_create_self_reference(source, result),
+                            };
+                            if !is_self_ref {
+                                trivial_phis.push((result, source));
                             }
+                        } else if unique_reachable.is_empty()
+                            && phi.operands().iter().any(|op| {
+                                let pred = op.predecessor();
+                                pred < block_count && rpreds.contains(pred)
+                            })
+                        {
+                            trivial_phis.push((result, result));
                         }
                     }
                 }
@@ -643,6 +617,17 @@ impl<T: Target> SsaFunction<T> {
                     None
                 };
                 let mut trivial_set = BitSet::new(variable_count);
+                // All replacements first, then *one* scan for what is still
+                // read. Interleaving them meant a whole-function scan per
+                // trivial phi — O(trivial_phis × function) per fixpoint round,
+                // and a rebuild produces trivial phis in proportion to the
+                // function, so the round was quadratic.
+                //
+                // Batching is equivalent: `replace_uses_checked_with(p, s)` only
+                // removes uses of `p` and adds uses of `s`, and `s` is never
+                // another phi result being tested in this round (chains were
+                // already resolved above), so no replacement can resurrect a use
+                // of a phi an earlier one retired.
                 for (phi_result, source) in &trivial_phis {
                     if *phi_result != *source {
                         let _ = self.replace_uses_checked_with(
@@ -650,10 +635,52 @@ impl<T: Target> SsaFunction<T> {
                             *source,
                             dominators.as_ref(),
                         );
-                        if !has_remaining_uses_including_phis(self, *phi_result, None) {
-                            trivial_set.insert(phi_result.index());
+                    }
+                }
+                // Collapse phi-operand references too.
+                //
+                // `replace_uses_checked_with` walks only `block.instructions()`,
+                // so a trivial phi whose result is another phi's operand stays
+                // "read" and survives the round. In a chain
+                // `p1 = phi(x); p2 = phi(p1); ...` that retires exactly one phi
+                // per round — the fixpoint runs as many rounds as there are
+                // phis, and since each round is already O(phis x function),
+                // the whole thing would be cubic — seconds on a chain of a few
+                // hundred phis.
+                //
+                // Rewriting the operand is the sanctioned case for touching phi
+                // operands directly (see the module header on
+                // `replace_uses_including_phis`): a trivial phi's value *is* its
+                // source, so an operand naming it and an operand naming the
+                // source denote the same value on the same edge. Chains were
+                // resolved into `trivial_phis` above, so `source` is already the
+                // end of the chain.
+                let resolved: BTreeMap<SsaVarId, SsaVarId> = trivial_phis
+                    .iter()
+                    .filter(|(result, source)| result != source)
+                    .copied()
+                    .collect();
+                if !resolved.is_empty() {
+                    for block in &mut self.blocks {
+                        for phi in block.phi_nodes_mut() {
+                            let result = phi.result();
+                            for operand in phi.operands_mut() {
+                                if let Some(&target) = resolved.get(&operand.value())
+                                    // Never rewrite an operand into a reference
+                                    // to its own phi — that would manufacture the
+                                    // self-referential shape this pass removes.
+                                    && target != result
+                                {
+                                    *operand = PhiOperand::new(target, operand.predecessor());
+                                }
+                            }
                         }
-                    } else if !has_remaining_uses_including_phis(self, *phi_result, None) {
+                    }
+                }
+
+                let still_read = self.collect_read_variables();
+                for (phi_result, _) in &trivial_phis {
+                    if !still_read.contains_checked(phi_result.index()) {
                         trivial_set.insert(phi_result.index());
                     }
                 }
@@ -668,10 +695,15 @@ impl<T: Target> SsaFunction<T> {
                         idx >= variable_count || !trivial_set.contains(idx)
                     });
                 }
-                self.variables.retain(|v| {
-                    let idx = v.id().index();
-                    idx >= variable_count || !trivial_set.contains(idx)
-                });
+                // The variable rows are deliberately left in place. `variables`
+                // is indexed by id (`variables[i].id().index() == i`), and
+                // dropping a row without renumbering makes every higher id
+                // resolve to the wrong variable. Renumbering here is not an
+                // option either: `var_def_block` above is built once and keyed
+                // by id, and the next fixpoint iteration reads it. Removing a
+                // phi removes a *definition*; deleting the now-orphaned row is
+                // `compact_variables`' job, and it already recognises variables
+                // with no remaining definition.
             } else {
                 // Rebuild mode: replace uses and remove unconditionally.
                 for (phi_result, source) in &trivial_phis {
@@ -691,10 +723,9 @@ impl<T: Target> SsaFunction<T> {
                         idx >= variable_count || !trivial_set.contains(idx)
                     });
                 }
-                self.variables.retain(|v| {
-                    let idx = v.id().index();
-                    idx >= variable_count || !trivial_set.contains(idx)
-                });
+                // Left in place for the same reason as the repair-mode branch
+                // above: `compact_variables` owns row removal, because it is the
+                // only path that renumbers afterwards.
             }
         }
 
@@ -708,15 +739,47 @@ impl<T: Target> SsaFunction<T> {
         instr_idx: usize,
         value: ConstValue<T>,
     ) -> bool {
-        if let Some(block) = self.blocks.get_mut(block_idx) {
-            if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                if let Some(dest) = instr.op().dest() {
-                    instr.set_op_preserving_type(SsaOp::Const { dest, value });
-                    return true;
+        if let Some(block) = self.blocks.get_mut(block_idx)
+            && let Some(instr) = block.instructions_mut().get_mut(instr_idx)
+            && let Some(dest) = instr.op().dest()
+        {
+            instr.set_op_preserving_type(SsaOp::Const { dest, value });
+            return true;
+        }
+        false
+    }
+
+    /// Returns the variables read by any live instruction or phi operand.
+    ///
+    /// Used by every path that would otherwise rewrite a variable's definition
+    /// site to [`DefSite::entry`] after its defining instruction disappeared.
+    /// That stamp is how an argument or a default-initialized local says "the
+    /// caller supplies this", so applying it to a variable something still
+    /// *reads* turns a dangling read into IR that looks legitimate — and
+    /// [`SsaVerifier`](crate::analysis::verifier::SsaVerifier), whose job is to
+    /// catch the pass that destroyed the definition, is left with nothing to
+    /// see. Leaving the stale site in place is the honest answer: it still names
+    /// an instruction, so the read is reported as an `UndefinedUse`.
+    ///
+    /// `Nop` instructions are skipped: a nopped instruction reads nothing.
+    pub(in crate::ir::function) fn collect_read_variables(&self) -> BitSet {
+        let mut read = BitSet::new(self.var_id_capacity());
+        for block in &self.blocks {
+            for instr in block.instructions() {
+                if matches!(instr.op(), SsaOp::Nop) {
+                    continue;
+                }
+                instr.op().for_each_use(|used| {
+                    read.insert_checked(used.index());
+                });
+            }
+            for phi in block.phi_nodes() {
+                for operand in phi.operands() {
+                    read.insert_checked(operand.value().index());
                 }
             }
         }
-        false
+        read
     }
 
     pub(in crate::ir::function) fn refresh_def_sites(&mut self) {
@@ -751,9 +814,15 @@ impl<T: Target> SsaFunction<T> {
             }
         }
 
+        let still_read = self.collect_read_variables();
+
         for var in &mut self.variables {
             let idx = var.id().index();
-            if idx < variable_count && !active_defs.contains(idx) && var.def_site().block != 0 {
+            if idx < variable_count
+                && !active_defs.contains(idx)
+                && !still_read.contains_checked(idx)
+                && var.def_site().block != 0
+            {
                 var.set_def_site(DefSite::entry());
             }
         }
@@ -904,13 +973,19 @@ impl<T: Target> SsaFunction<T> {
         }
 
         // Update variable DefSites to reflect new instruction positions.
-        // Variables whose defining instruction was a Nop get reset to entry.
+        // A variable whose defining instruction was a Nop is reset to entry —
+        // unless something still reads it, in which case the reset would
+        // disguise a dangling read as a legitimate entry definition. See
+        // `collect_read_variables`.
         if !remap.is_empty() || !nop_sites.is_empty() {
+            let still_read = self.collect_read_variables();
             for var in &mut self.variables {
                 let site = var.def_site();
                 if let Some(old_instr) = site.instruction {
                     if nop_sites.contains(&(site.block, old_instr)) {
-                        var.set_def_site(DefSite::entry());
+                        if !still_read.contains_checked(var.id().index()) {
+                            var.set_def_site(DefSite::entry());
+                        }
                     } else if let Some(&new_instr) = remap.get(&(site.block, old_instr)) {
                         var.set_def_site(DefSite::instruction(site.block, new_instr));
                     }
@@ -1054,10 +1129,10 @@ impl<T: Target> SsaFunction<T> {
             });
         }
 
-        self.variables.retain(|v| {
-            let idx = v.id().index();
-            idx >= variable_count || !dead_phis.contains(idx)
-        });
+        // As in `eliminate_trivial_phis`: the orphaned rows stay until
+        // `compact_variables` removes them, because that is the only path that
+        // renumbers `variables` and remaps the ids in blocks afterwards.
+        // Dropping them here would break `variables[i].id().index() == i`.
     }
 }
 
@@ -1126,5 +1201,301 @@ impl<T: Target> SsaFunction<T> {
 
         let needed = max_local_idx.map_or(0, |idx| (idx as usize).saturating_add(1));
         self.num_locals = needed.max(self.original_num_locals);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ir::{block::SsaBlock, instruction::SsaInstruction, phi::PhiNode},
+        testing::{MockTarget, MockType},
+    };
+
+    /// Builds `B0 -> B2`, `B1 -> B2`, where `B2` carries a phi merging one value
+    /// defined in `B0` with a second operand whose value has no definition in any
+    /// block. Both incoming edges are live.
+    fn merge_with_one_undefined_operand() -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+
+        let phi_res = SsaVarId::from_index(0);
+        ssa.create_variable(VariableOrigin::Local(0), 0, DefSite::phi(2), MockType::I32);
+        let defined = SsaVarId::from_index(1);
+        ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        // Registered but never defined by any instruction or phi.
+        let undefined = SsaVarId::from_index(2);
+        ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(9, 0),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: defined,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        let mut phi = PhiNode::new(phi_res, VariableOrigin::Local(0));
+        phi.add_operand(PhiOperand::new(defined, 0));
+        phi.add_operand(PhiOperand::new(undefined, 1));
+        b2.add_phi(phi);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(phi_res),
+        }));
+        ssa.add_block(b2);
+
+        ssa.recompute_uses();
+        ssa
+    }
+
+    /// Builds `B0 -> {B1, B2} -> B3` where `B3` carries a phi whose result is
+    /// never used, and where a *later* variable (`kept`) is allocated after the
+    /// dead phi's result. Removing the phi's row from `variables` without
+    /// renumbering shifts `kept` down a slot, so `variables[i].id().index() == i`
+    /// no longer holds.
+    fn dead_phi_before_a_live_variable() -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+
+        // Slot 0: the branch condition, defined in B0.
+        let cond = SsaVarId::from_index(0);
+        ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        // Slot 1: the dead phi's result, defined by the phi in B3.
+        let dead = SsaVarId::from_index(1);
+        ssa.create_variable(VariableOrigin::Local(1), 0, DefSite::phi(3), MockType::I32);
+        // Slot 2: allocated *after* the dead phi — this is the one that shifts.
+        let kept = SsaVarId::from_index(2);
+        ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(3, 0),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(b0);
+
+        for id in [1usize, 2] {
+            let mut block = SsaBlock::new(id);
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+            ssa.add_block(block);
+        }
+
+        let mut b3 = SsaBlock::new(3);
+        // Dead: `dead` is never read by any instruction or phi operand.
+        let mut phi = PhiNode::new(dead, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(cond, 1));
+        phi.add_operand(PhiOperand::new(cond, 2));
+        b3.add_phi(phi);
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: kept,
+            value: ConstValue::I32(7),
+        }));
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(kept),
+        }));
+        ssa.add_block(b3);
+
+        ssa.recompute_uses();
+        ssa
+    }
+
+    /// A chain `p1 = phi(x); p2 = phi(p1); ...` is entirely trivial and must
+    /// collapse in a bounded number of fixpoint rounds.
+    ///
+    /// `replace_uses_checked_with` rewrites only instruction uses, so without the
+    /// operand collapse each phi in the chain stays "read" by the next phi's
+    /// operand and exactly one phi retires per round. The fixpoint then runs once
+    /// per phi, and each round is already O(phis x function) — cubic, and
+    /// measurably so: this shape reaches seconds at a few hundred phis and tens
+    /// of seconds at 1,600.
+    #[test]
+    fn a_chain_of_trivial_phis_collapses_completely() {
+        const CHAIN: usize = 512;
+
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, CHAIN + 1);
+        let seed = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: seed,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+
+        let mut prev = seed;
+        for id in 1..=CHAIN {
+            let origin = VariableOrigin::Local(u16::try_from(id % 1000).unwrap_or(0));
+            let result = ssa.create_variable(origin, 0, DefSite::phi(id), MockType::I32);
+            let mut block = SsaBlock::new(id);
+            let mut phi = PhiNode::new(result, origin);
+            phi.add_operand(PhiOperand::new(prev, id.saturating_sub(1)));
+            block.add_phi(phi);
+            if id == CHAIN {
+                block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+                    value: Some(result),
+                }));
+            } else {
+                block.add_instruction(SsaInstruction::synthetic(SsaOp::Jump {
+                    target: id.saturating_add(1),
+                }));
+            }
+            ssa.add_block(block);
+            prev = result;
+        }
+        ssa.recompute_uses();
+
+        ssa.repair_ssa();
+
+        let remaining: usize = ssa.blocks().iter().map(|b| b.phi_nodes().len()).sum();
+        assert_eq!(
+            remaining, 0,
+            "every phi in the chain is trivial and must be eliminated"
+        );
+        assert_dense_variable_table(&ssa, "after collapsing a trivial phi chain");
+        // The return must now read the value the chain forwarded.
+        let returned = ssa
+            .blocks()
+            .iter()
+            .find_map(|block| match block.terminator_op() {
+                Some(SsaOp::Return { value: Some(v) }) => Some(*v),
+                _ => None,
+            });
+        assert_eq!(
+            returned,
+            Some(seed),
+            "the chain forwarded the seed, so the return must read it directly"
+        );
+    }
+
+    /// `SsaFunction::variable(id)` is a raw index into `variables`, so the whole
+    /// IR depends on `variables[i].id().index() == i`. Any method that drops a
+    /// row must renumber, or every id above the hole silently resolves to a
+    /// *different* variable's `def_site`/`var_type`/use list — which
+    /// `can_replace_instruction_use_with_dominators` then reads to approve
+    /// replacements that violate dominance.
+    fn assert_dense_variable_table(ssa: &SsaFunction<MockTarget>, label: &str) {
+        for (slot, var) in ssa.variables().iter().enumerate() {
+            assert_eq!(
+                var.id().index(),
+                slot,
+                "{label}: variable table density broken at slot {slot} \
+                 (found id {}), so variable(id) now resolves to the wrong row",
+                var.id().index()
+            );
+        }
+    }
+
+    #[test]
+    fn eliminate_dead_phis_preserves_dense_variable_table() {
+        let mut ssa = dead_phi_before_a_live_variable();
+        assert_dense_variable_table(&ssa, "before");
+
+        ssa.eliminate_dead_phis();
+
+        assert!(
+            ssa.block(3).unwrap().phi_nodes().is_empty(),
+            "the dead phi should have been removed"
+        );
+        assert_dense_variable_table(&ssa, "after eliminate_dead_phis");
+    }
+
+    #[test]
+    fn eliminate_trivial_phis_preserves_dense_variable_table() {
+        let mut ssa = dead_phi_before_a_live_variable();
+
+        // The phi merges the same value on both edges, so it is trivial as well
+        // as dead; repair mode removes it through the trivial-phi path.
+        ssa.eliminate_trivial_phis(&TrivialPhiOptions { reachable: None });
+
+        assert_dense_variable_table(&ssa, "after eliminate_trivial_phis");
+    }
+
+    /// An operand on a live incoming edge must survive pruning even when its
+    /// value has no reachable definition. Dropping it leaves the phi without an
+    /// operand for a real predecessor (`MissingPhiOperand`), and shrinks the phi
+    /// to a single operand that trivial-phi simplification then collapses into a
+    /// copy — silently discarding the other merged value.
+    #[test]
+    fn prune_phi_operands_keeps_live_edges_with_undefined_values() {
+        let mut ssa = merge_with_one_undefined_operand();
+        let mut reachable = BitSet::new(3);
+        for block in 0..3 {
+            reachable.insert(block);
+        }
+
+        let pruned = ssa.prune_phi_operands(&reachable);
+
+        assert_eq!(pruned, 0, "no live-edge operand may be pruned");
+        let operands = ssa.block(2).unwrap().phi_nodes()[0].operands();
+        assert_eq!(
+            operands.len(),
+            2,
+            "both incoming edges must retain an operand"
+        );
+        let mut preds: Vec<usize> = operands.iter().map(PhiOperand::predecessor).collect();
+        preds.sort_unstable();
+        assert_eq!(preds, vec![0, 1]);
+    }
+
+    /// Control: an operand naming a block that is not a predecessor is still
+    /// pruned. Structural staleness remains the sole removal criterion.
+    #[test]
+    fn prune_phi_operands_drops_operands_from_non_predecessors() {
+        let mut ssa = merge_with_one_undefined_operand();
+        let defined = SsaVarId::from_index(1);
+        // B1 no longer reaches B2, so its operand is stale.
+        ssa.block_mut(1)
+            .unwrap()
+            .instructions_mut()
+            .last_mut()
+            .unwrap()
+            .set_op(SsaOp::Return { value: None });
+
+        let mut reachable = BitSet::new(3);
+        for block in 0..3 {
+            reachable.insert(block);
+        }
+
+        let pruned = ssa.prune_phi_operands(&reachable);
+
+        assert_eq!(pruned, 1, "the stale operand must be pruned");
+        let operands = ssa.block(2).unwrap().phi_nodes()[0].operands();
+        assert_eq!(operands.len(), 1);
+        assert_eq!(operands[0].predecessor(), 0);
+        assert_eq!(operands[0].value(), defined);
     }
 }

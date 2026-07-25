@@ -18,6 +18,7 @@
 #![cfg(feature = "serde")]
 
 use analyssa::{
+    Endianness, PointerSize,
     ir::{
         block::SsaBlock,
         exception::NativeExceptionKind,
@@ -40,7 +41,6 @@ use analyssa::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     testing::{MockTarget, MockType},
-    Endianness, PointerSize,
 };
 
 /// Asserts that a value survives a JSON round trip unchanged.
@@ -253,6 +253,14 @@ fn ssa_op_round_trips() {
         dest: v1,
         addr: v0,
         value_type: MockType::I32,
+        address_space: None,
+    });
+    // A segment-qualified access must survive the wire unchanged.
+    round_trip(SsaOp::<MockTarget>::LoadIndirect {
+        dest: v1,
+        addr: v0,
+        value_type: MockType::I32,
+        address_space: Some(1),
     });
     round_trip(SsaOp::<MockTarget>::CallClobber { outputs: vec![v0] });
     round_trip(SsaOp::<MockTarget>::Nop);

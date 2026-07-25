@@ -144,10 +144,10 @@ fn has_cycle_dfs<G: Successors>(
             }
             None => {
                 // Successors exhausted: leave the node (back to black).
-                if let Some((node, _)) = stack.pop() {
-                    if let Some(slot) = in_stack.get_mut(node.index()) {
-                        *slot = false;
-                    }
+                if let Some((node, _)) = stack.pop()
+                    && let Some(slot) = in_stack.get_mut(node.index())
+                {
+                    *slot = false;
                 }
             }
         }
@@ -284,8 +284,8 @@ fn find_cycle_dfs<G: Successors>(
 #[cfg(test)]
 mod tests {
     use crate::graph::{
-        algorithms::cycles::{find_cycle, has_cycle},
         DirectedGraph, NodeId,
+        algorithms::cycles::{find_cycle, has_cycle},
     };
 
     fn create_linear_graph() -> DirectedGraph<'static, &'static str, ()> {

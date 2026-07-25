@@ -89,6 +89,12 @@ pub enum EventKind {
     ArtifactRemoved,
     /// Code regeneration completed.
     CodeRegenerated,
+    /// A load was replaced by a value already available in memory — forwarded
+    /// from a dominating store, or from an earlier redundant load.
+    LoadForwarded,
+    /// A store was removed because a later store to the same location
+    /// overwrote it before any intervening read.
+    DeadStoreRemoved,
 }
 
 impl EventKind {
@@ -96,6 +102,8 @@ impl EventKind {
     #[must_use]
     pub fn description(&self) -> &'static str {
         match self {
+            Self::LoadForwarded => "load forwarded",
+            Self::DeadStoreRemoved => "dead store removed",
             Self::StringDecrypted => "string decrypted",
             Self::ConstantDecrypted => "constant decrypted",
             Self::ConstantFolded => "constant folded",
@@ -173,6 +181,24 @@ pub trait EventListener<T: Target> {
     /// per-event allocation on the hot logging path when no one is observing.
     fn is_enabled(&self) -> bool {
         true
+    }
+
+    /// Number of events recorded so far.
+    ///
+    /// Used as a snapshot marker so a caller can summarise what happened between
+    /// two points. Defaults to `0` for sinks that keep no history, which makes
+    /// [`Self::count_by_kind_since`] correctly report nothing.
+    fn recorded_count(&self) -> usize {
+        0
+    }
+
+    /// Counts events by kind recorded at or after `offset`.
+    ///
+    /// Defaults to empty for sinks that keep no history. Callers should treat an
+    /// empty result as "no detail available" rather than "nothing happened".
+    fn count_by_kind_since(&self, offset: usize) -> HashMap<EventKind, usize> {
+        let _ = offset;
+        HashMap::new()
     }
 
     /// Open a fluent builder for an event of `kind`. The event is appended
@@ -322,6 +348,14 @@ impl<T: Target> Clone for EventLog<T> {
 impl<T: Target> EventListener<T> for EventLog<T> {
     fn push(&self, event: Event<T>) {
         self.events.push(event);
+    }
+
+    fn recorded_count(&self) -> usize {
+        self.len()
+    }
+
+    fn count_by_kind_since(&self, offset: usize) -> HashMap<EventKind, usize> {
+        Self::count_by_kind_since(self, offset)
     }
 }
 
@@ -578,6 +612,10 @@ pub struct DerivedStats {
     pub methods_regenerated: usize,
     /// Number of artifacts removed (methods, types, metadata).
     pub artifacts_removed: usize,
+    /// Number of loads replaced by an already-available value.
+    pub loads_forwarded: usize,
+    /// Number of dead stores removed.
+    pub dead_stores_removed: usize,
     /// Number of pass iterations.
     pub iterations: usize,
     /// Processing time.
@@ -605,6 +643,8 @@ impl DerivedStats {
             methods_marked_dead: get(EventKind::MethodMarkedDead),
             methods_regenerated: get(EventKind::CodeRegenerated),
             artifacts_removed: get(EventKind::ArtifactRemoved),
+            loads_forwarded: get(EventKind::LoadForwarded),
+            dead_stores_removed: get(EventKind::DeadStoreRemoved),
             iterations: 0,
             total_time: Duration::ZERO,
         }
@@ -720,10 +760,9 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::{sync::Arc, thread};
 
+    use super::*;
     use crate::testing::MockTarget;
 
     type Method = <MockTarget as Target>::MethodRef;

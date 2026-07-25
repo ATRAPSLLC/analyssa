@@ -3,6 +3,7 @@
 mod common;
 
 use analyssa::{
+    PointerSize,
     events::{EventKind, EventLog},
     ir::{
         block::SsaBlock,
@@ -19,9 +20,7 @@ use analyssa::{
     },
     passes::{self, PredicateResult},
     testing::{MockTarget, MockType},
-    PointerSize,
 };
-
 use common::{
     assert_event, assert_has_op, assert_valid_full, op_at, run_pass_boundary,
     run_pass_repaired_boundary, terminator_at,
@@ -500,24 +499,30 @@ fn native_side_effect_passes_preserve_barriers_after_each_boundary() {
         passes::deadcode::run(ssa, &method, &log, 50)
     });
 
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::NativeOpaque(_))));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::AtomicExchange { .. })));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Fence { .. })));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Call { .. })));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::VectorFaultingLoad { .. })));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::VectorSegmentStore { .. })));
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::NativeOpaque(_)))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::AtomicExchange { .. }))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Fence { .. }))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Call { .. }))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::VectorFaultingLoad { .. }))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::VectorSegmentStore { .. }))
+    );
 }
 
 #[test]
@@ -675,10 +680,10 @@ fn jump_threading_uses_incoming_phi_values_to_redirect_predecessors() {
     ));
 
     assert!(matches!(terminator_at(&ssa, 0), SsaOp::Jump { target: 3 }));
-    if let Some(block) = ssa.block(1) {
-        if let Some(terminator) = block.terminator_op() {
-            assert!(matches!(terminator, SsaOp::Jump { target: 4 }));
-        }
+    if let Some(block) = ssa.block(1)
+        && let Some(terminator) = block.terminator_op()
+    {
+        assert!(matches!(terminator, SsaOp::Jump { target: 4 }));
     }
     assert_event(&log, EventKind::ControlFlowRestructured);
 }
@@ -743,13 +748,17 @@ fn licm_hoists_loop_invariant_expression_to_preheader() {
         .iter()
         .map(SsaInstruction::op)
         .collect();
-    assert!(preheader_ops
-        .get(3)
-        .is_some_and(|op| matches!(op, SsaOp::Add { dest, .. } if *dest == invariant)));
-    assert!(some_or_abort(ssa.block(2))
-        .instructions()
-        .iter()
-        .all(|instr| !matches!(instr.op(), SsaOp::Add { dest, .. } if *dest == invariant)));
+    assert!(
+        preheader_ops
+            .get(3)
+            .is_some_and(|op| matches!(op, SsaOp::Add { dest, .. } if *dest == invariant))
+    );
+    assert!(
+        some_or_abort(ssa.block(2))
+            .instructions()
+            .iter()
+            .all(|instr| !matches!(instr.op(), SsaOp::Add { dest, .. } if *dest == invariant))
+    );
     assert_valid_ssa(&ssa, "licm hoist");
     assert!(log.has(EventKind::InstructionRemoved));
 }
@@ -1456,9 +1465,10 @@ fn dead_code_elimination_keeps_effectful_native_opaque_when_unused() {
     });
 
     assert_valid_ssa(&ssa, "native opaque dce");
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::NativeOpaque(_))));
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::NativeOpaque(_)))
+    );
 }
 
 #[test]
@@ -1503,12 +1513,14 @@ fn dead_code_elimination_keeps_atomic_and_fence_barriers_when_unused() {
     });
 
     assert_valid_ssa(&ssa, "atomic fence dce");
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::AtomicExchange { .. })));
-    assert!(ssa
-        .iter_instructions()
-        .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Fence { .. })));
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::AtomicExchange { .. }))
+    );
+    assert!(
+        ssa.iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Fence { .. }))
+    );
 }
 
 // Block merge: coalescing adjacent blocks
@@ -1918,4 +1930,110 @@ fn full_pass_pipeline_on_mixed_function_preserves_valid_ssa() {
     for ev in &log {
         assert_eq!(ev.method, Some(method));
     }
+}
+
+/// Folding `Branch(cond, A, B)` to `Jump(A)` must prune `B`'s phi operand for
+/// the folded block and settle at the cheap repair tier.
+///
+/// Removing an edge only *increases* dominance — it removes paths — so no new
+/// phi can ever be required and a full `rebuild_ssa` is unnecessary. That
+/// distinction is worth 23-54x a clone per fold, which is why the branch-folding
+/// passes use `fold_terminator_pruning_phis` rather than `mark_cfg_changed`.
+#[test]
+fn folding_a_branch_prunes_the_dropped_edges_phi_operand() {
+    use analyssa::{
+        ir::{
+            block::SsaBlock,
+            function::{SsaEditOptions, SsaFunction},
+            instruction::SsaInstruction,
+            ops::SsaOp,
+            phi::{PhiNode, PhiOperand},
+            value::ConstValue,
+            variable::{DefSite, SsaVarId, VariableOrigin},
+        },
+        testing::{MockTarget, MockType},
+    };
+
+    let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+    let a = SsaVarId::from_index(0);
+    ssa.create_variable(
+        VariableOrigin::Local(0),
+        0,
+        DefSite::instruction(0, 0),
+        MockType::I32,
+    );
+    let b = SsaVarId::from_index(1);
+    ssa.create_variable(
+        VariableOrigin::Local(1),
+        0,
+        DefSite::instruction(1, 0),
+        MockType::I32,
+    );
+    let merged = SsaVarId::from_index(2);
+    ssa.create_variable(VariableOrigin::Local(2), 0, DefSite::phi(2), MockType::I32);
+
+    // B0: cond -> Branch(B1, B2).  B1 -> B2.  B2: phi(B0, B1).
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+        dest: a,
+        value: ConstValue::I32(1),
+    }));
+    b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+        condition: a,
+        true_target: 1,
+        false_target: 2,
+    }));
+    ssa.add_block(b0);
+
+    let mut b1 = SsaBlock::new(1);
+    b1.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+        dest: b,
+        value: ConstValue::I32(2),
+    }));
+    b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+    ssa.add_block(b1);
+
+    let mut b2 = SsaBlock::new(2);
+    let mut phi = PhiNode::new(merged, VariableOrigin::Local(2));
+    phi.add_operand(PhiOperand::new(a, 0));
+    phi.add_operand(PhiOperand::new(b, 1));
+    b2.add_phi(phi);
+    b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+        value: Some(merged),
+    }));
+    ssa.add_block(b2);
+    ssa.recompute_uses();
+
+    // Fold B0's branch so it always goes to B1 — dropping the B0 -> B2 edge.
+    let mut pruned = 0;
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        pruned = editor.fold_terminator_pruning_phis(0, SsaOp::Jump { target: 1 })?;
+        Ok(())
+    });
+    assert!(
+        result.is_ok(),
+        "fold_terminator_pruning_phis must succeed on a well-formed branch"
+    );
+    let changed = result.map(|report| report.changed).unwrap_or(false);
+
+    assert_eq!(
+        pruned, 1,
+        "the dropped B0 -> B2 edge's operand must be pruned"
+    );
+
+    // No surviving phi may still name B0 as a predecessor. The phi itself may
+    // be gone entirely: once reduced to one operand it is trivial, and the
+    // boundary repair collapses it into a copy — which is the correct outcome,
+    // not a lost merge.
+    for block in ssa.blocks() {
+        for phi in block.phi_nodes() {
+            assert!(
+                phi.operands().iter().all(|op| op.predecessor() != 0),
+                "no phi may reference the folded-away B0 edge"
+            );
+        }
+    }
+
+    assert!(changed);
+    assert_eq!(ssa.validate(), Ok(()), "the fold must leave valid SSA");
 }

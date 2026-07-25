@@ -84,9 +84,11 @@ fn verifier_rejects_duplicate_instruction_definitions() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::DuplicateDefinition { var, .. } if *var == v0)));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::DuplicateDefinition { var, .. } if *var == v0))
+    );
 }
 
 #[test]
@@ -317,9 +319,11 @@ fn verifier_rejects_undefined_use_in_instruction() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::UndefinedUse { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::UndefinedUse { .. }))
+    );
 }
 
 #[test]
@@ -355,6 +359,425 @@ fn validate_returns_structured_verifier_errors() {
         err,
         VerifierError::OrphanVariable { var } if *var == orphan
     )));
+}
+
+/// `SsaFunction::variable(id)` indexes the variables table directly, so a row
+/// removed without renumbering makes every higher id resolve to a different
+/// variable's def site, type, and uses. Nothing else detects this: the IR stays
+/// structurally well-formed and merely describes the wrong variables.
+#[test]
+fn verifier_rejects_a_non_dense_variable_table() {
+    let mut ssa = SsaFunction::new(0, 2);
+    let a = local(&mut ssa, 0, 0, 0);
+    let b = local(&mut ssa, 1, 0, 1);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: a,
+        value: ConstValue::I32(1),
+    }));
+    block.add_instruction(instr(SsaOp::Const {
+        dest: b,
+        value: ConstValue::I32(2),
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: Some(b) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    // Dense to begin with.
+    assert!(
+        !SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Quick)
+            .iter()
+            .any(|e| matches!(e, VerifierError::VariableTableNotDense { .. })),
+        "the fixture must start dense"
+    );
+
+    // Punch a hole the way an unpaired `variables.retain(..)` would.
+    ssa.variables_mut().remove(0);
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            VerifierError::VariableTableNotDense { slot: 0, found } if *found == b
+        )),
+        "a hole in the variables table must be rejected; got {errors:?}"
+    );
+}
+
+/// A variable whose defining instruction was removed while a use survived is a
+/// dangling read, and the verifier must reject it.
+///
+/// This is the shape a pass produces when it deletes a multi-definition
+/// instruction on the strength of its primary result alone: the secondary
+/// (`flags`) definition disappears but its consumer does not. Repair then resets
+/// the now-undefined variable's def site to `DefSite::entry()`, making it look
+/// like an implicitly-defined argument — which is what previously let this pass
+/// verification clean.
+#[test]
+fn verifier_rejects_a_use_whose_definition_was_removed() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let defined = local(&mut ssa, 0, 0, 0);
+    // A temporary beyond the declared local count, with an entry-shaped def site
+    // and no defining instruction anywhere — exactly what repair leaves behind.
+    let dangling =
+        ssa.create_variable(VariableOrigin::Local(7), 0, DefSite::entry(), MockType::I32);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: defined,
+        value: ConstValue::I32(1),
+    }));
+    block.add_instruction(instr(SsaOp::Add {
+        dest: SsaVarId::from_index(2),
+        left: defined,
+        right: dangling,
+        flags: None,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            VerifierError::UndefinedUse { var, block: 0, instr_idx: 1 } if *var == dangling
+        )),
+        "a read of a variable nothing defines must be rejected, and must name the \
+         reading instruction rather than being filtered as a cosmetic orphan; got {errors:?}"
+    );
+}
+
+/// A `VariableOrigin::EntryLiveIn` variable is caller-supplied, so reading it
+/// without any defining instruction is legal.
+///
+/// This is the contract machine-code front ends depend on: a register read
+/// before the function body ever writes it has no definition to point at. It is
+/// deliberately a *distinct* origin from `Argument` — the lifter has not
+/// recovered the calling convention, so it cannot honestly claim a signature
+/// position — and distinct from `Phi`, which stays rejected so that a variable
+/// whose definition was destroyed cannot masquerade as an entry value.
+///
+/// This test exists because the entry-defined origin set is a public contract,
+/// not a verifier implementation detail: tightening it previously broke a
+/// downstream lifter silently, with no failure in this suite.
+#[test]
+fn verifier_accepts_a_read_of_an_entry_live_in() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let defined = local(&mut ssa, 0, 0, 0);
+    let live_in = ssa.create_variable(
+        VariableOrigin::EntryLiveIn,
+        0,
+        DefSite::entry(),
+        MockType::I32,
+    );
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: defined,
+        value: ConstValue::I32(1),
+    }));
+    block.add_instruction(instr(SsaOp::Add {
+        dest: SsaVarId::from_index(2),
+        left: defined,
+        right: live_in,
+        flags: None,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        !errors.iter().any(|err| matches!(
+            err,
+            VerifierError::UndefinedUse { var, .. } | VerifierError::OrphanVariable { var }
+                if *var == live_in
+        )),
+        "an entry live-in needs no definition in the body; got {errors:?}"
+    );
+}
+
+/// `EntryLiveIn` must not widen the hole that rejecting `Phi` closed: a
+/// phi-origin variable with an entry-shaped def site and no definition is still
+/// a destroyed definition, and still rejected.
+#[test]
+fn verifier_still_rejects_a_phi_origin_variable_with_no_definition() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let defined = local(&mut ssa, 0, 0, 0);
+    let destroyed = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: defined,
+        value: ConstValue::I32(1),
+    }));
+    block.add_instruction(instr(SsaOp::Add {
+        dest: SsaVarId::from_index(2),
+        left: defined,
+        right: destroyed,
+        flags: None,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            VerifierError::UndefinedUse { var, .. } if *var == destroyed
+        )),
+        "a phi-origin variable with no definition is a destroyed definition and \
+         must still be rejected; got {errors:?}"
+    );
+}
+
+/// The verifier is the safety net for malformed IR, so it must *report* a
+/// dangling phi predecessor rather than abort on it. `BitSet::contains` asserts
+/// its index is in range, and `check_dominance` fed it raw block indices taken
+/// straight from the IR — so `VerifyLevel::Full` aborted the process on one of
+/// the shapes it exists to catch.
+#[test]
+fn verifier_tolerates_a_phi_operand_naming_a_nonexistent_block() {
+    let mut ssa = SsaFunction::new(0, 2);
+    let value = local(&mut ssa, 0, 0, 0);
+    let merged = ssa.create_variable(VariableOrigin::Local(1), 0, DefSite::phi(1), MockType::I32);
+
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: value,
+        value: ConstValue::I32(1),
+    }));
+    b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+    ssa.add_block(b0);
+
+    let mut b1 = SsaBlock::new(1);
+    let mut phi = PhiNode::new(merged, VariableOrigin::Local(1));
+    phi.add_operand(PhiOperand::new(value, 0));
+    // Block 99 does not exist. The IR permits dangling successors, and the
+    // verifier documents that it tolerates them.
+    phi.add_operand(PhiOperand::new(value, 99));
+    b1.add_phi(phi);
+    b1.add_instruction(instr(SsaOp::Return {
+        value: Some(merged),
+    }));
+    ssa.add_block(b1);
+    ssa.recompute_uses();
+
+    // Every level must complete. Each returns findings; none may abort.
+    for level in [VerifyLevel::Quick, VerifyLevel::Standard, VerifyLevel::Full] {
+        let errors = SsaVerifier::new(&ssa).verify(level);
+        // At Standard and above the bogus edge is reported rather than ignored.
+        if level >= VerifyLevel::Standard {
+            assert!(
+                errors.iter().any(|err| matches!(
+                    err,
+                    VerifierError::ExtraPhiOperand { extra_pred: 99, .. }
+                )),
+                "the dangling predecessor must be reported at {level:?}; got {errors:?}"
+            );
+        }
+    }
+}
+
+/// A variable whose recorded definition site names a block that does not exist
+/// reaches the same asserting bounds check from the other direction.
+#[test]
+fn verifier_tolerates_a_definition_site_naming_a_nonexistent_block() {
+    let mut ssa = SsaFunction::new(0, 1);
+    // Claims to be defined in block 42, which does not exist.
+    let ghost = ssa.create_variable(
+        VariableOrigin::Local(0),
+        0,
+        DefSite::instruction(42, 0),
+        MockType::I32,
+    );
+
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(instr(SsaOp::Return { value: Some(ghost) }));
+    ssa.add_block(b0);
+    ssa.recompute_uses();
+
+    // Must not abort.
+    let _ = SsaVerifier::new(&ssa).verify(VerifyLevel::Full);
+}
+
+/// One CFG edge carries one value, so two operands naming the same predecessor
+/// have no defined meaning — and consumers disagree about them: `operand_from`
+/// returns the first and drops the rest, while SCCP meets them all and yields
+/// Bottom. Comparing operand predecessors as a *set* cannot see the duplicate,
+/// which is how the advertised "exactly one operand per predecessor" invariant
+/// went unchecked.
+#[test]
+fn verifier_rejects_two_phi_operands_for_one_predecessor() {
+    let mut ssa = SsaFunction::new(0, 3);
+    let left = local(&mut ssa, 0, 1, 0);
+    let right = local(&mut ssa, 1, 2, 0);
+    let merged = ssa.create_variable(VariableOrigin::Local(2), 0, DefSite::phi(3), MockType::I32);
+
+    let mut entry = SsaBlock::new(0);
+    entry.add_instruction(instr(SsaOp::Branch {
+        condition: left,
+        true_target: 1,
+        false_target: 2,
+    }));
+    ssa.add_block(entry);
+
+    for (id, var) in [(1usize, left), (2usize, right)] {
+        let mut block = SsaBlock::new(id);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: var,
+            value: ConstValue::I32(id as i32),
+        }));
+        block.add_instruction(instr(SsaOp::Jump { target: 3 }));
+        ssa.add_block(block);
+    }
+
+    let mut join = SsaBlock::new(3);
+    let mut phi = PhiNode::new(merged, VariableOrigin::Local(2));
+    phi.add_operand(PhiOperand::new(left, 1));
+    // A second, conflicting operand for the *same* edge — what an edge redirect
+    // produces when it retargets onto a predecessor that already has one.
+    phi.add_operand(PhiOperand::new(right, 1));
+    phi.add_operand(PhiOperand::new(right, 2));
+    join.add_phi(phi);
+    join.add_instruction(instr(SsaOp::Return {
+        value: Some(merged),
+    }));
+    ssa.add_block(join);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            VerifierError::DuplicatePhiOperand {
+                block: 3,
+                phi_idx: 0,
+                pred: 1
+            }
+        )),
+        "two operands on edge B1->B3 must be rejected; got {errors:?}"
+    );
+}
+
+/// A well-formed phi must not trip the duplicate check.
+#[test]
+fn verifier_accepts_one_operand_per_predecessor() {
+    let mut ssa = SsaFunction::new(0, 3);
+    let left = local(&mut ssa, 0, 1, 0);
+    let right = local(&mut ssa, 1, 2, 0);
+    let merged = ssa.create_variable(VariableOrigin::Local(2), 0, DefSite::phi(3), MockType::I32);
+
+    let mut entry = SsaBlock::new(0);
+    entry.add_instruction(instr(SsaOp::Branch {
+        condition: left,
+        true_target: 1,
+        false_target: 2,
+    }));
+    ssa.add_block(entry);
+
+    for (id, var) in [(1usize, left), (2usize, right)] {
+        let mut block = SsaBlock::new(id);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: var,
+            value: ConstValue::I32(id as i32),
+        }));
+        block.add_instruction(instr(SsaOp::Jump { target: 3 }));
+        ssa.add_block(block);
+    }
+
+    let mut join = SsaBlock::new(3);
+    let mut phi = PhiNode::new(merged, VariableOrigin::Local(2));
+    phi.add_operand(PhiOperand::new(left, 1));
+    phi.add_operand(PhiOperand::new(right, 2));
+    join.add_phi(phi);
+    join.add_instruction(instr(SsaOp::Return {
+        value: Some(merged),
+    }));
+    ssa.add_block(join);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        !errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::DuplicatePhiOperand { .. })),
+        "a well-formed phi must not be reported; got {errors:?}"
+    );
+}
+
+/// `strip_nops` resets a variable to `DefSite::entry()` when its defining
+/// instruction became a `Nop` — which is exactly what a pass leaves behind when
+/// it deletes a definition whose value is still read. That reset must not fire
+/// while something reads the variable, or the dangling read is disguised as an
+/// argument and `validate` returns `Ok`.
+#[test]
+fn stripping_nops_does_not_disguise_a_dangling_read_as_an_argument() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let defined = local(&mut ssa, 0, 0, 0);
+    let killed = local(&mut ssa, 1, 0, 1);
+    let sum = local(&mut ssa, 2, 0, 2);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: defined,
+        value: ConstValue::I32(1),
+    }));
+    // The instruction that defined `killed`, deleted by a pass.
+    block.add_instruction(instr(SsaOp::Nop));
+    // ...but its value is still read here.
+    block.add_instruction(instr(SsaOp::Add {
+        dest: sum,
+        left: defined,
+        right: killed,
+        flags: None,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: Some(sum) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    // `repair_ssa` runs `strip_nops` and then `refresh_def_sites`; neither may
+    // rewrite `killed` to look entry-defined.
+    ssa.repair_ssa();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::UndefinedUse { .. })),
+        "the read of a variable whose definition was nopped must survive repair \
+         as a reported error; got {errors:?}"
+    );
+}
+
+/// The counterpart: a real argument has no defining instruction either, and must
+/// not be reported. Without this, the check above would just be noise.
+#[test]
+fn verifier_accepts_an_argument_with_no_defining_instruction() {
+    let mut ssa = SsaFunction::new(1, 0);
+    let arg = ssa.create_variable(
+        VariableOrigin::Argument(0),
+        0,
+        DefSite::entry(),
+        MockType::I32,
+    );
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Return { value: Some(arg) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        !errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::OrphanVariable { .. })),
+        "an argument is defined at entry; got {errors:?}"
+    );
 }
 
 #[test]
@@ -395,9 +818,11 @@ fn verifier_rejects_phi_in_entry_block() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::PhiInEntryBlock { block: 0, .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::PhiInEntryBlock { block: 0, .. }))
+    );
 }
 
 #[test]
@@ -423,9 +848,11 @@ fn verifier_rejects_intra_block_cycle() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::IntraBlockCycle { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::IntraBlockCycle { .. }))
+    );
 }
 
 #[test]
@@ -450,9 +877,11 @@ fn verifier_rejects_placeholder_variable_in_instruction() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
-    assert!(errors
-        .iter()
-        .any(|err| matches!(err, VerifierError::PlaceholderVariable { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|err| matches!(err, VerifierError::PlaceholderVariable { .. }))
+    );
 }
 
 #[test]
@@ -470,9 +899,11 @@ fn verifier_all_levels_accept_well_formed_minimal_function() {
     ssa.recompute_uses();
 
     assert!(SsaVerifier::new(&ssa).verify(VerifyLevel::Quick).is_empty());
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
     assert!(SsaVerifier::new(&ssa).verify(VerifyLevel::Full).is_empty());
 }
 
@@ -524,9 +955,11 @@ fn verifier_all_levels_accept_diamond_with_phis() {
     ssa.recompute_uses();
 
     assert!(SsaVerifier::new(&ssa).verify(VerifyLevel::Quick).is_empty());
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
     assert!(SsaVerifier::new(&ssa).verify(VerifyLevel::Full).is_empty());
 }
 
@@ -601,9 +1034,11 @@ fn verifier_registers_secondary_flag_definitions() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Quick);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::DuplicateDefinition { var, .. } if *var == flags)));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::DuplicateDefinition { var, .. } if *var == flags))
+    );
 }
 
 #[test]
@@ -690,9 +1125,11 @@ fn verifier_accepts_matching_vector_binary_shapes() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -722,9 +1159,11 @@ fn verifier_rejects_mismatched_vector_binary_shapes() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. }))
+    );
 }
 
 #[test]
@@ -753,9 +1192,11 @@ fn verifier_rejects_invalid_vector_shuffle_lane() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. }))
+    );
 }
 
 #[test]
@@ -826,9 +1267,11 @@ fn verifier_accepts_scalable_vector_binary_and_compare() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -864,9 +1307,11 @@ fn verifier_rejects_fixed_and_scalable_vector_mix() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. }))
+    );
 }
 
 #[test]
@@ -923,9 +1368,11 @@ fn verifier_accepts_modern_simd_masked_memory_and_bitmask_ops() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -961,9 +1408,11 @@ fn verifier_rejects_masked_vector_memory_with_wrong_mask_shape() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. }))
+    );
 }
 
 #[test]
@@ -1012,9 +1461,11 @@ fn verifier_accepts_gather_and_scatter_shapes() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1070,9 +1521,11 @@ fn verifier_accepts_faulting_and_segment_vector_memory_shapes() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1098,9 +1551,11 @@ fn verifier_rejects_vector_segment_count_mismatch() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidVectorOperation { .. }))
+    );
 }
 
 #[test]
@@ -1141,9 +1596,11 @@ fn verifier_accepts_native_atomic_cmpxchg_with_status_output() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1174,9 +1631,11 @@ fn verifier_rejects_native_atomic_width_mismatch() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidAtomicOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidAtomicOperation { .. }))
+    );
 }
 
 #[test]
@@ -1208,9 +1667,11 @@ fn verifier_rejects_illegal_native_atomic_ordering() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidAtomicOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidAtomicOperation { .. }))
+    );
 }
 
 #[test]
@@ -1240,9 +1701,11 @@ fn verifier_accepts_wide_multiply_matching_half_widths() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    assert!(SsaVerifier::new(&ssa)
-        .verify(VerifyLevel::Standard)
-        .is_empty());
+    assert!(
+        SsaVerifier::new(&ssa)
+            .verify(VerifyLevel::Standard)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1279,9 +1742,11 @@ fn verifier_rejects_wide_divide_width_mismatch() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidWideArithmetic { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidWideArithmetic { .. }))
+    );
 }
 
 #[test]
@@ -1306,9 +1771,11 @@ fn verifier_rejects_pure_native_opaque_with_clobbers() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. }))
+    );
 }
 
 #[test]
@@ -1342,9 +1809,11 @@ fn verifier_rejects_invalid_native_machine_state_descriptor() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. }))
+    );
 }
 
 #[test]
@@ -1374,7 +1843,77 @@ fn verifier_rejects_inconsistent_native_effect_summary() {
     ssa.recompute_uses();
 
     let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. }))
+    );
+}
+
+/// A catch or filter handler receives its exception object from the runtime:
+/// nothing in the IR defines it, and the handler's leading `Pop` consumes it.
+/// `SsaRebuilder::strip_undefined_pops` already carves out exactly this shape,
+/// so the verifier must too — otherwise it rejects the IR the rebuilder is
+/// built to produce, and every method with a handler fails as soon as a
+/// CFG-modifying pass triggers a rebuild.
+#[test]
+fn verifier_accepts_runtime_supplied_exception_object() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let guarded = local(&mut ssa, 0, 0, 0);
+    // The exception object: a stack temporary with no defining instruction,
+    // which is how a frontend models the runtime-pushed value.
+    let exception = ssa.create_variable(VariableOrigin::Phi, 1, DefSite::entry(), MockType::I32);
+
+    let mut try_block = SsaBlock::new(0);
+    try_block.add_instruction(instr(SsaOp::Const {
+        dest: guarded,
+        value: ConstValue::I32(1),
+    }));
+    try_block.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(try_block);
+
+    let mut handler = SsaBlock::new(1);
+    handler.add_instruction(instr(SsaOp::Pop { value: exception }));
+    handler.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(handler);
+
+    ssa.set_exception_handlers(vec![analyssa::ir::exception::SsaExceptionHandler {
+        flags: 0,
+        try_offset: 0,
+        try_length: 1,
+        handler_offset: 1,
+        handler_length: 1,
+        class_token_or_filter: 0,
+        try_start_block: Some(0),
+        try_end_block: Some(1),
+        handler_start_block: Some(1),
+        handler_end_block: Some(2),
+        filter_start_block: None,
+    }]);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Full);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::UndefinedUse { var, .. } if *var == exception)),
+        "the handler's runtime-supplied exception object must not be reported \
+         as a dangling read; got {errors:?}"
+    );
+
+    // The carve-out is keyed on the handler's `Pop`: an undefined variable
+    // that no handler-entry `Pop` consumes is still a dangling read, even in
+    // the same block.
+    let stray = ssa.create_variable(VariableOrigin::Phi, 1, DefSite::entry(), MockType::I32);
+    if let Some(block) = ssa.block_mut(1) {
+        block.add_instruction(instr(SsaOp::Throw { exception: stray }));
+    }
+    ssa.recompute_uses();
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Full);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::UndefinedUse { var, .. } if *var == stray)),
+        "only the exception object the handler pops is runtime-supplied; got {errors:?}"
+    );
 }

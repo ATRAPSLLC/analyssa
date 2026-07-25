@@ -52,13 +52,12 @@
 //! | Standard | O(n*m) | n = blocks, m = avg predecessors per block |
 //! | Full | O(b^2) | Dominator computation + O(b * u) queries |
 
-use std::collections::HashMap;
-
 use crate::{
+    BitSet,
     analysis::cfg::SsaCfg,
     graph::{
-        algorithms::{compute_dominators, DominatorTree},
         NodeId, RootedGraph,
+        algorithms::{DominatorTree, compute_dominators},
     },
     ir::{
         function::SsaFunction,
@@ -67,10 +66,10 @@ use crate::{
             MemoryEffectLocation, NativeClobber, NativeStateAccessKind, SsaEffectKind, SsaEffects,
             SsaOp,
         },
-        variable::{DefSite, SsaVarId, SsaVariable},
+        variable::{DefSite, SsaVarId, SsaVariable, VariableOrigin},
+        varstore::VarMap,
     },
     target::{Target, VectorDescriptor, VectorMaskDescriptor, VectorMaskShape},
-    BitSet,
 };
 
 /// Definition site for verifier error reporting.
@@ -106,6 +105,21 @@ pub enum VerifierError {
         instr_idx: usize,
         /// Variable read before any verifier-visible definition.
         var: SsaVarId,
+    },
+    /// A phi node has more than one operand naming the same predecessor edge.
+    ///
+    /// One edge carries one value, so duplicates have no defined meaning and
+    /// consumers disagree about them: [`PhiNode::operand_from`] returns the first
+    /// and discards the rest, while SCCP meets all of them and yields Bottom.
+    ///
+    /// [`PhiNode::operand_from`]: crate::ir::phi::PhiNode::operand_from
+    DuplicatePhiOperand {
+        /// Index of the block containing the phi node.
+        block: usize,
+        /// Index of the phi node in the block's phi list.
+        phi_idx: usize,
+        /// Predecessor named by more than one operand.
+        pred: usize,
     },
     /// A phi node is missing an operand for a CFG predecessor.
     MissingPhiOperand {
@@ -185,6 +199,19 @@ pub enum VerifierError {
         def_instr: usize,
         /// Variable read before its in-block definition.
         var: SsaVarId,
+    },
+    /// The variables table is not densely indexed by variable id.
+    ///
+    /// [`SsaFunction::variable`] is a raw index into the table, so the whole IR
+    /// depends on `variables[i].id().index() == i`. When a transform drops a row
+    /// without renumbering, every id above the hole silently resolves to a
+    /// *different* variable's def site, type, and use list — corruption that no
+    /// other check detects, because the resulting IR is structurally well-formed.
+    VariableTableNotDense {
+        /// Position in the variables table.
+        slot: usize,
+        /// Id actually stored at that position.
+        found: SsaVarId,
     },
     /// A placeholder variable ID (usize::MAX) remains in finalized SSA.
     PlaceholderVariable {
@@ -273,7 +300,10 @@ impl std::fmt::Display for VerifierError {
                 def1.block, def1.kind, def2.block, def2.kind
             ),
             Self::OrphanVariable { var } => {
-                write!(f, "Variable {var:?} in variables vec but not defined in any block")
+                write!(
+                    f,
+                    "Variable {var:?} in variables vec but not defined in any block"
+                )
             }
             Self::UnregisteredVariable { var } => write!(
                 f,
@@ -310,6 +340,19 @@ impl std::fmt::Display for VerifierError {
                 f,
                 "Block {block}: instruction {use_instr} uses {var:?} defined at instruction {def_instr}"
             ),
+            Self::DuplicatePhiOperand {
+                block,
+                phi_idx,
+                pred,
+            } => write!(
+                f,
+                "Block {block}: phi {phi_idx} has multiple operands for predecessor {pred}"
+            ),
+            Self::VariableTableNotDense { slot, found } => write!(
+                f,
+                "Variable table slot {slot} holds {found:?}; `variable(id)` indexes this table \
+                 directly, so every id at or above {slot} now resolves to the wrong variable"
+            ),
             Self::PlaceholderVariable { block, location } => write!(
                 f,
                 "Block {block}: placeholder variable ID (usize::MAX) at {location}"
@@ -326,7 +369,10 @@ impl std::fmt::Display for VerifierError {
                 block,
                 instr_idx,
                 reason,
-            } => write!(f, "Block {block}: instruction {instr_idx} has invalid vector op: {reason}"),
+            } => write!(
+                f,
+                "Block {block}: instruction {instr_idx} has invalid vector op: {reason}"
+            ),
             Self::InvalidAtomicOperation {
                 block,
                 instr_idx,
@@ -389,6 +435,17 @@ pub struct SsaVerifier<'a, T: Target> {
     ssa: &'a SsaFunction<T>,
     /// Accumulated list of errors found during verification.
     errors: Vec<VerifierError>,
+    /// Exact capacity covering every variable id the function mentions,
+    /// computed once and shared by the three variable-indexed structures below.
+    ///
+    /// Deliberately [`SsaFunction::var_id_capacity`] and not the O(1)
+    /// [`SsaFunction::var_id_bound`]: the passes may assume ids come from the
+    /// allocator, but the verifier is what *establishes* that, so it has to
+    /// index ids outside the allocator's range rather than skip them — skipping
+    /// would make it silently fail to report the malformed IR it exists to
+    /// catch. The scan is O(function), which verification already is, and doing
+    /// it once here instead of per structure keeps it to a single extra walk.
+    var_capacity: usize,
 }
 
 impl<'a, T: Target> SsaVerifier<'a, T> {
@@ -398,6 +455,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         Self {
             ssa,
             errors: Vec::new(),
+            var_capacity: ssa.var_id_capacity(),
         }
     }
 
@@ -406,6 +464,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         self.errors.clear();
 
         // Quick checks (always run)
+        self.check_variable_table_density();
         self.check_single_definition();
         self.check_block_structure();
         self.check_no_placeholders_or_self_refs();
@@ -430,9 +489,35 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         self.errors
     }
 
+    /// Verifies the variables table is densely indexed by variable id.
+    ///
+    /// [`SsaFunction::variable`] and `variable_mut` are raw
+    /// `variables.get(id.index())`, so `variables[i].id().index() == i` is a
+    /// load-bearing invariant rather than a tidiness one. Removing a row without
+    /// renumbering shifts every id above it, and the reads that go wrong —
+    /// `def_site()` for dominance decisions, `var_type()` for type
+    /// compatibility — are exactly the ones passes consult before rewriting.
+    ///
+    /// This is a Quick check because it is a single linear scan and because
+    /// nothing else detects the violation: the resulting IR is well-formed in
+    /// every other respect, merely describing different variables than intended.
+    fn check_variable_table_density(&mut self) {
+        for (slot, var) in self.ssa.variables().iter().enumerate() {
+            if var.id().index() != slot {
+                self.errors.push(VerifierError::VariableTableNotDense {
+                    slot,
+                    found: var.id(),
+                });
+                // One report is enough: everything after the first hole is
+                // shifted too, and listing all of it buries the cause.
+                break;
+            }
+        }
+    }
+
     /// Verifies that every variable is defined at most once (the fundamental SSA property).
     fn check_single_definition(&mut self) {
-        let mut definitions: HashMap<SsaVarId, VerifierDefSite> = HashMap::new();
+        let mut definitions: VarMap<VerifierDefSite> = VarMap::new(self.var_capacity);
 
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
@@ -441,7 +526,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                     block: block_idx,
                     kind: DefKind::Phi(phi_idx),
                 };
-                if let Some(prev) = definitions.get(&var) {
+                if let Some(prev) = definitions.get(var) {
                     self.errors.push(VerifierError::DuplicateDefinition {
                         var,
                         def1: prev.clone(),
@@ -458,7 +543,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                         block: block_idx,
                         kind: DefKind::Instruction(instr_idx),
                     };
-                    if let Some(prev) = definitions.get(&dest) {
+                    if let Some(prev) = definitions.get(dest) {
                         self.errors.push(VerifierError::DuplicateDefinition {
                             var: dest,
                             def1: prev.clone(),
@@ -473,10 +558,28 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     }
 
     /// Checks block structural invariants:
-    /// - Every block with successors has a terminator
     /// - Terminators are the last instruction
     /// - No intra-block cycles (use before def)
+    ///
+    /// This deliberately does *not* check "every block with successors has a
+    /// terminator", and [`VerifierError::MissingTerminator`] is consequently
+    /// never constructed: [`SsaBlock::successors`](crate::ir::block::SsaBlock::successors)
+    /// derives the successor set from the block's *last instruction*, so a block
+    /// can only have successors when that instruction is a control-flow op. The
+    /// condition is unsatisfiable rather than unchecked.
+    ///
+    /// Detecting the related-but-different defect — a non-empty block whose last
+    /// instruction is not a terminator, so control falls off the end — would be a
+    /// new invariant, not a repair of this one.
     fn check_block_structure(&mut self) {
+        // One `(block stamp, instruction index)` slot per variable id, reused
+        // across every block rather than reallocated per block — this ran
+        // 27,384 times per verify on the largest function of a real binary.
+        // `usize::MAX` is a block index no function has, so an untouched slot
+        // never matches the current block, which avoids an O(variables x
+        // blocks) clear.
+        let mut def_indices: Vec<(usize, usize)> = vec![(usize::MAX, 0); self.var_capacity];
+
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             let instrs = block.instructions();
             let instr_count = instrs.len();
@@ -492,25 +595,38 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                 }
             }
 
-            // Check for intra-block use-before-def cycles
-            let mut def_indices: HashMap<SsaVarId, usize> = HashMap::new();
+            // Check for intra-block use-before-def cycles.
+            //
+            // `def_indices` is stamped with the block index rather than cleared:
+            // a slot whose stamp is not the current block is stale. Clearing a
+            // capacity-sized buffer per block would be O(variables x blocks),
+            // and allocating a fresh map per block — which this did — costs one
+            // allocation per block, 23,744 of them on the largest function of a
+            // real binary, on every verify.
             for (instr_idx, instr) in instrs.iter().enumerate() {
                 for dest in instr.op().defs() {
-                    def_indices.insert(dest, instr_idx);
+                    if dest.is_placeholder() {
+                        continue;
+                    }
+                    if let Some(slot) = def_indices.get_mut(dest.index()) {
+                        *slot = (block_idx, instr_idx);
+                    }
                 }
             }
 
             for (instr_idx, instr) in instrs.iter().enumerate() {
                 instr.op().for_each_use(|used_var| {
-                    if let Some(&def_idx) = def_indices.get(&used_var) {
-                        if def_idx >= instr_idx {
-                            self.errors.push(VerifierError::IntraBlockCycle {
-                                block: block_idx,
-                                use_instr: instr_idx,
-                                def_instr: def_idx,
-                                var: used_var,
-                            });
-                        }
+                    if let Some(&(stamp, def_idx)) = def_indices.get(used_var.index())
+                        && !used_var.is_placeholder()
+                        && stamp == block_idx
+                        && def_idx >= instr_idx
+                    {
+                        self.errors.push(VerifierError::IntraBlockCycle {
+                            block: block_idx,
+                            use_instr: instr_idx,
+                            def_instr: def_idx,
+                            var: used_var,
+                        });
                     }
                 });
             }
@@ -518,8 +634,8 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     }
 
     /// Collects all variable definitions into a map: var_id -> (block, def_site).
-    fn collect_definitions(&self) -> HashMap<SsaVarId, (usize, DefSite)> {
-        let mut defs: HashMap<SsaVarId, (usize, DefSite)> = HashMap::new();
+    fn collect_definitions(&self) -> VarMap<(usize, DefSite)> {
+        let mut defs: VarMap<(usize, DefSite)> = VarMap::new(self.var_capacity);
 
         // Variables from the variables vec (includes entry-block defs for args/locals)
         for var in self.ssa.variables() {
@@ -529,13 +645,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         // Also collect from actual block contents (may differ after transforms)
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             for phi in block.phi_nodes() {
-                defs.entry(phi.result())
-                    .or_insert((block_idx, DefSite::phi(block_idx)));
+                defs.or_insert(phi.result(), (block_idx, DefSite::phi(block_idx)));
             }
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
                 for dest in instr.op().defs() {
-                    defs.entry(dest)
-                        .or_insert((block_idx, DefSite::instruction(block_idx, instr_idx)));
+                    defs.or_insert(
+                        dest,
+                        (block_idx, DefSite::instruction(block_idx, instr_idx)),
+                    );
                 }
             }
         }
@@ -577,10 +694,24 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                     continue;
                 }
 
+                // Counted, not set-tested: two operands naming one predecessor
+                // collapse to a single bit, so a set comparison cannot see the
+                // duplicate and the advertised "exactly one operand per
+                // predecessor" invariant goes unchecked. `PhiNode::add_operand`
+                // does not dedup and `PhiOperand::set_predecessor` allows a
+                // retarget onto an edge that already has an operand, which is
+                // what edge redirection during block merging does.
                 let mut operand_preds = BitSet::new(capacity);
+                let mut seen_twice = BitSet::new(capacity);
                 for op in phi.operands() {
                     let pred = op.predecessor();
-                    operand_preds.insert(pred);
+                    if !operand_preds.insert(pred) && seen_twice.insert(pred) {
+                        self.errors.push(VerifierError::DuplicatePhiOperand {
+                            block: block_idx,
+                            phi_idx,
+                            pred,
+                        });
+                    }
                 }
 
                 // Check for missing predecessors
@@ -610,11 +741,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
 
     /// Checks that every variable used in an instruction or phi operand is defined
     /// somewhere (either in the variables vec or in a block).
-    fn check_defined_before_use(&mut self, definitions: &HashMap<SsaVarId, (usize, DefSite)>) {
+    fn check_defined_before_use(&mut self, definitions: &VarMap<(usize, DefSite)>) {
+        let runtime_supplied = self.runtime_supplied_vars();
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
                 instr.op().for_each_use(|used_var| {
-                    if !definitions.contains_key(&used_var) {
+                    if !definitions.contains(used_var)
+                        && !runtime_supplied.contains_checked(used_var.index())
+                    {
                         self.errors.push(VerifierError::UndefinedUse {
                             block: block_idx,
                             instr_idx,
@@ -624,6 +758,53 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                 });
             }
         }
+    }
+
+    /// Variables the runtime supplies rather than any instruction: the exception
+    /// object a catch or filter handler receives on entry.
+    ///
+    /// The handler's first instruction is a [`SsaOp::Pop`] consuming an object
+    /// the runtime pushed, so there is no definition to find and none should be
+    /// demanded. [`SsaRebuilder`] already carves out exactly this shape — it
+    /// preserves such a `Pop` where it drops every other one whose operand has
+    /// no definition — and without the matching carve-out here the verifier
+    /// rejects the IR the rebuilder is built to produce, failing every method
+    /// with a handler as soon as a CFG-modifying pass triggers a rebuild.
+    ///
+    /// The `Pop` at a handler entry is what *identifies* the variable; once
+    /// identified, it is exempt as a definition would be, since that is exactly
+    /// what the runtime provides. Reading it outside the handler is a dominance
+    /// violation, which [`Self::check_dominance`] reports on its own. Every
+    /// other undefined read — including one in the same block that no
+    /// handler-entry `Pop` consumes — stays reportable.
+    ///
+    /// [`SsaRebuilder`]: crate::ir::function::rebuild::SsaRebuilder
+    fn runtime_supplied_vars(&self) -> BitSet {
+        let mut vars = BitSet::lazy(self.var_capacity);
+        let block_count = self.ssa.blocks().len();
+        let mut entry_blocks = BitSet::new(block_count.max(1));
+        for handler in self.ssa.exception_handlers() {
+            for block in [handler.handler_start_block, handler.filter_start_block]
+                .into_iter()
+                .flatten()
+            {
+                entry_blocks.insert_checked(block);
+            }
+        }
+        if entry_blocks.count() == 0 {
+            return vars;
+        }
+        for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
+            if !entry_blocks.contains_checked(block_idx) {
+                continue;
+            }
+            for instr in block.instructions() {
+                if let SsaOp::Pop { value } = instr.op() {
+                    vars.insert_checked(value.index());
+                }
+            }
+        }
+        vars
     }
 
     /// Checks that every variable used in blocks is registered in the variables vec.
@@ -700,17 +881,111 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
             }
         }
 
+        // Where each variable is first read, if anywhere. An undefined variable
+        // that is also unread is dead weight for `compact_variables` to collect;
+        // an undefined variable with a live *use* is a dangling read, and the two
+        // deserve different errors because consumers treat them differently
+        // (`SsaRebuilder::verify` filters the former as cosmetic).
+        let mut first_use: Vec<Option<(usize, usize)>> = vec![None; capacity];
+        for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                instr.op().for_each_use(|var| {
+                    if let Some(slot) = first_use.get_mut(var.index())
+                        && slot.is_none()
+                    {
+                        *slot = Some((block_idx, instr_idx));
+                    }
+                });
+            }
+            for phi in block.phi_nodes() {
+                for operand in phi.operands() {
+                    if let Some(slot) = first_use.get_mut(operand.value().index())
+                        && slot.is_none()
+                    {
+                        *slot = Some((block_idx, 0));
+                    }
+                }
+            }
+        }
+
+        let runtime_supplied = self.runtime_supplied_vars();
         for var in self.ssa.variables() {
-            // Version 0 entry-point variables are defined at function entry, not
-            // in blocks. This includes args, locals, and Phi-origin placeholder
-            // variables created during SSA rebuild for stack temp groups.
-            if var.version() == 0 && var.def_site().instruction.is_none() {
+            if block_defined.contains(var.id().index())
+                || runtime_supplied.contains_checked(var.id().index())
+            {
                 continue;
             }
-            if !block_defined.contains(var.id().index()) {
-                self.errors
-                    .push(VerifierError::OrphanVariable { var: var.id() });
+            match first_use.get(var.id().index()).copied().flatten() {
+                // Something reads it. Only a genuine entry definition excuses
+                // that — see `is_entry_defined` for why the obvious weaker test
+                // does not. Reported as `UndefinedUse` rather than
+                // `OrphanVariable`: it names the reading instruction, and it is
+                // not the class `SsaRebuilder::verify` discards.
+                Some((block, instr_idx)) if !self.is_entry_defined(var) => {
+                    self.errors.push(VerifierError::UndefinedUse {
+                        block,
+                        instr_idx,
+                        var: var.id(),
+                    });
+                }
+                Some(_) => {}
+                // Nothing reads it: a leftover row. The weaker test is right
+                // here — tightening it would report every temporary a pass
+                // legitimately killed.
+                None => {
+                    if !(var.version() == 0 && var.def_site().instruction.is_none()) {
+                        self.errors
+                            .push(VerifierError::OrphanVariable { var: var.id() });
+                    }
+                }
             }
+        }
+    }
+
+    /// Returns `true` when `var` is defined at function entry rather than by any
+    /// instruction or phi — arguments, default-initialized locals, and the
+    /// phi-origin placeholders the rebuilder creates for stack temp groups.
+    ///
+    /// This test is deliberately narrow, and the narrowness is the point. The
+    /// obvious formulation — "version 0 and no defining instruction" — also
+    /// matches a variable whose defining instruction was *destroyed*:
+    /// [`refresh_def_sites`](SsaFunction::repair_ssa) resets such a variable to
+    /// [`DefSite::entry`], leaving it indistinguishable from a real argument. A
+    /// pass that nops a definition while a use survives would then produce IR
+    /// that verifies clean, which is exactly how a dangling `flags` use escaped
+    /// detection.
+    ///
+    /// Requiring the origin to name a real argument or local closes that: a
+    /// temporary whose definition was removed does not.
+    fn is_entry_defined(&self, var: &SsaVariable<T>) -> bool {
+        if var.version() != 0 || var.def_site().instruction.is_some() {
+            return false;
+        }
+        match var.origin() {
+            // An argument origin is an explicit statement that the caller
+            // supplies this value, so it needs no definition in the body. (The
+            // index is not bounds-checked against `num_args`: a mismatch there is
+            // a signature inconsistency, not a dangling read, and reporting it as
+            // an orphan variable would be misleading.)
+            VariableOrigin::Argument(_) => true,
+            // A declared local is default-initialized at entry. An index beyond
+            // the declared count is not a real local — it is a temporary, and a
+            // temporary with no definition left is the case worth catching.
+            VariableOrigin::Local(index) => usize::from(index) < self.ssa.num_locals(),
+            // A phi-origin variable is defined by a phi node, full stop. The
+            // rebuilder does create placeholder reaching-defs with this origin
+            // for stack temp groups, and those legitimately have no definition
+            // *while it is running* — but they are resolved before it verifies,
+            // so exempting them here would only widen the hole. Nothing in the
+            // suite depends on the exemption.
+            VariableOrigin::Phi => false,
+            // A machine-code front end's function-entry live-in: the caller
+            // supplies it, so like an argument it needs no definition in the
+            // body. This is the origin such a lifter must use — `Phi` above is
+            // rejected precisely so a destroyed definition cannot masquerade as
+            // an entry value, and `Argument` would assert a signature position
+            // the lifter has not recovered.
+            VariableOrigin::EntryLiveIn => true,
         }
     }
 
@@ -785,14 +1060,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                     } => {
                         let left_shape = self.var_vector_shape(*left);
                         let right_shape = self.var_vector_shape(*right);
-                        if let (Some(left_shape), Some(right_shape)) = (left_shape, right_shape) {
-                            if left_shape != right_shape {
-                                self.invalid_vector(
-                                    block_idx,
-                                    instr_idx,
-                                    "operand vector shapes differ",
-                                );
-                            }
+                        if let (Some(left_shape), Some(right_shape)) = (left_shape, right_shape)
+                            && left_shape != right_shape
+                        {
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "operand vector shapes differ",
+                            );
                         }
                         if matches!(op, SsaOp::VectorBinary { .. }) {
                             self.check_dest_shape(block_idx, instr_idx, *dest, left_shape);
@@ -823,14 +1098,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                         let a = self.var_vector_shape(*first);
                         let b = self.var_vector_shape(*second);
                         let c = self.var_vector_shape(*third);
-                        if let (Some(a), Some(b), Some(c)) = (a, b, c) {
-                            if a != b || a != c {
-                                self.invalid_vector(
-                                    block_idx,
-                                    instr_idx,
-                                    "ternary operand vector shapes differ",
-                                );
-                            }
+                        if let (Some(a), Some(b), Some(c)) = (a, b, c)
+                            && (a != b || a != c)
+                        {
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "ternary operand vector shapes differ",
+                            );
                         }
                         self.check_dest_shape(block_idx, instr_idx, *dest, a);
                     }
@@ -1120,16 +1395,16 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                                 "splat vector_type is not a supported vector",
                             );
                         }
-                        if let Some(shape) = shape {
-                            if let Some(expected) = T::vector_descriptor_lane_type(shape) {
-                                self.check_var_type(
-                                    block_idx,
-                                    instr_idx,
-                                    *value,
-                                    &expected,
-                                    "splat value type does not match lane type",
-                                );
-                            }
+                        if let Some(shape) = shape
+                            && let Some(expected) = T::vector_descriptor_lane_type(shape)
+                        {
+                            self.check_var_type(
+                                block_idx,
+                                instr_idx,
+                                *value,
+                                &expected,
+                                "splat value type does not match lane type",
+                            );
                         }
                         self.check_dest_shape(block_idx, instr_idx, *dest, shape);
                     }
@@ -1194,17 +1469,16 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                     } => {
                         let source_shape = self.var_vector_shape(*value);
                         let target_shape = T::vector_descriptor(target_type);
-                        if let (Some(source), Some(target)) = (source_shape, target_shape) {
-                            if source.total_bits().is_some()
-                                && target.total_bits().is_some()
-                                && source.total_bits() != target.total_bits()
-                            {
-                                self.invalid_vector(
-                                    block_idx,
-                                    instr_idx,
-                                    "reinterpret source and target widths differ",
-                                );
-                            }
+                        if let (Some(source), Some(target)) = (source_shape, target_shape)
+                            && source.total_bits().is_some()
+                            && target.total_bits().is_some()
+                            && source.total_bits() != target.total_bits()
+                        {
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "reinterpret source and target widths differ",
+                            );
                         }
                         self.check_dest_shape(block_idx, instr_idx, *dest, target_shape);
                     }
@@ -1218,54 +1492,53 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                     } => {
                         let left_shape = self.var_mask_shape(*left);
                         let right_shape = self.var_mask_shape(*right);
-                        if let (Some(left_shape), Some(right_shape)) = (left_shape, right_shape) {
-                            if left_shape != right_shape {
-                                self.invalid_vector(
-                                    block_idx,
-                                    instr_idx,
-                                    "mask operand lane counts differ",
-                                );
-                            }
+                        if let (Some(left_shape), Some(right_shape)) = (left_shape, right_shape)
+                            && left_shape != right_shape
+                        {
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "mask operand lane counts differ",
+                            );
                         }
                         if let Some(shape) = left_shape {
                             self.check_mask_dest_shape(block_idx, instr_idx, *dest, shape);
                         }
                     }
                     SsaOp::VectorReduce { dest, value, .. } => {
-                        if let Some(shape) = self.var_vector_shape(*value) {
-                            if let Some(expected) = T::vector_descriptor_lane_type(shape) {
-                                self.check_var_type(
-                                    block_idx,
-                                    instr_idx,
-                                    *dest,
-                                    &expected,
-                                    "reduction destination type does not match lane type",
-                                );
-                            }
+                        if let Some(shape) = self.var_vector_shape(*value)
+                            && let Some(expected) = T::vector_descriptor_lane_type(shape)
+                        {
+                            self.check_var_type(
+                                block_idx,
+                                instr_idx,
+                                *dest,
+                                &expected,
+                                "reduction destination type does not match lane type",
+                            );
                         }
                     }
                     SsaOp::VectorBitmask { dest, value, .. } => {
-                        if let Some(ty) = self.var_type(*dest) {
-                            if !T::is_unknown(ty) && !T::is_integer(ty) {
-                                self.invalid_vector(
-                                    block_idx,
-                                    instr_idx,
-                                    "bitmask destination must be an integer scalar",
-                                );
-                            }
+                        if let Some(ty) = self.var_type(*dest)
+                            && !T::is_unknown(ty)
+                            && !T::is_integer(ty)
+                        {
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "bitmask destination must be an integer scalar",
+                            );
                         }
                         if self.var_vector_shape(*value).is_none()
                             && self.var_mask_shape(*value).is_none()
+                            && let Some(ty) = self.var_type(*value)
+                            && !T::is_unknown(ty)
                         {
-                            if let Some(ty) = self.var_type(*value) {
-                                if !T::is_unknown(ty) {
-                                    self.invalid_vector(
-                                        block_idx,
-                                        instr_idx,
-                                        "bitmask source must be a vector or mask",
-                                    );
-                                }
-                            }
+                            self.invalid_vector(
+                                block_idx,
+                                instr_idx,
+                                "bitmask source must be a vector or mask",
+                            );
                         }
                     }
                     _ => {}
@@ -1321,16 +1594,16 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                         self.check_atomic_width(block_idx, instr_idx, *old, *width);
                         self.check_atomic_width(block_idx, instr_idx, *expected, *width);
                         self.check_atomic_width(block_idx, instr_idx, *desired, *width);
-                        if let Some(success) = success {
-                            if let Some(ty) = self.var_type(*success) {
-                                if !T::is_unknown(ty) && !T::is_integer(ty) {
-                                    self.invalid_atomic(
-                                        block_idx,
-                                        instr_idx,
-                                        "compare-exchange success output must be an integer boolean",
-                                    );
-                                }
-                            }
+                        if let Some(success) = success
+                            && let Some(ty) = self.var_type(*success)
+                            && !T::is_unknown(ty)
+                            && !T::is_integer(ty)
+                        {
+                            self.invalid_atomic(
+                                block_idx,
+                                instr_idx,
+                                "compare-exchange success output must be an integer boolean",
+                            );
                         }
                         if matches!(
                             failure_ordering,
@@ -1559,10 +1832,11 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
 
     /// Checks that an atomic address is pointer-like when the type is known.
     fn check_atomic_address(&mut self, block: usize, instr_idx: usize, addr: SsaVarId) {
-        if let Some(ty) = self.var_type(addr) {
-            if !T::is_unknown(ty) && !T::is_pointer(ty) {
-                self.invalid_atomic(block, instr_idx, "atomic address must be pointer-like");
-            }
+        if let Some(ty) = self.var_type(addr)
+            && !T::is_unknown(ty)
+            && !T::is_pointer(ty)
+        {
+            self.invalid_atomic(block, instr_idx, "atomic address must be pointer-like");
         }
     }
 
@@ -1574,16 +1848,16 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         var: SsaVarId,
         width: AtomicAccessWidth,
     ) {
-        if let Some(expected) = width.bits() {
-            if let Some(ty) = self.var_type(var) {
-                if !T::is_unknown(ty) && T::bit_width(ty) != Some(expected) {
-                    self.invalid_atomic(
-                        block,
-                        instr_idx,
-                        "atomic value type width does not match access width",
-                    );
-                }
-            }
+        if let Some(expected) = width.bits()
+            && let Some(ty) = self.var_type(var)
+            && !T::is_unknown(ty)
+            && T::bit_width(ty) != Some(expected)
+        {
+            self.invalid_atomic(
+                block,
+                instr_idx,
+                "atomic value type width does not match access width",
+            );
         }
     }
 
@@ -1681,14 +1955,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         var: SsaVarId,
         expected: Option<VectorDescriptor>,
     ) {
-        if let (Some(actual), Some(expected)) = (self.var_vector_shape(var), expected) {
-            if actual != expected {
-                self.invalid_vector(
-                    block,
-                    instr_idx,
-                    "variable vector shape does not match expected shape",
-                );
-            }
+        if let (Some(actual), Some(expected)) = (self.var_vector_shape(var), expected)
+            && actual != expected
+        {
+            self.invalid_vector(
+                block,
+                instr_idx,
+                "variable vector shape does not match expected shape",
+            );
         }
     }
 
@@ -1764,10 +2038,11 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         expected: &T::Type,
         reason: &str,
     ) {
-        if let Some(actual) = self.var_type(var) {
-            if !T::is_unknown(actual) && actual != expected {
-                self.invalid_vector(block, instr_idx, reason);
-            }
+        if let Some(actual) = self.var_type(var)
+            && !T::is_unknown(actual)
+            && actual != expected
+        {
+            self.invalid_vector(block, instr_idx, reason);
         }
     }
 
@@ -1779,7 +2054,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         &mut self,
         cfg: &SsaCfg<'_, T>,
         dom_tree: &DominatorTree,
-        definitions: &HashMap<SsaVarId, (usize, DefSite)>,
+        definitions: &VarMap<(usize, DefSite)>,
     ) {
         // Compute reachable blocks
         let block_count = self.ssa.block_count().max(1);
@@ -1796,15 +2071,27 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         }
 
         // Check instruction uses
+        let mut use_buf: Vec<SsaVarId> = Vec::new();
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             if !reachable.contains(block_idx) {
                 continue;
             }
 
             for instr in block.instructions() {
-                for used_var in instr.op().uses() {
-                    if let Some(&(def_block, _)) = definitions.get(&used_var) {
-                        if !reachable.contains(def_block) {
+                // Reuse one scratch buffer instead of `SsaOp::uses()`, which
+                // allocates a fresh `Vec` per instruction — this runs over every
+                // instruction of every function that gets verified.
+                use_buf.clear();
+                instr.op().for_each_use(|var| use_buf.push(var));
+                for &used_var in &use_buf {
+                    if let Some(&(def_block, _)) = definitions.get(used_var) {
+                        // `def_block` is a variable's recorded `DefSite::block`,
+                        // which malformed IR can put past the block count.
+                        // `contains` asserts; an out-of-range block is by
+                        // definition unreachable, so `false` is also the correct
+                        // answer. The verifier is the net for malformed IR and
+                        // must not abort on a shape it exists to report.
+                        if !reachable.contains_checked(def_block) {
                             continue;
                         }
                         // Definition must dominate use block
@@ -1829,8 +2116,14 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                 for operand in phi.operands() {
                     let used_var = operand.value();
                     let pred_block = operand.predecessor();
-                    if let Some(&(def_block, _)) = definitions.get(&used_var) {
-                        if !reachable.contains(def_block) || !reachable.contains(pred_block) {
+                    if let Some(&(def_block, _)) = definitions.get(used_var) {
+                        // Both indices come straight out of the IR — `pred_block`
+                        // is a raw phi-operand predecessor, which
+                        // `check_phi_operands` explicitly tolerates naming a
+                        // non-existent block.
+                        if !reachable.contains_checked(def_block)
+                            || !reachable.contains_checked(pred_block)
+                        {
                             continue;
                         }
                         // Definition must dominate the predecessor block

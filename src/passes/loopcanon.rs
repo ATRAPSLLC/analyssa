@@ -83,6 +83,16 @@ where
     }
 }
 
+/// Cap on loop-canonicalization rounds.
+///
+/// Each round restructures the CFG — inserting preheaders, splitting latches —
+/// and then re-analyses the loop forest, so unlike the monotone worklists in
+/// `licm` and `predicates` there is no measure that provably decreases. A round
+/// that undoes a previous round's change would spin forever. Progress still
+/// terminates the loop normally; this bound only stops pathological input from
+/// hanging the pass.
+const MAX_CANONICALIZATION_ROUNDS: usize = 16;
+
 fn canonicalize_loops<T, L>(ssa: &mut SsaFunction<T>, method: &T::MethodRef, events: &L) -> usize
 where
     T: Target,
@@ -90,7 +100,7 @@ where
 {
     let mut total_modified: usize = 0;
 
-    loop {
+    for _ in 0..MAX_CANONICALIZATION_ROUNDS {
         let forest = ssa.analyze_loops();
         if forest.is_empty() {
             break;
@@ -98,9 +108,14 @@ where
 
         let mut modified_this_iteration: usize = 0;
 
+        // One predecessor relation per round, shared by every loop. Deriving it
+        // per loop would be O(blocks) each, so a function with many loops would
+        // pay O(loops x blocks).
+        let predecessors = ssa.compute_predecessors();
+
         for loop_info in forest.by_depth_descending() {
             if !loop_info.has_preheader() {
-                let non_loop_preds = get_non_loop_predecessors(ssa, loop_info);
+                let non_loop_preds = get_non_loop_predecessors(&predecessors, loop_info);
                 if non_loop_preds.len() > 1 {
                     insert_preheader(ssa, loop_info, &non_loop_preds, method, events);
                     modified_this_iteration = modified_this_iteration.saturating_add(1);
@@ -122,51 +137,20 @@ where
     total_modified
 }
 
-fn get_non_loop_predecessors<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> Vec<usize> {
+/// Returns the loop header's predecessors that lie outside the loop body.
+///
+/// Reads the precomputed predecessor relation rather than re-deriving it by
+/// scanning every block's terminator. Besides being O(preds) instead of
+/// O(blocks), this sees exception edges, which a terminator scan cannot.
+fn get_non_loop_predecessors(predecessors: &[Vec<usize>], loop_info: &LoopInfo) -> Vec<usize> {
     let header_idx = loop_info.header.index();
-    let mut non_loop_preds = Vec::new();
-    for (block_idx, block) in ssa.iter_blocks() {
-        if let Some(op) = block.terminator_op() {
-            let targets = get_targets(op);
-            if targets.contains(&header_idx) && !loop_info.body.contains(block_idx) {
-                non_loop_preds.push(block_idx);
-            }
-        }
-    }
-    non_loop_preds
-}
-
-/// Extract the set of target block indices from a terminator operation.
-fn get_targets<T: Target>(op: &SsaOp<T>) -> Vec<usize> {
-    match op {
-        SsaOp::Jump { target } | SsaOp::Leave { target } => vec![*target],
-        SsaOp::Branch {
-            true_target,
-            false_target,
-            ..
-        }
-        | SsaOp::BranchCmp {
-            true_target,
-            false_target,
-            ..
-        }
-        | SsaOp::BranchFlags {
-            true_target,
-            false_target,
-            ..
-        } => vec![*true_target, *false_target],
-        SsaOp::Switch {
-            targets, default, ..
-        } => {
-            let mut all = targets.clone();
-            all.push(*default);
-            all
-        }
-        SsaOp::IndirectBranch {
-            resolved_targets, ..
-        } => resolved_targets.clone(),
-        _ => vec![],
-    }
+    predecessors
+        .get(header_idx)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|block_idx| !loop_info.body.contains(*block_idx))
+        .collect()
 }
 
 fn insert_preheader<T, L>(
@@ -388,7 +372,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{assert_mock_valid_full, run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, assert_mock_valid_full, run_mock_pass_boundary},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {

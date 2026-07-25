@@ -48,8 +48,8 @@
 //! overflow on large graphs, instead of the traditional recursive path compression.
 
 use crate::{
-    graph::{NodeId, RootedGraph, Successors},
     BitSet,
+    graph::{NodeId, RootedGraph, Successors},
 };
 
 /// Result of dominator tree computation.
@@ -96,6 +96,14 @@ pub struct DominatorTree {
     /// [`compute_dominance_frontiers`] can reuse them instead of recomputing the
     /// predecessor relation in a second O(V+E) pass.
     predecessors: Vec<Vec<NodeId>>,
+    /// DFS entry time of each node in the dominator tree, or [`Self::UNVISITED`]
+    /// for nodes unreachable from the entry. Together with `tout` this turns
+    /// [`DominatorTree::dominates`] into two integer comparisons; see
+    /// [`compute_dfs_intervals`].
+    tin: Vec<usize>,
+    /// DFS exit time of each node in the dominator tree, or [`Self::UNVISITED`]
+    /// for nodes unreachable from the entry.
+    tout: Vec<usize>,
 }
 
 impl DominatorTree {
@@ -118,6 +126,10 @@ impl DominatorTree {
         }
     }
 
+    /// Marks a node that the dominator-tree DFS never reached, i.e. one
+    /// unreachable from the entry.
+    const UNVISITED: usize = usize::MAX;
+
     /// Checks if node `a` dominates node `b`.
     ///
     /// A node dominates itself. The entry node dominates all reachable nodes.
@@ -125,35 +137,36 @@ impl DominatorTree {
     ///
     /// # Complexity
     ///
-    /// O(depth) where depth is the depth of `b` in the dominator tree.
+    /// O(1) — two integer comparisons against the dominator tree's DFS
+    /// intervals, which [`compute_dominators`] computes once at construction.
+    ///
+    /// Dominance is ancestry in the dominator tree, and in a DFS numbering `a`
+    /// is an ancestor of `b` exactly when `a`'s interval encloses `b`'s. This
+    /// used to walk the immediate-dominator chain from `b` to the entry, which
+    /// is O(depth); loop detection calls it once per CFG edge, making back-edge
+    /// discovery O(E × depth) — near-quadratic on the deep dominator trees that
+    /// lifted native code produces, and measurably so (loop-forest construction
+    /// grew ~O(n^1.7) in `benches/ssa_repair.rs`).
     pub fn dominates(&self, a: NodeId, b: NodeId) -> bool {
+        // Reflexive, and deliberately checked before any bounds test so the
+        // out-of-bounds behaviour of the previous chain walk is preserved.
         if a == b {
             return true;
         }
 
-        // Handle out-of-bounds node indices
-        if b.index() >= self.node_count {
+        let (Some(&a_in), Some(&b_in)) = (self.tin.get(a.index()), self.tin.get(b.index())) else {
+            return false;
+        };
+        // An unreachable node neither dominates nor is dominated.
+        if a_in == Self::UNVISITED || b_in == Self::UNVISITED {
             return false;
         }
+        let (Some(&a_out), Some(&b_out)) = (self.tout.get(a.index()), self.tout.get(b.index()))
+        else {
+            return false;
+        };
 
-        let mut current = b;
-        while current != self.entry {
-            // Check for unreachable nodes (sentinel value) or out-of-bounds
-            let Some(&idom) = self.idom.get(current.index()) else {
-                return false;
-            };
-            if idom == a {
-                return true;
-            }
-            // Detect infinite loop (unreachable node pointing to sentinel)
-            if idom == current {
-                return false;
-            }
-            current = idom;
-        }
-
-        // Only the entry can dominate the entry
-        a == self.entry
+        a_in <= b_in && b_out <= a_out
     }
 
     /// Checks if node `a` strictly dominates node `b`.
@@ -167,6 +180,10 @@ impl DominatorTree {
 
     /// Returns an iterator over all dominators of a node, from the node itself
     /// up to (and including) the entry node.
+    ///
+    /// A node unreachable from the entry has no dominators, so the iterator
+    /// yields only that node itself. It never yields the tree's internal
+    /// sentinel, which would be a `NodeId` indexing nothing.
     ///
     /// # Examples
     ///
@@ -247,11 +264,20 @@ impl Iterator for DominatorIterator<'_> {
 
         if current == self.tree.entry {
             self.current = None;
-            Some(current)
-        } else {
-            self.current = self.tree.idom.get(current.index()).copied();
-            Some(current)
+            return Some(current);
         }
+
+        // An unreachable node has no immediate dominator, and `idom` stores the
+        // internal sentinel there. Yielding it would hand callers a `NodeId` that
+        // indexes nothing — the same sentinel `dominates` already tests for
+        // rather than trusting.
+        self.current = self
+            .tree
+            .idom
+            .get(current.index())
+            .copied()
+            .filter(|next| next.index() < self.tree.node_count());
+        Some(current)
     }
 }
 
@@ -331,6 +357,8 @@ where
             children: Vec::new(),
             node_count: 0,
             predecessors: Vec::new(),
+            tin: Vec::new(),
+            tout: Vec::new(),
         };
     }
 
@@ -356,12 +384,16 @@ where
         }
     }
 
+    let (tin, tout) = compute_dfs_intervals(entry, &children, node_count);
+
     DominatorTree {
         entry,
         idom: lt.idom,
         children,
         node_count,
         predecessors,
+        tin,
+        tout,
     }
 }
 
@@ -373,6 +405,66 @@ where
     G: RootedGraph,
 {
     compute_dominators(graph, graph.entry())
+}
+
+/// Assigns each node its DFS entry and exit time in the dominator tree.
+///
+/// The pair `(tin, tout)` is what makes [`DominatorTree::dominates`] O(1): `a`
+/// dominates `b` exactly when `a` is an ancestor of `b` in this tree, and in a
+/// DFS numbering that is `tin[a] <= tin[b] && tout[b] <= tout[a]`.
+///
+/// Nodes unreachable from `entry` keep [`DominatorTree::UNVISITED`] in both
+/// arrays, which `dominates` rejects.
+///
+/// The traversal uses an explicit stack rather than recursion: a lifted
+/// function can have tens of thousands of blocks in one dominator chain, which
+/// would overflow the native stack. Nodes are marked on entry, so a malformed
+/// `children` array containing a self-edge or cycle terminates rather than
+/// looping forever.
+fn compute_dfs_intervals(
+    entry: NodeId,
+    children: &[Vec<NodeId>],
+    node_count: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut tin = vec![DominatorTree::UNVISITED; node_count];
+    let mut tout = vec![DominatorTree::UNVISITED; node_count];
+    if entry.index() >= node_count {
+        return (tin, tout);
+    }
+
+    let mut timer: usize = 0;
+    if let Some(slot) = tin.get_mut(entry.index()) {
+        *slot = timer;
+    }
+    timer = timer.saturating_add(1);
+
+    // (node, index of the next child to descend into)
+    let mut stack: Vec<(NodeId, usize)> = vec![(entry, 0)];
+    while let Some(&(node, next_child)) = stack.last() {
+        let kids = children
+            .get(node.index())
+            .map_or([].as_slice(), Vec::as_slice);
+        if let Some(&child) = kids.get(next_child) {
+            if let Some(top) = stack.last_mut() {
+                top.1 = next_child.saturating_add(1);
+            }
+            if tin.get(child.index()).copied() == Some(DominatorTree::UNVISITED) {
+                if let Some(slot) = tin.get_mut(child.index()) {
+                    *slot = timer;
+                }
+                timer = timer.saturating_add(1);
+                stack.push((child, 0));
+            }
+        } else {
+            if let Some(slot) = tout.get_mut(node.index()) {
+                *slot = timer;
+            }
+            timer = timer.saturating_add(1);
+            stack.pop();
+        }
+    }
+
+    (tin, tout)
 }
 
 /// Pre-computes the predecessor list for all nodes in a single O(V+E) pass.
@@ -637,8 +729,13 @@ impl LengauerTarjan {
 ///
 /// # Complexity
 ///
-/// - Time: O(V + E)
-/// - Space: O(V²) worst case for the frontiers
+/// - Time: Θ(V + E + Σ|DF(v)|). The runner walk visits one node per frontier
+///   membership it records, so the total is the summed frontier size, not
+///   `O(V + E)` — a spine `b1→b2→…→bn` where every `bi` also branches to one
+///   common join is Θ(V²).
+/// - Space: Θ(V + Σ|DF(v)|). Rows are allocated on first insert
+///   ([`BitSet::lazy`]), so nodes with an empty frontier cost only a `Vec`
+///   header; the dense worst case is still `O(V²)` bits.
 ///
 /// # Examples
 ///
@@ -670,10 +767,18 @@ where
     G: Successors,
 {
     let n = graph.node_count();
-    // Dense per-node frontier bitsets: consumers (notably the SSA rebuilder)
-    // merge handler dominance frontiers via `BitSet` union, which needs the
-    // set representation.
-    let mut frontiers: Vec<BitSet> = vec![BitSet::new(n); n];
+    // Per-node frontier bitsets. Consumers (notably the SSA rebuilder) merge
+    // handler dominance frontiers via `BitSet` union, so the set representation
+    // has to stay — but the rows are allocated lazily. Real dominance frontiers
+    // are sparse: most nodes are not on any runner walk and keep an empty
+    // frontier forever, so eagerly allocating `n` rows of `n` bits costs
+    // `O(V²)` bytes of memset to store almost nothing.
+    //
+    // This matters because `SsaRebuilder::merge_handler_dom_trees` calls this
+    // once per exception-handler root, and handler tables come from the input
+    // binary. A 20k-block function with 500 handler roots would otherwise
+    // memset ~50 MB per call, ~25 GB for the function.
+    let mut frontiers: Vec<BitSet> = (0..n).map(|_| BitSet::lazy(n)).collect();
 
     // Reuse the predecessor lists cached on the dominator tree when they match
     // this graph (the normal case — the tree was computed from it), avoiding a
@@ -716,10 +821,12 @@ where
                 }
             }
             // Also check entry if needed (guard against invalid index)
-            if Some(runner) != idom_node && runner == dom_tree.entry() && runner.index() < n {
-                if let Some(slot) = frontiers.get_mut(runner.index()) {
-                    slot.insert(node.index());
-                }
+            if Some(runner) != idom_node
+                && runner == dom_tree.entry()
+                && runner.index() < n
+                && let Some(slot) = frontiers.get_mut(runner.index())
+            {
+                slot.insert(node.index());
             }
         }
     }
@@ -730,9 +837,217 @@ where
 #[cfg(test)]
 mod tests {
     use crate::graph::{
-        algorithms::dominators::{compute_dominance_frontiers, compute_dominators},
         DirectedGraph, NodeId,
+        algorithms::dominators::{DominatorTree, compute_dominance_frontiers, compute_dominators},
     };
+
+    /// The dominance test exactly as it was implemented before DFS intervals:
+    /// walk the immediate-dominator chain from `b` up to the entry.
+    ///
+    /// Kept verbatim as the oracle for
+    /// `dfs_interval_dominance_matches_chain_walk`. The replacement is an
+    /// asymptotic change to a predicate that five analyses and the verifier
+    /// depend on, so "the existing tests still pass" is too weak a claim —
+    /// equivalence is checked over every node pair of every graph below,
+    /// including the out-of-bounds and unreachable arguments the original had
+    /// specific behaviour for.
+    fn dominates_by_chain_walk(tree: &DominatorTree, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+        if b.index() >= tree.node_count {
+            return false;
+        }
+        let mut current = b;
+        while current != tree.entry {
+            let Some(&idom) = tree.idom.get(current.index()) else {
+                return false;
+            };
+            if idom == a {
+                return true;
+            }
+            if idom == current {
+                return false;
+            }
+            current = idom;
+        }
+        a == tree.entry
+    }
+
+    /// One dominance test case: a label, a node count, and an edge list.
+    type DominanceCase = (&'static str, usize, Vec<(usize, usize)>);
+
+    /// Builds a graph from an edge list over `node_count` nodes.
+    fn graph_from(node_count: usize, edges: &[(usize, usize)]) -> DirectedGraph<'static, (), ()> {
+        let mut graph: DirectedGraph<'static, (), ()> = DirectedGraph::new();
+        for _ in 0..node_count {
+            graph.add_node(());
+        }
+        for &(from, to) in edges {
+            let _ = graph.add_edge(NodeId::new(from), NodeId::new(to), ());
+        }
+        graph
+    }
+
+    /// A deterministic LCG, so the generated cases are reproducible across runs.
+    fn next_rand(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// The O(1) interval test must agree with the O(depth) chain walk on every
+    /// node pair — including self-pairs, unreachable nodes, and indices past the
+    /// end of the graph.
+    /// An unreachable node has no immediate dominator, and the tree stores an
+    /// internal sentinel there. Walking the chain must stop rather than hand the
+    /// caller a `NodeId` that indexes nothing — `dominates` already tests for
+    /// the sentinel instead of trusting it.
+    #[test]
+    fn dominators_of_an_unreachable_node_yield_only_itself() {
+        let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
+        let entry = graph.add_node("entry");
+        let reachable = graph.add_node("reachable");
+        let orphan = graph.add_node("orphan");
+        let _ = graph.add_edge(entry, reachable, ());
+
+        let tree = compute_dominators(&graph, entry);
+
+        let chain: Vec<NodeId> = tree.dominators(orphan).collect();
+        assert_eq!(
+            chain,
+            vec![orphan],
+            "an unreachable node dominates only itself and must not yield a sentinel"
+        );
+        for node in &chain {
+            assert!(
+                node.index() < graph.node_count(),
+                "every yielded id must index a real node, got {node:?}"
+            );
+        }
+
+        // The reachable chain is unaffected.
+        assert_eq!(
+            tree.dominators(reachable).collect::<Vec<_>>(),
+            vec![reachable, entry]
+        );
+    }
+
+    #[test]
+    fn dfs_interval_dominance_matches_chain_walk() {
+        let mut cases: Vec<DominanceCase> = vec![
+            ("empty", 0, vec![]),
+            ("single", 1, vec![]),
+            ("self_loop", 1, vec![(0, 0)]),
+            ("chain", 4, vec![(0, 1), (1, 2), (2, 3)]),
+            ("diamond", 4, vec![(0, 1), (0, 2), (1, 3), (2, 3)]),
+            ("loop", 3, vec![(0, 1), (1, 2), (2, 1)]),
+            (
+                "nested_loops",
+                5,
+                vec![(0, 1), (1, 2), (2, 3), (3, 2), (3, 4), (4, 1)],
+            ),
+            // Irreducible: two distinct entries into the same cycle, the case
+            // that makes naive dominance reasoning wrong.
+            (
+                "irreducible",
+                5,
+                vec![(0, 1), (0, 2), (1, 3), (2, 3), (3, 4), (4, 3)],
+            ),
+            // Blocks 3 and 4 are unreachable from the entry.
+            ("unreachable", 5, vec![(0, 1), (1, 2), (3, 4)]),
+            // An unreachable self-loop, which drove the original walk's
+            // `idom == current` guard.
+            ("unreachable_self_loop", 3, vec![(0, 1), (2, 2)]),
+        ];
+
+        // Generated graphs: dense enough to produce deep dominator trees and
+        // plenty of back edges.
+        let mut state = 0x5DEE_CE66_D1BB_1A3Fu64;
+        for case in 0..40 {
+            let node_count = 2 + (next_rand(&mut state) as usize % 12);
+            let edge_count = 1 + (next_rand(&mut state) as usize % 24);
+            let mut edges = Vec::new();
+            for _ in 0..edge_count {
+                let from = next_rand(&mut state) as usize % node_count;
+                let to = next_rand(&mut state) as usize % node_count;
+                edges.push((from, to));
+            }
+            let name: &'static str = Box::leak(format!("generated_{case}").into_boxed_str());
+            cases.push((name, node_count, edges));
+        }
+
+        for (name, node_count, edges) in cases {
+            let graph = graph_from(node_count, &edges);
+            let tree = compute_dominators(&graph, NodeId::new(0));
+
+            // Probe two indices past the end to cover out-of-bounds arguments.
+            let probe = node_count.saturating_add(2);
+            for a in 0..probe {
+                for b in 0..probe {
+                    let (a, b) = (NodeId::new(a), NodeId::new(b));
+                    assert_eq!(
+                        tree.dominates(a, b),
+                        dominates_by_chain_walk(&tree, a, b),
+                        "dominates({}, {}) disagrees with the chain walk in case {name}",
+                        a.index(),
+                        b.index()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Dominance must remain a partial order: reflexive, antisymmetric, and
+    /// transitive. The interval encoding makes these structural, but a bug in
+    /// the DFS numbering would break them, and the oracle above cannot catch a
+    /// fault the old implementation shared.
+    #[test]
+    fn dfs_interval_dominance_is_a_partial_order() {
+        let graph = graph_from(
+            8,
+            &[
+                (0, 1),
+                (0, 2),
+                (1, 3),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 4),
+                (5, 6),
+                (6, 7),
+                (7, 3),
+            ],
+        );
+        let tree = compute_dominators(&graph, NodeId::new(0));
+        let nodes: Vec<NodeId> = (0..8).map(NodeId::new).collect();
+
+        for &a in &nodes {
+            assert!(tree.dominates(a, a), "not reflexive at {}", a.index());
+            for &b in &nodes {
+                if a != b && tree.dominates(a, b) {
+                    assert!(
+                        !tree.dominates(b, a),
+                        "not antisymmetric: {} and {}",
+                        a.index(),
+                        b.index()
+                    );
+                }
+                for &c in &nodes {
+                    if tree.dominates(a, b) && tree.dominates(b, c) {
+                        assert!(
+                            tree.dominates(a, c),
+                            "not transitive: {} -> {} -> {}",
+                            a.index(),
+                            b.index(),
+                            c.index()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_dominator_empty_graph() {

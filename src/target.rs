@@ -22,7 +22,7 @@
 
 use std::{fmt::Debug, hash::Hash};
 
-use crate::{ir::value::ConstValue, PointerSize};
+use crate::{PointerSize, ir::value::ConstValue};
 
 /// Element category for a target-independent vector lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -834,6 +834,17 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
 
     /// RVA of the original instruction. Hosts without source mapping return 0.
     fn instruction_rva(instr: &Self::OriginalInstruction) -> u64;
+
+    /// Declaration-order member index of `field` within its parent composite,
+    /// when the host has resolved one.
+    ///
+    /// Field-sensitive analyses (points-to, alias partitioning) use this to keep
+    /// distinct members of the same object disjoint; `None` means the field is
+    /// unresolved and must fall back to the sound whole-object approximation.
+    /// Defaults to `None`, which is exactly that conservative fallback.
+    fn field_member_index(_field: &Self::FieldRef) -> Option<u32> {
+        None
+    }
 
     /// `true` if `flags` denotes a filter-style exception handler (i.e. one
     /// that runs a user-supplied predicate before catching). Hosts without a

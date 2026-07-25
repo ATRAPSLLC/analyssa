@@ -130,8 +130,10 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    PointerSize,
     analysis::{
         constraints::Constraint,
+        consts::evaluate_const_op,
         memory::{MemoryLocation, MemoryState},
         symbolic::{SymbolicExpr, SymbolicOp},
     },
@@ -142,7 +144,6 @@ use crate::{
         variable::{SsaVarId, VariableOrigin},
     },
     target::Target,
-    PointerSize,
 };
 
 /// Result of evaluating a control flow decision.
@@ -767,9 +768,15 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         return true;
                     }
                 } else {
-                    // left <= right
+                    // left <= right — under the *same* ordering the comparison
+                    // used. Recording the signed form for an unsigned compare
+                    // claims something the branch does not prove.
                     if let Some(v) = right_val {
-                        self.add_constraint(*left, Constraint::LessOrEqual(v));
+                        if *unsigned {
+                            self.add_constraint(*left, Constraint::LessOrEqualUnsigned(v));
+                        } else {
+                            self.add_constraint(*left, Constraint::LessOrEqual(v));
+                        }
                         return true;
                     }
                 }
@@ -796,9 +803,13 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         return true;
                     }
                 } else {
-                    // left >= right
+                    // left >= right, under the comparison's own ordering.
                     if let Some(v) = right_val {
-                        self.add_constraint(*left, Constraint::GreaterOrEqual(v));
+                        if *unsigned {
+                            self.add_constraint(*left, Constraint::GreaterOrEqualUnsigned(v));
+                        } else {
+                            self.add_constraint(*left, Constraint::GreaterOrEqual(v));
+                        }
                         return true;
                     }
                 }
@@ -857,13 +868,13 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         }
                         Constraint::GreaterThan(v)
                             // left > v, so if right_val <= v, then left != right_val
-                            if right_val.cgt(v).is_none_or(|r| r.is_zero()) =>
+                            if right_val.cgt(v).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
                         Constraint::LessThan(v)
                             // left < v, so if right_val >= v, then left != right_val
-                            if right_val.clt(v).is_none_or(|r| r.is_zero()) =>
+                            if right_val.clt(v).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
@@ -881,19 +892,19 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     match constraint {
                         Constraint::GreaterThan(v)
                             // left > v, so if v >= right_val, then left > right_val
-                            if v.clt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.clt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(true);
                         }
                         Constraint::LessOrEqual(v)
                             // left <= v, so if v <= right_val, then left <= right_val
-                            if v.cgt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.cgt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
                         Constraint::LessThan(v)
                             // left < v, so if v <= right_val, then left < right_val <= right_val
-                            if v.cgt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.cgt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
@@ -915,19 +926,19 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     match constraint {
                         Constraint::LessThan(v)
                             // left < v, so if v <= right_val, then left < right_val
-                            if v.cgt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.cgt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(true);
                         }
                         Constraint::GreaterOrEqual(v)
                             // left >= v, so if v >= right_val, then left >= right_val
-                            if v.clt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.clt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
                         Constraint::GreaterThan(v)
                             // left > v, so if v >= right_val, then left > right_val >= right_val
-                            if v.clt(right_val).is_none_or(|r| r.is_zero()) =>
+                            if v.clt(right_val).is_some_and(|r| r.is_zero()) =>
                         {
                             return Some(false);
                         }
@@ -1045,6 +1056,47 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         }
     }
 
+    /// Evaluates a block's instructions, leaving phi results untouched.
+    ///
+    /// Use this when the caller has already established the phi values itself —
+    /// typically by seeding them symbolically with
+    /// [`set_symbolic`](Self::set_symbolic) to reason about a merge abstractly.
+    ///
+    /// [`evaluate_block`](Self::evaluate_block) would erase those seeds:
+    /// [`evaluate_phis`](Self::evaluate_phis) resolves each phi through the
+    /// current predecessor, and with no predecessor set there is no operand to
+    /// choose, so it *removes* the result's value. Seeding and then calling
+    /// `evaluate_block` therefore leaves every phi-derived value Unknown, which
+    /// is the opposite of what the seeding was for.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use analyssa::{analysis::SsaEvaluator, ir::SsaVarId, testing, PointerSize};
+    ///
+    /// let ssa = testing::diamond_phi_fixture();
+    /// let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
+    ///
+    /// // Block 3's phi merges the two arms; treat it as an unknown symbol.
+    /// let phi_result = SsaVarId::from_index(2);
+    /// eval.set_symbolic(phi_result, "merged".to_string());
+    /// eval.evaluate_block_instructions(3);
+    ///
+    /// // The seed survives, so anything derived from it stays symbolic.
+    /// assert!(eval.get(phi_result).is_some());
+    /// ```
+    pub fn evaluate_block_instructions(&mut self, block_idx: usize) {
+        if self.config.track_path {
+            self.path.push(block_idx);
+        }
+        let Some(block) = self.ssa.block(block_idx) else {
+            return;
+        };
+        for instr in block.instructions() {
+            self.evaluate_op(instr.op());
+        }
+    }
+
     /// Evaluates a sequence of blocks in order.
     ///
     /// This is useful for evaluating a path through the CFG.
@@ -1061,10 +1113,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     /// block before evaluation. This enables accurate phi node evaluation.
     pub fn evaluate_path(&mut self, path: &[usize]) {
         for (i, &block_idx) in path.iter().enumerate() {
-            if i > 0 {
-                if let Some(&prev) = path.get(i.saturating_sub(1)) {
-                    self.set_predecessor(Some(prev));
-                }
+            if i > 0
+                && let Some(&prev) = path.get(i.saturating_sub(1))
+            {
+                self.set_predecessor(Some(prev));
             }
             self.evaluate_block(block_idx);
         }
@@ -1173,11 +1225,11 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 // If this op defines variables, consider widening them
                 for dest in instr.op().defs() {
                     // Keep concrete values if they're stable, widen symbolic to unknown
-                    if let Some(expr) = self.values.get(&dest) {
-                        if !expr.is_constant() {
-                            // Symbolic values that didn't stabilize become unknown
-                            self.values.remove(&dest);
-                        }
+                    if let Some(expr) = self.values.get(&dest)
+                        && !expr.is_constant()
+                    {
+                        // Symbolic values that didn't stabilize become unknown
+                        self.values.remove(&dest);
                     }
                 }
             }
@@ -1191,10 +1243,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     pub fn evaluate_loop_iterations(&mut self, loop_blocks: &[usize], iterations: usize) {
         for _ in 0..iterations {
             for (i, &block_idx) in loop_blocks.iter().enumerate() {
-                if i > 0 {
-                    if let Some(&prev) = loop_blocks.get(i.saturating_sub(1)) {
-                        self.set_predecessor(Some(prev));
-                    }
+                if i > 0
+                    && let Some(&prev) = loop_blocks.get(i.saturating_sub(1))
+                {
+                    self.set_predecessor(Some(prev));
                 }
                 self.evaluate_block(block_idx);
             }
@@ -1365,101 +1417,43 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 self.eval_unary_op(*dest, *operand, SymbolicOp::Not)
             }
 
-            // Rotations (like shifts - pure, two operands)
-            SsaOp::Rol {
-                dest,
-                value,
-                amount,
-            } => {
-                let v = self.values.get(value).and_then(|e| e.as_i64());
-                let a = self.values.get(amount).and_then(|e| e.as_i64());
-                match (v, a) {
-                    (Some(v), Some(a)) => {
-                        let shift = (a & 0x1f) as u32;
-                        let v32 = v as u32;
-                        let result = v32.rotate_left(shift);
-                        let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
+            // Rotations. Delegated to `evaluate_const_op` rather than folded
+            // here: the local version masked the distance by 31 and truncated
+            // through `u32` regardless of the operand's real width, so an `I64`
+            // rotate produced a 32-bit answer and an `I8` rotate was masked by
+            // the wrong modulus. `evaluate_const_op` matches on the `ConstValue`
+            // variant and rotates at that width.
+            SsaOp::Rol { dest, .. } | SsaOp::Ror { dest, .. } => {
+                let folded = evaluate_const_op(
+                    op,
+                    |var| {
+                        self.values
+                            .get(&var)
+                            .and_then(|expr| expr.as_constant().cloned())
+                    },
+                    self.pointer_size,
+                );
+                match folded {
+                    Some(value) => {
+                        let expr = SymbolicExpr::constant(value);
                         self.values.insert(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
-                    _ => {
+                    None => {
                         self.values.remove(dest);
                         None
                     }
                 }
             }
 
-            SsaOp::Ror {
-                dest,
-                value,
-                amount,
-            } => {
-                let v = self.values.get(value).and_then(|e| e.as_i64());
-                let a = self.values.get(amount).and_then(|e| e.as_i64());
-                match (v, a) {
-                    (Some(v), Some(a)) => {
-                        let shift = (a & 0x1f) as u32;
-                        let v32 = v as u32;
-                        let result = v32.rotate_right(shift);
-                        let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
-                        self.values.insert(*dest, expr.clone());
-                        self.track_origin_state(*dest, &expr);
-                        Some(expr)
-                    }
-                    _ => {
-                        self.values.remove(dest);
-                        None
-                    }
-                }
-            }
-
-            SsaOp::Rcl {
-                dest,
-                value,
-                amount,
-            } => {
-                let v = self.values.get(value).and_then(|e| e.as_i64());
-                let a = self.values.get(amount).and_then(|e| e.as_i64());
-                match (v, a) {
-                    (Some(v), Some(a)) => {
-                        let shift = (a & 0x1f) as u32;
-                        let v32 = v as u32;
-                        let result = v32.rotate_left(shift);
-                        let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
-                        self.values.insert(*dest, expr.clone());
-                        self.track_origin_state(*dest, &expr);
-                        Some(expr)
-                    }
-                    _ => {
-                        self.values.remove(dest);
-                        None
-                    }
-                }
-            }
-
-            SsaOp::Rcr {
-                dest,
-                value,
-                amount,
-            } => {
-                let v = self.values.get(value).and_then(|e| e.as_i64());
-                let a = self.values.get(amount).and_then(|e| e.as_i64());
-                match (v, a) {
-                    (Some(v), Some(a)) => {
-                        let shift = (a & 0x1f) as u32;
-                        let v32 = v as u32;
-                        let result = v32.rotate_right(shift);
-                        let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
-                        self.values.insert(*dest, expr.clone());
-                        self.track_origin_state(*dest, &expr);
-                        Some(expr)
-                    }
-                    _ => {
-                        self.values.remove(dest);
-                        None
-                    }
-                }
+            // `Rcl`/`Rcr` rotate through the carry flag, which is not an SSA
+            // operand of theirs — see `analysis::consts::evaluate_const_op`.
+            // Folding them as plain rotates is wrong whenever the rotated-out
+            // bit differs from the incoming carry, so the value becomes unknown.
+            SsaOp::Rcl { dest, .. } | SsaOp::Rcr { dest, .. } => {
+                self.values.remove(dest);
+                None
             }
 
             // Bit manipulation (like unary ops - pure, one operand)
@@ -1822,7 +1816,14 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ) -> Option<SymbolicExpr<T>> {
         let left_expr = self.values.get(&left)?;
         let right_expr = self.values.get(&right)?;
-        if left_expr.reaches_recursive_depth_limit() || right_expr.reaches_recursive_depth_limit() {
+        // Depth *and* size. Both operand trees are cloned into the result, so
+        // `x op x` doubles the node count while adding 1 to the depth — the depth
+        // cap alone cannot fire before memory is exhausted.
+        let too_large = SymbolicExpr::combining_reaches_size_limit(left_expr, right_expr);
+        if too_large
+            || left_expr.reaches_recursive_depth_limit()
+            || right_expr.reaches_recursive_depth_limit()
+        {
             let result = SymbolicExpr::variable(dest);
             self.values.insert(dest, result.clone());
             self.track_origin_state(dest, &result);
@@ -1933,12 +1934,11 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
 
         // Recursively resolve operands first
         for operand in op.uses() {
-            if !self.values.contains_key(&operand) {
-                if let Some(resolved) =
+            if !self.values.contains_key(&operand)
+                && let Some(resolved) =
                     self.resolve_with_trace(operand, max_depth.saturating_sub(1))
-                {
-                    self.values.insert(operand, resolved);
-                }
+            {
+                self.values.insert(operand, resolved);
             }
         }
 

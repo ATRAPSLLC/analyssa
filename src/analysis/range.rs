@@ -84,6 +84,8 @@ use std::{
     fmt,
 };
 
+use crate::analysis::dataflow::lattice::{JoinSemiLattice, MeetSemiLattice};
+
 /// A range of possible integer values for analysis.
 ///
 /// Represents the set of values a variable might hold at runtime.
@@ -104,6 +106,29 @@ pub enum ValueRange {
     /// All values possible (no information).
     #[default]
     Top,
+}
+
+/// Lets the generic dataflow solver drive a range analysis: the inherent
+/// `meet`/`join` already have the right algebra, this exposes them under the
+/// lattice traits the solver is written against.
+impl MeetSemiLattice for ValueRange {
+    fn meet(&self, other: &Self) -> Self {
+        Self::meet(self, other)
+    }
+
+    fn is_bottom(&self) -> bool {
+        Self::is_bottom(self)
+    }
+}
+
+impl JoinSemiLattice for ValueRange {
+    fn join(&self, other: &Self) -> Self {
+        Self::join(self, other)
+    }
+
+    fn is_top(&self) -> bool {
+        Self::is_top(self)
+    }
 }
 
 /// A single contiguous interval `[min, max]`.
@@ -225,10 +250,10 @@ impl IntervalRange {
             // If max >= value, then at least one value (max) is NOT < value
             return Some(false);
         }
-        if let Some(min_val) = self.min {
-            if min_val >= value {
-                return Some(false);
-            }
+        if let Some(min_val) = self.min
+            && min_val >= value
+        {
+            return Some(false);
         }
         None
     }
@@ -243,10 +268,10 @@ impl IntervalRange {
             // If min <= value, then at least one value (min) is NOT > value
             return Some(false);
         }
-        if let Some(max_val) = self.max {
-            if max_val <= value {
-                return Some(false);
-            }
+        if let Some(max_val) = self.max
+            && max_val <= value
+        {
+            return Some(false);
         }
         None
     }
@@ -254,15 +279,15 @@ impl IntervalRange {
     /// Checks if all values in this range are less than or equal to `value`.
     #[must_use]
     pub fn always_less_equal(&self, value: i64) -> Option<bool> {
-        if let Some(max_val) = self.max {
-            if max_val <= value {
-                return Some(true);
-            }
+        if let Some(max_val) = self.max
+            && max_val <= value
+        {
+            return Some(true);
         }
-        if let Some(min_val) = self.min {
-            if min_val > value {
-                return Some(false);
-            }
+        if let Some(min_val) = self.min
+            && min_val > value
+        {
+            return Some(false);
         }
         None
     }
@@ -270,15 +295,15 @@ impl IntervalRange {
     /// Checks if all values in this range are greater than or equal to `value`.
     #[must_use]
     pub fn always_greater_equal(&self, value: i64) -> Option<bool> {
-        if let Some(min_val) = self.min {
-            if min_val >= value {
-                return Some(true);
-            }
+        if let Some(min_val) = self.min
+            && min_val >= value
+        {
+            return Some(true);
         }
-        if let Some(max_val) = self.max {
-            if max_val < value {
-                return Some(false);
-            }
+        if let Some(max_val) = self.max
+            && max_val < value
+        {
+            return Some(false);
         }
         None
     }
@@ -327,15 +352,15 @@ impl IntervalRange {
     #[must_use]
     pub fn adjacent(&self, other: &Self) -> bool {
         // Check if max + 1 == other.min or other.max + 1 == self.min
-        if let (Some(self_max), Some(other_min)) = (self.max, other.min) {
-            if self_max.checked_add(1) == Some(other_min) {
-                return true;
-            }
+        if let (Some(self_max), Some(other_min)) = (self.max, other.min)
+            && self_max.checked_add(1) == Some(other_min)
+        {
+            return true;
         }
-        if let (Some(other_max), Some(self_min)) = (other.max, self.min) {
-            if other_max.checked_add(1) == Some(self_min) {
-                return true;
-            }
+        if let (Some(other_max), Some(self_min)) = (other.max, self.min)
+            && other_max.checked_add(1) == Some(self_min)
+        {
+            return true;
         }
         false
     }
@@ -358,10 +383,10 @@ impl IntervalRange {
         };
 
         // Check if result is empty
-        if let (Some(min_val), Some(max_val)) = (new_min, new_max) {
-            if min_val > max_val {
-                return None; // Empty intersection
-            }
+        if let (Some(min_val), Some(max_val)) = (new_min, new_max)
+            && min_val > max_val
+        {
+            return None; // Empty intersection
         }
 
         Some(Self {
@@ -636,11 +661,11 @@ impl ValueRange {
         // Merge overlapping/adjacent intervals
         let mut merged: Vec<IntervalRange> = Vec::new();
         for interval in intervals {
-            if let Some(last) = merged.last_mut() {
-                if last.overlaps(&interval) || last.adjacent(&interval) {
-                    *last = last.join(&interval);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && (last.overlaps(&interval) || last.adjacent(&interval))
+            {
+                *last = last.join(&interval);
+                continue;
             }
             merged.push(interval);
         }

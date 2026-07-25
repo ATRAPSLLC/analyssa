@@ -99,9 +99,6 @@ struct ReassociationCandidate<T: Target> {
     base_var: SsaVarId,
     /// Variable holding the first constant `c1`.
     const1_var: SsaVarId,
-    /// Variable holding the second constant `c2`.
-    #[allow(dead_code)]
-    const2_var: SsaVarId,
     /// Value of the first constant.
     const1_value: ConstValue<T>,
     /// Value of the second constant.
@@ -182,39 +179,78 @@ impl OpKind {
     }
 }
 
-fn get_op_kind<T: Target>(op: &SsaOp<T>) -> Option<(OpKind, SsaVarId, SsaVarId, SsaVarId)> {
+/// Decodes a reassociable binary op, declining any whose `flags` definition is
+/// still read.
+///
+/// `flags` is a real secondary definition (`SsaOp::defs()` yields it,
+/// `SsaOp::ReadFlags` and `SsaOp::BranchFlags` consume it) and `make_op` below
+/// reproduces none of them — it builds every replacement with `flags: None`, and
+/// additionally rewrites the outer op into a `Copy`, dropping a second one.
+/// Forwarding the flags through would be wrong rather than merely incomplete:
+/// the carry of a combined `add x, (c1 + c2)` is not the carry of the two
+/// chained adds it replaces.
+///
+/// The condition is *liveness*, not presence. A lifter emits flags for nearly
+/// every arithmetic instruction while only a few feed a conditional branch, so
+/// rejecting every flag-producing op would disable this pass on essentially all
+/// native code. A definition nothing reads can be dropped with the op that made
+/// it, which is what dead-code elimination would do regardless.
+fn get_op_kind<T: Target>(
+    op: &SsaOp<T>,
+    uses: &BTreeMap<SsaVarId, usize>,
+) -> Option<(OpKind, SsaVarId, SsaVarId, SsaVarId)> {
+    let flags_are_dead =
+        |flags: &Option<SsaVarId>| flags.is_none_or(|f| uses.get(&f).copied().unwrap_or(0) == 0);
     match op {
         SsaOp::Add {
-            dest, left, right, ..
-        } => Some((OpKind::Add, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Add, *dest, *left, *right)),
         SsaOp::Sub {
-            dest, left, right, ..
-        } => Some((OpKind::Sub, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Sub, *dest, *left, *right)),
         SsaOp::Mul {
-            dest, left, right, ..
-        } => Some((OpKind::Mul, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Mul, *dest, *left, *right)),
         SsaOp::And {
-            dest, left, right, ..
-        } => Some((OpKind::And, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::And, *dest, *left, *right)),
         SsaOp::Or {
-            dest, left, right, ..
-        } => Some((OpKind::Or, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Or, *dest, *left, *right)),
         SsaOp::Xor {
-            dest, left, right, ..
-        } => Some((OpKind::Xor, *dest, *left, *right)),
+            dest,
+            left,
+            right,
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Xor, *dest, *left, *right)),
         SsaOp::Shl {
             dest,
             value,
             amount,
-            ..
-        } => Some((OpKind::Shl, *dest, *value, *amount)),
+            flags,
+        } if flags_are_dead(flags) => Some((OpKind::Shl, *dest, *value, *amount)),
         SsaOp::Shr {
             dest,
             value,
             amount,
             unsigned,
-            ..
-        } => Some((
+            flags,
+        } if flags_are_dead(flags) => Some((
             OpKind::Shr {
                 unsigned: *unsigned,
             },
@@ -288,9 +324,15 @@ fn find_candidates<T: Target>(
 ) -> Vec<ReassociationCandidate<T>> {
     let mut candidates = Vec::new();
     for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-        if let Some(candidate) =
-            check_reassociation(instr.op(), block_idx, instr_idx, constants, index, uses)
-        {
+        if let Some(candidate) = check_reassociation(
+            ssa,
+            instr.op(),
+            block_idx,
+            instr_idx,
+            constants,
+            index,
+            uses,
+        ) {
             candidates.push(candidate);
         }
     }
@@ -298,6 +340,7 @@ fn find_candidates<T: Target>(
 }
 
 fn check_reassociation<T: Target>(
+    ssa: &SsaFunction<T>,
     op: &SsaOp<T>,
     block_idx: usize,
     instr_idx: usize,
@@ -305,11 +348,11 @@ fn check_reassociation<T: Target>(
     index: &DefUseIndex<T>,
     uses: &BTreeMap<SsaVarId, usize>,
 ) -> Option<ReassociationCandidate<T>> {
-    let (outer_kind, dest, outer_left, outer_right) = get_op_kind(op)?;
+    let (outer_kind, dest, outer_left, outer_right) = get_op_kind(op, uses)?;
     let c2_value = constants.get(&outer_right)?;
 
     let (inner_block, inner_instr, inner_op) = index.full_definition(outer_left)?;
-    let (inner_kind, inner_dest, inner_left, inner_right) = get_op_kind(inner_op)?;
+    let (inner_kind, inner_dest, inner_left, inner_right) = get_op_kind(inner_op, uses)?;
 
     if inner_kind != outer_kind {
         return None;
@@ -319,14 +362,51 @@ fn check_reassociation<T: Target>(
         return None;
     }
 
+    // `apply_reassociations` rewrites the instruction defining the inner
+    // constant *in place*, so that constant must be private to this chain. The
+    // `inner_uses` check above guards the intermediate result, which is a
+    // different variable — a constant materialized once and read by several
+    // instructions would be silently rewritten under all of them.
+    let const_is_private = |const_var: SsaVarId| uses.get(&const_var).copied().unwrap_or(0) <= 1;
+
+    // `(x << c1) << c2 == x << (c1 + c2)` only while the combined count stays
+    // below the operand's width. This crate's shift semantics mask the count to
+    // `bits - 1` (`ConstValue::shl`/`shr` use `wrapping_shl`/`wrapping_shr`,
+    // x86-style), so once `c1 + c2` reaches the width the two forms diverge:
+    // chained shifts saturate — to zero, or to -1 for an arithmetic right shift
+    // of a negative value — while the combined masked shift wraps around and
+    // returns some other value entirely. The other six kinds are width-
+    // independent, so this only gates the shifts.
+    let shift_stays_in_width = |base: SsaVarId, c1: &ConstValue<T>, c2: &ConstValue<T>| {
+        if !matches!(outer_kind, OpKind::Shl | OpKind::Shr { .. }) {
+            return true;
+        }
+        let Some(width) = ssa
+            .variable(base)
+            .map(|var| var.var_type().clone())
+            .and_then(|ty| T::bit_width(&ty))
+        else {
+            // No width information means no proof; refuse rather than guess.
+            return false;
+        };
+        match (c1.as_i64(), c2.as_i64()) {
+            (Some(a), Some(b)) => a
+                .checked_add(b)
+                .is_some_and(|total| total >= 0 && total < i64::from(width)),
+            _ => false,
+        }
+    };
+
     if let Some(c1_value) = constants.get(&inner_right) {
+        if !const_is_private(inner_right) || !shift_stays_in_width(inner_left, c1_value, c2_value) {
+            return None;
+        }
         return Some(ReassociationCandidate {
             block_idx,
             instr_idx,
             dest,
             base_var: inner_left,
             const1_var: inner_right,
-            const2_var: outer_right,
             const1_value: c1_value.clone(),
             const2_value: c2_value.clone(),
             inner_block,
@@ -336,23 +416,25 @@ fn check_reassociation<T: Target>(
         });
     }
 
-    if outer_kind.is_commutative() {
-        if let Some(c1_value) = constants.get(&inner_left) {
-            return Some(ReassociationCandidate {
-                block_idx,
-                instr_idx,
-                dest,
-                base_var: inner_right,
-                const1_var: inner_left,
-                const2_var: outer_right,
-                const1_value: c1_value.clone(),
-                const2_value: c2_value.clone(),
-                inner_block,
-                inner_instr,
-                inner_dest,
-                op_kind: outer_kind,
-            });
+    if outer_kind.is_commutative()
+        && let Some(c1_value) = constants.get(&inner_left)
+    {
+        if !const_is_private(inner_left) || !shift_stays_in_width(inner_right, c1_value, c2_value) {
+            return None;
         }
+        return Some(ReassociationCandidate {
+            block_idx,
+            instr_idx,
+            dest,
+            base_var: inner_right,
+            const1_var: inner_left,
+            const1_value: c1_value.clone(),
+            const2_value: c2_value.clone(),
+            inner_block,
+            inner_instr,
+            inner_dest,
+            op_kind: outer_kind,
+        });
     }
 
     None
@@ -484,10 +566,11 @@ mod tests {
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            ops::FlagsMask,
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, mock_op_at, run_mock_pass_boundary},
     };
 
     fn add(
@@ -688,6 +771,287 @@ mod tests {
         let changed = run_reassociate(&mut ssa, "add reassociation", &log);
         assert!(changed, "constant add reassociation should fire");
         assert!(log.has(EventKind::ConstantFolded));
+    }
+
+    /// `(x << c1) << c2` is `x << (c1 + c2)` only while the combined count stays
+    /// below the operand's width. This crate masks shift counts to `bits - 1`
+    /// (x86-style), so `(x << 20) << 20` on a 32-bit value saturates to zero
+    /// while `x << 40` masks to `x << 8` — a completely different value.
+    #[test]
+    fn chained_shifts_past_the_operand_width_are_not_combined() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let c1 = local_at(&mut ssa, 1, 0, 1);
+        let c2 = local_at(&mut ssa, 2, 0, 2);
+        let inner = local_at(&mut ssa, 3, 0, 3);
+        let outer = local_at(&mut ssa, 4, 0, 4);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c1,
+            value: ConstValue::I32(20),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c2,
+            value: ConstValue::I32(20),
+        }));
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: inner,
+            value: x,
+            amount: c1,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: outer,
+            value: inner,
+            amount: c2,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(outer) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run_reassociate(&mut ssa, "overwide shift chain", &log);
+
+        assert!(
+            matches!(mock_op_at(&ssa, 0, 4), SsaOp::Shl { .. }),
+            "40 >= 32, so the shifts must not be combined; got {:?}",
+            mock_op_at(&ssa, 0, 4)
+        );
+    }
+
+    /// A chain that stays inside the width must still combine.
+    #[test]
+    fn chained_shifts_within_the_operand_width_are_combined() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let c1 = local_at(&mut ssa, 1, 0, 1);
+        let c2 = local_at(&mut ssa, 2, 0, 2);
+        let inner = local_at(&mut ssa, 3, 0, 3);
+        let outer = local_at(&mut ssa, 4, 0, 4);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c1,
+            value: ConstValue::I32(2),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c2,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: inner,
+            value: x,
+            amount: c1,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: outer,
+            value: inner,
+            amount: c2,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(outer) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let changed = run_reassociate(&mut ssa, "in-width shift chain", &log);
+        assert!(changed, "2 + 3 = 5 < 32, so the shifts should combine");
+    }
+
+    /// A flags definition that something reads blocks the rewrite: `make_op`
+    /// builds every replacement with `flags: None` and turns the outer op into a
+    /// `Copy`, so both flags definitions would be dropped while a reader remains.
+    #[test]
+    fn a_chain_with_live_flags_is_not_reassociated() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let c1 = local_at(&mut ssa, 1, 0, 1);
+        let c2 = local_at(&mut ssa, 2, 0, 2);
+        let inner = local_at(&mut ssa, 3, 0, 3);
+        let inner_flags = local_at(&mut ssa, 4, 0, 3);
+        let outer = local_at(&mut ssa, 5, 0, 4);
+        let read = local_at(&mut ssa, 6, 0, 5);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c1,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c2,
+            value: ConstValue::I32(7),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: inner,
+            left: x,
+            right: c1,
+            flags: Some(inner_flags),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: outer,
+            left: inner,
+            right: c2,
+            flags: None,
+        }));
+        // The inner op's carry is read, so the chain may not be rewritten.
+        block.add_instruction(instr(SsaOp::ReadFlags {
+            dest: read,
+            flags: inner_flags,
+            mask: FlagsMask::CARRY,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(read) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run_reassociate(&mut ssa, "live flags reassociation", &log);
+
+        assert!(
+            matches!(mock_op_at(&ssa, 0, 3), SsaOp::Add { flags: Some(_), .. }),
+            "the flag-producing inner add must survive; got {:?}",
+            mock_op_at(&ssa, 0, 3)
+        );
+        assert_eq!(ssa.validate(), Ok(()));
+    }
+
+    /// ...but a flags definition nothing reads must not block it, or the pass
+    /// would never fire on native code, where nearly every arithmetic
+    /// instruction defines flags.
+    #[test]
+    fn a_chain_with_dead_flags_is_still_reassociated() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let c1 = local_at(&mut ssa, 1, 0, 1);
+        let c2 = local_at(&mut ssa, 2, 0, 2);
+        let inner = local_at(&mut ssa, 3, 0, 3);
+        let inner_flags = local_at(&mut ssa, 4, 0, 3);
+        let outer = local_at(&mut ssa, 5, 0, 4);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c1,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c2,
+            value: ConstValue::I32(7),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: inner,
+            left: x,
+            right: c1,
+            // Defined but never read.
+            flags: Some(inner_flags),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: outer,
+            left: inner,
+            right: c2,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(outer) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let changed = run_reassociate(&mut ssa, "dead flags reassociation", &log);
+
+        assert!(
+            changed,
+            "a dead flags definition must not block reassociation"
+        );
+    }
+
+    /// The rewrite overwrites the instruction defining the inner constant *in
+    /// place*, so that constant must belong to this chain alone. The
+    /// `inner_uses > 1` guard checks the intermediate *result*, not the
+    /// constant, so a constant shared with an unrelated instruction is silently
+    /// rewritten under it.
+    ///
+    /// `c1 = Const 3; t = x + c1; r = t + c2; s = x + c1` — combining into
+    /// `c1 = Const 10` also changes `s` from `x + 3` to `x + 10`.
+    #[test]
+    fn a_constant_shared_with_another_instruction_is_not_overwritten() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let c1 = local_at(&mut ssa, 1, 0, 1);
+        let c2 = local_at(&mut ssa, 2, 0, 2);
+        let inner = local_at(&mut ssa, 3, 0, 3);
+        let outer = local_at(&mut ssa, 4, 0, 4);
+        let other = local_at(&mut ssa, 5, 0, 5);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c1,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: c2,
+            value: ConstValue::I32(7),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: inner,
+            left: x,
+            right: c1,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: outer,
+            left: inner,
+            right: c2,
+            flags: None,
+        }));
+        // A second, independent user of the same constant.
+        block.add_instruction(instr(SsaOp::Add {
+            dest: other,
+            left: x,
+            right: c1,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(other) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run_reassociate(&mut ssa, "shared constant reassociation", &log);
+
+        let c1_value = ssa.blocks().iter().find_map(|block| {
+            block
+                .instructions()
+                .iter()
+                .find_map(|instr| match instr.op() {
+                    SsaOp::Const { dest, value } if *dest == c1 => Some(value.clone()),
+                    _ => None,
+                })
+        });
+        assert_eq!(
+            c1_value,
+            Some(ConstValue::I32(3)),
+            "the shared constant must keep its value; the other `x + c1` still reads it"
+        );
     }
 
     #[test]

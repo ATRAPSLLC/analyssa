@@ -9,9 +9,9 @@
 //!
 //! Tarjan's algorithm performs a single DFS pass over the graph while maintaining:
 //!
-//! - **index[v]**: The discovery time (DFS number) of node `v`, assigned
+//! - **index\[v\]**: The discovery time (DFS number) of node `v`, assigned
 //!   sequentially as nodes are first visited.
-//! - **lowlink[v]**: The smallest index reachable from `v` via tree edges and at
+//! - **lowlink\[v\]**: The smallest index reachable from `v` via tree edges and at
 //!   most one additional edge (a back edge or cross edge to an unprocessed SCC).
 //!   Only nodes on the stack are considered reachable; nodes in already-completed
 //!   SCCs are excluded from lowlink computation.
@@ -33,6 +33,8 @@
 //! - **Call graph analysis**: Finding mutually recursive function groups
 //! - **Dependency analysis**: Detecting circular dependencies
 //! - **Dead code elimination**: Unreachable code forms trivial SCCs
+
+use std::collections::HashSet;
 
 use crate::graph::{NodeId, Successors};
 
@@ -61,7 +63,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// 1. Perform DFS, assigning each node an index in discovery order
 /// 2. Compute lowlink values (minimum index reachable via DFS subtree + back edges)
-/// 3. When `lowlink\[v\] == index\[v\]`, v is root of an SCC; pop stack until v
+/// 3. When `lowlink[v] == index[v]`, v is root of an SCC; pop stack until v
 ///
 /// # Examples
 ///
@@ -193,20 +195,20 @@ impl TarjanState {
     fn finish_component_if_root(&mut self, v: NodeId) {
         let v_idx = v.index();
         let v_index = self.index.get(v_idx).copied().flatten();
-        if let Some(idx) = v_index {
-            if self.lowlink.get(v_idx).copied().unwrap_or(usize::MAX) == idx {
-                let mut scc = Vec::new();
-                while let Some(w) = self.stack.pop() {
-                    if let Some(slot) = self.on_stack.get_mut(w.index()) {
-                        *slot = false;
-                    }
-                    scc.push(w);
-                    if w == v {
-                        break;
-                    }
+        if let Some(idx) = v_index
+            && self.lowlink.get(v_idx).copied().unwrap_or(usize::MAX) == idx
+        {
+            let mut scc = Vec::new();
+            while let Some(w) = self.stack.pop() {
+                if let Some(slot) = self.on_stack.get_mut(w.index()) {
+                    *slot = false;
                 }
-                self.sccs.push(scc);
+                scc.push(w);
+                if w == v {
+                    break;
+                }
             }
+            self.sccs.push(scc);
         }
     }
 
@@ -222,10 +224,10 @@ impl TarjanState {
                 if w_index_visited.is_none() {
                     self.visit_node(w);
                     work.push(TarjanFrame::new(graph, w));
-                } else if self.on_stack.get(w_idx).copied().unwrap_or(false) {
-                    if let Some(idx) = w_index_visited {
-                        self.update_lowlink(frame.node, idx);
-                    }
+                } else if self.on_stack.get(w_idx).copied().unwrap_or(false)
+                    && let Some(idx) = w_index_visited
+                {
+                    self.update_lowlink(frame.node, idx);
                 }
                 continue;
             }
@@ -299,7 +301,7 @@ where
 
     // Find edges between different SCCs
     let mut edges = Vec::new();
-    let mut seen_edges = std::collections::HashSet::new();
+    let mut seen_edges = HashSet::new();
 
     for i in 0..node_count {
         let from_node = NodeId::new(i);
@@ -322,8 +324,8 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::graph::{
-        algorithms::scc::{condensation, strongly_connected_components},
         DirectedGraph, NodeId,
+        algorithms::scc::{condensation, strongly_connected_components},
     };
 
     #[test]

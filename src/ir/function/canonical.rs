@@ -31,6 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    BitSet,
     ir::{
         block::SsaBlock,
         function::SsaFunction,
@@ -40,7 +41,6 @@ use crate::{
         variable::{DefSite, SsaVarId},
     },
     target::Target,
-    BitSet,
 };
 
 /// Finds kept predecessors of a removed block during canonicalization.
@@ -109,29 +109,29 @@ impl<T: Target> SsaFunction<T> {
 
         // Protect exception handler entry blocks
         for handler in &self.exception_handlers {
-            if let Some(try_block) = handler.try_start_block {
-                if try_block < block_count {
-                    protected_blocks.insert(try_block);
-                }
+            if let Some(try_block) = handler.try_start_block
+                && try_block < block_count
+            {
+                protected_blocks.insert(try_block);
             }
-            if let Some(handler_block) = handler.handler_start_block {
-                if handler_block < block_count {
-                    protected_blocks.insert(handler_block);
-                }
+            if let Some(handler_block) = handler.handler_start_block
+                && handler_block < block_count
+            {
+                protected_blocks.insert(handler_block);
             }
-            if let Some(filter_block) = handler.filter_start_block {
-                if filter_block < block_count {
-                    protected_blocks.insert(filter_block);
-                }
+            if let Some(filter_block) = handler.filter_start_block
+                && filter_block < block_count
+            {
+                protected_blocks.insert(filter_block);
             }
         }
 
         // Protect Leave targets (exception handler exit blocks)
         for block in &self.blocks {
-            if let Some(SsaOp::Leave { target }) = block.terminator_op() {
-                if *target < block_count {
-                    protected_blocks.insert(*target);
-                }
+            if let Some(SsaOp::Leave { target }) = block.terminator_op()
+                && *target < block_count
+            {
+                protected_blocks.insert(*target);
             }
         }
 
@@ -327,10 +327,20 @@ impl<T: Target> SsaFunction<T> {
             .map(|block| block.instructions().len())
             .collect();
 
+        // A variable whose defining block or instruction no longer exists falls
+        // back to an entry def site — but only when nothing reads it. Stamping
+        // `DefSite::entry()` on a still-read variable makes a dangling read
+        // indistinguishable from an argument, which is precisely the disguise
+        // the verifier must be able to see through. See
+        // `SsaFunction::collect_read_variables`.
+        let still_read = self.collect_read_variables();
         for var in &mut self.variables {
             let site = var.def_site();
+            let readable = still_read.contains_checked(var.id().index());
             let Some(Some(new_block)) = block_remap.get(site.block) else {
-                var.set_def_site(DefSite::entry());
+                if !readable {
+                    var.set_def_site(DefSite::entry());
+                }
                 continue;
             };
 
@@ -340,7 +350,7 @@ impl<T: Target> SsaFunction<T> {
                     .is_some_and(|count| instr_idx < *count)
                 {
                     var.set_def_site(DefSite::instruction(*new_block, instr_idx));
-                } else {
+                } else if !readable {
                     var.set_def_site(DefSite::entry());
                 }
             } else {
@@ -371,13 +381,10 @@ impl<T: Target> SsaFunction<T> {
         });
 
         // If there's no useful code, replace entry block with just a Return
-        if !has_useful_code {
-            if let Some(entry_block) = self.blocks.first_mut() {
-                entry_block.instructions_mut().clear();
-                entry_block.phi_nodes_mut().clear();
-                entry_block
-                    .add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
-            }
+        if !has_useful_code && let Some(entry_block) = self.blocks.first_mut() {
+            entry_block.instructions_mut().clear();
+            entry_block.phi_nodes_mut().clear();
+            entry_block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
         }
     }
 

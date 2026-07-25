@@ -19,6 +19,10 @@
 //! - **`range`**: Interval-based value range analysis with a lattice structure supporting
 //!   constant, bounded, half-open, and union ranges for opaque predicate detection and
 //!   bounds check elimination.
+//! - **`address`**: Normalized `base + index*stride + offset` address model recovered from
+//!   `PtrAdd` or shredded `Shl`/`Mul`/`Add` chains, plus the cell-identity `AliasKey`
+//!   projection. The decoded form is stable under GVN/LICM rewrites of the address
+//!   computation, which keying on the address value id is not.
 //!
 //! ## Evaluation
 //!
@@ -60,6 +64,9 @@
 //! - **`memory`**: Memory SSA (MSSA) for tracking versioned memory locations. Supports
 //!   static fields, instance fields, array elements, and indirect accesses through
 //!   a hierarchical alias analysis.
+//! - **`pointsto`**: Inclusion-based (Andersen) points-to analysis — a standalone
+//!   constraint solver plus an intraprocedural, field-sensitive extractor. A may-analysis:
+//!   both the step budget and field-cell exhaustion lose precision rather than soundness.
 //!
 //! ## Dataflow Framework
 //!
@@ -81,6 +88,7 @@
 //!   checking single-definition, def-use chains, phi operand coverage, dominance,
 //!   and structural integrity.
 
+pub mod address;
 pub mod algebraic;
 pub mod cfg;
 pub mod constraints;
@@ -94,21 +102,24 @@ pub mod loops;
 pub mod memory;
 pub mod patterns;
 pub mod phis;
+pub mod pointsto;
 pub mod range;
 pub mod resolver;
 pub mod symbolic;
 pub mod taint;
 pub mod verifier;
 
-pub use algebraic::{simplify_op, SimplifyResult};
+pub use address::{AddressExpr, AliasKey, normalize_address};
+pub use algebraic::{SimplifyResult, simplify_op};
 pub use cfg::SsaCfg;
-pub use consts::{evaluate_const_op, ConstEvaluator};
+pub use consts::{ConstEvaluator, evaluate_const_op};
 pub use defuse::{DefUseIndex, Location};
 pub use evaluator::{ControlFlow, SsaEvaluator};
 pub use loop_analyzer::{LoopAnalyzer, SsaLoopAnalysis};
-pub use loops::{detect_loops, InductionVar, LoopForest, LoopInfo, LoopType};
+pub use loops::{InductionVar, LoopForest, LoopInfo, LoopType, detect_loops};
 pub use patterns::PatternDetector;
-pub use phis::{place_pruned_phis, PhiAnalyzer};
+pub use phis::{PhiAnalyzer, place_pruned_phis};
+pub use pointsto::{Constraint, PointsTo};
 pub use range::ValueRange;
 pub use resolver::ValueResolver;
 pub use symbolic::{SymbolicEvaluator, SymbolicExpr, SymbolicOp};

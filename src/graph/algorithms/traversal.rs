@@ -115,11 +115,11 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
         scratch.clear();
         scratch.extend(self.graph.successors(node));
         for &succ in scratch.iter().rev() {
-            if let Some(slot) = self.visited.get_mut(succ.index()) {
-                if !*slot {
-                    *slot = true;
-                    self.stack.push(succ);
-                }
+            if let Some(slot) = self.visited.get_mut(succ.index())
+                && !*slot
+            {
+                *slot = true;
+                self.stack.push(succ);
             }
         }
         self.scratch = scratch;
@@ -230,11 +230,11 @@ impl<G: Successors> Iterator for BfsIterator<'_, G> {
 
         // Enqueue unvisited successors
         for succ in self.graph.successors(node) {
-            if let Some(slot) = self.visited.get_mut(succ.index()) {
-                if !*slot {
-                    *slot = true;
-                    self.queue.push_back(succ);
-                }
+            if let Some(slot) = self.visited.get_mut(succ.index())
+                && !*slot
+            {
+                *slot = true;
+                self.queue.push_back(succ);
             }
         }
 
@@ -429,8 +429,8 @@ pub fn reverse_postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId>
 #[cfg(test)]
 mod tests {
     use crate::graph::{
-        algorithms::traversal::{bfs, dfs, postorder, reverse_postorder},
         DirectedGraph, NodeId,
+        algorithms::traversal::{bfs, dfs, postorder, reverse_postorder},
     };
 
     fn create_linear_graph() -> DirectedGraph<'static, &'static str, ()> {

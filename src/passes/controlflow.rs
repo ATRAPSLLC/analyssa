@@ -99,8 +99,13 @@ where
     // Preserve canonical loop preheaders: threading through them re-exposes a
     // loop header's multiple non-loop predecessors, which the loop canonicalizer
     // immediately re-funnels through a fresh preheader — an endless oscillation.
-    let preheaders = loop_canonical_blocks(ssa);
-    trampolines.retain(|block, _| !preheaders.contains(block));
+    //
+    // Guarded, because `loop_canonical_blocks` builds the entire loop forest and
+    // this runs on every fixpoint iteration, including the terminating one.
+    if !trampolines.is_empty() {
+        let preheaders = loop_canonical_blocks(ssa);
+        trampolines.retain(|block, _| !preheaders.contains(block));
+    }
 
     // Step 2: find branches to same target (also resolves through trampolines).
     let same_target_branches = find_same_target_branches(ssa, &trampolines);
@@ -244,7 +249,14 @@ where
 
         let old_targets = op.successors();
         let mut changed = false;
-        for (&trampoline, &ultimate) in &ultimate_targets {
+        // Look up this block's own successors in the trampoline map, rather than
+        // trying every trampoline against this block. The latter is
+        // O(blocks x trampolines); a terminator has at most a handful of
+        // successors, so this is O(blocks x successors + trampolines).
+        for trampoline in old_targets.clone() {
+            let Some(&ultimate) = ultimate_targets.get(&trampoline) else {
+                continue;
+            };
             if op.redirect_target(trampoline, ultimate) {
                 redirected_preds
                     .entry((trampoline, ultimate))
@@ -359,8 +371,8 @@ mod tests {
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         testing::{
-            mock_terminator_at, run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
-            MockTarget, MockType,
+            MockTarget, MockType, mock_terminator_at, run_mock_malformed_cleanup_boundary,
+            run_mock_pass_boundary,
         },
     };
 

@@ -105,6 +105,17 @@ use crate::bitset::BitSet;
 /// assert_eq!(conflict.meet(&one), ConstantLattice::Bottom);
 /// ```
 pub trait MeetSemiLattice: Clone + Debug + PartialEq {
+    /// Meets `other` into `self` in place.
+    ///
+    /// Defaults to `*self = self.meet(other)`, so implementing it is optional.
+    /// Override it where the meet can be done without allocating — a `BitSet`
+    /// union, for example. The solver folds the meet over every predecessor of
+    /// every block on every visit, so the default's per-predecessor temporary is
+    /// the dominant allocation in a dense CFG.
+    fn meet_into(&mut self, other: &Self) {
+        *self = self.meet(other);
+    }
+
     /// Computes the meet (greatest lower bound) of two lattice elements.
     ///
     /// The meet represents combining information from two paths that merge.
@@ -173,6 +184,11 @@ impl MeetSemiLattice for BitSet {
         result
     }
 
+    /// Union in place — no temporary set per predecessor.
+    fn meet_into(&mut self, other: &Self) {
+        self.union_with(other);
+    }
+
     fn is_bottom(&self) -> bool {
         // For may analysis, bottom is the full set.
         self.is_full()
@@ -196,11 +212,11 @@ impl JoinSemiLattice for BitSet {
 mod tests {
     use super::*;
 
-    /// The lattice traits are reachable from `analysis::dataflow` directly, like
-    /// every other trait the module's header advertises. They were previously
-    /// only reachable via the longer `dataflow::lattice::` path, so the
-    /// documented import did not compile. Importing through the short path here
-    /// keeps the re-export from silently disappearing again.
+    /// The lattice traits must stay reachable from `analysis::dataflow` directly,
+    /// like every other trait the module's header advertises — not only via the
+    /// longer `dataflow::lattice::` path, which would make the documented import
+    /// fail to compile. Importing through the short path here pins the
+    /// re-export.
     /// A two-point lattice, the smallest thing that can implement [`Lattice`].
     ///
     /// No type in the crate implements the full [`Lattice`] trait — `BitSet`
@@ -250,11 +266,45 @@ mod tests {
         }
     }
 
-    /// The lattice traits are reachable from `analysis::dataflow` directly, like
-    /// every other trait the module header advertises. They were previously only
-    /// reachable via the longer `dataflow::lattice::` path, so the documented
-    /// import did not compile. Naming them through the short path here stops the
-    /// re-export from silently disappearing again.
+    /// The lattice traits must stay reachable from `analysis::dataflow` directly,
+    /// like every other trait the module header advertises — not only via the
+    /// longer `dataflow::lattice::` path, which would make the documented import
+    /// fail to compile. Naming them through the short path here pins the
+    /// re-export.
+    /// `meet_into` is an optimisation of `meet`, so an override that disagrees
+    /// with it would silently corrupt every analysis built on the lattice. The
+    /// solver calls it once per predecessor per visit, so a divergence would be
+    /// both pervasive and hard to attribute.
+    #[test]
+    fn meet_into_agrees_with_meet_for_every_lattice() {
+        fn check<L: MeetSemiLattice>(a: &L, b: &L) {
+            let expected = a.meet(b);
+            let mut actual = a.clone();
+            actual.meet_into(b);
+            assert_eq!(actual, expected, "meet_into must equal meet");
+        }
+
+        let mut a = BitSet::new(128);
+        a.insert(1);
+        a.insert(70);
+        let mut b = BitSet::new(128);
+        b.insert(70);
+        b.insert(100);
+        check(&a, &b);
+        check(&b, &a);
+        check(&a, &a.clone());
+        check(&BitSet::new(128), &a);
+        check(&a, &BitSet::new(128));
+        // A lazily-allocated operand must behave identically.
+        check(&a, &BitSet::lazy(128));
+        check(&BitSet::lazy(128), &a);
+
+        // And the default implementation, via a lattice that does not override.
+        check(&TwoPoint::Top, &TwoPoint::Bottom);
+        check(&TwoPoint::Bottom, &TwoPoint::Top);
+        check(&TwoPoint::Top, &TwoPoint::Top);
+    }
+
     #[test]
     fn lattice_traits_are_re_exported_from_dataflow() {
         use crate::analysis::dataflow::{JoinSemiLattice, Lattice, MeetSemiLattice};

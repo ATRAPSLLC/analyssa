@@ -56,7 +56,9 @@
 //!   ├── ArrayElement(arr, idx)   - Specific array element
 //!   │     ├── ArrayElement(arr, Constant(i)) - Known index
 //!   │     └── ArrayElement(arr, Variable(v)) - Unknown index (may alias)
-//!   └── Indirect(addr)          - Pointer dereference
+//!   └── Indirect{base,index,offset,size} - Decoded pointer dereference
+//!         ├── same base    - compare bit extents (disjoint offsets don't alias)
+//!         └── other base   - may alias (needs points-to to separate)
 //! ```
 //!
 //! # Alias Analysis
@@ -69,10 +71,18 @@
 //! | StaticField(f1) | StaticField(f2) | f1 == f2 | f1 == f2 |
 //! | InstanceField(o1, f1) | InstanceField(o2, f2) | o1==o2 && f1==f2 | o1==o2 && f1==f2 |
 //! | ArrayElement(a1, i1) | ArrayElement(a2, i2) | a1==a2 && i1.may_overlap(i2) | a1==a2 && i1.must_equal(i2) |
-//! | Indirect(p1) | Indirect(p2) | p1 == p2 | p1 == p2 |
+//! | Indirect(a) | Indirect(b) | see below | see below |
 //! | Unknown | Anything | true | false |
 //! | StaticField | InstanceField/ArrayElement | false | false |
 //! | InstanceField | ArrayElement | false | false |
+//!
+//! An `Indirect` location is a *decoded* address — `base + index*stride +
+//! offset` plus the access width — not the SSA id of the address operand. Two
+//! of them off a common base compare by overlapping bit extent, so `[rbp-8]`
+//! and `[rbp-16]` are provably disjoint; different bases conservatively
+//! may-alias, since two SSA pointers can hold one address. See
+//! [`IndirectLocation`] for the full rationale, including why keying on the
+//! address value id is both imprecise and unstable under GVN.
 //!
 //! # Usage
 //!
@@ -83,24 +93,28 @@
 //!         SsaCfg,
 //!     },
 //!     ir::SsaVarId,
-//!     testing,
+//!     testing, PointerSize,
 //! };
 //!
 //! // Fixture that stores to `object.field1`, loads it back, then performs
 //! // an indirect store and an atomic exchange.
 //! let ssa = testing::memory_effect_fixture();
 //! let cfg = SsaCfg::from_ssa(&ssa);
-//! let mem_ssa = MemorySsa::build(&ssa, &cfg);
+//! let mem_ssa = MemorySsa::build(&ssa, &cfg, PointerSize::Bit64);
 //!
 //! // The store and the load are attributed to the same memory location.
 //! let object = SsaVarId::from_index(0);
 //! let loc = MemoryLocation::InstanceField(object, 1);
 //! assert!(mem_ssa.locations().contains(&loc));
 //!
-//! // Query the memory version entering and leaving a block: the store in
-//! // block 0 bumps the version of that location.
+//! // Query the memory version entering and leaving a block. Every operation
+//! // that may alias this location bumps its version, not just the ones naming
+//! // it: the fixture's indirect store and atomic exchange both classify to
+//! // `Unknown`, which may-aliases everything, so the field's version advances
+//! // past them too. That is what makes a version comparison a valid test for
+//! // "is the value I read here still intact".
 //! assert_eq!(mem_ssa.version_at_entry(&loc, 0), Some(0));
-//! assert_eq!(mem_ssa.version_at_exit(&loc, 0), Some(1));
+//! assert_eq!(mem_ssa.version_at_exit(&loc, 0), Some(4));
 //!
 //! // A must-alias query holds for the identical location...
 //! assert!(loc.must_alias(&loc));
@@ -117,17 +131,33 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+/// Maximum `locations × blocks` product [`MemorySsa::build`] will construct.
+///
+/// Renaming records an entry and an exit version per location per block, so the
+/// retained allocation is quadratic when the location count scales with the
+/// block count — which it does for a "function" that is really data misread as
+/// code, where each distinct `base + offset` mints its own `Indirect` location.
+/// At 4000 blocks × 4000 locations that is ~16M map entries, several GB.
+///
+/// 4M cells is far above any real function (a 2000-block function touching 200
+/// distinct cells is 400k) and bounds the structure at tens of MB.
+const MAX_MEMORY_SSA_CELLS: usize = 4_000_000;
+
 use crate::{
-    analysis::cfg::SsaCfg,
+    analysis::{
+        address::{const_i64, normalize_address},
+        cfg::SsaCfg,
+    },
     graph::{
-        algorithms::{compute_dominance_frontiers, compute_dominators},
         GraphBase, NodeId, RootedGraph, Successors,
+        algorithms::{compute_dominance_frontiers, compute_dominators},
     },
     ir::{
         function::SsaFunction,
         ops::{MemoryEffectLocation, SsaEffectKind, SsaEffects, SsaOp},
         variable::SsaVarId,
     },
+    pointer::PointerSize,
     target::Target,
 };
 
@@ -159,11 +189,12 @@ pub enum MemoryLocation<T: Target> {
     /// Array element locations may alias based on array identity and index overlap.
     ArrayElement(SsaVarId, ArrayIndex),
 
-    /// Indirect memory access through a pointer: `*ptr`
+    /// Indirect memory access through a pointer: `*(base + index*stride + offset)`
     ///
-    /// The `SsaVarId` is the pointer variable. Indirect accesses are the most
-    /// conservative - they may alias anything the pointer could point to.
-    Indirect(SsaVarId),
+    /// Decoded from the address expression rather than keyed on the address
+    /// value id — see [`IndirectLocation`] for why that distinction is
+    /// load-bearing.
+    Indirect(IndirectLocation),
 
     /// Unknown/escaped memory.
     ///
@@ -182,7 +213,7 @@ impl<T: Target> MemoryLocation<T> {
         match self {
             Self::InstanceField(obj, _) => Some(*obj),
             Self::ArrayElement(arr, _) => Some(*arr),
-            Self::Indirect(ptr) => Some(*ptr),
+            Self::Indirect(indirect) => Some(indirect.base),
             Self::StaticField(_) | Self::Unknown => None,
         }
     }
@@ -216,19 +247,32 @@ impl<T: Target> MemoryLocation<T> {
             | (Self::InstanceField(..), Self::ArrayElement(..))
             | (Self::ArrayElement(..), Self::InstanceField(..)) => false,
 
-            // Instance fields alias if same object AND same field
-            // Conservative: different objects assumed to not alias
+            // Instance fields on the same object alias iff it is the same field.
+            //
+            // Different *SSA ids* for the object do NOT prove different objects:
+            // two un-GVN'd loads of one slot, two arguments, or a value and a phi
+            // of it all name one object through distinct ids. Treating distinct
+            // ids as disjoint would be a false NoAlias, which is unsound in the
+            // direction that matters — `may_alias` drives the invalidation half
+            // of the memory pass, so a false NoAlias lets a stale value survive a
+            // store to the same cell. This mirrors `Indirect`, which is already
+            // may-alias across distinct bases for exactly this reason.
+            //
+            // `must_alias` keeps requiring identical ids, so forwarding still
+            // fires on the common same-id case.
             (Self::InstanceField(obj1, f1), Self::InstanceField(obj2, f2)) => {
-                obj1 == obj2 && f1 == f2
+                obj1 != obj2 || f1 == f2
             }
 
-            // Array elements alias if same array AND indices may overlap
+            // Array elements: same reasoning for the array reference. Distinct
+            // ids may name one array, so only same-id lets the index comparison
+            // prove disjointness.
             (Self::ArrayElement(arr1, idx1), Self::ArrayElement(arr2, idx2)) => {
-                arr1 == arr2 && idx1.may_overlap(idx2)
+                arr1 != arr2 || idx1.may_overlap(idx2)
             }
 
-            // Indirect access may alias anything with same pointer
-            (Self::Indirect(p1), Self::Indirect(p2)) => p1 == p2,
+            // Two indirect accesses: compare the decoded address expressions.
+            (Self::Indirect(a), Self::Indirect(b)) => a.may_alias(b),
         }
     }
 
@@ -252,12 +296,197 @@ impl<T: Target> MemoryLocation<T> {
                 arr1 == arr2 && idx1.must_equal(idx2)
             }
 
-            // Indirect must-alias iff same pointer
-            (Self::Indirect(p1), Self::Indirect(p2)) => p1 == p2,
+            // Indirect must-alias iff the decoded addresses denote one cell
+            (Self::Indirect(a), Self::Indirect(b)) => a.must_alias(b),
 
             // Unknown never must-aliases (not precise enough)
             _ => false,
         }
+    }
+}
+
+/// A pointer dereference decoded into `base + index*stride + offset`, together
+/// with the width of the access.
+///
+/// # Why not the address value id
+///
+/// The obvious encoding for `*ptr` is the `SsaVarId` of the address operand.
+/// That is wrong for native code in both directions:
+///
+/// - It is **imprecise**: `[rbp-8]` and `[rbp-16]` compute two different
+///   address values, so nothing relates them — even though they provably do not
+///   overlap. Every stack slot looks unrelated to every other.
+/// - It is **unstable**: the address is produced by a [`SsaOp::PtrAdd`], which
+///   is a pure op, so GVN and LICM freely re-number and hoist it. The identity
+///   of a memory cell would then depend on which optimization ran.
+///
+/// Decoding the address (via [`crate::analysis::address::normalize_address`])
+/// fixes both: the cell is named by what it *is*, not by which instruction computed
+/// it, and two accesses off a common base become comparable by offset.
+///
+/// # Soundness
+///
+/// Distinct `base` values are treated as **may-alias**. Two unrelated SSA
+/// pointers can hold the same address, so nothing in the address expression
+/// alone can rule that out; separating them requires a points-to oracle, which
+/// is not available to a pure function on locations (see
+/// [`pointsto`](crate::analysis::pointsto)). This is deliberately weaker than
+/// the managed-code variants above, which key on object identity.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct IndirectLocation {
+    /// Root value the address is measured from.
+    pub base: SsaVarId,
+    /// Scaled index term, when the address carries one.
+    pub index: Option<SsaVarId>,
+    /// Stride applied to [`Self::index`], in bytes.
+    ///
+    /// Meaningless without an index, and therefore held at `0` whenever
+    /// [`Self::index`] is `None` — see [`IndirectLocation::new`]. Keeping that
+    /// invariant is what lets the derived `Eq`/`Hash` agree with
+    /// [`must_alias`](Self::must_alias): otherwise two locations denoting the
+    /// same cell could differ in a field neither alias rule consults, and be
+    /// tracked as two separate memory versions.
+    pub stride_bytes: u64,
+    /// Constant displacement from [`Self::base`], in bits.
+    pub offset_bits: i64,
+    /// Width of the access in bits; `None` when the host reports no width.
+    pub size_bits: Option<u32>,
+    /// Address space the access is qualified by, or `None` for the target's
+    /// default (flat) space. Distinct spaces never alias.
+    pub address_space: Option<u16>,
+    /// Target pointer width this address was decoded against.
+    ///
+    /// Address arithmetic wraps here, so the width is part of what the offset
+    /// *means*: `+4294967288` and `-8` are one displacement on a 32-bit target
+    /// and two distinct ones on a 64-bit target.
+    /// [`normalize_address`](crate::analysis::address::normalize_address)
+    /// canonicalises every folded displacement into it, and
+    /// [`extents_overlap`](Self::extents_overlap) needs it to notice an access
+    /// that runs off the top of the address space and wraps to the bottom.
+    ///
+    /// Every location within one function shares this, so it does not fragment
+    /// the derived `Eq`/`Hash`.
+    pub ptr_size: PointerSize,
+}
+
+impl IndirectLocation {
+    /// Builds a location, normalizing the stride so it is `0` whenever there is
+    /// no index (see [`Self::stride_bytes`]).
+    #[must_use]
+    pub fn new(
+        base: SsaVarId,
+        index: Option<SsaVarId>,
+        stride_bytes: u64,
+        offset_bits: i64,
+        size_bits: Option<u32>,
+        address_space: Option<u16>,
+        ptr_size: PointerSize,
+    ) -> Self {
+        Self {
+            base,
+            index,
+            stride_bytes: if index.is_some() { stride_bytes } else { 0 },
+            offset_bits,
+            size_bits,
+            address_space,
+            ptr_size,
+        }
+    }
+
+    /// Returns `true` when this access runs past the top of the address space.
+    ///
+    /// Displacements are canonicalised into the signed pointer-width range, so
+    /// an access whose *end* exceeds that range wraps around to the bottom — and
+    /// can then overlap a low-offset access that the linear extent comparison
+    /// calls disjoint.
+    fn crosses_wrap_boundary(&self) -> bool {
+        let Some(size) = self.size_bits else {
+            return false;
+        };
+        // Highest representable signed displacement, in bits. Beyond 64-bit
+        // pointers this cannot overflow `i64` in a reachable way, and the shift
+        // would, so treat those as never wrapping.
+        let Some(max_bits) = 1i64
+            .checked_shl(self.ptr_size.bits().saturating_sub(1))
+            .and_then(|bytes| bytes.checked_mul(8))
+        else {
+            return false;
+        };
+        self.offset_bits
+            .checked_add(i64::from(size))
+            .is_none_or(|end| end > max_bits)
+    }
+
+    /// Returns `true` if the two accesses may touch overlapping memory.
+    #[must_use]
+    pub fn may_alias(&self, other: &Self) -> bool {
+        // Distinct address spaces are disjoint by construction: a segmented
+        // access and a flat one at the same numeric offset name different
+        // memory, so this holds even when everything else matches.
+        if self.address_space != other.address_space {
+            return false;
+        }
+        // Different roots: two distinct SSA pointers can hold the same address.
+        if self.base != other.base {
+            return true;
+        }
+        // A scaled index term whose contribution we cannot equate defeats any
+        // offset reasoning — the indices could take the same value.
+        if !self.index_matches(other) {
+            return true;
+        }
+        self.extents_overlap(other)
+    }
+
+    /// Returns `true` if the two accesses provably name exactly one cell.
+    #[must_use]
+    pub fn must_alias(&self, other: &Self) -> bool {
+        self.address_space == other.address_space
+            && self.base == other.base
+            && self.index_matches(other)
+            && self.offset_bits == other.offset_bits
+            // An unknown width cannot prove equal extent, so it never
+            // must-aliases -- not even against itself.
+            && matches!(
+                (self.size_bits, other.size_bits),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+
+    /// Returns `true` when both addresses carry the same scaled-index
+    /// contribution, so their constant offsets are directly comparable.
+    ///
+    /// Equal index *value ids* with equal strides contribute equally whatever
+    /// the runtime value. Anything else — different index values, different
+    /// strides, or an index on only one side (it could be zero) — is not
+    /// comparable.
+    fn index_matches(&self, other: &Self) -> bool {
+        match (self.index, other.index) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b && self.stride_bytes == other.stride_bytes,
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when the half-open bit extents `[offset, offset + size)`
+    /// intersect. An unknown width on either side overlaps anything.
+    fn extents_overlap(&self, other: &Self) -> bool {
+        let (Some(self_size), Some(other_size)) = (self.size_bits, other.size_bits) else {
+            return true;
+        };
+        // An access that wraps off the top of the address space reappears at the
+        // bottom, where the linear comparison below cannot see it. Refuse to
+        // prove disjointness rather than prove it wrongly.
+        if self.crosses_wrap_boundary() || other.crosses_wrap_boundary() {
+            return true;
+        }
+        let (Some(self_end), Some(other_end)) = (
+            self.offset_bits.checked_add(i64::from(self_size)),
+            other.offset_bits.checked_add(i64::from(other_size)),
+        ) else {
+            return true;
+        };
+        self.offset_bits < other_end && other.offset_bits < self_end
     }
 }
 
@@ -507,6 +736,19 @@ pub enum MemoryDefSite {
     },
 }
 
+/// One step of the dominator-tree walk in
+/// [`MemorySsa::rename_memory_versions`].
+///
+/// The walk is an explicit-stack DFS rather than recursion, so the scope
+/// restore that recursion would get for free is modelled as its own step.
+enum RenameStep<T: Target> {
+    /// Rename this block, then descend into its dominator-tree children.
+    Enter(usize),
+    /// Leaving a block's dominator subtree: pop one version for each location
+    /// listed, restoring the rename state that block's siblings must observe.
+    Exit(Vec<MemoryLocation<T>>),
+}
+
 /// Memory SSA representation.
 ///
 /// This structure tracks versioned memory locations throughout a function,
@@ -523,19 +765,32 @@ pub struct MemorySsa<T: Target> {
     /// Definition sites for each memory version.
     definitions: HashMap<MemoryVersion<T>, MemoryDefSite>,
 
-    /// Memory version at block entry for each location.
-    /// Key is (location, block), value is version.
-    entry_versions: HashMap<(MemoryLocation<T>, usize), u32>,
+    /// Memory version at block entry, keyed by `(interned location id, block)`.
+    ///
+    /// Keyed by an interned id rather than a cloned [`MemoryLocation`]: the map
+    /// holds up to `blocks × locations` entries, and an `Indirect` location is
+    /// ~48 bytes to clone and hash for every one of them.
+    entry_versions: HashMap<(u32, usize), u32>,
 
-    /// Memory version at block exit for each location.
-    /// Key is (location, block), value is version.
-    exit_versions: HashMap<(MemoryLocation<T>, usize), u32>,
+    /// Memory version at block exit, keyed by `(interned location id, block)`.
+    exit_versions: HashMap<(u32, usize), u32>,
+
+    /// Interning table: location to its index in [`Self::ordered_locations`].
+    location_ids: HashMap<MemoryLocation<T>, u32>,
 
     /// All identified memory operations.
     operations: Vec<MemoryOp<T>>,
 
     /// All unique memory locations in the function.
     locations: HashSet<MemoryLocation<T>>,
+    /// The same locations in first-appearance order.
+    ///
+    /// `locations` is a `HashSet`, so iterating it is nondeterministic across
+    /// runs. Version numbers and the order availability is seeded both derive
+    /// from that iteration, and the downstream similarity pipeline is
+    /// content-addressed — it requires byte-identical optimized IR. This list is
+    /// built from `operations`, which is instruction order.
+    ordered_locations: Vec<MemoryLocation<T>>,
 }
 
 impl<T: Target> MemorySsa<T> {
@@ -548,8 +803,10 @@ impl<T: Target> MemorySsa<T> {
             definitions: HashMap::new(),
             entry_versions: HashMap::new(),
             exit_versions: HashMap::new(),
+            location_ids: HashMap::new(),
             operations: Vec::new(),
             locations: HashSet::new(),
+            ordered_locations: Vec::new(),
         }
     }
 
@@ -564,22 +821,51 @@ impl<T: Target> MemorySsa<T> {
     ///
     /// * `ssa` - The SSA function to analyze.
     /// * `cfg` - The control flow graph of the function.
+    /// * `ptr_size` - Target pointer width, used to canonicalise folded address
+    ///   displacements. Address arithmetic wraps at this width, and the model
+    ///   cannot tell a sign-extended `-8` from a zero-extended `0xFFFF_FFF8`
+    ///   without it — see
+    ///   [`normalize_address`](crate::analysis::address::normalize_address).
     ///
     /// # Returns
     ///
     /// A complete Memory SSA representation.
     #[must_use]
-    pub fn build(ssa: &SsaFunction<T>, cfg: &SsaCfg<'_, T>) -> Self {
+    pub fn build(ssa: &SsaFunction<T>, cfg: &SsaCfg<'_, T>, ptr_size: PointerSize) -> Self {
         let mut mem_ssa = Self::new();
 
         // Phase 1: Identify all memory operations
-        mem_ssa.identify_memory_operations(ssa);
+        mem_ssa.identify_memory_operations(ssa, ptr_size);
+
+        // Renaming records an entry and an exit version for every location in
+        // every block, so the retained size is `2 × blocks × locations`. A
+        // function that is really misread data yields a distinct `Indirect`
+        // location per distinct `base + offset`, so the location count scales
+        // with the block count and the product is quadratic.
+        //
+        // Past the budget, drop the analysis rather than the process: an empty
+        // `MemorySsa` reports no locations, every alias query falls back to the
+        // conservative answer, and the memory pass simply finds nothing to do.
+        let budget = MAX_MEMORY_SSA_CELLS;
+        let cells = mem_ssa
+            .ordered_locations
+            .len()
+            .saturating_mul(ssa.block_count());
+        if cells > budget {
+            log::warn!(
+                "memory SSA exceeded its size budget ({} locations x {} blocks = {cells} cells, \
+                 bound {budget}); skipping memory analysis for this function",
+                mem_ssa.ordered_locations.len(),
+                ssa.block_count(),
+            );
+            return Self::new();
+        }
 
         // Phase 2: Place memory phi nodes
         mem_ssa.place_memory_phis(cfg);
 
         // Phase 3: Rename memory versions
-        mem_ssa.rename_memory_versions(ssa, cfg);
+        mem_ssa.rename_memory_versions(ssa, cfg, ptr_size);
 
         mem_ssa
     }
@@ -605,13 +891,15 @@ impl<T: Target> MemorySsa<T> {
     /// Returns the memory version at block entry for a location.
     #[must_use]
     pub fn version_at_entry(&self, location: &MemoryLocation<T>, block: usize) -> Option<u32> {
-        self.entry_versions.get(&(location.clone(), block)).copied()
+        let id = *self.location_ids.get(location)?;
+        self.entry_versions.get(&(id, block)).copied()
     }
 
     /// Returns the memory version at block exit for a location.
     #[must_use]
     pub fn version_at_exit(&self, location: &MemoryLocation<T>, block: usize) -> Option<u32> {
-        self.exit_versions.get(&(location.clone(), block)).copied()
+        let id = *self.location_ids.get(location)?;
+        self.exit_versions.get(&(id, block)).copied()
     }
 
     /// Returns the definition site for a memory version.
@@ -629,18 +917,29 @@ impl<T: Target> MemorySsa<T> {
     }
 
     /// Phase 1: Identify all memory operations in the SSA function.
-    fn identify_memory_operations(&mut self, ssa: &SsaFunction<T>) {
+    fn identify_memory_operations(&mut self, ssa: &SsaFunction<T>, ptr_size: PointerSize) {
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-            if let Some(mem_op) = Self::classify_memory_operation(instr.op(), block_idx, instr_idx)
+            if let Some(mem_op) =
+                Self::classify_memory_operation(ssa, instr.op(), block_idx, instr_idx, ptr_size)
             {
-                self.locations.insert(mem_op.location().clone());
+                if self.locations.insert(mem_op.location().clone()) {
+                    let id = u32::try_from(self.ordered_locations.len()).unwrap_or(u32::MAX);
+                    self.location_ids.insert(mem_op.location().clone(), id);
+                    self.ordered_locations.push(mem_op.location().clone());
+                }
                 self.operations.push(mem_op);
             }
         }
     }
 
     /// Classifies an SSA operation as a memory operation, if applicable.
-    fn classify_memory_operation(op: &SsaOp<T>, block: usize, instr: usize) -> Option<MemoryOp<T>> {
+    fn classify_memory_operation(
+        ssa: &SsaFunction<T>,
+        op: &SsaOp<T>,
+        block: usize,
+        instr: usize,
+        ptr_size: PointerSize,
+    ) -> Option<MemoryOp<T>> {
         match op {
             SsaOp::LoadField {
                 dest,
@@ -689,7 +988,7 @@ impl<T: Target> MemorySsa<T> {
             SsaOp::LoadElement {
                 dest, array, index, ..
             } => {
-                let idx = Self::resolve_array_index(*index);
+                let idx = Self::resolve_array_index(ssa, *index);
                 let location = MemoryLocation::ArrayElement(*array, idx);
                 Some(MemoryOp::Load {
                     location,
@@ -704,7 +1003,7 @@ impl<T: Target> MemorySsa<T> {
                 value,
                 ..
             } => {
-                let idx = Self::resolve_array_index(*index);
+                let idx = Self::resolve_array_index(ssa, *index);
                 let location = MemoryLocation::ArrayElement(*array, idx);
                 Some(MemoryOp::Store {
                     location,
@@ -713,8 +1012,14 @@ impl<T: Target> MemorySsa<T> {
                     instr,
                 })
             }
-            SsaOp::LoadIndirect { dest, addr, .. } => {
-                let location = MemoryLocation::Indirect(*addr);
+            SsaOp::LoadIndirect {
+                dest,
+                addr,
+                value_type,
+                address_space,
+            } => {
+                let location =
+                    Self::indirect_location(ssa, *addr, value_type, *address_space, ptr_size);
                 Some(MemoryOp::Load {
                     location,
                     dest: *dest,
@@ -722,8 +1027,14 @@ impl<T: Target> MemorySsa<T> {
                     instr,
                 })
             }
-            SsaOp::StoreIndirect { addr, value, .. } => {
-                let location = MemoryLocation::Indirect(*addr);
+            SsaOp::StoreIndirect {
+                addr,
+                value,
+                value_type,
+                address_space,
+            } => {
+                let location =
+                    Self::indirect_location(ssa, *addr, value_type, *address_space, ptr_size);
                 Some(MemoryOp::Store {
                     location,
                     value: *value,
@@ -780,11 +1091,38 @@ impl<T: Target> MemorySsa<T> {
         }
     }
 
-    /// Resolves an array index to an `ArrayIndex` abstraction.
-    fn resolve_array_index(index_var: SsaVarId) -> ArrayIndex {
-        // For now, treat all variable indices as unknown
-        // Could be improved with constant propagation
-        ArrayIndex::Variable(index_var)
+    /// Decodes an indirect access into an offset-aware memory location.
+    ///
+    /// The address is normalized to `base + index*stride + offset` rather than
+    /// keyed on `addr` itself, so the resulting cell identity survives the
+    /// address computation being re-numbered or hoisted. See
+    /// [`IndirectLocation`].
+    fn indirect_location(
+        ssa: &SsaFunction<T>,
+        addr: SsaVarId,
+        value_type: &T::Type,
+        address_space: Option<u16>,
+        ptr_size: PointerSize,
+    ) -> MemoryLocation<T> {
+        let address = normalize_address(ssa, addr, ptr_size);
+        MemoryLocation::Indirect(IndirectLocation::new(
+            address.base,
+            address.index,
+            address.stride_bytes,
+            address.offset_bits,
+            T::bit_width(value_type),
+            address_space,
+            ptr_size,
+        ))
+    }
+
+    /// Resolves an array index to an [`ArrayIndex`] abstraction, folding a
+    /// constant index so that distinct constant elements stop may-aliasing.
+    fn resolve_array_index(ssa: &SsaFunction<T>, index_var: SsaVarId) -> ArrayIndex {
+        match const_i64(ssa, index_var) {
+            Some(index) => ArrayIndex::Constant(index),
+            None => ArrayIndex::Variable(index_var),
+        }
     }
 
     /// Phase 2: Place memory phi nodes at dominance frontiers.
@@ -798,19 +1136,35 @@ impl<T: Target> MemorySsa<T> {
         let dom_tree = compute_dominators(cfg, cfg.entry());
         let frontiers = compute_dominance_frontiers(cfg, &dom_tree);
 
-        // For each memory location, find blocks that define it (stores)
+        // A definition of `L` is also a definition of every location it may
+        // alias. Memory versions are per-location, so without this a store to
+        // `*(p+16)` bumps only its own version and a barrier bumps only
+        // `Unknown` — leaving the version of a may-aliasing cell unchanged and
+        // therefore still looking forwardable across a block boundary.
         let mut def_blocks: HashMap<MemoryLocation<T>, BTreeSet<usize>> = HashMap::new();
         for op in &self.operations {
-            if op.defines_memory() {
-                def_blocks
-                    .entry(op.location().clone())
-                    .or_default()
-                    .insert(op.block());
+            if !op.defines_memory() {
+                continue;
+            }
+            let defined = op.location();
+            for location in &self.ordered_locations {
+                if location.may_alias(defined) {
+                    def_blocks
+                        .entry(location.clone())
+                        .or_default()
+                        .insert(op.block());
+                }
             }
         }
 
-        // Standard phi placement algorithm (iterated dominance frontier)
-        for (location, defs) in def_blocks {
+        // Standard phi placement algorithm (iterated dominance frontier).
+        // Iterated in `ordered_locations` order so version numbering does not
+        // depend on `HashMap` iteration order.
+        let ordered = self.ordered_locations.clone();
+        for location in ordered {
+            let Some(defs) = def_blocks.get(&location).cloned() else {
+                continue;
+            };
             let mut phi_blocks: BTreeSet<usize> = BTreeSet::new();
             let mut worklist: VecDeque<usize> = defs.iter().copied().collect();
             let mut processed: BTreeSet<usize> = BTreeSet::new();
@@ -851,7 +1205,27 @@ impl<T: Target> MemorySsa<T> {
     }
 
     /// Phase 3: Rename memory versions using dominator tree traversal.
-    fn rename_memory_versions(&mut self, ssa: &SsaFunction<T>, cfg: &SsaCfg<'_, T>) {
+    ///
+    /// Implements the renaming half of Cytron et al.: each block pushes the
+    /// versions its phis and stores define, recurses into its dominator-tree
+    /// children, then **pops exactly what it pushed** so that a sibling subtree
+    /// sees the state its own dominator left, not its sibling's.
+    ///
+    /// The walk is an explicit-stack DFS rather than recursion: dominator trees
+    /// on real functions reach thousands of blocks deep, and this crate denies
+    /// panics — a blown call stack is not a recoverable error.
+    ///
+    /// Version *numbering* is an opaque identity, not an ordering: phi versions
+    /// are allocated during phi placement (phase 2), so a location carrying phis
+    /// receives its entry version here with a number above them. Consumers that
+    /// need to recognise the entry version match [`MemoryDefSite::Entry`] via
+    /// [`MemorySsa::definition`] rather than comparing against zero.
+    fn rename_memory_versions(
+        &mut self,
+        ssa: &SsaFunction<T>,
+        cfg: &SsaCfg<'_, T>,
+        ptr_size: PointerSize,
+    ) {
         let block_count = cfg.node_count();
         if block_count == 0 {
             return;
@@ -860,11 +1234,12 @@ impl<T: Target> MemorySsa<T> {
         // Compute dominators for traversal order
         let dom_tree = compute_dominators(cfg, cfg.entry());
 
-        // Stack of versions for each location
+        // Live version stack per location; the top is the version reaching the
+        // block currently being renamed.
         let mut version_stacks: HashMap<MemoryLocation<T>, Vec<u32>> = HashMap::new();
 
-        // Initialize all locations with version 0 (entry version)
-        let locations: Vec<_> = self.locations.iter().cloned().collect();
+        // Seed every location with its function-entry version.
+        let locations = self.ordered_locations.clone();
         for location in locations {
             let entry_version = self.allocate_version(&location);
             version_stacks
@@ -877,44 +1252,66 @@ impl<T: Target> MemorySsa<T> {
             );
         }
 
-        // Rename in dominator tree order (preorder)
+        // Rename in dominator-tree preorder, restoring scope on the way out.
         let mut visited = vec![false; block_count];
-        let mut worklist = vec![cfg.entry().index()];
+        let mut worklist = vec![RenameStep::Enter(cfg.entry().index())];
 
-        while let Some(block_idx) = worklist.pop() {
-            match visited.get(block_idx) {
-                Some(true) => continue,
-                None => continue,
-                Some(false) => {}
-            }
-            if let Some(slot) = visited.get_mut(block_idx) {
-                *slot = true;
-            }
+        while let Some(step) = worklist.pop() {
+            match step {
+                RenameStep::Enter(block_idx) => {
+                    match visited.get(block_idx) {
+                        Some(true) | None => continue,
+                        Some(false) => {}
+                    }
+                    if let Some(slot) = visited.get_mut(block_idx) {
+                        *slot = true;
+                    }
 
-            self.rename_block(block_idx, ssa, cfg, &mut version_stacks);
+                    let pushed =
+                        self.rename_block(block_idx, ssa, cfg, &mut version_stacks, ptr_size);
 
-            // Add dominated blocks to worklist
-            for child in dom_tree.children(NodeId::new(block_idx)) {
-                if visited.get(child.index()).copied() == Some(false) {
-                    worklist.push(child.index());
+                    // Pushed before the children so it pops after all of them:
+                    // the subtree runs with this block's definitions live.
+                    worklist.push(RenameStep::Exit(pushed));
+                    for child in dom_tree.children(NodeId::new(block_idx)) {
+                        if visited.get(child.index()).copied() == Some(false) {
+                            worklist.push(RenameStep::Enter(child.index()));
+                        }
+                    }
+                }
+                RenameStep::Exit(pushed) => {
+                    for location in pushed {
+                        if let Some(stack) = version_stacks.get_mut(&location) {
+                            stack.pop();
+                        }
+                    }
                 }
             }
         }
     }
 
     /// Renames memory versions within a single block.
+    ///
+    /// Returns one entry per version pushed onto [`version_stacks`], which the
+    /// caller pops when leaving this block's dominator subtree. A block that
+    /// stores twice to the same location pushes twice and so appears twice.
+    ///
+    /// [`version_stacks`]: MemorySsa::rename_memory_versions
     fn rename_block(
         &mut self,
         block_idx: usize,
         ssa: &SsaFunction<T>,
         cfg: &SsaCfg<'_, T>,
         version_stacks: &mut HashMap<MemoryLocation<T>, Vec<u32>>,
-    ) {
-        // Record entry versions
-        for location in self.locations.clone() {
-            if let Some(&version) = version_stacks.get(&location).and_then(|s| s.last()) {
-                self.entry_versions
-                    .insert((location.clone(), block_idx), version);
+        ptr_size: PointerSize,
+    ) -> Vec<MemoryLocation<T>> {
+        let mut pushed: Vec<MemoryLocation<T>> = Vec::new();
+
+        // Record entry versions. Every location was seeded with a stack, so
+        // iterating the stacks covers `self.locations` without cloning it.
+        for (location, stack) in version_stacks.iter() {
+            if let Some((&version, &id)) = stack.last().zip(self.location_ids.get(location)) {
+                self.entry_versions.insert((id, block_idx), version);
             }
         }
 
@@ -925,41 +1322,60 @@ impl<T: Target> MemorySsa<T> {
                     .entry(phi.location.clone())
                     .or_default()
                     .push(phi.result_version);
+                pushed.push(phi.location);
             }
         }
 
         // Process instructions in the block
         let Some(block) = ssa.block(block_idx) else {
-            return;
+            return pushed;
         };
 
         for (instr_idx, instr) in block.instructions().iter().enumerate() {
             // Handle stores - create new version
-            if let Some(mem_op) = Self::classify_memory_operation(instr.op(), block_idx, instr_idx)
+            if let Some(mem_op) =
+                Self::classify_memory_operation(ssa, instr.op(), block_idx, instr_idx, ptr_size)
+                && mem_op.defines_memory()
             {
-                if mem_op.defines_memory() {
-                    let location = mem_op.location().clone();
+                // The op defines its own location *and clobbers every location
+                // it may alias*. A store to `*(p+16)` invalidates the overlapping
+                // `*(p+0)`; a call, fence, atomic, volatile or opaque op
+                // classifies to `Unknown`, which may-aliases everything and so
+                // invalidates all of memory. Versioning only the named location
+                // is what let a value survive across a block boundary that a
+                // barrier or an overlapping store had already destroyed.
+                //
+                // Matches `place_memory_phis`, which places phis for the same
+                // set, so every clobbered location has a merge point.
+                let defined = mem_op.location().clone();
+                let clobbered: Vec<MemoryLocation<T>> = self
+                    .ordered_locations
+                    .iter()
+                    .filter(|candidate| candidate.may_alias(&defined))
+                    .cloned()
+                    .collect();
+                for location in clobbered {
                     let new_version = self.allocate_version(&location);
                     version_stacks
                         .entry(location.clone())
                         .or_default()
                         .push(new_version);
                     self.definitions.insert(
-                        MemoryVersion::new(location, new_version),
+                        MemoryVersion::new(location.clone(), new_version),
                         MemoryDefSite::Store {
                             block: block_idx,
                             instr: instr_idx,
                         },
                     );
+                    pushed.push(location);
                 }
             }
         }
 
         // Record exit versions
-        for location in self.locations.clone() {
-            if let Some(&version) = version_stacks.get(&location).and_then(|s| s.last()) {
-                self.exit_versions
-                    .insert((location.clone(), block_idx), version);
+        for (location, stack) in version_stacks.iter() {
+            if let Some((&version, &id)) = stack.last().zip(self.location_ids.get(location)) {
+                self.exit_versions.insert((id, block_idx), version);
             }
         }
 
@@ -975,6 +1391,8 @@ impl<T: Target> MemorySsa<T> {
                 }
             }
         }
+
+        pushed
     }
 
     /// Returns statistics about the Memory SSA.

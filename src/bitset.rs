@@ -33,12 +33,41 @@
 ///
 /// This is commonly used for analyses that track sets of definitions,
 /// variables, or other entities identified by small integers.
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default)]
 pub struct BitSet {
     /// The bits, stored as a vector of words.
+    ///
+    /// May be shorter than `len.div_ceil(64)` — empty, in particular, for a set
+    /// built by [`BitSet::lazy`] that has not been written to. Every absent word
+    /// reads as zero. Because the same set therefore has more than one possible
+    /// representation, `PartialEq`, `Eq` and `Hash` are implemented by hand over
+    /// the *logical* contents rather than derived over these fields.
     words: Vec<u64>,
     /// The number of bits in the set.
     len: usize,
+}
+
+impl PartialEq for BitSet {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let words = self.len.div_ceil(64);
+        (0..words).all(|i| {
+            self.words.get(i).copied().unwrap_or(0) == other.words.get(i).copied().unwrap_or(0)
+        })
+    }
+}
+
+impl Eq for BitSet {}
+
+impl std::hash::Hash for BitSet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len.hash(state);
+        for i in 0..self.len.div_ceil(64) {
+            self.words.get(i).copied().unwrap_or(0).hash(state);
+        }
+    }
 }
 
 impl BitSet {
@@ -52,6 +81,74 @@ impl BitSet {
         }
     }
 
+    /// Creates a bit set of `capacity` bits whose backing words are not
+    /// allocated until the first write.
+    ///
+    /// Reads are indistinguishable from [`new`](Self::new): every bit is clear,
+    /// [`len`](Self::len) is `capacity`, and [`contains`](Self::contains) has
+    /// the same bounds behaviour. The difference is that an all-clear set costs
+    /// one `Vec` header instead of `capacity / 8` zeroed bytes.
+    ///
+    /// Use this where many sets are created and most stay empty.
+    /// [`compute_dominance_frontiers`](crate::graph::algorithms::compute_dominance_frontiers)
+    /// is the motivating case: it needs one set per graph node, but real
+    /// dominance frontiers are sparse, so the dense allocation is `O(V²)` bytes
+    /// of memset to hold almost nothing. On a 20k-block function that is ~50 MB
+    /// per call.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use analyssa::bitset::BitSet;
+    ///
+    /// let mut set = BitSet::lazy(1024);
+    /// assert_eq!(set.len(), 1024);
+    /// assert!(!set.contains(500));
+    /// assert!(set.is_empty());
+    ///
+    /// set.insert(500);
+    /// assert!(set.contains(500));
+    /// ```
+    #[must_use]
+    pub const fn lazy(capacity: usize) -> Self {
+        Self {
+            words: Vec::new(),
+            len: capacity,
+        }
+    }
+
+    /// Grows the set so `index` is representable, if it is not already.
+    ///
+    /// Used by containers keyed on SSA variable ids, which are sized from
+    /// `var_id_bound()` but can be handed a larger id by malformed IR. Growing
+    /// is the only option that neither loses the write (silently, so the value
+    /// reads back as absent — "dead", for a liveness set) nor aborts the process
+    /// on input the crate is specifically expected to survive.
+    pub fn ensure_capacity(&mut self, index: usize) {
+        let Some(required) = index.checked_add(1) else {
+            return;
+        };
+        if required <= self.len {
+            return;
+        }
+        self.len = required;
+        let words = required.div_ceil(64);
+        if !self.words.is_empty() || required > 0 {
+            self.words.resize(words, 0);
+        }
+    }
+
+    /// Allocates the backing words if this set was created by
+    /// [`lazy`](Self::lazy) and has not been written to yet.
+    ///
+    /// A set built by [`new`](Self::new) or [`full`](Self::full) always has its
+    /// words allocated when `len > 0`, so this is a no-op for those.
+    fn materialize(&mut self) {
+        if self.words.is_empty() && self.len > 0 {
+            self.words = vec![0; self.len.div_ceil(64)];
+        }
+    }
+
     /// Creates a new bit set with all bits set.
     #[must_use]
     pub fn full(capacity: usize) -> Self {
@@ -59,10 +156,10 @@ impl BitSet {
         let mut words = vec![u64::MAX; num_words];
 
         // Clear the excess bits in the last word
-        if !capacity.is_multiple_of(64) {
-            if let Some(last) = words.last_mut() {
-                *last = (1u64 << (capacity % 64)).saturating_sub(1);
-            }
+        if !capacity.is_multiple_of(64)
+            && let Some(last) = words.last_mut()
+        {
+            *last = (1u64 << (capacity % 64)).saturating_sub(1);
         }
 
         Self {
@@ -92,6 +189,7 @@ impl BitSet {
     /// Panics if `index >= self.len()`.
     pub fn insert(&mut self, index: usize) -> bool {
         assert!(index < self.len, "index out of bounds");
+        self.materialize();
         let word = index / 64;
         let bit = index % 64;
         let mask = 1u64 << bit;
@@ -194,14 +292,15 @@ impl BitSet {
 
     /// Sets all bits.
     pub fn fill(&mut self) {
+        self.materialize();
         for word in &mut self.words {
             *word = u64::MAX;
         }
         // Clear excess bits in last word
-        if !self.len.is_multiple_of(64) {
-            if let Some(last) = self.words.last_mut() {
-                *last = (1u64 << (self.len % 64)).saturating_sub(1);
-            }
+        if !self.len.is_multiple_of(64)
+            && let Some(last) = self.words.last_mut()
+        {
+            *last = (1u64 << (self.len % 64)).saturating_sub(1);
         }
     }
 
@@ -210,6 +309,12 @@ impl BitSet {
     /// Returns `true` if `self` changed.
     pub fn union_with(&mut self, other: &Self) -> bool {
         assert_eq!(self.len, other.len, "bit sets must have same length");
+        if other.words.is_empty() {
+            // `other` is lazy and still all-clear: the union is a no-op, and
+            // materializing `self` for it would defeat the point.
+            return false;
+        }
+        self.materialize();
         let mut changed = false;
         for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
             let old = *a;
@@ -224,6 +329,13 @@ impl BitSet {
     /// Returns `true` if `self` changed.
     pub fn intersect_with(&mut self, other: &Self) -> bool {
         assert_eq!(self.len, other.len, "bit sets must have same length");
+        if other.words.is_empty() {
+            // `other` is lazy and all-clear, so the intersection is empty. The
+            // zip below would iterate zero words and wrongly leave `self` alone.
+            let changed = !self.is_empty();
+            self.clear();
+            return changed;
+        }
         let mut changed = false;
         for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
             let old = *a;
@@ -391,6 +503,113 @@ mod tests {
 
             assert!(!BitSet::new(cap).is_full() || cap == 0);
         }
+    }
+
+    /// A lazily-allocated set must be observationally identical to an eager one.
+    /// It is used for the dominance-frontier rows, where most sets stay empty
+    /// but any of them may be read, unioned, or intersected.
+    #[test]
+    fn lazy_sets_behave_exactly_like_eager_ones() {
+        let eager = BitSet::new(200);
+        let lazy = BitSet::lazy(200);
+
+        assert_eq!(lazy.len(), eager.len());
+        assert_eq!(lazy.is_empty(), eager.is_empty());
+        assert_eq!(lazy.count(), eager.count());
+        assert_eq!(lazy.is_full(), eager.is_full());
+        assert_eq!(lazy.contains(0), eager.contains(0));
+        assert_eq!(lazy.contains(199), eager.contains(199));
+        assert_eq!(lazy.iter().count(), eager.iter().count());
+        assert_eq!(lazy, eager, "an untouched lazy set equals an eager one");
+    }
+
+    /// `BitSet` is `Hash`, so the two representations of one set must hash
+    /// alike or a lazy set and an eager set would land in different buckets.
+    #[test]
+    fn equal_sets_hash_equally_regardless_of_representation() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let hasher = RandomState::new();
+        let mut lazy = BitSet::lazy(200);
+        let mut eager = BitSet::new(200);
+
+        assert_eq!(lazy, eager);
+        assert_eq!(hasher.hash_one(&lazy), hasher.hash_one(&eager));
+
+        lazy.insert(3);
+        lazy.insert(150);
+        eager.insert(3);
+        eager.insert(150);
+        assert_eq!(lazy, eager);
+        assert_eq!(hasher.hash_one(&lazy), hasher.hash_one(&eager));
+
+        // Different capacities are different sets even when both are empty.
+        assert_ne!(BitSet::lazy(64), BitSet::lazy(128));
+    }
+
+    #[test]
+    fn writing_to_a_lazy_set_allocates_it() {
+        let mut set = BitSet::lazy(200);
+        assert!(
+            set.insert(64),
+            "first insert must report the bit as newly set"
+        );
+        assert!(set.contains(64));
+        assert!(!set.contains(63));
+        assert_eq!(set.count(), 1);
+        assert!(!set.is_empty());
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![64]);
+
+        let mut eager = BitSet::new(200);
+        eager.insert(64);
+        assert_eq!(set, eager);
+    }
+
+    #[test]
+    fn lazy_set_fill_and_is_full() {
+        let mut set = BitSet::lazy(130);
+        assert!(!set.is_full(), "an unallocated set is not full");
+        set.fill();
+        assert!(set.is_full());
+        assert_eq!(set.count(), 130);
+    }
+
+    #[test]
+    fn set_operations_against_a_lazy_operand() {
+        // union with an all-clear lazy set changes nothing
+        let mut a = BitSet::new(128);
+        a.insert(1);
+        a.insert(100);
+        let lazy = BitSet::lazy(128);
+        assert!(!a.union_with(&lazy));
+        assert_eq!(a.count(), 2);
+
+        // intersect with an all-clear lazy set empties the receiver
+        let mut b = BitSet::new(128);
+        b.insert(1);
+        b.insert(100);
+        assert!(
+            b.intersect_with(&lazy),
+            "intersection with the empty set changes b"
+        );
+        assert!(
+            b.is_empty(),
+            "intersecting with an all-clear set must clear b"
+        );
+
+        // difference against an all-clear lazy set changes nothing
+        let mut c = BitSet::new(128);
+        c.insert(7);
+        assert!(!c.difference_with(&lazy));
+        assert!(c.contains(7));
+
+        // a lazy receiver is materialized by a union that has something to add
+        let mut d = BitSet::lazy(128);
+        let mut src = BitSet::new(128);
+        src.insert(42);
+        assert!(d.union_with(&src));
+        assert!(d.contains(42));
+        assert_eq!(d.count(), 1);
     }
 
     #[test]

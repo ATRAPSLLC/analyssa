@@ -263,7 +263,6 @@ impl<T: Target> SsaExceptionHandler<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::testing::MockTarget;
 
     fn handler(flags: u32) -> SsaExceptionHandler<MockTarget> {

@@ -1,9 +1,10 @@
 //! Diamond and loop-shaped SSA fixtures for infrastructure coverage.
 
 use analyssa::{
+    PointerSize,
     analysis::{
-        loop_analyzer::SsaLoopAnalysis, LoopForest, LoopType, SsaCfg, SsaEvaluator, SsaVerifier,
-        VerifyLevel,
+        LoopForest, LoopType, SsaCfg, SsaEvaluator, SsaVerifier, VerifyLevel,
+        loop_analyzer::SsaLoopAnalysis,
     },
     graph::NodeId,
     ir::{
@@ -16,7 +17,6 @@ use analyssa::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     testing::{MockTarget, MockType},
-    PointerSize,
 };
 
 fn some_or_abort<T>(value: Option<T>) -> T {

@@ -36,6 +36,7 @@ use std::{
 };
 
 use crate::{
+    BitSet,
     ir::{
         instruction::SsaInstruction,
         ops::SsaOp,
@@ -43,7 +44,6 @@ use crate::{
         variable::SsaVarId,
     },
     target::Target,
-    BitSet,
 };
 
 /// Result of a variable replacement operation.
@@ -104,7 +104,7 @@ impl std::ops::Add for ReplaceResult {
 /// // Add instructions
 /// block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(result) }));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
@@ -128,6 +128,48 @@ pub struct SsaBlock<T: Target> {
 
     /// SSA instructions in execution order.
     instructions: Vec<SsaInstruction<T>>,
+}
+
+impl<T: Target> Clone for SsaBlock<T> {
+    fn clone(&self) -> Self {
+        let Self {
+            id,
+            phi_nodes,
+            instructions,
+        } = self;
+        Self {
+            id: *id,
+            phi_nodes: phi_nodes.clone(),
+            instructions: instructions.clone(),
+        }
+    }
+
+    /// Overwrites `self` from `source`, **reusing this block's existing
+    /// allocations**.
+    ///
+    /// Hand-written for the same reason as
+    /// [`SsaFunction::clone_from`](crate::ir::function::SsaFunction): the
+    /// derived `Clone` supplies only the default `clone_from`
+    /// (`*self = source.clone()`), which drops and reallocates this block's
+    /// `phi_nodes` and `instructions` buffers on every call. `Vec::clone_from`
+    /// calls `clone_from` element-wise over the overlap, so specializing here is
+    /// what lets a `SsaFunction` snapshot's capacity reuse reach *inside* the
+    /// per-block vectors instead of stopping at the `blocks` spine — the
+    /// instruction buffer is the largest per-block allocation the optimization
+    /// pipeline's repeated rollback snapshots would otherwise re-make.
+    ///
+    /// The exhaustive destructure is deliberate: adding a field makes this fail
+    /// to compile rather than silently producing a stale-in-one-field clone.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            id,
+            phi_nodes,
+            instructions,
+        } = source;
+        self.id = *id;
+        self.phi_nodes.clone_from(phi_nodes);
+        self.instructions.clone_from(instructions);
+    }
 }
 
 impl<T: Target> SsaBlock<T> {
@@ -519,7 +561,32 @@ impl<T: Target> SsaBlock<T> {
             return None;
         }
 
-        // That operation must be an unconditional control transfer
+        // That operation must be a plain unconditional jump.
+        //
+        // `SsaOp::Leave` is deliberately *not* a trampoline. It exits a protected
+        // region, and the passes that consume this treat a trampoline as pure
+        // forwarding: they redirect predecessors past the block and clear it,
+        // which rewrites `pred -> Leave(target)` into `pred -> Jump(target)` and
+        // silently drops the region-exit semantics. `canonicalize` protects
+        // `Leave` targets for the same reason.
+        match self.instructions.first()?.op() {
+            SsaOp::Jump { target } => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// Returns the target when this block's only instruction is an
+    /// unconditional transfer — either [`SsaOp::Jump`] or [`SsaOp::Leave`].
+    ///
+    /// Unlike [`Self::is_trampoline`] this includes `Leave`, so it answers
+    /// "does this block do nothing but transfer control" rather than "may this
+    /// block be bypassed and removed". Use it for structural queries; use
+    /// `is_trampoline` for anything that rewrites the CFG.
+    #[must_use]
+    pub fn is_unconditional_transfer(&self) -> Option<usize> {
+        if !self.phi_nodes.is_empty() || self.instructions.len() != 1 {
+            return None;
+        }
         match self.instructions.first()?.op() {
             SsaOp::Jump { target } | SsaOp::Leave { target } => Some(*target),
             _ => None,
@@ -641,9 +708,17 @@ impl<T: Target> SsaBlock<T> {
             .map(|(pos, &idx)| (idx, pos))
             .collect();
 
+        // Sparse adjacency, not two n x n bit matrices. Kahn's algorithm needs
+        // only an in-degree count and the reverse edges; the forward set was
+        // read solely via `BitSet::count` to seed those degrees, so materialising
+        // it cost O(n²) bits to answer a question each edge could answer as it
+        // was discovered. A duplicate edge (an instruction using one variable
+        // twice, or a data edge that coincides with a side-effect edge) now
+        // increments and decrements symmetrically, so the count still reaches
+        // zero exactly once.
         let n = non_terminator_indices.len();
-        let mut deps: Vec<BitSet> = (0..n).map(|_| BitSet::new(n)).collect();
-        let mut rdeps: Vec<BitSet> = (0..n).map(|_| BitSet::new(n)).collect();
+        let mut in_degree: Vec<usize> = vec![0; n];
+        let mut rdeps: Vec<Vec<usize>> = vec![Vec::new(); n];
 
         // Track the previous side-effecting instruction position to preserve ordering.
         // Side-effecting operations (Call, CallVirt, Stfld, etc.) must execute in their
@@ -662,17 +737,16 @@ impl<T: Target> SsaBlock<T> {
                     return;
                 }
                 // Skip if not defined in this block
-                if let Some(&dep_idx) = def_index.get(&used) {
-                    if dep_idx != idx {
-                        if let Some(&dep_pos) = idx_to_pos.get(&dep_idx) {
-                            // instruction at pos depends on instruction at dep_pos
-                            if let Some(d) = deps.get_mut(pos) {
-                                d.insert(dep_pos);
-                            }
-                            if let Some(r) = rdeps.get_mut(dep_pos) {
-                                r.insert(pos);
-                            }
-                        }
+                if let Some(&dep_idx) = def_index.get(&used)
+                    && dep_idx != idx
+                    && let Some(&dep_pos) = idx_to_pos.get(&dep_idx)
+                {
+                    // instruction at pos depends on instruction at dep_pos
+                    if let Some(degree) = in_degree.get_mut(pos) {
+                        *degree = degree.saturating_add(1);
+                    }
+                    if let Some(r) = rdeps.get_mut(dep_pos) {
+                        r.push(pos);
                     }
                 }
             });
@@ -683,11 +757,11 @@ impl<T: Target> SsaBlock<T> {
             if !instr.op().is_pure() {
                 if let Some(prev_pos) = prev_side_effect_pos {
                     // This side-effecting instruction depends on the previous one
-                    if let Some(d) = deps.get_mut(pos) {
-                        d.insert(prev_pos);
+                    if let Some(degree) = in_degree.get_mut(pos) {
+                        *degree = degree.saturating_add(1);
                     }
                     if let Some(r) = rdeps.get_mut(prev_pos) {
-                        r.insert(pos);
+                        r.push(pos);
                     }
                 }
                 prev_side_effect_pos = Some(pos);
@@ -695,7 +769,6 @@ impl<T: Target> SsaBlock<T> {
         }
 
         // Kahn's algorithm: process instructions with no unsatisfied dependencies
-        let mut in_degree: Vec<usize> = deps.iter().map(BitSet::count).collect();
         let mut ready: VecDeque<usize> = VecDeque::new();
 
         // Find instructions with no dependencies (in_degree == 0)
@@ -714,7 +787,7 @@ impl<T: Target> SsaBlock<T> {
             let Some(rd) = rdeps.get(pos) else {
                 continue;
             };
-            for dep_pos in rd.iter() {
+            for &dep_pos in rd {
                 if let Some(slot) = in_degree.get_mut(dep_pos) {
                     *slot = slot.saturating_sub(1);
                     if *slot == 0 {

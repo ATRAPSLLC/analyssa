@@ -1,0 +1,33 @@
+[package]
+name = "analyssa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.4.2", features = ["derive"] }
+
+[dependencies.analyssa]
+path = ".."
+
+# Fuzz targets are built as their own binaries; the workspace exclusion keeps
+# `cargo test` at the repo root from trying to build them.
+[workspace]
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipeline"
+path = "fuzz_targets/pipeline.rs"
+test = false
+doc = false
+bench = false

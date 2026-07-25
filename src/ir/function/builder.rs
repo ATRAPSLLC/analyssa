@@ -13,6 +13,7 @@ use crate::{
     error::{Error, Result},
     ir::{
         block::SsaBlock,
+        function::SsaFunction,
         instruction::SsaInstruction,
         ops::{
             AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind, CmpKind, FenceKind,
@@ -28,8 +29,6 @@ use crate::{
     },
     target::{Target, VectorShuffleMask},
 };
-
-use super::SsaFunction;
 
 /// Describes a definition that a builder-created instruction or phi node will produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1838,6 +1837,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             dest,
             addr,
             value_type,
+            address_space: None,
         })
     }
 
@@ -1856,6 +1856,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             addr,
             value,
             value_type,
+            address_space: None,
         })
     }
 
@@ -2035,11 +2036,18 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     /// # Errors
     ///
     /// Returns an error if instruction insertion fails.
-    pub fn init_blk(&mut self, dest_addr: SsaVarId, value: SsaVarId, size: SsaVarId) -> Result<()> {
+    pub fn init_blk(
+        &mut self,
+        dest_addr: SsaVarId,
+        value: SsaVarId,
+        size: SsaVarId,
+        reverse: bool,
+    ) -> Result<()> {
         self.emit_no_defs(SsaOp::InitBlk {
             dest_addr,
             value,
             size,
+            reverse,
         })
     }
 
@@ -2053,11 +2061,13 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         dest_addr: SsaVarId,
         src_addr: SsaVarId,
         size: SsaVarId,
+        reverse: bool,
     ) -> Result<()> {
         self.emit_no_defs(SsaOp::CopyBlk {
             dest_addr,
             src_addr,
             size,
+            reverse,
         })
     }
 
@@ -3144,6 +3154,7 @@ mod tests {
     use crate::{
         analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
         ir::{
+            ConstValue, SsaDefSpec, SsaFunctionBuilder,
             function::VectorFaultingLoadSpec,
             ops::{
                 AtomicAccessWidth, AtomicOrdering, FlagCondition, FlagsMask, SsaEffectKind,
@@ -3151,7 +3162,6 @@ mod tests {
                 VectorMaskMode, VectorSegmentLayout,
             },
             variable::{DefSite, SsaVarId, VariableOrigin},
-            ConstValue, SsaDefSpec, SsaFunctionBuilder,
         },
         testing::{MockTarget, MockType},
     };

@@ -103,6 +103,44 @@ where
     changed
 }
 
+/// Blocks that must not be merged *into* — a region entry absorbing a
+/// predecessor from outside would pull non-region code into the region.
+///
+/// Together with [`exception_region_ends`] these are the exception-region
+/// boundaries. Every path that removes or bypasses a block has to respect them:
+/// nothing in the crate rewrites `handler_start_block` / `filter_start_block`
+/// after a block is emptied, so a boundary block that is silently dropped leaves
+/// the exception edge pointing at a block with no terminator, and the real
+/// handler body loses its only root.
+fn exception_region_starts<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
+    let mut starts = BitSet::new(ssa.block_count());
+    for handler in ssa.exception_handlers() {
+        for block in [handler.try_start_block, handler.handler_start_block]
+            .into_iter()
+            .chain(std::iter::once(handler.filter_start_block))
+            .flatten()
+        {
+            starts.insert_checked(block);
+        }
+    }
+    starts
+}
+
+/// Blocks that must not be merged *from* — a region end absorbing its successor
+/// would extend the region past its boundary.
+fn exception_region_ends<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
+    let mut ends = BitSet::new(ssa.block_count());
+    for handler in ssa.exception_handlers() {
+        for block in [handler.try_end_block, handler.handler_end_block]
+            .into_iter()
+            .flatten()
+        {
+            ends.insert_checked(block);
+        }
+    }
+    ends
+}
+
 fn run_trampoline_iteration<T, L>(
     ssa: &mut SsaFunction<T>,
     method: &T::MethodRef,
@@ -113,10 +151,27 @@ where
     L: EventListener<T> + ?Sized,
 {
     let mut trampolines = ssa.find_trampoline_blocks(true);
+    // Nothing to filter, so do not pay for the loop forest. This runs once per
+    // fixpoint iteration, including the terminating one that finds nothing —
+    // and `loop_canonical_blocks` builds the whole loop forest.
+    if trampolines.is_empty() {
+        return 0;
+    }
     // Preserve canonical loop preheaders so this pass does not fight the loop
     // canonicalizer (which re-inserts any preheader merged away here).
     let preheaders = loop_canonical_blocks(ssa);
-    trampolines.retain(|block, _| !preheaders.contains(block));
+    // ...and preserve exception-region boundaries, which `coalesce_blocks`
+    // already refuses to merge across. `find_trampoline_blocks` only skips the
+    // entry block, so without this a handler or filter entry that happens to be
+    // a bare forwarding jump has its predecessors redirected past it and is then
+    // cleared — leaving `handler_start_block` pointing at an empty block.
+    let region_starts = exception_region_starts(ssa);
+    let region_ends = exception_region_ends(ssa);
+    trampolines.retain(|block, _| {
+        !preheaders.contains(block)
+            && !region_starts.contains_checked(*block)
+            && !region_ends.contains_checked(*block)
+    });
     if trampolines.is_empty() {
         return 0;
     }
@@ -345,25 +400,8 @@ where
     //   predecessor outside the region would pull non-region code in.
     // - Region *end* blocks must not be the merge source — absorbing a
     //   successor outside the region would extend the region.
-    let mut no_merge_into = BitSet::new(ssa.block_count());
-    let mut no_merge_from = BitSet::new(ssa.block_count());
-    for handler in ssa.exception_handlers() {
-        if let Some(b) = handler.try_start_block {
-            no_merge_into.insert(b);
-        }
-        if let Some(b) = handler.try_end_block {
-            no_merge_from.insert(b);
-        }
-        if let Some(b) = handler.handler_start_block {
-            no_merge_into.insert(b);
-        }
-        if let Some(b) = handler.handler_end_block {
-            no_merge_from.insert(b);
-        }
-        if let Some(b) = handler.filter_start_block {
-            no_merge_into.insert(b);
-        }
-    }
+    let no_merge_into = exception_region_starts(ssa);
+    let no_merge_from = exception_region_ends(ssa);
 
     for _ in 0..max_iterations {
         let mut iteration_merges: usize = 0;
@@ -490,13 +528,14 @@ mod tests {
         events::EventLog,
         ir::{
             block::SsaBlock,
+            exception::SsaExceptionHandler,
             instruction::SsaInstruction,
             ops::SsaOp,
             phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, run_mock_pass_boundary},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -515,6 +554,91 @@ mod tests {
             DefSite::instruction(block, instr),
             MockType::I32,
         )
+    }
+
+    /// A handler entry that is a bare forwarding jump must survive the
+    /// trampoline pass. `coalesce_blocks` already refuses to merge across an
+    /// exception-region boundary; the trampoline path had no such guard, so it
+    /// redirected the region's predecessors past the handler entry and cleared
+    /// it. Nothing in the crate rewrites `handler_start_block` afterwards, so the
+    /// exception edge would still point at a now-empty block and the real handler
+    /// body would lose its only root.
+    #[test]
+    fn a_handler_entry_that_is_a_trampoline_is_not_removed() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b1);
+
+        // The handler entry: a bare forwarding jump into the handler body.
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(instr(SsaOp::Jump { target: 3 }));
+        ssa.add_block(b2);
+
+        let mut b3 = SsaBlock::new(3);
+        b3.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b3);
+
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 0,
+            try_offset: 0,
+            try_length: 1,
+            handler_offset: 2,
+            handler_length: 1,
+            class_token_or_filter: 0,
+            try_start_block: Some(0),
+            try_end_block: Some(1),
+            handler_start_block: Some(2),
+            handler_end_block: Some(3),
+            filter_start_block: None,
+        }]);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run(&mut ssa, &0u32, &log, 8);
+
+        let handler_entry = ssa.block(2).expect("handler entry block must still exist");
+        assert!(
+            handler_entry.terminator_op().is_some(),
+            "the handler entry must keep its terminator; `handler_start_block` \
+             still points here and nothing rewrites it"
+        );
+        // Coalescing the entry with its body is fine — the entry keeps a
+        // terminator and still roots the handler. What must never happen is the
+        // entry being *emptied*, which is what the trampoline path did.
+        assert!(
+            !handler_entry.instructions().is_empty(),
+            "the handler entry must not be cleared out from under \
+             `handler_start_block`"
+        );
+    }
+
+    /// `SsaOp::Leave` exits a protected region. Treating it as a plain
+    /// forwarding jump rewrites `pred -> Leave(target)` into
+    /// `pred -> Jump(target)`, dropping the region-exit semantics.
+    #[test]
+    fn a_leave_only_block_is_not_a_trampoline() {
+        let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Leave { target: 1 }));
+        assert_eq!(
+            block.is_trampoline(),
+            None,
+            "Leave carries region-exit semantics a Jump does not"
+        );
+        assert_eq!(
+            block.is_unconditional_transfer(),
+            Some(1),
+            "but it is still structurally an unconditional transfer"
+        );
+
+        let mut jump: SsaBlock<MockTarget> = SsaBlock::new(1);
+        jump.add_instruction(instr(SsaOp::Jump { target: 2 }));
+        assert_eq!(jump.is_trampoline(), Some(2));
     }
 
     #[test]

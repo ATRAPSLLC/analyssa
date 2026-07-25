@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    analysis::algebraic::{simplify_op, SimplifyResult},
+    analysis::algebraic::{SimplifyResult, simplify_op},
     events::{EventKind, EventListener},
     ir::{
         function::{SsaEditOptions, SsaFunction},
@@ -91,7 +91,7 @@ fn find_candidates<T: Target>(
     let mut candidates = Vec::new();
     for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
         let op = instr.op();
-        if let Some(candidate) = check_simplification(op, block_idx, instr_idx, constants) {
+        if let Some(candidate) = check_simplification(ssa, op, block_idx, instr_idx, constants) {
             candidates.push(candidate);
         }
     }
@@ -99,6 +99,7 @@ fn find_candidates<T: Target>(
 }
 
 fn check_simplification<T: Target>(
+    ssa: &SsaFunction<T>,
     op: &SsaOp<T>,
     block_idx: usize,
     instr_idx: usize,
@@ -108,7 +109,16 @@ fn check_simplification<T: Target>(
         return None;
     }
     let dest = op.dest()?;
-    match simplify_op(op, constants) {
+    // The *operand* type decides whether a self-cancelling identity holds
+    // (`x - x` is NaN for a NaN float) and at what width its constant should be
+    // materialised. A comparison's destination is a boolean, so the destination
+    // type would answer neither question.
+    let operand_type = op
+        .uses()
+        .first()
+        .and_then(|operand| ssa.variable(*operand))
+        .map(|var| var.var_type().clone());
+    match simplify_op(op, constants, operand_type.as_ref()) {
         SimplifyResult::Constant(value) => Some(SimplificationCandidate {
             block_idx,
             instr_idx,
@@ -176,14 +186,14 @@ where
 mod tests {
     use super::*;
     use crate::{
+        NullListener,
         events::EventLog,
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{mock_op_at, run_mock_pass_boundary, MockTarget, MockType},
-        NullListener,
+        testing::{MockTarget, MockType, mock_op_at, run_mock_pass_boundary},
     };
 
     fn build_function() -> SsaFunction<MockTarget> {
@@ -240,6 +250,115 @@ mod tests {
         f.add_block(block);
         f.recompute_uses();
         f
+    }
+
+    /// `x - x` is NaN when `x` is NaN, and `x == x` is *false* for NaN. `Sub`,
+    /// `Ceq`, `Clt` and `Cgt` carry no float discriminator — `ConstValue` folds
+    /// `F32`/`F64` pairs for all of them — so the operand's declared type is the
+    /// only thing that can distinguish the sound case from the unsound one.
+    #[test]
+    fn self_cancelling_identities_are_refused_on_float_operands() {
+        let ssa = typed_fn(&[MockType::F64, MockType::F64, MockType::F64]);
+        let x = SsaVarId::from_index(0);
+        let dest = SsaVarId::from_index(2);
+        let constants: BTreeMap<SsaVarId, ConstValue<MockTarget>> = BTreeMap::new();
+
+        for op in [
+            SsaOp::<MockTarget>::Sub {
+                dest,
+                left: x,
+                right: x,
+                flags: None,
+            },
+            SsaOp::Ceq {
+                dest,
+                left: x,
+                right: x,
+            },
+            SsaOp::Clt {
+                dest,
+                left: x,
+                right: x,
+                unsigned: false,
+            },
+        ] {
+            assert!(
+                check_simplification(&ssa, &op, 0, 0, &constants).is_none(),
+                "{op:?} must not fold on a float operand"
+            );
+        }
+    }
+
+    /// The same identities on integers must still fold — the guard must not cost
+    /// the optimization it protects.
+    #[test]
+    fn self_cancelling_identities_still_fold_on_integer_operands() {
+        let ssa = int_fn();
+        let x = SsaVarId::from_index(0);
+        let dest = SsaVarId::from_index(2);
+        let constants: BTreeMap<SsaVarId, ConstValue<MockTarget>> = BTreeMap::new();
+
+        let sub: SsaOp<MockTarget> = SsaOp::Sub {
+            dest,
+            left: x,
+            right: x,
+            flags: None,
+        };
+        let candidate =
+            check_simplification(&ssa, &sub, 0, 0, &constants).expect("x - x folds for integers");
+        assert!(matches!(
+            candidate.simplification,
+            Simplification::Constant(ConstValue::I32(0))
+        ));
+    }
+
+    /// `xor rax, rax` is the ubiquitous zeroing idiom. Folding it to an `I32`
+    /// zero redefines a 64-bit destination with a 32-bit constant.
+    #[test]
+    fn self_cancellation_materialises_a_constant_of_the_operand_width() {
+        let ssa = typed_fn(&[MockType::I64, MockType::I64, MockType::I64]);
+        let x = SsaVarId::from_index(0);
+        let dest = SsaVarId::from_index(2);
+        let constants: BTreeMap<SsaVarId, ConstValue<MockTarget>> = BTreeMap::new();
+
+        let xor: SsaOp<MockTarget> = SsaOp::Xor {
+            dest,
+            left: x,
+            right: x,
+            flags: None,
+        };
+        let candidate =
+            check_simplification(&ssa, &xor, 0, 0, &constants).expect("x ^ x folds for integers");
+        assert!(
+            matches!(
+                candidate.simplification,
+                Simplification::Constant(ConstValue::I64(0))
+            ),
+            "a 64-bit operand must yield a 64-bit zero, got {:?}",
+            candidate.simplification
+        );
+    }
+
+    /// Three `I32` variables (v0..v2), enough for any binary op's operands and
+    /// destination. `check_simplification` reads the *operand* type to decide
+    /// whether a self-cancelling identity is sound and at what width to
+    /// materialise its constant.
+    fn int_fn() -> SsaFunction<MockTarget> {
+        typed_fn(&[MockType::I32, MockType::I32, MockType::I32])
+    }
+
+    /// Same, with caller-chosen types.
+    fn typed_fn(types: &[MockType]) -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        for (idx, ty) in types.iter().enumerate() {
+            ssa.create_variable(
+                VariableOrigin::Local(u16::try_from(idx).unwrap_or(0)),
+                0,
+                DefSite::instruction(0, idx),
+                *ty,
+            );
+        }
+        ssa
     }
 
     #[test]
@@ -314,7 +433,7 @@ mod tests {
             unsigned: false,
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("div-by-1 should simplify");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == left));
     }
@@ -333,7 +452,8 @@ mod tests {
             unsigned: false,
             flags: None,
         };
-        let candidate = check_simplification(&op, 0, 0, &constants).expect("rem-by-1 simplifies");
+        let candidate =
+            check_simplification(&int_fn(), &op, 0, 0, &constants).expect("rem-by-1 simplifies");
         assert!(matches!(
             candidate.simplification,
             Simplification::Constant(ConstValue::I32(0))
@@ -350,7 +470,8 @@ mod tests {
             left: x,
             right: x,
         };
-        let candidate = check_simplification(&op, 0, 0, &constants).expect("ceq(x,x) simplifies");
+        let candidate =
+            check_simplification(&int_fn(), &op, 0, 0, &constants).expect("ceq(x,x) simplifies");
         assert!(matches!(
             candidate.simplification,
             Simplification::Constant(ConstValue::I32(1))
@@ -368,7 +489,8 @@ mod tests {
             right: x,
             unsigned: false,
         };
-        let candidate = check_simplification(&op, 0, 0, &constants).expect("clt(x,x) simplifies");
+        let candidate =
+            check_simplification(&int_fn(), &op, 0, 0, &constants).expect("clt(x,x) simplifies");
         assert!(matches!(
             candidate.simplification,
             Simplification::Constant(ConstValue::I32(0))
@@ -386,7 +508,8 @@ mod tests {
             right: x,
             unsigned: false,
         };
-        let candidate = check_simplification(&op, 0, 0, &constants).expect("cgt(x,x) simplifies");
+        let candidate =
+            check_simplification(&int_fn(), &op, 0, 0, &constants).expect("cgt(x,x) simplifies");
         assert!(matches!(
             candidate.simplification,
             Simplification::Constant(ConstValue::I32(0))
@@ -405,7 +528,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x + 0 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -422,7 +545,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x * 1 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -439,7 +562,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x * 0 should simplify to 0");
         assert!(matches!(
             candidate.simplification,
@@ -458,7 +581,7 @@ mod tests {
             right: x,
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x - x should simplify to 0");
         assert!(matches!(
             candidate.simplification,
@@ -477,7 +600,7 @@ mod tests {
             right: x,
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x & x should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -493,7 +616,7 @@ mod tests {
             right: x,
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x | x should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -510,7 +633,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x & -1 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -527,7 +650,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x | 0 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -544,7 +667,7 @@ mod tests {
             right: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x ^ 0 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -561,7 +684,7 @@ mod tests {
             amount: SsaVarId::from_index(1),
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x << 0 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -579,7 +702,7 @@ mod tests {
             unsigned: false,
             flags: None,
         };
-        let result = check_simplification(&op, 0, 0, &constants);
+        let result = check_simplification(&int_fn(), &op, 0, 0, &constants);
         let candidate = result.expect("x >> 0 should simplify to x");
         assert!(matches!(candidate.simplification, Simplification::Copy(v) if v == x));
     }
@@ -596,7 +719,7 @@ mod tests {
             right: y,
             flags: None,
         };
-        assert!(check_simplification(&op, 0, 0, &constants).is_none());
+        assert!(check_simplification(&int_fn(), &op, 0, 0, &constants).is_none());
     }
 
     #[test]

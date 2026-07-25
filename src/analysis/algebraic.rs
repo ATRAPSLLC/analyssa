@@ -41,7 +41,7 @@
 //!
 //! ```rust
 //! use analyssa::analysis::algebraic::{simplify_op, SimplifyResult};
-//! use analyssa::{MockTarget, ir::{ConstValue, SsaOp, SsaVarId}};
+//! use analyssa::{MockTarget, testing::MockType, ir::{ConstValue, SsaOp, SsaVarId}};
 //! use std::collections::BTreeMap;
 //!
 //! let x = SsaVarId::from_index(0);
@@ -49,7 +49,9 @@
 //! let dest = SsaVarId::from_index(2);
 //! let constants = BTreeMap::from([(zero, ConstValue::<MockTarget>::I32(0))]);
 //! let op = SsaOp::<MockTarget>::Add { dest, left: x, right: zero, flags: None };
-//! match simplify_op(&op, &constants) {
+//! // The operand type decides whether a self-cancelling identity is sound
+//! // (`x - x` is NaN for a NaN float) and at what width its constant is built.
+//! match simplify_op(&op, &constants, Some(&MockType::I32)) {
 //!     SimplifyResult::Constant(value) => { /* replace with constant */ }
 //!     SimplifyResult::Copy(var) => assert_eq!(var, x),
 //!     SimplifyResult::None => { /* no simplification */ }
@@ -96,12 +98,37 @@ impl<T: Target> SimplifyResult<T> {
 pub fn simplify_op<T: Target>(
     op: &SsaOp<T>,
     constants: &BTreeMap<SsaVarId, ConstValue<T>>,
+    operand_type: Option<&T::Type>,
 ) -> SimplifyResult<T> {
+    // Self-cancelling identities (`x - x`, `x ^ x`, `x == x`, `x < x`) hold for
+    // integers and pointers but not for floats: `x - x` is NaN when `x` is NaN or
+    // infinite, and `x == x` is *false* for NaN. `Sub`/`Xor`/`Ceq`/`Clt`/`Cgt`
+    // carry no float discriminator — `ConstValue` folds `F32`/`F64` pairs for all
+    // of them — so the operand's declared type is the only thing that can tell
+    // them apart. An unknown type is treated as possibly-float and refused.
+    let self_identity_is_sound =
+        operand_type.is_some_and(|ty| !T::is_floating(ty) && !T::is_unknown(ty));
+    // Self-cancellation produces a zero (or one) *of the operand's type*.
+    // Hard-coding `I32` redefines an `I64` or `F64` destination with a 32-bit
+    // constant — `xor rax, rax` is the ubiquitous case.
+    let typed_zero = |value: i64| -> Option<ConstValue<T>> {
+        let ty = operand_type?;
+        let width = T::bit_width(ty)?;
+        match width {
+            8 => Some(ConstValue::I8(i8::try_from(value).ok()?)),
+            16 => Some(ConstValue::I16(i16::try_from(value).ok()?)),
+            64 => Some(ConstValue::I64(value)),
+            _ => Some(ConstValue::I32(i32::try_from(value).ok()?)),
+        }
+    };
     match op {
         // XOR: x ^ x = 0, x ^ 0 = x
         SsaOp::Xor { left, right, .. } => {
-            if left == right {
-                return SimplifyResult::Constant(ConstValue::I32(0));
+            if left == right
+                && self_identity_is_sound
+                && let Some(zero) = typed_zero(0)
+            {
+                return SimplifyResult::Constant(zero);
             }
             if constants.get(right).is_some_and(ConstValue::is_zero) {
                 return SimplifyResult::Copy(*left);
@@ -173,8 +200,11 @@ pub fn simplify_op<T: Target>(
 
         // SUB: x - 0 = x, x - x = 0
         SsaOp::Sub { left, right, .. } => {
-            if left == right {
-                return SimplifyResult::Constant(ConstValue::I32(0));
+            if left == right
+                && self_identity_is_sound
+                && let Some(zero) = typed_zero(0)
+            {
+                return SimplifyResult::Constant(zero);
             }
             if constants.get(right).is_some_and(ConstValue::is_zero) {
                 return SimplifyResult::Copy(*left);
@@ -208,25 +238,25 @@ pub fn simplify_op<T: Target>(
             if constants.get(right).is_some_and(ConstValue::is_one) {
                 return SimplifyResult::Copy(*left);
             }
-            if let Some(c) = constants.get(left) {
-                if c.is_zero() {
-                    return SimplifyResult::Constant(c.clone());
-                }
+            if let Some(c) = constants.get(left)
+                && c.is_zero()
+            {
+                return SimplifyResult::Constant(c.clone());
             }
             SimplifyResult::None
         }
 
         // REM: 0 % x = 0, x % 1 = 0
         SsaOp::Rem { left, right, .. } => {
-            if let Some(c) = constants.get(left) {
-                if c.is_zero() {
-                    return SimplifyResult::Constant(c.clone());
-                }
+            if let Some(c) = constants.get(left)
+                && c.is_zero()
+            {
+                return SimplifyResult::Constant(c.clone());
             }
-            if let Some(c) = constants.get(right) {
-                if c.is_one() {
-                    return SimplifyResult::Constant(c.zero_of_same_type());
-                }
+            if let Some(c) = constants.get(right)
+                && c.is_one()
+            {
+                return SimplifyResult::Constant(c.zero_of_same_type());
             }
             SimplifyResult::None
         }
@@ -246,14 +276,16 @@ pub fn simplify_op<T: Target>(
 
         // Comparisons: x == x → true, x < x → false, x > x → false
         SsaOp::Ceq { left, right, .. } => {
-            if left == right {
+            // A comparison result is a boolean, so its own width is I32 by
+            // convention — but the *operands* decide whether the identity holds.
+            if left == right && self_identity_is_sound {
                 return SimplifyResult::Constant(ConstValue::I32(1));
             }
             SimplifyResult::None
         }
 
         SsaOp::Clt { left, right, .. } | SsaOp::Cgt { left, right, .. } => {
-            if left == right {
+            if left == right && self_identity_is_sound {
                 return SimplifyResult::Constant(ConstValue::I32(0));
             }
             SimplifyResult::None
@@ -268,7 +300,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::testing::MockTarget;
+    use crate::testing::{MockTarget, MockType};
 
     fn make_constants(
         pairs: &[(SsaVarId, ConstValue<MockTarget>)],
@@ -287,7 +319,7 @@ mod tests {
             flags: None,
         };
         assert_eq!(
-            simplify_op(&op, &BTreeMap::new()),
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -304,7 +336,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -320,7 +355,7 @@ mod tests {
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
         assert_eq!(
-            simplify_op(&op, &constants),
+            simplify_op(&op, &constants, Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -337,7 +372,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(1))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -352,7 +390,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -366,7 +407,7 @@ mod tests {
             flags: None,
         };
         assert_eq!(
-            simplify_op(&op, &BTreeMap::new()),
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -384,7 +425,7 @@ mod tests {
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
         assert_eq!(
-            simplify_op(&op, &constants),
+            simplify_op(&op, &constants, Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -401,7 +442,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -417,7 +461,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(1))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -432,7 +479,10 @@ mod tests {
             flags: None,
         };
         let constants = make_constants(&[(v2, ConstValue::I32(0))]);
-        assert_eq!(simplify_op(&op, &constants), SimplifyResult::Copy(v1));
+        assert_eq!(
+            simplify_op(&op, &constants, Some(&MockType::I32)),
+            SimplifyResult::Copy(v1)
+        );
     }
 
     #[test]
@@ -446,7 +496,10 @@ mod tests {
             right: v2,
             flags: None,
         };
-        assert_eq!(simplify_op(&op, &BTreeMap::new()), SimplifyResult::None);
+        assert_eq!(
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
+            SimplifyResult::None
+        );
     }
 
     #[test]
@@ -463,7 +516,7 @@ mod tests {
         };
         let constants = make_constants(&[(v2, ConstValue::I32(1))]);
         assert_eq!(
-            simplify_op(&op, &constants),
+            simplify_op(&op, &constants, Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -478,7 +531,7 @@ mod tests {
             right: v1,
         };
         assert_eq!(
-            simplify_op(&op, &BTreeMap::new()),
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(1))
         );
     }
@@ -494,7 +547,7 @@ mod tests {
             unsigned: false,
         };
         assert_eq!(
-            simplify_op(&op, &BTreeMap::new()),
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }
@@ -510,7 +563,7 @@ mod tests {
             unsigned: false,
         };
         assert_eq!(
-            simplify_op(&op, &BTreeMap::new()),
+            simplify_op(&op, &BTreeMap::new(), Some(&MockType::I32)),
             SimplifyResult::Constant(ConstValue::I32(0))
         );
     }

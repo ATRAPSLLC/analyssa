@@ -11,7 +11,7 @@
 
 use crate::{
     error::Result,
-    events::EventLog,
+    events::EventListener,
     host::{DirtySet, SsaStore},
     ir::function::SsaFunction,
     pointer::PointerSize,
@@ -29,7 +29,15 @@ use crate::{
 /// the concrete host type.
 pub trait SsaPassHost<T: Target>: World<T> + SsaStore<T> + DirtySet<T> + Sync {
     /// Returns the event sink for transformation events recorded by passes.
-    fn events(&self) -> &EventLog<T>;
+    ///
+    /// A trait object rather than a concrete [`EventLog<T>`], so a host can
+    /// choose its sink. [`EventLog<T>`] is an append-only `boxcar::Vec` with no
+    /// bound and no way to drain it, so naming it concretely would force a host
+    /// that never consumes events to retain every one for the process lifetime.
+    /// [`NullListener`] discards them instead.
+    ///
+    /// [`NullListener`]: crate::events::NullListener
+    fn events(&self) -> &dyn EventListener<T>;
 
     /// Returns the pointer width of the target's runtime.
     ///

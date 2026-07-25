@@ -31,8 +31,11 @@
 //!
 //! # Complexity
 //!
-//! Construction: O(E + H) time, O(E + H) memory where E is the number of
+//! Construction: O(E + H log H) time, O(E + H) memory, where E is the number of
 //! terminator-derived edges and H is the number of exception handler entries.
+//! The `log H` is the set used to deduplicate synthetic handler edges against the
+//! terminator edges in one pass; checking each handler against the whole edge
+//! list instead would be O(H·E), and the handler table is attacker-controlled.
 //! All queries are O(1) or O(k) where k is the number of adjacent nodes.
 //!
 //! # Construction
@@ -50,10 +53,12 @@
 //! assert_eq!(cfg.block_count(), 1);
 //! ```
 
+use std::collections::BTreeSet;
+
 use crate::{
     graph::{
-        algorithms::{postorder, reverse_postorder},
         GraphBase, NodeId, Predecessors, RootedGraph, Successors,
+        algorithms::{postorder, reverse_postorder},
     },
     ir::function::SsaFunction,
     target::Target,
@@ -81,10 +86,21 @@ use crate::{
 pub struct SsaCfg<'a, T: Target> {
     /// Reference to the SSA function.
     ssa: &'a SsaFunction<T>,
-    /// Precomputed successor lists for each block (includes exception handler edges).
-    successors: Vec<Vec<usize>>,
-    /// Precomputed predecessor lists for each block (includes exception handler edges).
-    predecessors: Vec<Vec<usize>>,
+    /// Precomputed successor lists for each block (includes exception handler
+    /// edges), flattened: block `b` owns
+    /// `successor_values[successor_offsets[b]..successor_offsets[b + 1]]`.
+    ///
+    /// Flattened rather than `Vec<Vec<usize>>` because a CFG view is rebuilt
+    /// repeatedly (dominators, loop analysis, and most passes construct one),
+    /// and a vector per block cost two allocations per block every time. The
+    /// flattened form is a fixed handful of buffers regardless of block count.
+    successor_offsets: Vec<u32>,
+    /// Concatenated per-block successor lists; see [`Self::successor_offsets`].
+    successor_values: Vec<usize>,
+    /// Precomputed predecessor lists, flattened; see [`Self::successor_offsets`].
+    predecessor_offsets: Vec<u32>,
+    /// Concatenated per-block predecessor lists; see [`Self::predecessor_offsets`].
+    predecessor_values: Vec<usize>,
 }
 
 impl<'a, T: Target> SsaCfg<'a, T> {
@@ -118,8 +134,12 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     #[must_use]
     pub fn from_ssa(ssa: &'a SsaFunction<T>) -> Self {
         let block_count = ssa.block_count();
-        let mut successors = vec![Vec::new(); block_count];
-        let mut predecessors = vec![Vec::new(); block_count];
+
+        // Collect edges flat, in exactly the order the previous per-block
+        // vectors pushed them: terminator edges in block order, then the
+        // synthetic handler edges below. Grouping them into CSR afterwards
+        // reproduces both lists' contents *and* their ordering.
+        let mut edges: Vec<(usize, usize)> = Vec::with_capacity(block_count.saturating_mul(2));
 
         // Build successor/predecessor lists from block terminators
         for block_idx in 0..block_count {
@@ -128,19 +148,13 @@ impl<'a, T: Target> SsaCfg<'a, T> {
             };
             let terminator = block.instructions().iter().rev().find_map(|instr| {
                 let op = instr.op();
-                if op.is_terminator() {
-                    Some(op)
-                } else {
-                    None
-                }
+                if op.is_terminator() { Some(op) } else { None }
             });
             if let Some(op) = terminator {
                 op.for_each_successor(|succ| {
-                    if let Some(slot) = predecessors.get_mut(succ) {
-                        if let Some(block_succs_list) = successors.get_mut(block_idx) {
-                            block_succs_list.push(succ);
-                        }
-                        slot.push(block_idx);
+                    // An out-of-range successor contributes no edge at all.
+                    if succ < block_count {
+                        edges.push((block_idx, succ));
                     }
                 });
             }
@@ -152,31 +166,115 @@ impl<'a, T: Target> SsaCfg<'a, T> {
         // the try region's entry block to the handler entry block so that
         // analyses (dominator computation, reachability, etc.) treat them as
         // connected.
+        //
+        // Duplicate suppression is done against a set of the handler pairs rather
+        // than by scanning `edges`. A linear `edges.contains(..)` per handler is
+        // O(H·E), and the handler table comes from the input binary — while
+        // `SsaCfg::from_ssa` is rebuilt by dominators, loop analysis, and most
+        // passes, so the cost is paid many times per pipeline run.
+        //
+        // Scanning only the handler pairs is sufficient: a terminator edge
+        // `try_start -> handler_start` can only exist if the try block branches
+        // to the handler explicitly, in which case the synthetic edge is
+        // genuinely redundant — which the per-destination check below still
+        // catches, because that edge is already in `edges` for that destination.
+        let mut handler_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut explicit_targets: BTreeSet<(usize, usize)> = BTreeSet::new();
         for handler in ssa.exception_handlers() {
             if let (Some(try_start), Some(handler_start)) =
                 (handler.try_start_block, handler.handler_start_block)
+                && handler_start < block_count
+                && try_start < block_count
             {
-                if handler_start < block_count
-                    && try_start < block_count
-                    && !predecessors
-                        .get(handler_start)
-                        .is_some_and(|p| p.contains(&try_start))
-                {
-                    if let Some(slot) = successors.get_mut(try_start) {
-                        slot.push(handler_start);
-                    }
-                    if let Some(slot) = predecessors.get_mut(handler_start) {
-                        slot.push(try_start);
-                    }
+                handler_pairs.insert((try_start, handler_start));
+            }
+        }
+        if !handler_pairs.is_empty() {
+            // One pass over the terminator edges to find any that already carry a
+            // handler pair, instead of one pass per handler.
+            for &edge in &edges {
+                if handler_pairs.contains(&edge) {
+                    explicit_targets.insert(edge);
                 }
+            }
+            for pair in handler_pairs {
+                if !explicit_targets.contains(&pair) {
+                    edges.push(pair);
+                }
+            }
+        }
+
+        // Group the flat edge list into CSR: count per endpoint (staged one slot
+        // high), prefix-sum in place, then fill through per-block cursors.
+        let mut successor_offsets: Vec<u32> = vec![0; block_count.saturating_add(1)];
+        let mut predecessor_offsets: Vec<u32> = vec![0; block_count.saturating_add(1)];
+        for (from, to) in &edges {
+            if let Some(slot) = from
+                .checked_add(1)
+                .and_then(|next| successor_offsets.get_mut(next))
+            {
+                *slot = slot.saturating_add(1);
+            }
+            if let Some(slot) = to
+                .checked_add(1)
+                .and_then(|next| predecessor_offsets.get_mut(next))
+            {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let mut running_succ: u32 = 0;
+        for slot in &mut successor_offsets {
+            running_succ = running_succ.saturating_add(*slot);
+            *slot = running_succ;
+        }
+        let mut running_pred: u32 = 0;
+        for slot in &mut predecessor_offsets {
+            running_pred = running_pred.saturating_add(*slot);
+            *slot = running_pred;
+        }
+
+        let mut successor_values: Vec<usize> = vec![0; running_succ as usize];
+        let mut predecessor_values: Vec<usize> = vec![0; running_pred as usize];
+        let mut succ_cursors: Vec<u32> = successor_offsets.clone();
+        let mut pred_cursors: Vec<u32> = predecessor_offsets.clone();
+        for (from, to) in &edges {
+            if let Some(cursor) = succ_cursors.get_mut(*from) {
+                if let Some(slot) = successor_values.get_mut(*cursor as usize) {
+                    *slot = *to;
+                }
+                *cursor = cursor.saturating_add(1);
+            }
+            if let Some(cursor) = pred_cursors.get_mut(*to) {
+                if let Some(slot) = predecessor_values.get_mut(*cursor as usize) {
+                    *slot = *from;
+                }
+                *cursor = cursor.saturating_add(1);
             }
         }
 
         Self {
             ssa,
-            successors,
-            predecessors,
+            successor_offsets,
+            successor_values,
+            predecessor_offsets,
+            predecessor_values,
         }
+    }
+
+    /// Returns one block's slice out of a CSR pair, or an empty slice when the
+    /// block does not exist.
+    fn csr_row<'s>(offsets: &[u32], values: &'s [usize], block: usize) -> &'s [usize] {
+        let Some(start) = offsets.get(block).map(|offset| *offset as usize) else {
+            return &[];
+        };
+        let Some(end) = block
+            .checked_add(1)
+            .and_then(|next| offsets.get(next))
+            .map(|offset| *offset as usize)
+        else {
+            return &[];
+        };
+        values.get(start..end).unwrap_or(&[])
     }
 
     /// Returns the underlying SSA function.
@@ -215,7 +313,7 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     /// successors (e.g., return, throw) or doesn't exist.
     #[must_use]
     pub fn block_successors(&self, block_idx: usize) -> &[usize] {
-        self.successors.get(block_idx).map_or(&[], Vec::as_slice)
+        Self::csr_row(&self.successor_offsets, &self.successor_values, block_idx)
     }
 
     /// Returns the predecessor block indices for a given block.
@@ -229,7 +327,11 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     /// A slice of predecessor block indices.
     #[must_use]
     pub fn block_predecessors(&self, block_idx: usize) -> &[usize] {
-        self.predecessors.get(block_idx).map_or(&[], Vec::as_slice)
+        Self::csr_row(
+            &self.predecessor_offsets,
+            &self.predecessor_values,
+            block_idx,
+        )
     }
 
     /// Returns the exit nodes of the CFG.
@@ -313,7 +415,6 @@ impl<T: Target> RootedGraph for SsaCfg<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         graph::{GraphBase, Predecessors, RootedGraph, Successors},
         ir::{

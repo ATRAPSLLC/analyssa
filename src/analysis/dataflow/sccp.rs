@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::{
     analysis::{consts::evaluate_const_op, dataflow::lattice::MeetSemiLattice},
     bitset::BitSet,
-    graph::{NodeId, RootedGraph, Successors},
+    graph::{NodeId, RootedGraph, Successors, algorithms::compute_dominators},
     ir::{
         block::SsaBlock, function::SsaFunction, instruction::SsaInstruction, ops::SsaOp,
         phi::PhiNode, value::ConstValue, variable::SsaVarId,
@@ -126,8 +126,12 @@ pub struct ConstantPropagation<T: Target> {
     ssa_worklist: VecDeque<SsaVarId>,
     /// CFG worklist: edges that have become executable.
     cfg_worklist: VecDeque<(usize, usize)>,
-    /// Back edges: edges where the target was already executable when the edge was added.
-    /// These represent loop back edges and their values should be treated as unknown.
+    /// Loop back edges: `(u, v)` where `v` dominates `u`. Their phi operands are
+    /// treated as unknown, because they carry a value from a previous iteration.
+    ///
+    /// Determined structurally from the dominator tree, not from the order edges
+    /// happen to become executable — the latter also matches the second incoming
+    /// edge of every ordinary join, which would collapse all merge precision.
     back_edges: BTreeSet<(usize, usize)>,
     /// Target pointer size for native int/uint masking.
     pointer_size: PointerSize,
@@ -213,15 +217,20 @@ impl<T: Target> ConstantPropagation<T> {
         let entry = cfg.entry().index();
         self.mark_block_executable(entry);
 
-        // Add entry block's outgoing edges to CFG worklist
-        // For unconditional edges or first visit, add all successors
-        for succ in cfg.successors(cfg.entry()) {
-            self.cfg_worklist.push_back((entry, succ.index()));
-        }
-
-        // Process entry block definitions immediately
+        // Process the entry block's definitions *before* deciding which of its
+        // edges are executable, then route the decision through the same
+        // `propagate_outgoing_edges` every other block uses. Seeding all
+        // successors unconditionally — which is what this did — marks both arms
+        // of a constant branch in the entry block executable, so SCCP could
+        // never prune one. That is precisely the shape an opaque predicate takes
+        // when the lifter puts it first.
         if let Some(block) = ssa.block(entry) {
             self.process_block_definitions(block);
+            self.propagate_outgoing_edges(entry, block, cfg);
+        } else {
+            for succ in cfg.successors(cfg.entry()) {
+                self.cfg_worklist.push_back((entry, succ.index()));
+            }
         }
     }
 
@@ -230,16 +239,23 @@ impl<T: Target> ConstantPropagation<T> {
     where
         G: RootedGraph + Successors,
     {
+        // Back edges are a *structural* property of the CFG: `(u, v)` is one iff
+        // `v` dominates `u`. Deciding it by arrival order instead — "the target
+        // was already executable when this edge arrived" — is true of the second
+        // and every later incoming edge of *any* join block, not just of loops.
+        // Since `evaluate_phi` substitutes Bottom for back-edge operands, that
+        // collapsed every merge with two executable predecessors, which is the
+        // opposite of what SCCP's phi handling exists to do.
+        let dominators = compute_dominators(cfg, cfg.entry());
+
         // Process until both worklists are empty
         loop {
             // Process CFG worklist first (to discover new blocks)
             while let Some((from, to)) = self.cfg_worklist.pop_front() {
                 if self.executable_edges.insert((from, to)) {
-                    // Detect back edges: if the target block was already executable
-                    // when this edge is being added, it's a back edge (loop).
                     // PHI operands from back edges represent values that change
                     // across loop iterations and should be treated as unknown.
-                    if self.is_block_executable(to) {
+                    if dominators.dominates(NodeId::new(to), NodeId::new(from)) {
                         self.back_edges.insert((from, to));
                     }
                     // This edge became executable
@@ -293,10 +309,8 @@ impl<T: Target> ConstantPropagation<T> {
         }
 
         // If first visit, propagate outgoing edges based on terminator
-        if first_visit {
-            if let Some(block) = ssa.block(to) {
-                self.propagate_outgoing_edges(to, block, cfg);
-            }
+        if first_visit && let Some(block) = ssa.block(to) {
+            self.propagate_outgoing_edges(to, block, cfg);
         }
     }
 
@@ -327,22 +341,22 @@ impl<T: Target> ConstantPropagation<T> {
 
                 if use_site.is_phi_operand {
                     // Re-evaluate the phi node
-                    if let Some(block) = ssa.block(block_id) {
-                        if let Some(phi) = block.phi(use_site.instruction) {
-                            let new_value = self.evaluate_phi(phi, block_id);
-                            self.update_value(phi.result(), &new_value);
-                        }
+                    if let Some(block) = ssa.block(block_id)
+                        && let Some(phi) = block.phi(use_site.instruction)
+                    {
+                        let new_value = self.evaluate_phi(phi, block_id);
+                        self.update_value(phi.result(), &new_value);
                     }
                 } else {
                     // Re-evaluate the instruction
-                    if let Some(block) = ssa.block(block_id) {
-                        if let Some(instr) = block.instruction(use_site.instruction) {
-                            self.update_instruction_defs(instr);
+                    if let Some(block) = ssa.block(block_id)
+                        && let Some(instr) = block.instruction(use_site.instruction)
+                    {
+                        self.update_instruction_defs(instr);
 
-                            // Check if this is a branch instruction
-                            if instr.is_terminator() {
-                                self.propagate_outgoing_edges(block_id, block, cfg);
-                            }
+                        // Check if this is a branch instruction
+                        if instr.is_terminator() {
+                            self.propagate_outgoing_edges(block_id, block, cfg);
                         }
                     }
                 }
@@ -753,23 +767,141 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-
     use crate::{
+        PointerSize,
         analysis::{cfg::SsaCfg, dataflow::lattice::MeetSemiLattice},
         ir::{
             block::SsaBlock,
             function::SsaFunction,
             instruction::SsaInstruction,
             ops::SsaOp,
+            phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         testing::{MockTarget, MockType},
-        PointerSize,
     };
 
     type Sv = ScalarValue<MockTarget>;
     type Cv = ConstValue<MockTarget>;
+
+    /// A merge whose arms produce the *same* constant must fold to that
+    /// constant. This is the whole point of SCCP's phi handling.
+    ///
+    /// `B0: branch -> B1, B2` / `B1: x = 7` / `B2: y = 7` / `B3: p = phi(x, y)`.
+    /// Classifying an edge as a back edge by "the target was already executable"
+    /// is true of the *second* incoming edge of any join, so `p`'s second operand
+    /// gets substituted with Bottom and the merge collapses.
+    #[test]
+    fn a_diamond_whose_arms_agree_folds_to_that_constant() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let mk = |ssa: &mut SsaFunction<MockTarget>, o: u16, b: usize, i: usize| {
+            ssa.create_variable(
+                VariableOrigin::Local(o),
+                0,
+                DefSite::instruction(b, i),
+                MockType::I32,
+            )
+        };
+        let cond = mk(&mut ssa, 0, 0, 0);
+        let x = mk(&mut ssa, 1, 1, 0);
+        let y = mk(&mut ssa, 2, 2, 0);
+        let p = ssa.create_variable(VariableOrigin::Local(3), 0, DefSite::phi(3), MockType::I32);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(b0);
+
+        for (block_id, var) in [(1usize, x), (2usize, y)] {
+            let mut block = SsaBlock::new(block_id);
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+                dest: var,
+                value: ConstValue::I32(7),
+            }));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+            ssa.add_block(block);
+        }
+
+        let mut b3 = SsaBlock::new(3);
+        let mut phi = PhiNode::new(p, VariableOrigin::Local(3));
+        phi.add_operand(PhiOperand::new(x, 1));
+        phi.add_operand(PhiOperand::new(y, 2));
+        b3.add_phi(phi);
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(p) }));
+        ssa.add_block(b3);
+        ssa.recompute_uses();
+
+        let cfg = SsaCfg::from_ssa(&ssa);
+        let result = ConstantPropagation::<MockTarget>::new(PointerSize::Bit64).analyze(&ssa, &cfg);
+
+        assert_eq!(
+            result.constant_value(p),
+            Some(&ConstValue::I32(7)),
+            "both arms of the diamond produce 7, so the merge is 7"
+        );
+    }
+
+    /// The counterpart the back-edge substitution was written for: a genuine
+    /// loop-carried value must *not* be folded to its first-iteration value.
+    ///
+    /// `B0: c = 1; jump B1` / `B1: p = phi(c@B0, t@B1); t = p + c; jump B1`.
+    #[test]
+    fn a_loop_carried_phi_is_not_constant() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+        let c = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let p = ssa.create_variable(VariableOrigin::Local(1), 0, DefSite::phi(1), MockType::I32);
+        let t = ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: c,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        let mut phi = PhiNode::new(p, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(c, 0));
+        phi.add_operand(PhiOperand::new(t, 1));
+        b1.add_phi(phi);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: t,
+            left: p,
+            right: c,
+            flags: None,
+        }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b1);
+        ssa.recompute_uses();
+
+        let cfg = SsaCfg::from_ssa(&ssa);
+        let result = ConstantPropagation::<MockTarget>::new(PointerSize::Bit64).analyze(&ssa, &cfg);
+
+        assert_eq!(
+            result.constant_value(p),
+            None,
+            "p takes 1 then 2 then 3 ... and must not be folded to its first value"
+        );
+    }
 
     #[test]
     fn test_scalar_value_meet() {
@@ -856,8 +988,8 @@ mod tests {
     fn out_of_range_branch_targets_do_not_panic() {
         // A terminator may reference a block that was never recovered. SCCP's
         // `executable_blocks` bitset is sized to `block_count`, so an
-        // out-of-range target index used to panic in `BitSet::contains`. The
-        // analysis must instead treat it as unreachable. The condition is an
+        // out-of-range target index must be treated as unreachable rather than
+        // reaching the asserting `BitSet::contains`. The condition is an
         // unconstrained argument (`Bottom`), so both edges — including the
         // dangling one — are explored.
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);

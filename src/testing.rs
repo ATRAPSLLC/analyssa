@@ -271,7 +271,22 @@ impl Target for MockTarget {
     fn is_filter_handler(_flags: &Self::ExceptionKind) -> bool {
         false
     }
+
+    fn field_member_index(field: &Self::FieldRef) -> Option<u32> {
+        // The mock field reference *is* its member index, with
+        // [`MOCK_FIELD_UNRESOLVED`] reserved to model a host that could not
+        // recover one — the case that must fall back to a field-insensitive
+        // whole-object alias.
+        (*field != MOCK_FIELD_UNRESOLVED).then_some(*field)
+    }
 }
+
+/// Mock [`Target::FieldRef`] value denoting a field whose member index the host
+/// could not recover.
+///
+/// [`MockTarget::field_member_index`] maps every other value to itself, so tests
+/// use this sentinel to exercise the field-insensitive fallback path.
+pub const MOCK_FIELD_UNRESOLVED: u32 = u32::MAX;
 
 /// Minimal [`World`] implementation backed by deterministic collections.
 ///
@@ -473,6 +488,97 @@ pub fn loop_counter_fixture() -> SsaFunction<MockTarget> {
     fixture_result(builder.add_phi_operand(1, counter, 1, next));
     fixture_result(builder.in_block(2, |block| {
         block.ret(Some(counter))?;
+        Ok(())
+    }));
+    fixture_result(builder.finish())
+}
+
+/// Builds a single-block function of `instructions` chained additions.
+///
+/// A size-parameterized fixture for cost curves: the per-instruction terms
+/// (snapshot copying, use recomputation) grow with `instructions` while the
+/// per-block and phi-placement terms stay fixed, so pairing this with
+/// [`diamond_chain_fixture`] separates the two.
+///
+/// The chain is a genuine def-use dependency — each add consumes the previous
+/// result — so no pass can fold it away and the shape survives optimization.
+#[must_use]
+pub fn straight_line_fixture(instructions: usize) -> SsaFunction<MockTarget> {
+    let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 2);
+    fixture_result(builder.in_block(0, |block| {
+        let mut acc = block.const_i32(mock_i32(), 1)?;
+        let step = block.const_i32(mock_i32(), 1)?;
+        for _ in 0..instructions {
+            acc = block.add(mock_i32(), acc, step)?;
+        }
+        block.ret(Some(acc))?;
+        Ok(())
+    }));
+    fixture_result(builder.finish())
+}
+
+/// Builds a function of `diamonds` sequential diamond regions, each merging
+/// through a phi.
+///
+/// Block count and phi count both grow linearly with `diamonds`, which is the
+/// shape that drives the expensive parts of SSA reconstruction — dominance
+/// frontiers and phi placement — rather than the flat per-instruction copying
+/// that [`straight_line_fixture`] isolates.
+///
+/// Each diamond branches on a constant and merges the two arms, with one
+/// diamond's join block serving as the next diamond's head, giving
+/// `3 * diamonds + 1` blocks. The final join block carries the return.
+#[must_use]
+pub fn diamond_chain_fixture(diamonds: usize) -> SsaFunction<MockTarget> {
+    let block_count = diamonds.saturating_mul(3).saturating_add(1);
+    let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 2);
+    builder.ensure_block(block_count.saturating_sub(1));
+
+    let mut merged: Option<SsaVarId> = None;
+    for diamond in 0..diamonds {
+        let head = diamond.saturating_mul(3);
+        let left_idx = head.saturating_add(1);
+        let right_idx = head.saturating_add(2);
+        let join_idx = head.saturating_add(3);
+
+        fixture_result(builder.in_block(head, |block| {
+            let condition = block.const_bool(mock_i32(), true)?;
+            block.branch(condition, left_idx, right_idx)?;
+            Ok(())
+        }));
+        let left = fixture_result(builder.in_block(left_idx, |block| {
+            let value = block.const_i32(mock_i32(), 10)?;
+            let value = match merged {
+                Some(previous) => block.add(mock_i32(), previous, value)?,
+                None => value,
+            };
+            block.jump(join_idx)?;
+            Ok(value)
+        }));
+        let right = fixture_result(builder.in_block(right_idx, |block| {
+            let value = block.const_i32(mock_i32(), 20)?;
+            let value = match merged {
+                Some(previous) => block.add(mock_i32(), previous, value)?,
+                None => value,
+            };
+            block.jump(join_idx)?;
+            Ok(value)
+        }));
+        merged = Some(fixture_result(builder.in_block(join_idx, |block| {
+            block.phi(
+                SsaDefSpec::local(0, MockType::I32),
+                [(left_idx, left), (right_idx, right)],
+            )
+        })));
+    }
+
+    let last = block_count.saturating_sub(1);
+    fixture_result(builder.in_block(last, |block| {
+        let value = match merged {
+            Some(value) => value,
+            None => block.const_i32(mock_i32(), 0)?,
+        };
+        block.ret(Some(value))?;
         Ok(())
     }));
     fixture_result(builder.finish())
@@ -746,8 +852,26 @@ pub fn create_i32_local(
 
 #[cfg(test)]
 mod tests {
+    /// The size-parameterized benchmark fixtures must be verifier-valid at every
+    /// size, including the degenerate zero case — a benchmark built on invalid
+    /// SSA measures repair of garbage rather than of real code.
+    #[test]
+    fn scaling_fixtures_are_valid_at_every_size() {
+        for n in [0usize, 1, 2, 5, 32] {
+            let straight = crate::testing::straight_line_fixture(n);
+            crate::testing::assert_mock_valid_full(&straight, &format!("straight_line({n})"));
+
+            let diamonds = crate::testing::diamond_chain_fixture(n);
+            crate::testing::assert_mock_valid_full(&diamonds, &format!("diamond_chain({n})"));
+            assert_eq!(
+                diamonds.block_count(),
+                n.saturating_mul(3).saturating_add(1),
+                "diamond_chain({n}) block count"
+            );
+        }
+    }
     use super::*;
-    use crate::{ir::ConstValue, Endianness};
+    use crate::{Endianness, ir::ConstValue};
 
     #[test]
     fn mock_target_does_not_pull_in_host_metadata() {
@@ -809,7 +933,21 @@ mod tests {
         assert_eq!(world.entry_points(), vec![1]);
         assert_eq!(world.callees(&1), vec![2]);
         assert_eq!(world.callees(&2), vec![3]);
-        assert_eq!(world.methods_reverse_topological(), vec![1, 2, 3, 4]);
+        // Components arrive callee-first: with 1 -> 2 -> 3 and 4 isolated,
+        // every component is a singleton and 3 must precede 2, which must
+        // precede 1. The default derives this from `callees`, so a host gets
+        // the ordering without supplying one.
+        let components = world.methods_reverse_topological();
+        assert_eq!(components.len(), 4, "four singleton components");
+        assert!(
+            components.iter().all(|component| component.len() == 1),
+            "nothing here is mutually recursive"
+        );
+        let flat: Vec<u32> = components.into_iter().flatten().collect();
+        let position = |method: u32| flat.iter().position(|m| *m == method);
+        assert!(position(3) < position(2), "callee 3 precedes caller 2");
+        assert!(position(2) < position(1), "callee 2 precedes caller 1");
+        assert_eq!(flat.len(), 4);
         assert!(world.callees(&4).is_empty());
         assert!(!world.is_dead(&4));
 

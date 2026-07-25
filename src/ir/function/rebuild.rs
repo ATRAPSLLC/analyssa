@@ -48,15 +48,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::{
+    BitSet, Error, Result,
     analysis::{
         cfg::SsaCfg,
         liveness,
-        phis::{place_pruned_phis, PhiPlacementConfig},
+        phis::{PhiPlacementConfig, place_pruned_phis},
         verifier::{SsaVerifier, VerifierError, VerifyLevel},
     },
     graph::{
-        algorithms::{compute_dominance_frontiers, compute_dominators, DominatorTree},
         NodeId, RootedGraph,
+        algorithms::{DominatorTree, compute_dominance_frontiers, compute_dominators},
     },
     ir::{
         block::SsaBlock,
@@ -67,7 +68,6 @@ use crate::{
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     target::Target,
-    BitSet, Error, Result,
 };
 
 /// Immutable context passed through the SSA rename phase.
@@ -92,7 +92,8 @@ struct RenameContext<'a, T: Target> {
     var_types: &'a BTreeMap<SsaVarId, T::Type>,
 
     /// CFG successor map: block index → list of successor block indices.
-    /// Used by [`fill_successor_phi_operands`] to populate phi node operands.
+    /// Used by [`SsaRebuilder::fill_successor_phi_operands`] to populate phi node
+    /// operands.
     successor_map: &'a BTreeMap<usize, Vec<usize>>,
 
     /// Dominator tree child relationships: parent block → list of child blocks.
@@ -274,8 +275,14 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         self.remove_orphan_pops(); // Phase 16
         self.ssa.reindex_variables(); // Phase 17
         self.repair_same_block_future_uses(); // Phase 17b
-                                              // reindex can cause stale phi operand refs to collide with new IDs
+        // reindex can cause stale phi operand refs to collide with new IDs
         self.eliminate_trivial_phis(); // Phase 18
+        // Phi elimination leaves the eliminated results as orphaned rows in
+        // `variables` (it cannot drop them itself without breaking the
+        // id-is-index invariant). Phase 15's compaction ran before Phase 18, so
+        // without this the orphans would survive to `verify()` as
+        // `OrphanVariable` errors.
+        self.ssa.compact_variables(); // Phase 18a
         self.repair_same_block_future_uses(); // Phase 18b
         self.ssa.shrink_num_locals(); // Phase 19
 
@@ -294,6 +301,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             .filter(|e| {
                 let block = match e {
                     VerifierError::UndefinedUse { block, .. }
+                    | VerifierError::DuplicatePhiOperand { block, .. }
                     | VerifierError::MissingPhiOperand { block, .. }
                     | VerifierError::ExtraPhiOperand { block, .. }
                     | VerifierError::MissingTerminator { block }
@@ -308,10 +316,15 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                     | VerifierError::InvalidNativeOperation { block, .. } => Some(*block),
                     VerifierError::DominanceViolation { use_block, .. } => Some(*use_block),
                     VerifierError::DuplicateDefinition { .. }
-                    | VerifierError::UnregisteredVariable { .. } => None,
+                    | VerifierError::UnregisteredVariable { .. }
+                    // Block-independent and never cosmetic: `variable(id)` indexes
+                    // the table directly, so a hole misdirects every later id.
+                    | VerifierError::VariableTableNotDense { .. } => None,
                     // OrphanVariable is cosmetic — the variable exists without a
-                    // definition but isn't harmful. Typically caused by v0 entry
+                    // definition but nothing reads it. Typically v0 entry
                     // variables from stack temp groups that survive compaction.
+                    // A variable that *is* read but has no definition is reported
+                    // as `UndefinedUse` instead, and is not filtered here.
                     VerifierError::OrphanVariable { .. } => return false,
                 };
                 // Keep errors for reachable blocks (or block-independent errors)
@@ -438,11 +451,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
         // Clear unreachable blocks
         for block_idx in 0..self.ssa.blocks.len() {
-            if !reachable.contains(block_idx) {
-                if let Some(b) = self.ssa.blocks.get_mut(block_idx) {
-                    b.instructions_mut().clear();
-                    b.phi_nodes_mut().clear();
-                }
+            if !reachable.contains(block_idx)
+                && let Some(b) = self.ssa.blocks.get_mut(block_idx)
+            {
+                b.instructions_mut().clear();
+                b.phi_nodes_mut().clear();
             }
         }
 
@@ -459,7 +472,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
             // Remove operands from unreachable predecessors
             for phi in block.phi_nodes_mut().iter_mut() {
-                phi.retain_operands(|pred| reachable.contains(pred));
+                // A phi operand can name a predecessor that does not exist —
+                // the IR permits dangling successors and the verifier reports
+                // rather than rejects them. An out-of-range block is by
+                // definition unreachable, so `false` is also the right answer.
+                phi.retain_operands(|pred| reachable.contains_checked(pred));
             }
 
             // Inline trivial phis (0 or 1 unique operand value)
@@ -624,10 +641,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         // Union copy sources with their destinations
         for block in &self.ssa.blocks {
             for instr in block.instructions() {
-                if let SsaOp::Copy { dest, src } = instr.op() {
-                    if let (Some(dest_idx), Some(src_idx)) = (idx_of(*dest), idx_of(*src)) {
-                        union(&mut parent, &mut rank, dest_idx, src_idx);
-                    }
+                if let SsaOp::Copy { dest, src } = instr.op()
+                    && let (Some(dest_idx), Some(src_idx)) = (idx_of(*dest), idx_of(*src))
+                {
+                    union(&mut parent, &mut rank, dest_idx, src_idx);
                 }
             }
         }
@@ -1040,11 +1057,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                     if group != u32::MAX && !self.group_types.contains_key(&group) {
                         // Priority: instruction result_type (from converter with TypeContext)
                         // > op structural inference
-                        if let Some(rt) = instr.result_type() {
-                            if !T::is_unknown(rt) {
-                                self.group_types.insert(group, rt.clone());
-                                continue;
-                            }
+                        if let Some(rt) = instr.result_type()
+                            && !T::is_unknown(rt)
+                        {
+                            self.group_types.insert(group, rt.clone());
+                            continue;
                         }
                         if let Some(inferred) = instr.op().infer_result_type() {
                             self.group_types.insert(group, inferred);
@@ -1155,11 +1172,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         // causes incorrect dominator computation and stale variable references
         // during rename.
         for block_idx in 0..self.ssa.blocks.len() {
-            if !self.reachable.contains(block_idx) {
-                if let Some(b) = self.ssa.blocks.get_mut(block_idx) {
-                    b.instructions_mut().clear();
-                    b.phi_nodes_mut().clear();
-                }
+            if !self.reachable.contains(block_idx)
+                && let Some(b) = self.ssa.blocks.get_mut(block_idx)
+            {
+                b.instructions_mut().clear();
+                b.phi_nodes_mut().clear();
             }
         }
 
@@ -1549,10 +1566,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         let mut dom_tree_reachable = BitSet::new(block_count);
         let mut dom_stack = vec![0usize];
         while let Some(block_idx) = dom_stack.pop() {
-            if dom_tree_reachable.insert(block_idx) {
-                if let Some(children) = ctx.dom_children.get(&block_idx) {
-                    dom_stack.extend(children.iter().copied());
-                }
+            if dom_tree_reachable.insert(block_idx)
+                && let Some(children) = ctx.dom_children.get(&block_idx)
+            {
+                dom_stack.extend(children.iter().copied());
             }
         }
 
@@ -1573,10 +1590,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                     // Mark this subtree as reachable so we don't re-visit
                     let mut sub_stack = vec![block];
                     while let Some(b) = sub_stack.pop() {
-                        if dom_tree_reachable.insert(b) {
-                            if let Some(children) = ctx.dom_children.get(&b) {
-                                sub_stack.extend(children.iter().copied());
-                            }
+                        if dom_tree_reachable.insert(b)
+                            && let Some(children) = ctx.dom_children.get(&b)
+                        {
+                            sub_stack.extend(children.iter().copied());
                         }
                     }
                 }
@@ -1607,12 +1624,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                             }
                             let group = self.ssa.rename_group(phi.result());
                             for &pred in &preds {
-                                if !existing.contains(pred) {
-                                    if let Some(&v0) =
+                                if !existing.contains(pred)
+                                    && let Some(&v0) =
                                         version_stacks.get(&group).and_then(|stack| stack.first())
-                                    {
-                                        fixes.push((block_idx, phi_idx, pred, v0));
-                                    }
+                                {
+                                    fixes.push((block_idx, phi_idx, pred, v0));
                                 }
                             }
                         }
@@ -1623,10 +1639,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
             // Apply fixups
             for (block_idx, phi_idx, pred, v0) in fixups {
-                if let Some(block) = self.ssa.block_mut(block_idx) {
-                    if let Some(phi) = block.phi_nodes_mut().get_mut(phi_idx) {
-                        phi.set_operand(pred, v0);
-                    }
+                if let Some(block) = self.ssa.block_mut(block_idx)
+                    && let Some(phi) = block.phi_nodes_mut().get_mut(phi_idx)
+                {
+                    phi.set_operand(pred, v0);
                 }
             }
         }
@@ -1704,15 +1720,15 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         let block_count = self.ssa.blocks.len();
         let mut handler_entry_blocks = BitSet::new(block_count);
         for h in &self.ssa.exception_handlers {
-            if let Some(b) = h.handler_start_block {
-                if b < block_count {
-                    handler_entry_blocks.insert(b);
-                }
+            if let Some(b) = h.handler_start_block
+                && b < block_count
+            {
+                handler_entry_blocks.insert(b);
             }
-            if let Some(b) = h.filter_start_block {
-                if b < block_count {
-                    handler_entry_blocks.insert(b);
-                }
+            if let Some(b) = h.filter_start_block
+                && b < block_count
+            {
+                handler_entry_blocks.insert(b);
             }
         }
 
@@ -1740,14 +1756,21 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         let mut entry_replacements: BTreeMap<u32, SsaVarId> = BTreeMap::new();
         let def_sites = instruction_def_sites(self.ssa);
 
+        // Scratch buffers reused across every instruction: `SsaOp::uses()` and a
+        // fresh `BTreeSet` would each allocate once per instruction, and this
+        // runs over the whole function on every repair.
+        let mut use_buf: Vec<SsaVarId> = Vec::new();
+        let mut seen: BTreeSet<SsaVarId> = BTreeSet::new();
         for block_idx in 0..self.ssa.block_count() {
             let Some(block) = self.ssa.block(block_idx) else {
                 continue;
             };
 
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let mut seen = BTreeSet::new();
-                for used in instr.uses() {
+                seen.clear();
+                use_buf.clear();
+                instr.op().for_each_use(|var| use_buf.push(var));
+                for &used in &use_buf {
                     if !seen.insert(used) {
                         continue;
                     }
@@ -1768,18 +1791,18 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                 .or_else(|| {
                     self.entry_replacement_for_group(used, &mut entry_replacements, &def_sites)
                 });
-            if let Some(replacement) = replacement {
-                if replacement != used {
-                    repairs.push((block_idx, instr_idx, used, replacement));
-                }
+            if let Some(replacement) = replacement
+                && replacement != used
+            {
+                repairs.push((block_idx, instr_idx, used, replacement));
             }
         }
 
         for (block_idx, instr_idx, old_var, new_var) in repairs {
-            if let Some(block) = self.ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                    instr.op_mut().replace_uses(old_var, new_var);
-                }
+            if let Some(block) = self.ssa.block_mut(block_idx)
+                && let Some(instr) = block.instructions_mut().get_mut(instr_idx)
+            {
+                instr.op_mut().replace_uses(old_var, new_var);
             }
         }
     }
@@ -1979,7 +2002,12 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                                         VariableOrigin::Local(idx) => {
                                             (ctx.num_args as u32).saturating_add(idx as u32)
                                         }
-                                        VariableOrigin::Phi => u32::MAX,
+                                        // Neither names a slot in the
+                                        // argument/local index space, so there
+                                        // is no group to derive.
+                                        VariableOrigin::Phi | VariableOrigin::EntryLiveIn => {
+                                            u32::MAX
+                                        }
                                     }
                                 });
                             (group, origin, phi.result())
@@ -2003,10 +2031,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                 ssa.create_variable(*origin, version, DefSite::phi(block_idx), var_type);
             ssa.set_rename_group(new_var_id, *group);
 
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(phi) = block.phi_nodes_mut().get_mut(i) {
-                    phi.set_result(new_var_id);
-                }
+            if let Some(block) = ssa.block_mut(block_idx)
+                && let Some(phi) = block.phi_nodes_mut().get_mut(i)
+            {
+                phi.set_result(new_var_id);
             }
 
             version_stacks.entry(*group).or_default().push(new_var_id);
@@ -2060,26 +2088,23 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             let mut use_renames: Vec<(SsaVarId, SsaVarId)> = Vec::new();
             for &old_use in old_uses {
                 let group = ssa.rename_group(old_use);
-                if group != u32::MAX {
-                    if let Some(reaching_def) = version_stacks
+                if group != u32::MAX
+                    && let Some(reaching_def) = version_stacks
                         .get(&group)
                         .and_then(|stack| stack.last().copied())
-                    {
-                        if reaching_def != old_use {
-                            use_renames.push((old_use, reaching_def));
-                        }
-                    }
+                    && reaching_def != old_use
+                {
+                    use_renames.push((old_use, reaching_def));
                 }
             }
 
-            if !use_renames.is_empty() {
-                if let Some(block) = ssa.block_mut(block_idx) {
-                    if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                        let op = instr.op_mut();
-                        for (old_use, new_use) in &use_renames {
-                            op.replace_uses(*old_use, *new_use);
-                        }
-                    }
+            if !use_renames.is_empty()
+                && let Some(block) = ssa.block_mut(block_idx)
+                && let Some(instr) = block.instructions_mut().get_mut(*instr_idx)
+            {
+                let op = instr.op_mut();
+                for (old_use, new_use) in &use_renames {
+                    op.replace_uses(*old_use, *new_use);
                 }
             }
 
@@ -2089,79 +2114,76 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                 // that multiple loads of the same arg/local produce the same SSA
                 // variable, enabling patterns like `x - x = 0` to be recognized.
                 if let (Some(target_group), Some(old_dest)) = (load_target_group, old_defs.first())
-                {
-                    if let Some(reaching_def) = version_stacks
+                    && let Some(reaching_def) = version_stacks
                         .get(target_group)
                         .and_then(|stack| stack.last().copied())
-                    {
-                        rename_map.insert(*old_dest, reaching_def);
-                        // Also push the reaching def onto the dest's group stack
-                        // so that within-block uses (which resolve via version_stacks, not
-                        // rename_map) also see the correct reaching definition.
-                        let dest_group = ssa.rename_group(*old_dest);
-                        if dest_group != u32::MAX {
-                            version_stacks
-                                .entry(dest_group)
-                                .or_default()
-                                .push(reaching_def);
-                            let pc = pushed_counts.entry(dest_group).or_insert(0);
-                            *pc = pc.saturating_add(1);
-                        }
-                        // Convert to Nop since the value is the reaching definition
-                        if let Some(block) = ssa.block_mut(block_idx) {
-                            if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                                instr.set_op(SsaOp::Nop);
-                            }
-                        }
-                        continue;
+                {
+                    rename_map.insert(*old_dest, reaching_def);
+                    // Also push the reaching def onto the dest's group stack
+                    // so that within-block uses (which resolve via version_stacks, not
+                    // rename_map) also see the correct reaching definition.
+                    let dest_group = ssa.rename_group(*old_dest);
+                    if dest_group != u32::MAX {
+                        version_stacks
+                            .entry(dest_group)
+                            .or_default()
+                            .push(reaching_def);
+                        let pc = pushed_counts.entry(dest_group).or_insert(0);
+                        *pc = pc.saturating_add(1);
                     }
+                    // Convert to Nop since the value is the reaching definition
+                    if let Some(block) = ssa.block_mut(block_idx)
+                        && let Some(instr) = block.instructions_mut().get_mut(*instr_idx)
+                    {
+                        instr.set_op(SsaOp::Nop);
+                    }
+                    continue;
                 }
 
                 let mut def_renames = Vec::new();
                 for old_dest in old_defs {
                     let group = ssa.rename_group(*old_dest);
                     let origin = ctx.var_origins.get(old_dest).copied();
-                    if group != u32::MAX {
-                        if let Some(origin) = origin {
-                            let version = *next_version.get(&group).unwrap_or(&0);
-                            let nv = next_version.entry(group).or_insert(0);
-                            *nv = nv.saturating_add(1);
+                    if group != u32::MAX
+                        && let Some(origin) = origin
+                    {
+                        let version = *next_version.get(&group).unwrap_or(&0);
+                        let nv = next_version.entry(group).or_insert(0);
+                        *nv = nv.saturating_add(1);
 
-                            // Use per-variable type first (preserves stack-derived local types),
-                            // fall back to per-group type
-                            let var_type = ctx
-                                .var_types
-                                .get(old_dest)
-                                .or_else(|| ctx.group_types.get(&group))
-                                .cloned()
-                                .unwrap_or_else(T::unknown_type);
-                            let new_var_id = ssa.create_variable(
-                                origin,
-                                version,
-                                DefSite::instruction(block_idx, *instr_idx),
-                                var_type,
-                            );
-                            ssa.set_rename_group(new_var_id, group);
+                        // Use per-variable type first (preserves stack-derived local types),
+                        // fall back to per-group type
+                        let var_type = ctx
+                            .var_types
+                            .get(old_dest)
+                            .or_else(|| ctx.group_types.get(&group))
+                            .cloned()
+                            .unwrap_or_else(T::unknown_type);
+                        let new_var_id = ssa.create_variable(
+                            origin,
+                            version,
+                            DefSite::instruction(block_idx, *instr_idx),
+                            var_type,
+                        );
+                        ssa.set_rename_group(new_var_id, group);
 
-                            version_stacks.entry(group).or_default().push(new_var_id);
-                            let pc = pushed_counts.entry(group).or_insert(0);
-                            *pc = pc.saturating_add(1);
+                        version_stacks.entry(group).or_default().push(new_var_id);
+                        let pc = pushed_counts.entry(group).or_insert(0);
+                        *pc = pc.saturating_add(1);
 
-                            if *old_dest != new_var_id {
-                                rename_map.insert(*old_dest, new_var_id);
-                                def_renames.push((*old_dest, new_var_id));
-                            }
+                        if *old_dest != new_var_id {
+                            rename_map.insert(*old_dest, new_var_id);
+                            def_renames.push((*old_dest, new_var_id));
                         }
                     }
                 }
 
-                if !def_renames.is_empty() {
-                    if let Some(block) = ssa.block_mut(block_idx) {
-                        if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                            for (old_dest, new_dest) in def_renames {
-                                instr.op_mut().replace_def(old_dest, new_dest);
-                            }
-                        }
+                if !def_renames.is_empty()
+                    && let Some(block) = ssa.block_mut(block_idx)
+                    && let Some(instr) = block.instructions_mut().get_mut(*instr_idx)
+                {
+                    for (old_dest, new_dest) in def_renames {
+                        instr.op_mut().replace_def(old_dest, new_dest);
                     }
                 }
             }
@@ -2204,7 +2226,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                                                 VariableOrigin::Local(idx) => {
                                                     (ctx.num_args as u32).saturating_add(idx as u32)
                                                 }
-                                                VariableOrigin::Phi => u32::MAX,
+                                                // Neither names a slot in the
+                                                // argument/local index space.
+                                                VariableOrigin::Phi
+                                                | VariableOrigin::EntryLiveIn => u32::MAX,
                                             }
                                         }
                                     });
@@ -2253,12 +2278,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                         .find(|&&v| Some(v) != succ_phi_result)
                         .copied()
                 });
-                if let Some(reaching_def) = reaching_def {
-                    if let Some(succ_block) = ssa.block_mut(succ_idx) {
-                        if let Some(phi) = succ_block.phi_nodes_mut().get_mut(phi_idx) {
-                            phi.set_operand(block_idx, reaching_def);
-                        }
-                    }
+                if let Some(reaching_def) = reaching_def
+                    && let Some(succ_block) = ssa.block_mut(succ_idx)
+                    && let Some(phi) = succ_block.phi_nodes_mut().get_mut(phi_idx)
+                {
+                    phi.set_operand(block_idx, reaching_def);
                 }
             }
         }
@@ -2298,10 +2322,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         }
 
         for (block_idx, phi_idx, pred, new_val) in phi_updates {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(phi) = block.phi_nodes_mut().get_mut(phi_idx) {
-                    phi.set_operand(pred, new_val);
-                }
+            if let Some(block) = ssa.block_mut(block_idx)
+                && let Some(phi) = block.phi_nodes_mut().get_mut(phi_idx)
+            {
+                phi.set_operand(pred, new_val);
             }
         }
 
@@ -2310,11 +2334,17 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         // pass quadratic in instruction count on large functions).
         let def_sites = instruction_def_sites(ssa);
         let mut instr_updates: Vec<(usize, usize, SsaVarId, SsaVarId)> = Vec::new();
+        // Scratch buffers reused across every instruction; see
+        // `repair_same_block_future_uses` for the same pattern.
+        let mut use_buf: Vec<SsaVarId> = Vec::new();
+        let mut seen: BTreeSet<SsaVarId> = BTreeSet::new();
         for block in &ssa.blocks {
             let block_idx = block.id();
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let mut seen = std::collections::BTreeSet::new();
-                for &old_use in &instr.uses() {
+                seen.clear();
+                use_buf.clear();
+                instr.op().for_each_use(|var| use_buf.push(var));
+                for &old_use in &use_buf {
                     if seen.insert(old_use) {
                         let new_use = resolve(old_use);
                         if new_use != old_use {
@@ -2335,10 +2365,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         }
 
         for (block_idx, instr_idx, old_var, new_var) in instr_updates {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                    instr.op_mut().replace_uses(old_var, new_var);
-                }
+            if let Some(block) = ssa.block_mut(block_idx)
+                && let Some(instr) = block.instructions_mut().get_mut(instr_idx)
+            {
+                instr.op_mut().replace_uses(old_var, new_var);
             }
         }
 

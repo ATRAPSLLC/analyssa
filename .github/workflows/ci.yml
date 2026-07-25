@@ -29,19 +29,36 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The MSRV is a supported configuration, so it must lint clean too — a
+        # stable-only clippy job lets a 1.88 break land silently.
+        rust: [stable, "1.88"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  deny:
+    name: Advisories and licences
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: taiki-e/install-action@cargo-deny
+      # Without this, a RUSTSEC advisory against dashmap, rayon, boxcar or
+      # num_enum would never surface here.
+      - run: cargo deny check
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
       - run: cargo fmt --check
@@ -52,9 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --no-deps --all-features --document-private-items
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: -D warnings -D missing-docs
 
   doctest:
     name: Doctests
@@ -66,6 +83,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      # A short campaign per target, not an exhaustive one: this is a smoke
+      # gate that the targets still build and that no shallow crash has been
+      # introduced. Longer campaigns belong in a scheduled job.
+      #
+      # These targets feed deliberately malformed IR — dangling branch targets,
+      # phi operands naming non-existent predecessors, uses of variables nothing
+      # defines. That is what a hostile or misread binary produces, and it is
+      # what the verifier and passes must report rather than crash on.
+      - run: cargo fuzz run validate -- -max_total_time=60 -rss_limit_mb=2048
+      - run: cargo fuzz run pipeline -- -max_total_time=60 -rss_limit_mb=2048
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -75,4 +110,4 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-targets --all-features --fail-under-lines 39 --summary-only
+      - run: cargo llvm-cov --all-targets --all-features --fail-under-lines 70 --summary-only

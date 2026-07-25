@@ -10,7 +10,6 @@ pub use analyssa::testing::{
     run_mock_pass_boundary as run_pass_boundary,
     run_mock_pass_repaired_boundary as run_pass_repaired_boundary,
 };
-
 use analyssa::{
     events::{EventKind, EventLog},
     testing::MockTarget,
@@ -45,7 +44,7 @@ mod tests {
     use analyssa::{
         events::{EventKind, EventLog},
         ir::ops::SsaOp,
-        testing::{const_i32_return, MockTarget},
+        testing::{MockTarget, const_i32_return},
     };
 
     use super::{

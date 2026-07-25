@@ -29,10 +29,10 @@
 use std::collections::HashMap;
 
 use crate::{
+    PointerSize,
     analysis::symbolic::{expr::SymbolicExpr, ops::SymbolicOp},
     ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
     target::Target,
-    PointerSize,
 };
 
 /// Symbolic evaluator that builds expression trees from SSA operations.
@@ -452,6 +452,16 @@ impl<'a, T: Target> SymbolicEvaluator<'a, T> {
             self.expressions.insert(dest, SymbolicExpr::variable(dest));
             return;
         };
+
+        // Bound the combined *size*, not just the depth of each operand. Both
+        // operand trees are cloned into the result, so `x op x` doubles the node
+        // count while adding 1 to the depth — the depth cap cannot fire before
+        // memory is exhausted. Substituting an opaque variable is the same
+        // escape hatch the depth check uses.
+        if SymbolicExpr::combining_reaches_size_limit(&left_expr, &right_expr) {
+            self.expressions.insert(dest, SymbolicExpr::variable(dest));
+            return;
+        }
 
         let result = SymbolicExpr::binary(op, left_expr, right_expr).simplify(self.pointer_size);
         self.expressions.insert(dest, result);

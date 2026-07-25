@@ -4,7 +4,7 @@ use analyssa::{
     analysis::{SsaCfg, SsaVerifier, VerifyLevel},
     ir::{
         block::SsaBlock,
-        exception::{native_is_filter_handler, NativeExceptionKind, SsaExceptionHandler},
+        exception::{NativeExceptionKind, SsaExceptionHandler, native_is_filter_handler},
         function::{FunctionKind, SsaFunction},
         instruction::SsaInstruction,
         ops::{CmpKind, SsaOp},
@@ -195,9 +195,11 @@ fn interrupt_handler_with_interrupt_return_terminator() {
 
     assert_eq!(ssa.kind(), FunctionKind::InterruptHandler);
     assert!(ssa.has_interrupt_return());
-    assert!(some_or_abort(ssa.block(0))
-        .terminator_op()
-        .is_some_and(|op| { matches!(op, SsaOp::InterruptReturn) }));
+    assert!(
+        some_or_abort(ssa.block(0))
+            .terminator_op()
+            .is_some_and(|op| { matches!(op, SsaOp::InterruptReturn) })
+    );
 }
 
 #[test]

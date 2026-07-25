@@ -67,11 +67,7 @@ impl PointerSize {
     /// [`Bit64`](PointerSize::Bit64) if `is_64bit`, [`Bit32`](PointerSize::Bit32) otherwise.
     #[must_use]
     pub fn from_is_64bit(is_64bit: bool) -> Self {
-        if is_64bit {
-            Self::Bit64
-        } else {
-            Self::Bit32
-        }
+        if is_64bit { Self::Bit64 } else { Self::Bit32 }
     }
 
     /// Returns the pointer size in bytes.

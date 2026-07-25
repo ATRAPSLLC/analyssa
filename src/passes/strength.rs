@@ -34,13 +34,13 @@
 
 use crate::{
     analysis::DefUseIndex,
-    bitset::BitSet,
     events::{EventKind, EventListener},
     ir::{
         function::{SsaEditOptions, SsaFunction},
         ops::SsaOp,
         value::ConstValue,
         variable::SsaVarId,
+        varstore::VarSet,
     },
     passes::utils::is_power_of_two,
     target::Target,
@@ -113,15 +113,33 @@ struct ReductionChecker<'a, T: Target> {
     /// Def-use index for looking up variable definitions.
     index: &'a DefUseIndex<T>,
     /// Bitset of constant variables already claimed by earlier reductions.
-    used_constants: &'a BitSet,
+    used_constants: &'a VarSet,
 }
 
 impl<'a, T: Target> ReductionChecker<'a, T> {
-    fn new(index: &'a DefUseIndex<T>, used_constants: &'a BitSet) -> Self {
+    fn new(index: &'a DefUseIndex<T>, used_constants: &'a VarSet) -> Self {
         Self {
             index,
             used_constants,
         }
+    }
+
+    /// Returns `true` when an op's `flags` definition can be discarded.
+    ///
+    /// `flags` is a real secondary definition (`SsaOp::defs()` yields it,
+    /// `SsaOp::ReadFlags` and `SsaOp::BranchFlags` consume it), and none of the
+    /// replacement ops reproduces it — nor could they correctly: `shl`'s CF/OF
+    /// are not `imul`'s, so forwarding the variable through would substitute one
+    /// instruction's flag semantics for another's.
+    ///
+    /// But *most* flag definitions are never read. A lifter emits flags for
+    /// nearly every arithmetic instruction while only a few feed a conditional
+    /// branch, so refusing every flag-producing op would disable this pass on
+    /// essentially all native code. When nothing reads the definition, dropping
+    /// it along with the op it belonged to is exactly what dead-code elimination
+    /// would do anyway.
+    fn flags_are_dead(&self, flags: Option<SsaVarId>) -> bool {
+        flags.is_none_or(|flags| self.index.use_count(flags) == 0)
     }
 
     fn try_mul_reduction(
@@ -141,7 +159,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
         let value = const_value.as_i64()?;
         let exponent = is_power_of_two(value)?;
         let uses = self.index.use_count(const_var);
-        if uses != 1 || self.used_constants.contains(const_var.index()) {
+        if uses != 1 || self.used_constants.contains(const_var) {
             return None;
         }
         Some(ReductionCandidate {
@@ -149,7 +167,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
             const_var,
             const_block,
             const_instr,
-            new_const_value: ConstValue::I32(i32::from(exponent)),
+            new_const_value: const_value.integer_of_same_type(i64::from(exponent))?,
             new_op: SsaOp::Shl {
                 dest,
                 value: value_var,
@@ -178,7 +196,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
         let value = const_value.as_i64()?;
         let exponent = is_power_of_two(value)?;
         let uses = self.index.use_count(divisor_var);
-        if uses != 1 || self.used_constants.contains(divisor_var.index()) {
+        if uses != 1 || self.used_constants.contains(divisor_var) {
             return None;
         }
         let desc = if unsigned {
@@ -191,7 +209,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
             const_var: divisor_var,
             const_block,
             const_instr,
-            new_const_value: ConstValue::I32(i32::from(exponent)),
+            new_const_value: const_value.integer_of_same_type(i64::from(exponent))?,
             new_op: SsaOp::Shr {
                 dest,
                 value: dividend,
@@ -203,7 +221,6 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn try_rem_reduction(
         &self,
         dest: SsaVarId,
@@ -223,7 +240,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
         let _exponent = is_power_of_two(value)?;
         let mask = value.checked_sub(1)?;
         let uses = self.index.use_count(divisor_var);
-        if uses != 1 || self.used_constants.contains(divisor_var.index()) {
+        if uses != 1 || self.used_constants.contains(divisor_var) {
             return None;
         }
         let desc = if unsigned {
@@ -236,7 +253,7 @@ impl<'a, T: Target> ReductionChecker<'a, T> {
             const_var: divisor_var,
             const_block,
             const_instr,
-            new_const_value: ConstValue::I32(mask as i32),
+            new_const_value: const_value.integer_of_same_type(mask)?,
             new_op: SsaOp::And {
                 dest,
                 left: dividend,
@@ -254,7 +271,7 @@ fn find_candidates<T: Target>(
     is_non_negative: &dyn Fn(SsaVarId) -> bool,
 ) -> Vec<ReductionCandidate<T>> {
     let mut candidates = Vec::new();
-    let mut used_constants = BitSet::new(ssa.var_id_capacity());
+    let mut used_constants = VarSet::new(ssa.var_id_bound());
 
     for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
         let checker = ReductionChecker::new(index, &used_constants);
@@ -263,7 +280,7 @@ fn find_candidates<T: Target>(
             instr_idx,
         };
         if let Some(candidate) = check_reduction(instr.op(), location, &checker, is_non_negative) {
-            used_constants.insert(candidate.const_var.index());
+            used_constants.insert(candidate.const_var);
             candidates.push(candidate);
         }
     }
@@ -278,9 +295,16 @@ fn check_reduction<T: Target>(
     is_non_negative: &dyn Fn(SsaVarId) -> bool,
 ) -> Option<ReductionCandidate<T>> {
     match op {
+        // Every arm binds `flags` explicitly rather than swallowing it with
+        // `..`, and declines when that definition is live — see
+        // `ReductionChecker::flags_are_dead` for why liveness rather than mere
+        // presence is the right condition.
         SsaOp::Mul {
-            dest, left, right, ..
-        } => {
+            dest,
+            left,
+            right,
+            flags,
+        } if checker.flags_are_dead(*flags) => {
             if let Some(candidate) = checker.try_mul_reduction(*dest, *left, *right, location) {
                 return Some(candidate);
             }
@@ -291,15 +315,17 @@ fn check_reduction<T: Target>(
             left,
             right,
             unsigned: true,
-            ..
-        } => checker.try_div_reduction(*dest, *left, *right, true, location),
+            flags,
+        } if checker.flags_are_dead(*flags) => {
+            checker.try_div_reduction(*dest, *left, *right, true, location)
+        }
         SsaOp::Div {
             dest,
             left,
             right,
             unsigned: false,
-            ..
-        } => {
+            flags,
+        } if checker.flags_are_dead(*flags) => {
             if is_non_negative(*left) {
                 checker.try_div_reduction(*dest, *left, *right, false, location)
             } else {
@@ -311,15 +337,17 @@ fn check_reduction<T: Target>(
             left,
             right,
             unsigned: true,
-            ..
-        } => checker.try_rem_reduction(*dest, *left, *right, true, location),
+            flags,
+        } if checker.flags_are_dead(*flags) => {
+            checker.try_rem_reduction(*dest, *left, *right, true, location)
+        }
         SsaOp::Rem {
             dest,
             left,
             right,
             unsigned: false,
-            ..
-        } => {
+            flags,
+        } if checker.flags_are_dead(*flags) => {
             if is_non_negative(*left) {
                 checker.try_rem_reduction(*dest, *left, *right, false, location)
             } else {
@@ -400,14 +428,214 @@ mod tests {
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            ops::FlagsMask,
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{mock_op_at, run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, mock_op_at, run_mock_pass_boundary},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
         SsaInstruction::synthetic(op)
+    }
+
+    fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
+        ssa.create_variable(
+            VariableOrigin::Local(idx),
+            0,
+            DefSite::instruction(block, instr),
+            MockType::I32,
+        )
+    }
+
+    /// `x % 2^32` is not `x & -1`. The mask is `2^32 - 1`, which does not fit an
+    /// `i32`; materialising it as one produces `I32(-1)`, and because
+    /// `ConstValue::bitwise_and` sign-extends a narrower operand, the resulting
+    /// `and` is the identity. The rewrite must emit the mask in the divisor's
+    /// own type, or decline.
+    #[test]
+    fn rem_by_a_wide_power_of_two_does_not_truncate_its_mask() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local(&mut ssa, 0, 0, 0);
+        let divisor = local(&mut ssa, 1, 0, 1);
+        let result = local(&mut ssa, 2, 0, 2);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I64(12345),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: divisor,
+            // 2^32 — a power of two whose mask needs more than 32 bits.
+            value: ConstValue::I64(1i64 << 32),
+        }));
+        block.add_instruction(instr(SsaOp::Rem {
+            dest: result,
+            left: x,
+            right: divisor,
+            unsigned: true,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return {
+            value: Some(result),
+        }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run(&mut ssa, &0u32, &log, &|_| true);
+
+        // Whether or not the rewrite fires, the constant must never become the
+        // all-ones mask of the wrong width.
+        let value = ssa.blocks().iter().find_map(|block| {
+            block
+                .instructions()
+                .iter()
+                .find_map(|instruction| match instruction.op() {
+                    SsaOp::Const { dest, value } if *dest == divisor => Some(value.clone()),
+                    _ => None,
+                })
+        });
+        assert_ne!(
+            value,
+            Some(ConstValue::I32(-1)),
+            "the mask for 2^32 must not truncate to I32(-1), which makes `and` the identity"
+        );
+        assert_eq!(ssa.validate(), Ok(()));
+    }
+
+    /// A narrower power of two still reduces — the guard above must not cost the
+    /// optimization it protects.
+    #[test]
+    fn rem_by_a_narrow_power_of_two_still_reduces() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local(&mut ssa, 0, 0, 0);
+        let divisor = local(&mut ssa, 1, 0, 1);
+        let result = local(&mut ssa, 2, 0, 2);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(12345),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: divisor,
+            value: ConstValue::I32(16),
+        }));
+        block.add_instruction(instr(SsaOp::Rem {
+            dest: result,
+            left: x,
+            right: divisor,
+            unsigned: true,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Return {
+            value: Some(result),
+        }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        assert!(changed, "rem by 16 should reduce to and 15");
+        assert!(matches!(mock_op_at(&ssa, 0, 2), SsaOp::And { .. }));
+    }
+
+    /// The common native shape: the lifter emitted a flags definition because
+    /// the instruction sets flags, but nothing reads it. Dropping it with the op
+    /// is exactly what DCE would do, so the reduction must still fire — a lifter
+    /// sets flags on nearly every arithmetic instruction, and refusing all of
+    /// them would disable this pass on native code entirely.
+    #[test]
+    fn a_multiply_with_dead_flags_is_still_strength_reduced() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local(&mut ssa, 0, 0, 0);
+        let factor = local(&mut ssa, 1, 0, 1);
+        let product = local(&mut ssa, 2, 0, 2);
+        let flags = local(&mut ssa, 3, 0, 2);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: factor,
+            value: ConstValue::I32(8),
+        }));
+        block.add_instruction(instr(SsaOp::Mul {
+            dest: product,
+            left: x,
+            right: factor,
+            // Defined, but never read by any instruction.
+            flags: Some(flags),
+        }));
+        block.add_instruction(instr(SsaOp::Return {
+            value: Some(product),
+        }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+
+        assert!(
+            changed,
+            "a dead flags definition must not block the reduction"
+        );
+        assert!(
+            matches!(mock_op_at(&ssa, 0, 2), SsaOp::Shl { .. }),
+            "mul by 8 with dead flags should become shl; got {:?}",
+            mock_op_at(&ssa, 0, 2)
+        );
+    }
+
+    /// A flag-producing op must not be rewritten into one that drops the flags
+    /// definition. Forwarding the flags through would be wrong too — `shl`'s
+    /// CF/OF are not `imul`'s — so the rewrite has to be declined.
+    #[test]
+    fn a_flag_producing_multiply_is_not_strength_reduced() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let x = local(&mut ssa, 0, 0, 0);
+        let factor = local(&mut ssa, 1, 0, 1);
+        let product = local(&mut ssa, 2, 0, 2);
+        let flags = local(&mut ssa, 3, 0, 2);
+        let read = local(&mut ssa, 4, 0, 3);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: x,
+            value: ConstValue::I32(3),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: factor,
+            value: ConstValue::I32(8),
+        }));
+        block.add_instruction(instr(SsaOp::Mul {
+            dest: product,
+            left: x,
+            right: factor,
+            flags: Some(flags),
+        }));
+        block.add_instruction(instr(SsaOp::ReadFlags {
+            dest: read,
+            flags,
+            mask: FlagsMask::CARRY,
+        }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(read) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run(&mut ssa, &0u32, &log, &|_| true);
+
+        assert!(
+            matches!(mock_op_at(&ssa, 0, 2), SsaOp::Mul { flags: Some(_), .. }),
+            "a flag-setting multiply must be left alone; got {:?}",
+            mock_op_at(&ssa, 0, 2)
+        );
+        assert_eq!(ssa.validate(), Ok(()));
     }
 
     fn local_at(

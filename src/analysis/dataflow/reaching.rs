@@ -103,12 +103,12 @@ impl ReachingDefinitions {
         let mut gen_sets = Vec::with_capacity(num_blocks);
 
         for block in ssa.blocks() {
-            let mut gen = BitSet::new(num_vars);
+            let mut generated = BitSet::new(num_vars);
 
             // Phi nodes define variables
             for phi in block.phi_nodes() {
                 if let Some(idx) = ssa.var_index(phi.result()) {
-                    gen.insert(idx);
+                    generated.insert(idx);
                 }
             }
 
@@ -116,12 +116,12 @@ impl ReachingDefinitions {
             for instr in block.instructions() {
                 for def in instr.defs() {
                     if let Some(idx) = ssa.var_index(def) {
-                        gen.insert(idx);
+                        generated.insert(idx);
                     }
                 }
             }
 
-            gen_sets.push(gen);
+            gen_sets.push(generated);
         }
 
         Self { num_vars, gen_sets }
@@ -168,8 +168,8 @@ impl<T: Target> DataFlowAnalysis<T> for ReachingDefinitions {
     ) -> Self::Lattice {
         // OUT = GEN ∪ IN (no KILL in SSA since each variable is defined once)
         let mut result = input.defs.clone();
-        if let Some(gen) = self.gen_sets.get(block_id) {
-            result.union_with(gen);
+        if let Some(generated) = self.gen_sets.get(block_id) {
+            result.union_with(generated);
         }
         ReachingDefsResult { defs: result }
     }
@@ -238,6 +238,11 @@ impl MeetSemiLattice for ReachingDefsResult {
         let mut result = self.defs.clone();
         result.union_with(&other.defs);
         Self { defs: result }
+    }
+
+    /// Union in place — no temporary set per predecessor.
+    fn meet_into(&mut self, other: &Self) {
+        self.defs.union_with(&other.defs);
     }
 
     fn is_bottom(&self) -> bool {

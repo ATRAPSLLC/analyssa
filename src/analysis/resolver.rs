@@ -48,10 +48,10 @@
 //! ```
 
 use crate::{
+    PointerSize,
     analysis::{consts::ConstEvaluator, evaluator::SsaEvaluator, phis::PhiAnalyzer},
     ir::{function::SsaFunction, value::ConstValue, variable::SsaVarId},
     target::Target,
-    PointerSize,
 };
 
 /// Demand-driven constant resolver composing multiple analysis components.
@@ -116,12 +116,12 @@ impl<'a, T: Target> ValueResolver<'a, T> {
         }
 
         // 2. PHI uniform constant check
-        if self.resolve_phis {
-            if let Some((_, phi)) = self.ssa.find_phi_defining(var) {
-                let result = self.phi.uniform_constant(phi, &mut self.evaluator);
-                if result.is_some() {
-                    return result;
-                }
+        if self.resolve_phis
+            && let Some((_, phi)) = self.ssa.find_phi_defining(var)
+        {
+            let result = self.phi.uniform_constant(phi, &mut self.evaluator);
+            if result.is_some() {
+                return result;
             }
         }
 
@@ -129,11 +129,11 @@ impl<'a, T: Target> ValueResolver<'a, T> {
         //    that ConstEvaluator couldn't fold, e.g. XOR with a Call operand)
         if self.path_aware_fallback && self.ssa.get_definition(var).is_some() {
             let mut eval = SsaEvaluator::new(self.ssa, self.ptr_size);
-            if let Some(resolved) = eval.resolve_with_trace(var, 15) {
-                if let Some(c) = resolved.as_constant() {
-                    self.evaluator.set_known(var, c.clone());
-                    return Some(c.clone());
-                }
+            if let Some(resolved) = eval.resolve_with_trace(var, 15)
+                && let Some(c) = resolved.as_constant()
+            {
+                self.evaluator.set_known(var, c.clone());
+                return Some(c.clone());
             }
         }
 

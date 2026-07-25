@@ -204,6 +204,15 @@ impl fmt::Display for SsaVarId {
 /// | Stack operations (add, call, etc.) | `Local(num_locals + K)` |
 /// | Phi node result | `Phi` |
 ///
+/// # Machine-code front ends
+///
+/// The four variants above describe a CIL method, which has a declared
+/// signature and a declared local table. A machine-code lifter has neither: a
+/// register read before any write in the function body is a value the caller
+/// supplied, but its position in the (unrecovered) signature is unknown at lift
+/// time. That case is [`EntryLiveIn`](Self::EntryLiveIn) — not `Argument`, which
+/// would assert a signature position the lifter cannot yet know.
+///
 /// # Examples
 ///
 /// ```rust
@@ -212,6 +221,7 @@ impl fmt::Display for SsaVarId {
 /// let arg_origin = VariableOrigin::Argument(0);  // First method argument
 /// let local_origin = VariableOrigin::Local(2);   // Third local variable
 /// let phi_origin = VariableOrigin::Phi;          // From phi node
+/// let live_in = VariableOrigin::EntryLiveIn;     // Caller-supplied, position unknown
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -235,6 +245,20 @@ pub enum VariableOrigin {
     /// Phi nodes are synthetic - they don't correspond to any CIL instruction
     /// but rather represent the merging of values from different control flow paths.
     Phi,
+
+    /// A value live on entry to the function, supplied by the caller, whose
+    /// position in the signature is not known.
+    ///
+    /// Produced by machine-code front ends for a storage location (typically a
+    /// register) that is read before the function body ever writes it. Like
+    /// [`Argument`](Self::Argument) it needs no definition in the body — the
+    /// verifier treats it as entry-defined — but unlike `Argument` it makes no
+    /// claim about argument position, because at lift time the calling
+    /// convention has not been recovered.
+    ///
+    /// ABI recovery may later reclassify such a variable as a real
+    /// `Argument(n)`; until it does, this is the honest description.
+    EntryLiveIn,
 }
 
 impl VariableOrigin {
@@ -254,6 +278,22 @@ impl VariableOrigin {
     #[must_use]
     pub const fn is_phi(&self) -> bool {
         matches!(self, Self::Phi)
+    }
+
+    /// Returns `true` if this is a caller-supplied value live on function entry.
+    #[must_use]
+    pub const fn is_entry_live_in(&self) -> bool {
+        matches!(self, Self::EntryLiveIn)
+    }
+
+    /// Returns `true` if the caller supplies this value, so it needs no
+    /// definition in the function body.
+    ///
+    /// True for both [`Argument`](Self::Argument) (position known) and
+    /// [`EntryLiveIn`](Self::EntryLiveIn) (position not yet recovered).
+    #[must_use]
+    pub const fn is_caller_supplied(&self) -> bool {
+        matches!(self, Self::Argument(_) | Self::EntryLiveIn)
     }
 
     /// Returns the argument index if this is an argument origin.
@@ -281,6 +321,7 @@ impl fmt::Display for VariableOrigin {
             Self::Argument(idx) => write!(f, "arg{idx}"),
             Self::Local(idx) => write!(f, "loc{idx}"),
             Self::Phi => write!(f, "phi"),
+            Self::EntryLiveIn => write!(f, "livein"),
         }
     }
 }
@@ -453,7 +494,7 @@ impl UseSite {
 ///
 /// Variables are created through [`SsaFunction::create_variable()`](crate::ir::function::SsaFunction::create_variable),
 /// which ensures dense ID allocation, origin registration, and type tracking.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
@@ -494,7 +535,8 @@ pub struct SsaVariable<T: Target> {
 
     /// All use sites where this variable is referenced as an operand.
     ///
-    /// Populated during SSA construction by [`SsaFunction::recompute_uses`].
+    /// Populated during SSA construction by
+    /// [`crate::ir::function::SsaFunction::recompute_uses`].
     /// Enables dead code elimination (empty uses = dead) and use-based
     /// analyses.
     uses: Vec<UseSite>,
@@ -505,6 +547,64 @@ pub struct SsaVariable<T: Target> {
     /// ineligible for copy propagation, dead store elimination, and other
     /// optimizations that assume single-assignment immutability.
     address_taken: bool,
+}
+
+impl<T: Target> Clone for SsaVariable<T> {
+    fn clone(&self) -> Self {
+        let Self {
+            id,
+            origin,
+            version,
+            def_site,
+            var_type,
+            uses,
+            address_taken,
+        } = self;
+        Self {
+            id: *id,
+            origin: *origin,
+            version: *version,
+            def_site: *def_site,
+            var_type: var_type.clone(),
+            uses: uses.clone(),
+            address_taken: *address_taken,
+        }
+    }
+
+    /// Overwrites `self` from `source`, **reusing this variable's existing
+    /// `uses` allocation**.
+    ///
+    /// Hand-written for the same reason as
+    /// [`SsaFunction::clone_from`](crate::ir::function::SsaFunction): the
+    /// derived `Clone` supplies only the default `clone_from`
+    /// (`*self = source.clone()`), which drops and reallocates the `uses`
+    /// vector on every call. Because `Vec::clone_from` calls `clone_from`
+    /// element-wise, specializing here is what lets a whole-function snapshot
+    /// reuse every per-variable use-list buffer instead of stopping at the
+    /// `variables` spine. Functions carry one such vector *per SSA variable*, so
+    /// this is the largest count of small allocations the optimization
+    /// pipeline's repeated rollback snapshots would otherwise re-make.
+    ///
+    /// The exhaustive destructure is deliberate: adding a field makes this fail
+    /// to compile rather than silently producing a stale-in-one-field clone.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            id,
+            origin,
+            version,
+            def_site,
+            var_type,
+            uses,
+            address_taken,
+        } = source;
+        self.id = *id;
+        self.origin = *origin;
+        self.version = *version;
+        self.def_site = *def_site;
+        self.var_type.clone_from(var_type);
+        self.uses.clone_from(uses);
+        self.address_taken = *address_taken;
+    }
 }
 
 impl<T: Target> SsaVariable<T> {
@@ -616,6 +716,18 @@ impl<T: Target> SsaVariable<T> {
         self.uses.len()
     }
 
+    /// Drops the use sites for which `keep` returns `false`.
+    ///
+    /// Lets a caller that knows exactly which uses it rewrote keep this list
+    /// exact without a whole-function rescan — the difference between an O(1)
+    /// index update and an O(function) walk per replacement.
+    pub fn retain_uses<F>(&mut self, keep: F)
+    where
+        F: FnMut(&UseSite) -> bool,
+    {
+        self.uses.retain(keep);
+    }
+
     /// Adds a use site for this variable.
     pub fn add_use(&mut self, use_site: UseSite) {
         self.uses.push(use_site);
@@ -659,7 +771,6 @@ impl<T: Target> fmt::Display for SsaVariable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::testing::{MockTarget, MockType};
 
     type SsaVariable = super::SsaVariable<MockTarget>;

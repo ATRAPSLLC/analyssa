@@ -6,9 +6,8 @@ use analyssa::{
     events::{EventKind, EventLog},
     ir::{function::SsaFunctionBuilder, ops::SsaOp},
     passes,
-    testing::{mock_i32, scalar_rewrite_fixture, MockTarget},
+    testing::{MockTarget, mock_i32, scalar_rewrite_fixture},
 };
-
 use common::{assert_event, assert_has_op, assert_pass_changes, run_pass_boundary, terminator_at};
 
 fn result_or_abort<T>(result: analyssa::Result<T>) -> T {

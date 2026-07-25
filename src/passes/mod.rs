@@ -31,6 +31,7 @@ pub mod deadcode;
 pub mod gvn;
 pub mod licm;
 pub mod loopcanon;
+pub mod memory;
 pub mod predicates;
 pub mod ranges;
 pub mod reassociate;
@@ -44,7 +45,8 @@ pub use scheduling::{
     AlgebraicSimplificationPass, BlockMergingPass, ControlFlowSimplificationPass,
     CopyPropagationPass, DeadCodeEliminationPass, DeadMethodEliminationPass,
     GlobalValueNumberingPass, JumpThreadingPass, LicmPass, LoopCanonicalizationPass,
-    OpaquePredicatePass, ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
+    MemoryOptimizationPass, OpaquePredicatePass, ReassociationPass, StrengthReductionPass,
+    ValueRangePropagationPass,
 };
 
 #[cfg(test)]

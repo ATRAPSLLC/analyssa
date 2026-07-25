@@ -42,8 +42,8 @@ use std::{
 };
 
 use crate::{
-    graph::{algorithms, DirectedGraph, NodeId},
     Result,
+    graph::{DirectedGraph, NodeId, algorithms},
 };
 
 /// A graph wrapper that provides automatic mapping between domain types and `NodeId`.
@@ -256,12 +256,29 @@ where
 
     /// Finds any cycle in the graph.
     ///
-    /// Checks all nodes and returns the first cycle found.
+    /// Returns the cycle in the lowest-numbered strongly connected component
+    /// that has one, so the answer is **deterministic**: iterating
+    /// `key_to_node.values()` and returning the first hit made the result depend
+    /// on `HashMap` order, which varies run to run — and a downstream
+    /// content-addressed pipeline needs byte-identical output.
+    ///
+    /// # Complexity
+    ///
+    /// O(V + E), one Tarjan pass. Restarting `find_cycle` from every node was
+    /// O(V·(V+E)) because each restart re-walked the graph with fresh state.
     #[must_use]
     pub fn find_any_cycle(&self) -> Option<Vec<K>> {
-        for &start_node in self.key_to_node.values() {
-            if let Some(cycle_nodes) = algorithms::find_cycle(&self.graph, start_node) {
-                return Some(self.map_nodes_to_keys(&cycle_nodes));
+        // Components arrive in a deterministic order and a cycle exists exactly
+        // where a component has more than one node, or a single node with an
+        // edge to itself.
+        for component in algorithms::strongly_connected_components(&self.graph) {
+            if component.len() > 1 {
+                return Some(self.map_nodes_to_keys(&component));
+            }
+            if let Some(&only) = component.first()
+                && self.graph.successors(only).any(|succ| succ == only)
+            {
+                return Some(self.map_nodes_to_keys(&component));
             }
         }
         None
@@ -289,6 +306,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `find_any_cycle` iterated a `HashMap`'s values, so which cycle it
+    /// reported varied between runs of the same binary. The downstream
+    /// similarity pipeline is content-addressed and requires byte-identical
+    /// output, so a nondeterministic answer is a correctness problem there, not
+    /// just an aesthetic one.
+    #[test]
+    fn find_any_cycle_is_deterministic() {
+        let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
+        // Two disjoint cycles, so there is a real choice to make.
+        for (from, to) in [("a", "b"), ("b", "a"), ("x", "y"), ("y", "x")] {
+            let _ = graph.add_edge(from, to, ());
+        }
+
+        let first = graph.find_any_cycle().expect("the graph has cycles");
+        for _ in 0..16 {
+            let again = graph.find_any_cycle().expect("still cyclic");
+            assert_eq!(again, first, "the reported cycle must not vary");
+        }
+
+        // And a self-loop counts as a cycle.
+        let mut selfish: IndexedGraph<&str, ()> = IndexedGraph::new();
+        let _ = selfish.add_edge("n", "n", ());
+        assert_eq!(selfish.find_any_cycle(), Some(vec!["n"]));
+
+        // An acyclic graph reports none.
+        let mut dag: IndexedGraph<&str, ()> = IndexedGraph::new();
+        let _ = dag.add_edge("a", "b", ());
+        let _ = dag.add_edge("b", "c", ());
+        assert_eq!(dag.find_any_cycle(), None);
+    }
 
     #[test]
     fn test_indexed_graph_basic() {
@@ -335,8 +383,8 @@ mod tests {
     fn test_indexed_graph_find_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
 
-        graph.add_edge("A", "B", ()).unwrap();
-        graph.add_edge("B", "C", ()).unwrap();
+        let _ = graph.add_edge("A", "B", ()).unwrap();
+        let _ = graph.add_edge("B", "C", ()).unwrap();
         graph.add_edge("C", "A", ()).unwrap(); // Creates cycle
 
         let cycle = graph.find_cycle_from(&"A");
@@ -352,8 +400,8 @@ mod tests {
     fn test_indexed_graph_no_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
 
-        graph.add_edge("A", "B", ()).unwrap();
-        graph.add_edge("B", "C", ()).unwrap();
+        let _ = graph.add_edge("A", "B", ()).unwrap();
+        let _ = graph.add_edge("B", "C", ()).unwrap();
         // No back edge
 
         assert!(graph.find_cycle_from(&"A").is_none());
@@ -366,10 +414,10 @@ mod tests {
 
         // A -> B -> D
         // A -> C -> D
-        graph.add_edge("A", "B", ()).unwrap();
-        graph.add_edge("A", "C", ()).unwrap();
-        graph.add_edge("B", "D", ()).unwrap();
-        graph.add_edge("C", "D", ()).unwrap();
+        let _ = graph.add_edge("A", "B", ()).unwrap();
+        let _ = graph.add_edge("A", "C", ()).unwrap();
+        let _ = graph.add_edge("B", "D", ()).unwrap();
+        let _ = graph.add_edge("C", "D", ()).unwrap();
 
         let order = graph.topological_sort();
         assert!(order.is_some());
@@ -389,7 +437,7 @@ mod tests {
     fn test_indexed_graph_topological_sort_with_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
 
-        graph.add_edge("A", "B", ()).unwrap();
+        let _ = graph.add_edge("A", "B", ()).unwrap();
         graph.add_edge("B", "A", ()).unwrap(); // Cycle
 
         assert!(graph.topological_sort().is_none());
@@ -400,9 +448,9 @@ mod tests {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
 
         // Two SCCs: {A, B} and {C}
-        graph.add_edge("A", "B", ()).unwrap();
+        let _ = graph.add_edge("A", "B", ()).unwrap();
         graph.add_edge("B", "A", ()).unwrap(); // A <-> B cycle
-        graph.add_edge("B", "C", ()).unwrap();
+        let _ = graph.add_edge("B", "C", ()).unwrap();
 
         let sccs = graph.strongly_connected_components();
         assert_eq!(sccs.len(), 2);
@@ -417,8 +465,8 @@ mod tests {
     fn test_indexed_graph_with_integers() {
         let mut graph: IndexedGraph<i32, &str> = IndexedGraph::new();
 
-        graph.add_edge(1, 2, "one-two").unwrap();
-        graph.add_edge(2, 3, "two-three").unwrap();
+        let _ = graph.add_edge(1, 2, "one-two").unwrap();
+        let _ = graph.add_edge(2, 3, "two-three").unwrap();
 
         assert_eq!(graph.node_count(), 3);
         assert!(graph.topological_sort().is_some());

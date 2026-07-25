@@ -118,6 +118,7 @@ mod error;
 pub mod events;
 pub mod graph;
 pub mod host;
+pub mod interproc;
 pub mod ir;
 pub mod passes;
 mod pointer;
@@ -132,6 +133,7 @@ pub use events::{
     DerivedStats, Event, EventBuilder, EventKind, EventListener, EventLog, NullListener,
 };
 pub use host::{DirtySet, SsaStore};
+pub use interproc::{CallGraph, SummaryStore, SummaryTransfer};
 pub use pointer::PointerSize;
 pub use scheduling::{
     DeobfuscationCapability, ModificationScope, PassScheduler, PipelineConfig, SsaPass, SsaPassHost,

@@ -1,0 +1,35 @@
+# Configuration for `cargo deny check`, run in CI.
+#
+# The crate's inputs are attacker-controlled binaries, so a RUSTSEC advisory
+# against a dependency is a security-relevant event that must fail the build
+# rather than be discovered later.
+
+[advisories]
+# Fail on any security advisory or unmaintained-crate warning affecting the
+# dependency graph.
+yanked = "deny"
+
+[licenses]
+# Apache-2.0 is this crate's own licence; the rest are the permissive licences
+# the current dependency set actually uses. A dependency arriving under anything
+# else should be a deliberate decision, not a silent one.
+# Kept to exactly what the current graph uses, so a new licence is a build
+# failure that gets looked at rather than a silent addition.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of one crate bloat the build and usually mean a dependency
+# is lagging; warn rather than fail, since transitive graphs are not fully under
+# this crate's control.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

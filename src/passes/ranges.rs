@@ -35,13 +35,19 @@
 //! - Does not handle loop-carried ranges (widening/ narrowing not
 //!   implemented — loops iterate up to `max_iterations` then stop).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    marker::PhantomData,
+};
 
 use crate::{
-    analysis::{cfg::SsaCfg, range::ValueRange},
+    analysis::{
+        cfg::SsaCfg,
+        range::{IntervalRange, ValueRange},
+    },
     bitset::BitSet,
     events::{EventKind, EventListener},
-    graph::{NodeId, RootedGraph, Successors},
+    graph::{NodeId, RootedGraph, Successors, algorithms::DominatorTree},
     ir::{
         block::SsaBlock,
         function::{SsaEditOptions, SsaFunction},
@@ -53,6 +59,228 @@ use crate::{
     },
     target::Target,
 };
+
+/// Converged per-variable value ranges for one function.
+///
+/// Only produced by [`analyze`], and only when the analysis reached its
+/// fixpoint — the analysis is optimistic, so a partial run's ranges are too
+/// narrow and prove things that are not true. There is deliberately no way to
+/// obtain this type from an unconverged run.
+#[derive(Debug, Clone, Default)]
+pub struct ValueRanges {
+    ranges: HashMap<SsaVarId, ValueRange>,
+}
+
+impl ValueRanges {
+    /// Returns the range proved for `var`, if any.
+    #[must_use]
+    pub fn get(&self, var: SsaVarId) -> Option<&ValueRange> {
+        self.ranges.get(&var)
+    }
+
+    /// Returns the number of variables with a recorded range.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Returns `true` when no variable has a recorded range.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Iterates the variables with a recorded range.
+    pub fn iter(&self) -> impl Iterator<Item = (SsaVarId, &ValueRange)> {
+        self.ranges.iter().map(|(var, range)| (*var, range))
+    }
+
+    /// Returns `var`'s range as known *at* `block`, refined by the branch
+    /// guards that dominate it.
+    ///
+    /// The whole-function range is a single fact per variable, so it cannot say
+    /// that `idx` is bounded only on the path a `cmp idx, N; ja default` guard
+    /// admits — which is exactly the fact a switch dispatch depends on. This
+    /// walks up the dominator tree from `block`; whenever the path arrives
+    /// through one arm of a conditional branch, the comparison driving that
+    /// branch is intersected into the result.
+    ///
+    /// Refinement only applies where the guard is *unambiguous*: the path must
+    /// enter through exactly one arm, so a block reachable through both arms of
+    /// the same branch learns nothing from it.
+    #[must_use]
+    pub fn range_at<T: Target>(
+        &self,
+        ssa: &SsaFunction<T>,
+        dominators: &DominatorTree,
+        var: SsaVarId,
+        block: usize,
+    ) -> ValueRange {
+        let mut range = self.get(var).cloned().unwrap_or_default();
+        let mut current = NodeId::new(block);
+        // Bound the climb by the block count: a dominator chain cannot be
+        // longer, and this keeps a malformed tree from looping.
+        for _ in 0..ssa.block_count() {
+            let Some(parent) = dominators.immediate_dominator(current) else {
+                break;
+            };
+            if let Some(refined) = self.refine_through_edge(ssa, dominators, var, parent, current) {
+                range = range.meet(&refined);
+            }
+            current = parent;
+        }
+        range
+    }
+
+    /// Returns what `parent`'s terminator proves about `var` on the path that
+    /// reaches `child`, if anything.
+    fn refine_through_edge<T: Target>(
+        &self,
+        ssa: &SsaFunction<T>,
+        dominators: &DominatorTree,
+        var: SsaVarId,
+        parent: NodeId,
+        child: NodeId,
+    ) -> Option<ValueRange> {
+        let block = ssa.block(parent.index())?;
+        let SsaOp::Branch {
+            condition,
+            true_target,
+            false_target,
+        } = block.terminator_op()?
+        else {
+            return None;
+        };
+        // The guard only holds if control necessarily arrived through one arm.
+        // A block that both arms reach learns nothing.
+        let via_true =
+            dominators.dominates(NodeId::new(*true_target), child) || child.index() == *true_target;
+        let via_false = dominators.dominates(NodeId::new(*false_target), child)
+            || child.index() == *false_target;
+        let taken = match (via_true, via_false) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => return None,
+        };
+        let comparison = ssa.get_definition(*condition)?;
+        self.refine_from_comparison(comparison, var, taken)
+    }
+
+    /// Intersects what a comparison proves about `var` when it evaluates to
+    /// `taken`.
+    ///
+    /// Only the constant-bounded forms are used: `x < k`, `x > k`, and their
+    /// negations. `k` is read from the other operand's proved range, so a
+    /// comparison against a computed-but-bounded value refines too.
+    fn refine_from_comparison<T: Target>(
+        &self,
+        comparison: &SsaOp<T>,
+        var: SsaVarId,
+        taken: bool,
+    ) -> Option<ValueRange> {
+        match comparison {
+            SsaOp::Clt { left, right, .. } => {
+                if *left == var {
+                    // taken: x < limit -> x <= limit_max - 1
+                    // else:  x >= limit -> x >= limit_min
+                    let limit = self.get(*right)?;
+                    if taken {
+                        limit
+                            .max()
+                            .and_then(|m| m.checked_sub(1))
+                            .map(|upper| ValueRange::Interval(IntervalRange::at_most(upper)))
+                    } else {
+                        limit
+                            .min()
+                            .map(|lower| ValueRange::Interval(IntervalRange::at_least(lower)))
+                    }
+                } else if *right == var {
+                    // taken: limit < x -> x >= limit_min + 1
+                    let limit = self.get(*left)?;
+                    if taken {
+                        limit
+                            .min()
+                            .and_then(|m| m.checked_add(1))
+                            .map(|lower| ValueRange::Interval(IntervalRange::at_least(lower)))
+                    } else {
+                        limit
+                            .max()
+                            .map(|upper| ValueRange::Interval(IntervalRange::at_most(upper)))
+                    }
+                } else {
+                    None
+                }
+            }
+            SsaOp::Cgt { left, right, .. } => {
+                if *left == var {
+                    let limit = self.get(*right)?;
+                    if taken {
+                        limit
+                            .min()
+                            .and_then(|m| m.checked_add(1))
+                            .map(|lower| ValueRange::Interval(IntervalRange::at_least(lower)))
+                    } else {
+                        limit
+                            .max()
+                            .map(|upper| ValueRange::Interval(IntervalRange::at_most(upper)))
+                    }
+                } else if *right == var {
+                    let limit = self.get(*left)?;
+                    if taken {
+                        limit
+                            .max()
+                            .and_then(|m| m.checked_sub(1))
+                            .map(|upper| ValueRange::Interval(IntervalRange::at_most(upper)))
+                    } else {
+                        limit
+                            .min()
+                            .map(|lower| ValueRange::Interval(IntervalRange::at_least(lower)))
+                    }
+                } else {
+                    None
+                }
+            }
+            // `x == k` on the taken arm pins `x` to `k`; the untaken arm proves
+            // only that it differs, which an interval cannot express.
+            SsaOp::Ceq { left, right, .. } if taken => {
+                let other = if *left == var {
+                    *right
+                } else if *right == var {
+                    *left
+                } else {
+                    return None;
+                };
+                self.get(other).cloned()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Computes value ranges for `ssa` without modifying it.
+///
+/// This is the query entry point for consumers that want the numeric facts
+/// rather than the rewrites — indirect-branch recovery, bounds reasoning, and
+/// tests that need to assert on a range directly.
+///
+/// # Arguments
+///
+/// * `ssa` — The SSA function to analyze.
+/// * `max_iterations` — Rounds over the function before the analysis gives up.
+///
+/// # Returns
+///
+/// `Some(ranges)` when the analysis reached its fixpoint, `None` otherwise. A
+/// `None` means nothing was proved, not that nothing is provable — retrying
+/// with a larger budget may succeed.
+#[must_use]
+pub fn analyze<T: Target>(ssa: &SsaFunction<T>, max_iterations: usize) -> Option<ValueRanges> {
+    let mut analysis: RangeAnalysis<T> = RangeAnalysis::new(max_iterations);
+    let result = analysis.analyze(ssa);
+    result.converged.then_some(ValueRanges {
+        ranges: result.ranges,
+    })
+}
 
 /// Run value-range propagation on `ssa`.
 ///
@@ -92,18 +320,17 @@ where
             true_target,
             false_target,
         }) = block.terminator_op()
+            && let Some(range) = result.get_range(*condition)
         {
-            if let Some(range) = result.get_range(*condition) {
-                if let Some(is_true) = range.always_equal_to(0) {
-                    if is_true {
-                        branch_simplifications.push((block_idx, *false_target, false));
-                    }
-                }
-                if let Some(val) = range.as_constant() {
-                    if val != 0 {
-                        branch_simplifications.push((block_idx, *true_target, true));
-                    }
-                }
+            if let Some(is_true) = range.always_equal_to(0)
+                && is_true
+            {
+                branch_simplifications.push((block_idx, *false_target, false));
+            }
+            if let Some(val) = range.as_constant()
+                && val != 0
+            {
+                branch_simplifications.push((block_idx, *true_target, true));
             }
         }
 
@@ -118,16 +345,14 @@ where
 
     let result = ssa.edit(SsaEditOptions::new(), |editor| {
         for (block_idx, target, is_true) in branch_simplifications {
-            let Some(last_idx) = editor
-                .function()
-                .block(block_idx)
-                .and_then(|block| block.instructions().len().checked_sub(1))
-            else {
+            let Some(_) = editor.function().block(block_idx) else {
                 continue;
             };
 
-            editor.replace_instruction_op(block_idx, last_idx, SsaOp::Jump { target })?;
-            editor.mark_cfg_changed();
+            // Folding a branch removes an edge, which can only *increase*
+            // dominance — no new phi can be required, so this needs a phi-operand
+            // prune plus `repair_ssa`, not a full `rebuild_ssa`.
+            editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
             let event = crate::events::Event {
                 kind: EventKind::OpaquePredicateRemoved,
                 method: Some(method.clone()),
@@ -203,15 +428,15 @@ fn try_simplify_comparison<T: Target>(
         } => {
             let left_range = result.get_range(*left)?;
             let right_range = result.get_range(*right)?;
-            if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min()) {
-                if l_max < r_min {
-                    return Some((*dest, true));
-                }
+            if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
+                && l_max < r_min
+            {
+                return Some((*dest, true));
             }
-            if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max()) {
-                if l_min >= r_max {
-                    return Some((*dest, false));
-                }
+            if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
+                && l_min >= r_max
+            {
+                return Some((*dest, false));
             }
             None
         }
@@ -220,15 +445,15 @@ fn try_simplify_comparison<T: Target>(
         } => {
             let left_range = result.get_range(*left)?;
             let right_range = result.get_range(*right)?;
-            if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max()) {
-                if l_min > r_max {
-                    return Some((*dest, true));
-                }
+            if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
+                && l_min > r_max
+            {
+                return Some((*dest, true));
             }
-            if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min()) {
-                if l_max <= r_min {
-                    return Some((*dest, false));
-                }
+            if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
+                && l_max <= r_min
+            {
+                return Some((*dest, false));
             }
             None
         }
@@ -275,10 +500,23 @@ struct RangeAnalysis<T: Target> {
     ssa_worklist: VecDeque<SsaVarId>,
     /// Worklist of CFG edges to process for first-time execution.
     cfg_worklist: VecDeque<(usize, usize)>,
-    /// Maximum iterations to prevent non-termination on loops without widening.
+    /// Number of times each variable's range has been revised, driving the
+    /// switch to widening once a value looks loop-carried.
+    update_counts: HashMap<SsaVarId, u32>,
+    /// Rounds over the function the caller allows before giving up.
     max_iterations: usize,
-    _phantom: std::marker::PhantomData<T>,
+    _phantom: PhantomData<T>,
 }
+
+/// Revisions of one variable's range before the analysis starts widening
+/// instead of taking the newly computed range verbatim.
+///
+/// A value revised more than this is loop-carried: each trip round the loop
+/// grows it by one step, so taking the exact range would need as many rounds as
+/// the loop has trips. Widening drops the growing bound to infinity, which
+/// reaches the fixpoint in a bounded number of steps at the cost of precision on
+/// that bound.
+const WIDEN_AFTER_REVISIONS: u32 = 3;
 
 impl<T: Target> RangeAnalysis<T> {
     fn new(max_iterations: usize) -> Self {
@@ -288,17 +526,19 @@ impl<T: Target> RangeAnalysis<T> {
             executable_blocks: BitSet::new(0),
             ssa_worklist: VecDeque::new(),
             cfg_worklist: VecDeque::new(),
+            update_counts: HashMap::new(),
             max_iterations,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
     fn analyze(&mut self, ssa: &SsaFunction<T>) -> RangeResult {
         let cfg = SsaCfg::from_ssa(ssa);
         self.initialize(ssa, &cfg);
-        self.propagate(ssa, &cfg);
+        let converged = self.propagate(ssa, &cfg);
         RangeResult {
             ranges: std::mem::take(&mut self.ranges),
+            converged,
         }
     }
 
@@ -311,6 +551,7 @@ impl<T: Target> RangeAnalysis<T> {
         self.executable_blocks = BitSet::new(ssa.block_count());
         self.ssa_worklist.clear();
         self.cfg_worklist.clear();
+        self.update_counts.clear();
 
         for var in ssa.variables() {
             self.ranges.insert(var.id(), ValueRange::top());
@@ -322,30 +563,50 @@ impl<T: Target> RangeAnalysis<T> {
             self.cfg_worklist.push_back((entry, succ.index()));
         }
         if let Some(block) = ssa.block(entry) {
-            self.process_block_definitions(block);
+            self.process_block_definitions(block, ssa);
         }
     }
 
-    fn propagate<G>(&mut self, ssa: &SsaFunction<T>, cfg: &G)
+    /// Drains both worklists to the fixpoint.
+    ///
+    /// Returns `true` when the fixpoint was reached. This is **not** advisory:
+    /// the analysis is optimistic — it starts from an empty executable-edge set
+    /// and grows ranges as edges are discovered — so its conclusions are only
+    /// sound *at* the fixpoint. A partial run leaves ranges that are too narrow,
+    /// which proves comparisons that are not actually provable. The caller must
+    /// discard the result when this returns `false`.
+    ///
+    /// Termination comes from widening (see [`WIDEN_AFTER_REVISIONS`]); the step
+    /// budget is a backstop for pathological constraint counts, sized from the
+    /// function so ordinary code always converges well inside it.
+    fn propagate<G>(&mut self, ssa: &SsaFunction<T>, cfg: &G) -> bool
     where
         G: RootedGraph + Successors,
     {
-        let mut iterations: usize = 0;
+        let work = ssa
+            .block_count()
+            .saturating_add(ssa.variable_count())
+            .saturating_add(16);
+        let budget = self.max_iterations.saturating_mul(work).saturating_add(64);
+        let mut steps: usize = 0;
         loop {
-            iterations = iterations.saturating_add(1);
-            if iterations > self.max_iterations {
-                break;
-            }
             while let Some((from, to)) = self.cfg_worklist.pop_front() {
+                steps = steps.saturating_add(1);
+                if steps > budget {
+                    return false;
+                }
                 if self.executable_edges.insert((from, to)) {
                     self.process_edge(from, to, ssa, cfg);
                 }
             }
-            if let Some(var) = self.ssa_worklist.pop_front() {
-                self.process_variable_uses(var, ssa, cfg);
-            } else {
-                break;
+            let Some(var) = self.ssa_worklist.pop_front() else {
+                return true;
+            };
+            steps = steps.saturating_add(1);
+            if steps > budget {
+                return false;
             }
+            self.process_variable_uses(var, ssa, cfg);
         }
     }
 
@@ -357,7 +618,7 @@ impl<T: Target> RangeAnalysis<T> {
         if first_visit {
             self.mark_block_executable(to);
             if let Some(block) = ssa.block(to) {
-                self.process_block_definitions(block);
+                self.process_block_definitions(block, ssa);
             }
         }
         if let Some(block) = ssa.block(to) {
@@ -368,16 +629,14 @@ impl<T: Target> RangeAnalysis<T> {
                 }
             }
         }
-        if first_visit {
-            if let Some(block) = ssa.block(to) {
-                self.propagate_outgoing_edges(to, block, cfg);
-            }
+        if first_visit && let Some(block) = ssa.block(to) {
+            self.propagate_outgoing_edges(to, block, cfg);
         }
     }
 
-    fn process_block_definitions(&mut self, block: &SsaBlock<T>) {
+    fn process_block_definitions(&mut self, block: &SsaBlock<T>, ssa: &SsaFunction<T>) {
         for instr in block.instructions() {
-            self.update_instruction_defs(instr);
+            self.update_instruction_defs(instr, ssa);
         }
     }
 
@@ -392,27 +651,27 @@ impl<T: Target> RangeAnalysis<T> {
                     continue;
                 }
                 if use_site.is_phi_operand {
-                    if let Some(block) = ssa.block(block_id) {
-                        if let Some(phi) = block.phi(use_site.instruction) {
-                            let new_range = self.evaluate_phi(phi, block_id);
-                            self.update_range(phi.result(), &new_range);
-                        }
+                    if let Some(block) = ssa.block(block_id)
+                        && let Some(phi) = block.phi(use_site.instruction)
+                    {
+                        let new_range = self.evaluate_phi(phi, block_id);
+                        self.update_range(phi.result(), &new_range);
                     }
-                } else if let Some(block) = ssa.block(block_id) {
-                    if let Some(instr) = block.instruction(use_site.instruction) {
-                        self.update_instruction_defs(instr);
-                        if instr.is_terminator() {
-                            self.propagate_outgoing_edges(block_id, block, cfg);
-                        }
+                } else if let Some(block) = ssa.block(block_id)
+                    && let Some(instr) = block.instruction(use_site.instruction)
+                {
+                    self.update_instruction_defs(instr, ssa);
+                    if instr.is_terminator() {
+                        self.propagate_outgoing_edges(block_id, block, cfg);
                     }
                 }
             }
         }
     }
 
-    fn update_instruction_defs(&mut self, instr: &SsaInstruction<T>) {
+    fn update_instruction_defs(&mut self, instr: &SsaInstruction<T>, ssa: &SsaFunction<T>) {
         let primary = instr.op().dest();
-        let range = self.evaluate_instruction(instr.op());
+        let range = self.evaluate_instruction(instr.op(), ssa);
         for def in instr.defs() {
             if Some(def) == primary {
                 self.update_range(def, &range);
@@ -536,7 +795,47 @@ impl<T: Target> RangeAnalysis<T> {
         result
     }
 
-    fn evaluate_instruction(&self, op: &SsaOp<T>) -> ValueRange {
+    /// Returns the bit width of `var`'s declared type, when the target knows it.
+    fn width_of(ssa: &SsaFunction<T>, var: SsaVarId) -> Option<u32> {
+        ssa.variable(var).and_then(|v| T::bit_width(v.var_type()))
+    }
+
+    /// Clamps `range` to what `width_bits` can represent, falling back to `Top`
+    /// when it cannot.
+    ///
+    /// Interval arithmetic here is done in `i64`, but the values are not: a
+    /// 32-bit `add` wraps, so `0x7fff_ffff + 1` is `-0x8000_0000` and not
+    /// `0x8000_0000`. A result that escapes the destination's width has
+    /// therefore wrapped to somewhere this domain cannot name, and the only
+    /// sound answer is no information.
+    fn wrap_to_width(range: ValueRange, width_bits: Option<u32>) -> ValueRange {
+        let Some(width) = width_bits else {
+            // An unknown width cannot be checked, so nothing may be assumed
+            // about whether the operation stayed in range.
+            return ValueRange::top();
+        };
+        if width == 0 || width > 64 {
+            return ValueRange::top();
+        }
+        // Signed bounds for `width`: [-2^(w-1), 2^(w-1) - 1].
+        let Some(shift) = width.checked_sub(1) else {
+            return ValueRange::top();
+        };
+        let Some(magnitude) = 1i64.checked_shl(shift) else {
+            return ValueRange::top();
+        };
+        let Some(upper) = magnitude.checked_sub(1) else {
+            return ValueRange::top();
+        };
+        let lower = magnitude.saturating_neg();
+        match (range.min(), range.max()) {
+            (Some(min), Some(max)) if min >= lower && max <= upper => range,
+            _ => ValueRange::top(),
+        }
+    }
+
+    fn evaluate_instruction(&self, op: &SsaOp<T>, ssa: &SsaFunction<T>) -> ValueRange {
+        let dest_width = op.dest().and_then(|dest| Self::width_of(ssa, dest));
         match op {
             SsaOp::Const { value, .. } => {
                 if let Some(v) = value.as_i64() {
@@ -549,26 +848,89 @@ impl<T: Target> RangeAnalysis<T> {
             SsaOp::Add { left, right, .. } => {
                 let l = self.get_range(*left);
                 let r = self.get_range(*right);
-                l.add(&r)
+                Self::wrap_to_width(l.add(&r), dest_width)
             }
             SsaOp::Sub { left, right, .. } => {
                 let l = self.get_range(*left);
                 let r = self.get_range(*right);
-                l.sub(&r)
+                Self::wrap_to_width(l.sub(&r), dest_width)
             }
             SsaOp::Mul { left, right, .. } => {
                 let l = self.get_range(*left);
                 let r = self.get_range(*right);
-                l.mul(&r)
+                Self::wrap_to_width(l.mul(&r), dest_width)
+            }
+            SsaOp::Neg { operand, .. } => {
+                let value = self.get_range(*operand);
+                let negated = match (value.min(), value.max()) {
+                    (Some(min), Some(max)) => match (min.checked_neg(), max.checked_neg()) {
+                        (Some(neg_min), Some(neg_max)) => {
+                            ValueRange::bounded(neg_max.min(neg_min), neg_max.max(neg_min))
+                        }
+                        _ => ValueRange::top(),
+                    },
+                    _ => ValueRange::top(),
+                };
+                Self::wrap_to_width(negated, dest_width)
+            }
+            SsaOp::Shl { value, amount, .. } => {
+                let val_range = self.get_range(*value);
+                let amt_range = self.get_range(*amount);
+                if let Some(amt) = amt_range.as_constant()
+                    && (0..64).contains(&amt)
+                    && let Ok(shift) = u32::try_from(amt)
+                    && let (Some(min), Some(max)) = (val_range.min(), val_range.max())
+                    && let (Some(new_min), Some(new_max)) =
+                        (min.checked_shl(shift), max.checked_shl(shift))
+                    // A left shift is only a multiply while nothing leaves the
+                    // top of the value; verify by shifting back.
+                    && new_min.checked_shr(shift) == Some(min)
+                    && new_max.checked_shr(shift) == Some(max)
+                {
+                    return Self::wrap_to_width(
+                        ValueRange::bounded(new_min.min(new_max), new_min.max(new_max)),
+                        dest_width,
+                    );
+                }
+                ValueRange::top()
+            }
+            SsaOp::Or { left, right, .. } | SsaOp::Xor { left, right, .. } => {
+                // For non-negative operands the result cannot exceed the next
+                // power of two above either bound, and cannot go negative.
+                let l = self.get_range(*left);
+                let r = self.get_range(*right);
+                match (l.max(), r.max()) {
+                    (Some(l_max), Some(r_max))
+                        if l.is_always_non_negative()
+                            && r.is_always_non_negative()
+                            && l_max >= 0
+                            && r_max >= 0 =>
+                    {
+                        let bound = l_max.max(r_max);
+                        // Saturate to all-ones at the width of the larger bound.
+                        let bits = i64::BITS.saturating_sub(bound.leading_zeros());
+                        match 1i64.checked_shl(bits).map(|v| v.saturating_sub(1)) {
+                            Some(all_ones) if all_ones >= 0 => ValueRange::bounded(0, all_ones),
+                            _ => ValueRange::non_negative(),
+                        }
+                    }
+                    _ => ValueRange::top(),
+                }
             }
             SsaOp::And { left, right, .. } => {
+                // Delegate to the lattice operation rather than re-deriving the
+                // bound here. `mask.max(0)` looks like a clamp but is not: for a
+                // negative mask it yields `bounded(0, 0)`, which claims the
+                // result is the *constant zero*. `x & -16` clears only the low
+                // four bits and can be any value, so the correct answer for a
+                // negative mask is Top — which is what `and_constant` returns.
                 let r = self.get_range(*right);
                 if let Some(mask) = r.as_constant() {
-                    ValueRange::bounded(0, mask.max(0))
+                    r.and_constant(mask)
                 } else {
                     let l = self.get_range(*left);
                     if let Some(mask) = l.as_constant() {
-                        ValueRange::bounded(0, mask.max(0))
+                        l.and_constant(mask)
                     } else {
                         ValueRange::top()
                     }
@@ -582,25 +944,26 @@ impl<T: Target> RangeAnalysis<T> {
             } => {
                 let val_range = self.get_range(*value);
                 let amt_range = self.get_range(*amount);
-                if let Some(amt) = amt_range.as_constant() {
-                    if (0..64).contains(&amt) && *unsigned && val_range.is_always_non_negative() {
-                        if let (Some(min), Some(max)) = (val_range.min(), val_range.max()) {
-                            let new_min = min >> amt;
-                            let new_max = max >> amt;
-                            return ValueRange::bounded(new_min, new_max);
-                        }
-                    }
+                if let Some(amt) = amt_range.as_constant()
+                    && (0..64).contains(&amt)
+                    && *unsigned
+                    && val_range.is_always_non_negative()
+                    && let (Some(min), Some(max)) = (val_range.min(), val_range.max())
+                {
+                    let new_min = min >> amt;
+                    let new_max = max >> amt;
+                    return ValueRange::bounded(new_min, new_max);
                 }
                 ValueRange::top()
             }
             SsaOp::Rem { left, right, .. } => {
                 let r = self.get_range(*right);
-                if let Some(n) = r.as_constant() {
-                    if n > 0 {
-                        let l = self.get_range(*left);
-                        if l.is_always_non_negative() {
-                            return ValueRange::bounded(0, n.saturating_sub(1));
-                        }
+                if let Some(n) = r.as_constant()
+                    && n > 0
+                {
+                    let l = self.get_range(*left);
+                    if l.is_always_non_negative() {
+                        return ValueRange::bounded(0, n.saturating_sub(1));
                     }
                 }
                 ValueRange::top()
@@ -619,10 +982,24 @@ impl<T: Target> RangeAnalysis<T> {
         self.ranges.get(&var).cloned().unwrap_or_default()
     }
 
+    /// Revises `var`'s range, widening once the value has been revised often
+    /// enough to look loop-carried.
+    ///
+    /// Without widening a counted loop needs one round per trip, so a bounded
+    /// run stops mid-ascent holding a range that is too narrow — the unsound
+    /// direction. Widening drops the unstable bound to infinity instead, which
+    /// converges in a bounded number of steps.
     fn update_range(&mut self, var: SsaVarId, new_range: &ValueRange) {
         let old_range = self.ranges.get(&var).cloned().unwrap_or_default();
-        if *new_range != old_range {
-            self.ranges.insert(var, new_range.clone());
+        let revisions = self.update_counts.entry(var).or_insert(0);
+        *revisions = revisions.saturating_add(1);
+        let next_range = if *revisions > WIDEN_AFTER_REVISIONS {
+            old_range.widen(new_range)
+        } else {
+            new_range.clone()
+        };
+        if next_range != old_range {
+            self.ranges.insert(var, next_range);
             self.ssa_worklist.push_back(var);
         }
     }
@@ -631,10 +1008,18 @@ impl<T: Target> RangeAnalysis<T> {
 #[derive(Debug)]
 struct RangeResult {
     ranges: HashMap<SsaVarId, ValueRange>,
+    /// `false` when the analysis stopped before reaching its fixpoint, in which
+    /// case no range in `ranges` may be trusted.
+    converged: bool,
 }
 
 impl RangeResult {
+    /// Returns `var`'s range, or `None` when the analysis did not converge and
+    /// therefore proved nothing.
     fn get_range(&self, var: SsaVarId) -> Option<&ValueRange> {
+        if !self.converged {
+            return None;
+        }
         self.ranges.get(&var)
     }
 }
@@ -651,7 +1036,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{mock_terminator_at, run_mock_pass_boundary, MockTarget, MockType},
+        testing::{MockTarget, MockType, mock_terminator_at, run_mock_pass_boundary},
     };
 
     #[test]
@@ -682,7 +1067,20 @@ mod tests {
     fn make_result(entries: Vec<(SsaVarId, ValueRange)>) -> RangeResult {
         RangeResult {
             ranges: entries.into_iter().collect(),
+            converged: true,
         }
+    }
+
+    /// A result from a run that never reached its fixpoint proves nothing, so
+    /// every query answers `None` regardless of what was recorded.
+    #[test]
+    fn unconverged_result_yields_no_ranges() {
+        let var = SsaVarId::from_index(0);
+        let result = RangeResult {
+            ranges: [(var, ValueRange::constant(5))].into_iter().collect(),
+            converged: false,
+        };
+        assert_eq!(result.get_range(var), None);
     }
 
     #[test]
@@ -873,6 +1271,74 @@ mod tests {
         ));
     }
 
+    /// `x & -16` clears the low four bits and leaves everything else alone, so
+    /// its value is unconstrained. Deriving `[0, 0]` from the mask — which
+    /// `mask.max(0)` does for any negative mask — claims the result is the
+    /// constant zero, and the pass then folds a live branch to its false arm and
+    /// deletes the true arm.
+    #[test]
+    fn and_with_a_negative_mask_does_not_prove_a_constant() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let x = local_at(&mut ssa, 0, 0, 0);
+        let mask = local_at(&mut ssa, 1, 0, 1);
+        let masked = local_at(&mut ssa, 2, 0, 2);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::LoadArg {
+            dest: x,
+            arg_index: 0,
+        }));
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: mask,
+            value: ConstValue::I32(-16),
+        }));
+        b0.add_instruction(instr(SsaOp::And {
+            dest: masked,
+            left: x,
+            right: mask,
+            flags: None,
+        }));
+        b0.add_instruction(instr(SsaOp::Branch {
+            condition: masked,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b2);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0u32;
+        run(&mut ssa, &method, &log, 20);
+
+        assert!(
+            matches!(mock_terminator_at(&ssa, 0), SsaOp::Branch { .. }),
+            "the branch on `x & -16` must survive; got {:?}",
+            mock_terminator_at(&ssa, 0)
+        );
+    }
+
+    /// The non-negative case must keep folding: `x & 15` really is in `[0, 15]`.
+    #[test]
+    fn and_with_a_non_negative_mask_still_bounds_the_result() {
+        let range = ValueRange::top().and_constant(15);
+        assert_eq!(range.min(), Some(0));
+        assert_eq!(range.max(), Some(15));
+
+        let unconstrained = ValueRange::top().and_constant(-16);
+        assert!(
+            unconstrained.as_constant().is_none(),
+            "a negative mask must not yield a constant, got {unconstrained:?}"
+        );
+    }
+
     #[test]
     fn single_block_no_branch_no_changes() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
@@ -991,10 +1457,9 @@ mod tests {
     fn out_of_range_branch_targets_do_not_panic() {
         // A terminator may reference a block that was never recovered (the IR
         // permits dangling successors and the verifier tolerates them). The
-        // `executable_blocks` bitset is sized to `block_count`, so feeding it an
-        // out-of-range target index used to panic in `BitSet::contains`. The
-        // pass must instead treat the unknown target as unreachable and run
-        // cleanly. Here the condition is an unconstrained argument (range stays
+        // `executable_blocks` bitset is sized to `block_count`, so an
+        // out-of-range target index must be treated as unreachable rather than
+        // reaching the asserting `BitSet::contains`. Here the condition is an unconstrained argument (range stays
         // `top`), so both the in-range and the out-of-range edge are explored.
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
         let cond = ssa.create_variable(

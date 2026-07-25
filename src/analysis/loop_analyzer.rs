@@ -26,9 +26,9 @@
 use crate::{
     analysis::{
         cfg::SsaCfg,
-        loops::{detect_loops, LoopForest},
+        loops::{LoopForest, detect_loops},
     },
-    graph::{algorithms, RootedGraph},
+    graph::{RootedGraph, algorithms},
     ir::function::SsaFunction,
     target::Target,
 };

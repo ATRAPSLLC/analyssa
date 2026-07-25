@@ -37,6 +37,7 @@
 //! | [`JumpThreadingPass`] | 0 | [`super::threading`] | CfgModifying |
 //! | [`LicmPass`] | 1 | [`super::licm`] | CfgModifying |
 //! | [`LoopCanonicalizationPass`] | 0 | [`super::loopcanon`] | CfgModifying |
+//! | [`MemoryOptimizationPass`] | 1 | [`super::memory`] | InstructionsOnly |
 //! | [`OpaquePredicatePass<T>`] | 1 | [`super::predicates`] | CfgModifying |
 //! | [`ReassociationPass`] | 1 | [`super::reassociate`] | InstructionsOnly |
 //! | [`StrengthReductionPass`] | 1 | [`super::strength`] | InstructionsOnly |
@@ -598,6 +599,55 @@ where
         host: &H,
     ) -> Result<bool> {
         Ok(passes::predicates::run(
+            ssa,
+            method,
+            host.events(),
+            host.ptr_size(),
+        ))
+    }
+}
+
+/// Memory optimization pass.
+///
+/// Runs store-to-load forwarding, redundant load elimination, and dead store
+/// elimination, all gated on Memory SSA alias proofs.
+///
+/// # Modification scope
+///
+/// [`ModificationScope::InstructionsOnly`] — replaces uses and nops
+/// instructions, never touching the CFG.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemoryOptimizationPass;
+
+impl<T, H> SsaPass<T, H> for MemoryOptimizationPass
+where
+    T: Target,
+    T::MethodRef: Send + Sync,
+    H: SsaPassHost<T>,
+{
+    fn name(&self) -> &'static str {
+        "memory-optimization"
+    }
+
+    fn description(&self) -> &'static str {
+        "Forward stores to loads, drop redundant loads, and remove dead stores"
+    }
+
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::InstructionsOnly
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
+    fn run_on_method(
+        &self,
+        ssa: &mut SsaFunction<T>,
+        method: &T::MethodRef,
+        host: &H,
+    ) -> Result<bool> {
+        Ok(passes::memory::run(
             ssa,
             method,
             host.events(),

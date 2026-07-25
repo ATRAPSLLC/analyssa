@@ -63,9 +63,9 @@
 use std::collections::HashMap;
 
 use crate::{
+    BitSet, PointerSize,
     ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
     target::Target,
-    BitSet, PointerSize,
 };
 
 /// Evaluates SSA operations to constant values.
@@ -379,11 +379,7 @@ pub fn evaluate_const_op<T: Target>(
         } => {
             let l = get_const(*left)?;
             let r = get_const(*right)?;
-            if *unsigned {
-                l.clt_un(&r)
-            } else {
-                l.clt(&r)
-            }
+            if *unsigned { l.clt_un(&r) } else { l.clt(&r) }
         }
         SsaOp::Cgt {
             left,
@@ -393,11 +389,7 @@ pub fn evaluate_const_op<T: Target>(
         } => {
             let l = get_const(*left)?;
             let r = get_const(*right)?;
-            if *unsigned {
-                l.cgt_un(&r)
-            } else {
-                l.cgt(&r)
-            }
+            if *unsigned { l.cgt_un(&r) } else { l.cgt(&r) }
         }
 
         // Overflow-checked arithmetic
@@ -524,42 +516,13 @@ pub fn evaluate_const_op<T: Target>(
                 _ => None,
             }
         }
-        SsaOp::Rcl { value, amount, .. } => {
-            let v = get_const(*value)?;
-            let a = get_const(*amount)?;
-            let shift = a.as_i32()? as u32;
-            match v {
-                ConstValue::I8(v) => Some(ConstValue::I8(v.rotate_left(shift))),
-                ConstValue::I16(v) => Some(ConstValue::I16(v.rotate_left(shift))),
-                ConstValue::I32(v) => Some(ConstValue::I32(v.rotate_left(shift))),
-                ConstValue::I64(v) => Some(ConstValue::I64(v.rotate_left(shift))),
-                ConstValue::U8(v) => Some(ConstValue::U8(v.rotate_left(shift))),
-                ConstValue::U16(v) => Some(ConstValue::U16(v.rotate_left(shift))),
-                ConstValue::U32(v) => Some(ConstValue::U32(v.rotate_left(shift))),
-                ConstValue::U64(v) => Some(ConstValue::U64(v.rotate_left(shift))),
-                ConstValue::NativeInt(v) => Some(ConstValue::NativeInt(v.rotate_left(shift))),
-                ConstValue::NativeUInt(v) => Some(ConstValue::NativeUInt(v.rotate_left(shift))),
-                _ => None,
-            }
-        }
-        SsaOp::Rcr { value, amount, .. } => {
-            let v = get_const(*value)?;
-            let a = get_const(*amount)?;
-            let shift = a.as_i32()? as u32;
-            match v {
-                ConstValue::I8(v) => Some(ConstValue::I8(v.rotate_right(shift))),
-                ConstValue::I16(v) => Some(ConstValue::I16(v.rotate_right(shift))),
-                ConstValue::I32(v) => Some(ConstValue::I32(v.rotate_right(shift))),
-                ConstValue::I64(v) => Some(ConstValue::I64(v.rotate_right(shift))),
-                ConstValue::U8(v) => Some(ConstValue::U8(v.rotate_right(shift))),
-                ConstValue::U16(v) => Some(ConstValue::U16(v.rotate_right(shift))),
-                ConstValue::U32(v) => Some(ConstValue::U32(v.rotate_right(shift))),
-                ConstValue::U64(v) => Some(ConstValue::U64(v.rotate_right(shift))),
-                ConstValue::NativeInt(v) => Some(ConstValue::NativeInt(v.rotate_right(shift))),
-                ConstValue::NativeUInt(v) => Some(ConstValue::NativeUInt(v.rotate_right(shift))),
-                _ => None,
-            }
-        }
+        // `Rcl`/`Rcr` rotate *through the carry flag* — a 9/17/33/65-bit rotation
+        // whose extra bit is CF, which is not one of their SSA operands. Folding
+        // them as plain `Rol`/`Ror` is silently wrong for every input where the
+        // rotated-out bit differs from the incoming carry. `passes::gvn`
+        // excludes them from value numbering for the same reason. Declining to
+        // fold is the only sound option until the ops carry an explicit carry-in.
+        SsaOp::Rcl { .. } | SsaOp::Rcr { .. } => None,
 
         // Byte/bit manipulation
         SsaOp::BSwap { src, .. } => {
@@ -676,9 +639,8 @@ pub fn evaluate_const_op<T: Target>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
-        ir::{block::SsaBlock, instruction::SsaInstruction, variable::DefSite, VariableOrigin},
+        ir::{VariableOrigin, block::SsaBlock, instruction::SsaInstruction, variable::DefSite},
         testing,
         testing::{MockTarget, MockType},
     };
@@ -697,6 +659,59 @@ mod tests {
             3 => Some(Cv::I32(i32::MAX)),
             _ => None,
         }
+    }
+
+    /// `Rcl`/`Rcr` rotate *through the carry flag* — a 9/17/33/65-bit rotation
+    /// whose extra bit is CF, which is not one of their SSA operands. Folding
+    /// them as plain `Rol`/`Ror` is silently wrong for every input where the
+    /// rotated-out bit differs from the incoming carry. `passes::gvn` already
+    /// refuses to value-number them for the same reason.
+    #[test]
+    fn carry_coupled_rotates_are_not_folded() {
+        let value = SsaVarId::from_index(0);
+        let amount = SsaVarId::from_index(1);
+        let dest = SsaVarId::from_index(2);
+        let constants = |var: SsaVarId| -> Option<ConstValue<MockTarget>> {
+            match var.index() {
+                0 => Some(ConstValue::U32(0x8000_0001)),
+                1 => Some(ConstValue::I32(1)),
+                _ => None,
+            }
+        };
+
+        for op in [
+            SsaOp::<MockTarget>::Rcl {
+                dest,
+                value,
+                amount,
+            },
+            SsaOp::Rcr {
+                dest,
+                value,
+                amount,
+            },
+        ] {
+            assert_eq!(
+                evaluate_const_op(&op, constants, PointerSize::Bit64),
+                None,
+                "{op:?} depends on the carry flag and must not fold"
+            );
+        }
+
+        // The plain rotates are a pure function of their operands and do fold,
+        // at the operand's own width.
+        assert_eq!(
+            evaluate_const_op(
+                &SsaOp::<MockTarget>::Rol {
+                    dest,
+                    value,
+                    amount
+                },
+                constants,
+                PointerSize::Bit64
+            ),
+            Some(ConstValue::U32(0x0000_0003)),
+        );
     }
 
     #[test]

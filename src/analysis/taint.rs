@@ -319,21 +319,21 @@ impl TaintAnalysis {
     ) {
         self.tainted_instrs.insert((block, instr));
 
-        if let Some(block_data) = ssa.block(block) {
-            if let Some(instruction) = block_data.instructions().get(instr) {
-                // Taint the instruction's defined variable (for forward propagation)
-                for def in instruction.defs() {
-                    self.tainted_vars.insert(def);
-                }
+        if let Some(block_data) = ssa.block(block)
+            && let Some(instruction) = block_data.instructions().get(instr)
+        {
+            // Taint the instruction's defined variable (for forward propagation)
+            for def in instruction.defs() {
+                self.tainted_vars.insert(def);
+            }
 
-                // Also taint the instruction's uses (for backward propagation).
-                // This is critical for instructions like StoreStaticField that have
-                // no def - we need to taint what feeds into them.
-                if self.config.backward {
-                    instruction.op().for_each_use(|use_var| {
-                        self.tainted_vars.insert(use_var);
-                    });
-                }
+            // Also taint the instruction's uses (for backward propagation).
+            // This is critical for instructions like StoreStaticField that have
+            // no def - we need to taint what feeds into them.
+            if self.config.backward {
+                instruction.op().for_each_use(|use_var| {
+                    self.tainted_vars.insert(use_var);
+                });
             }
         }
     }
@@ -356,10 +356,10 @@ impl TaintAnalysis {
         self.tainted_phis.insert((block, phi_idx));
 
         // Also taint the PHI's result variable
-        if let Some(block_data) = ssa.block(block) {
-            if let Some(phi) = block_data.phi_nodes().get(phi_idx) {
-                self.tainted_vars.insert(phi.result());
-            }
+        if let Some(block_data) = ssa.block(block)
+            && let Some(phi) = block_data.phi_nodes().get(phi_idx)
+        {
+            self.tainted_vars.insert(phi.result());
         }
     }
 
@@ -544,18 +544,16 @@ impl TaintAnalysis {
             // operations to that array are also tainted (they're preparing dead data).
             // This is critical for cleanup neutralization where protection code fills
             // arrays that are passed to removed methods.
-            if self.config.backward {
-                if let SsaOp::StoreElement { array, .. } = instr.op() {
-                    if self.tainted_vars.contains(array)
-                        && self.tainted_instrs.insert((block_idx, instr_idx))
-                    {
+            if self.config.backward
+                && let SsaOp::StoreElement { array, .. } = instr.op()
+                && self.tainted_vars.contains(array)
+                && self.tainted_instrs.insert((block_idx, instr_idx))
+            {
+                changed = true;
+                // Also taint the value and index being stored - they feed into dead code
+                for use_var in &uses {
+                    if self.tainted_vars.insert(*use_var) {
                         changed = true;
-                        // Also taint the value and index being stored - they feed into dead code
-                        for use_var in &uses {
-                            if self.tainted_vars.insert(*use_var) {
-                                changed = true;
-                            }
-                        }
                     }
                 }
             }

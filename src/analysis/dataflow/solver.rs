@@ -91,6 +91,10 @@ pub struct DataFlowSolver<T: Target, A: DataFlowAnalysis<T>> {
     worklist: BinaryHeap<Reverse<(usize, usize)>>,
     /// Whether each block is currently in the worklist (for deduplication).
     in_worklist: Vec<bool>,
+    /// Times each block's transfer function has run, handed to
+    /// [`DataFlowAnalysis::widen`] so an unbounded-height lattice can stay
+    /// exact for the first few passes and widen after.
+    visits: Vec<usize>,
     /// Per-block traversal priority (position in RPO for forward analyses,
     /// postorder for backward); smaller is processed first.
     order_priority: Vec<usize>,
@@ -112,6 +116,7 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
             out_states: Vec::new(),
             worklist: BinaryHeap::new(),
             in_worklist: Vec::new(),
+            visits: Vec::new(),
             order_priority: Vec::new(),
             exit_blocks: BitSet::new(0),
             iterations: 0,
@@ -168,6 +173,7 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         self.in_states = vec![initial.clone(); num_blocks];
         self.out_states = vec![initial; num_blocks];
         self.in_worklist = vec![false; num_blocks];
+        self.visits = vec![0; num_blocks];
 
         // Set boundary conditions based on direction
         match A::DIRECTION {
@@ -262,16 +268,18 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
             // Entry block or unreachable - keep current in_state
             current_in.clone()
         } else {
-            // Meet all predecessor outputs
+            // Meet all predecessor outputs. The accumulator is seeded from the
+            // first predecessor and the rest are folded in place, so the whole
+            // fold costs one clone rather than one per predecessor.
             let mut result: Option<A::Lattice> = None;
             for pred in cfg.predecessors(node) {
                 let Some(pred_out) = self.out_states.get(pred.index()) else {
                     continue;
                 };
-                result = Some(match result {
-                    None => pred_out.clone(),
-                    Some(acc) => acc.meet(pred_out),
-                });
+                match result.as_mut() {
+                    None => result = Some(pred_out.clone()),
+                    Some(acc) => acc.meet_into(pred_out),
+                }
             }
             result.unwrap_or_else(|| current_in.clone())
         };
@@ -292,13 +300,24 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         let output = self.analysis.transfer(block_idx, block, &input, ssa);
 
         // Check if output changed
+        let visit = self.bump_visit(block_idx);
         let Some(out_slot) = self.out_states.get_mut(block_idx) else {
             return false;
         };
+        let output = self.analysis.widen(block_idx, out_slot, output, visit);
         let changed = output != *out_slot;
         *out_slot = output;
 
         changed
+    }
+
+    /// Records another transfer of `block_idx` and returns the running count.
+    fn bump_visit(&mut self, block_idx: usize) -> usize {
+        let Some(slot) = self.visits.get_mut(block_idx) else {
+            return 0;
+        };
+        *slot = slot.saturating_add(1);
+        *slot
     }
 
     /// Processes a block in backward direction.
@@ -352,9 +371,11 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         let input = self.analysis.transfer(block_idx, block, &output, ssa);
 
         // Check if input changed
+        let visit = self.bump_visit(block_idx);
         let Some(in_slot) = self.in_states.get_mut(block_idx) else {
             return false;
         };
+        let input = self.analysis.widen(block_idx, in_slot, input, visit);
         let changed = input != *in_slot;
         *in_slot = input;
 
@@ -368,12 +389,12 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         let priority = &self.order_priority;
         let enqueue =
             |idx: usize, list: &mut Vec<bool>, work: &mut BinaryHeap<Reverse<(usize, usize)>>| {
-                if let Some(slot) = list.get_mut(idx) {
-                    if !*slot {
-                        let prio = priority.get(idx).copied().unwrap_or(usize::MAX);
-                        work.push(Reverse((prio, idx)));
-                        *slot = true;
-                    }
+                if let Some(slot) = list.get_mut(idx)
+                    && !*slot
+                {
+                    let prio = priority.get(idx).copied().unwrap_or(usize::MAX);
+                    work.push(Reverse((prio, idx)));
+                    *slot = true;
                 }
             };
 
