@@ -992,7 +992,7 @@ mod tests {
                     log_clone
                         .record(EventKind::StringDecrypted)
                         .at(m, j as usize)
-                        .message(format!("thread {} event {}", i, j));
+                        .message(format!("thread {i} event {j}"));
                 }
             }));
         }

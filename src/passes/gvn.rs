@@ -710,7 +710,7 @@ mod tests {
                 assert_eq!(*left, v2);
                 assert_eq!(*right, v2);
             }
-            other => panic!("expected Mul, got {:?}", other),
+            other => panic!("expected Mul, got {other:?}"),
         }
     }
 

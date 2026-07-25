@@ -359,9 +359,9 @@ pub struct IndirectLocation {
     /// Address arithmetic wraps here, so the width is part of what the offset
     /// *means*: `+4294967288` and `-8` are one displacement on a 32-bit target
     /// and two distinct ones on a 64-bit target.
-    /// [`normalize_address`](crate::analysis::address::normalize_address)
+    /// [`normalize_address`]
     /// canonicalises every folded displacement into it, and
-    /// [`extents_overlap`](Self::extents_overlap) needs it to notice an access
+    /// `extents_overlap` needs it to notice an access
     /// that runs off the top of the address space and wraps to the bottom.
     ///
     /// Every location within one function shares this, so it does not fragment
@@ -825,7 +825,7 @@ impl<T: Target> MemorySsa<T> {
     ///   displacements. Address arithmetic wraps at this width, and the model
     ///   cannot tell a sign-extended `-8` from a zero-extended `0xFFFF_FFF8`
     ///   without it — see
-    ///   [`normalize_address`](crate::analysis::address::normalize_address).
+    ///   [`normalize_address`].
     ///
     /// # Returns
     ///

@@ -382,7 +382,7 @@ mod tests {
                 value: ConstValue::I32(0),
                 dest: d,
             } => assert_eq!(*d, dest),
-            other => panic!("expected Const I32(0), got {:?}", other),
+            other => panic!("expected Const I32(0), got {other:?}"),
         }
     }
 

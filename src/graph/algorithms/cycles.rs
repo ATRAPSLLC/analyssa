@@ -470,9 +470,7 @@ mod tests {
             let successors: Vec<NodeId> = graph.successors(current).collect();
             assert!(
                 successors.contains(&next),
-                "Invalid cycle path: no edge from {:?} to {:?}",
-                current,
-                next
+                "Invalid cycle path: no edge from {current:?} to {next:?}"
             );
         }
     }

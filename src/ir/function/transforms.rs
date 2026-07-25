@@ -316,7 +316,7 @@ impl<T: Target> SsaFunction<T> {
                         continue;
                     }
 
-                    operands.retain(|op| keeps(op));
+                    operands.retain(keeps);
 
                     pruned = pruned.saturating_add(original_len.saturating_sub(operands.len()));
                 }

@@ -795,7 +795,7 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to shift left.
     ///
     /// Returns `None` when the shift distance is negative or at least the
-    /// value's own width — see [`Self::shift_distance`] for why declining is the
+    /// value's own width — see `shift_distance` for why declining is the
     /// only convention-independent answer.
     #[must_use]
     pub fn shl(&self, amount: &Self, ptr_size: PointerSize) -> Option<Self> {
@@ -822,7 +822,7 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to shift right (arithmetic for signed, logical for unsigned).
     ///
     /// Returns `None` when the shift distance is negative or at least the
-    /// value's own width — see [`Self::shift_distance`].
+    /// value's own width — see `shift_distance`.
     #[must_use]
     #[allow(clippy::cast_sign_loss)] // Shift amounts and unsigned shifts use intentional casts
     #[allow(clippy::cast_possible_wrap)] // Wrapping is expected for logical shift operations

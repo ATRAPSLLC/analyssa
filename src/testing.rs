@@ -886,7 +886,7 @@ mod tests {
         assert!(MockTarget::is_unknown(&MockType::Unknown));
         assert_eq!(MockTarget::bit_width(&MockType::I64), Some(64));
         assert_eq!(MockTarget::unknown_type(), MockType::Unknown);
-        assert_eq!(MockTarget::synthetic_instruction(), ());
+        let _: () = MockTarget::synthetic_instruction();
         assert_eq!(MockTarget::instruction_mnemonic(&()), "<mock>");
         assert_eq!(MockTarget::instruction_rva(&()), 0);
         assert!(!MockTarget::is_filter_handler(&0));

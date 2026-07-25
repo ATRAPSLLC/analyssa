@@ -765,7 +765,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     ///
     /// The handler's first instruction is a [`SsaOp::Pop`] consuming an object
     /// the runtime pushed, so there is no definition to find and none should be
-    /// demanded. [`SsaRebuilder`] already carves out exactly this shape — it
+    /// demanded. `SsaRebuilder` already carves out exactly this shape — it
     /// preserves such a `Pop` where it drops every other one whose operand has
     /// no definition — and without the matching carve-out here the verifier
     /// rejects the IR the rebuilder is built to produce, failing every method
@@ -777,8 +777,6 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     /// violation, which [`Self::check_dominance`] reports on its own. Every
     /// other undefined read — including one in the same block that no
     /// handler-entry `Pop` consumes — stays reportable.
-    ///
-    /// [`SsaRebuilder`]: crate::ir::function::rebuild::SsaRebuilder
     fn runtime_supplied_vars(&self) -> BitSet {
         let mut vars = BitSet::lazy(self.var_capacity);
         let block_count = self.ssa.blocks().len();

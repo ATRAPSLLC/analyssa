@@ -89,7 +89,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      # Pinned to @v2 with an explicit `tool:` rather than the @cargo-fuzz tag:
+      # that tag stopped carrying a default tool, so the install silently became
+      # a no-op and `cargo fuzz` failed with "no such command".
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       # A short campaign per target, not an exhaustive one: this is a smoke
       # gate that the targets still build and that no shallow crash has been
       # introduced. Longer campaigns belong in a scheduled job.

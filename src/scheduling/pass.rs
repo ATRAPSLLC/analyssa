@@ -36,6 +36,7 @@ pub trait SsaPassHost<T: Target>: World<T> + SsaStore<T> + DirtySet<T> + Sync {
     /// that never consumes events to retain every one for the process lifetime.
     /// [`NullListener`] discards them instead.
     ///
+    /// [`EventLog<T>`]: crate::events::EventLog
     /// [`NullListener`]: crate::events::NullListener
     fn events(&self) -> &dyn EventListener<T>;
 

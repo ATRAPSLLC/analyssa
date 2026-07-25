@@ -427,7 +427,7 @@ where
 
         for iteration in 0..max_iterations {
             iterations = iteration.saturating_add(1);
-            debug!("Pipeline iteration {}/{}", iterations, max_iterations);
+            debug!("Pipeline iteration {iterations}/{max_iterations}");
 
             let iteration_modified: DashSet<T::MethodRef> = DashSet::new();
             let mut iteration_changed = false;
@@ -481,7 +481,7 @@ where
             } else {
                 stable_count = stable_count.saturating_add(1);
                 if stable_count >= stable_iterations {
-                    debug!("Pipeline stable after {} iterations", iterations);
+                    debug!("Pipeline stable after {iterations} iterations");
                     break;
                 }
             }
@@ -675,12 +675,14 @@ where
     ///
     /// Returns `(all_methods, dirty_methods)`. Both derive from the same
     /// traversal order, so the call graph behind
-    /// [`SsaPassHost::methods_reverse_topological`] is built **once** per pass
+    /// [`World::methods_reverse_topological`] is built **once** per pass
     /// batch rather than once per list — and the batch itself sits inside the
     /// scheduler's fixpoint, so a per-list rebuild is paid on every iteration.
     ///
     /// Ordering follows reverse topological order if the host supplies one, or
     /// falls back to `host.iter_methods()`.
+    ///
+    /// [`World::methods_reverse_topological`]: crate::world::World::methods_reverse_topological
     fn method_orders(host: &H) -> (Vec<T::MethodRef>, Vec<T::MethodRef>) {
         // Components arrive callee-first and grouped by mutual recursion.
         // Flattening discards the grouping, which is correct here: this order
