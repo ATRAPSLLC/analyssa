@@ -114,7 +114,7 @@ pub use algebraic::{SimplifyResult, simplify_op};
 pub use cfg::SsaCfg;
 pub use consts::{ConstEvaluator, evaluate_const_op};
 pub use defuse::{DefUseIndex, Location};
-pub use evaluator::{ControlFlow, SsaEvaluator};
+pub use evaluator::{ControlFlow, EvaluatorMark, SsaEvaluator};
 pub use loop_analyzer::{LoopAnalyzer, SsaLoopAnalysis};
 pub use loops::{InductionVar, LoopForest, LoopInfo, LoopType, detect_loops};
 pub use patterns::PatternDetector;

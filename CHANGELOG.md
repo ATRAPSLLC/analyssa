@@ -4,6 +4,39 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-26
+
+Speculative evaluation for `SsaEvaluator`. Consumers that explore alternative
+executions — a symbolic executor taking both arms of a branch, a control-flow
+deobfuscator tracing every path through a dispatcher — previously had to clone
+the evaluator per fork, paying for everything learned so far on every fork. A
+checkpoint costs nothing to take and one journal entry per mutation to undo, so
+the cost tracks the speculation rather than the accumulated state.
+
+### Added
+
+- **`SsaEvaluator::checkpoint` and `SsaEvaluator::rollback`**, with the
+  `EvaluatorMark` token they exchange (re-exported from `analysis`) — mark a
+  state, evaluate speculatively, and restore exactly what was marked. Marks
+  nest, and rolling back to an outer mark subsumes any inner ones, so an
+  abandoned branch is discarded in one step rather than unwound level by level.
+  Rolling back a stale mark leaves the state unchanged rather than corrupting
+  it. Journaling is latched on by the first checkpoint, so evaluators that never
+  speculate are unaffected; when `track_memory` or `track_path` is on, the mark
+  additionally snapshots those two structures outright instead of journaling
+  them.
+
+### Performance
+
+- **Trivial-phi elimination in rebuild mode is no longer quadratic.** The
+  rebuild path substituted each trivial phi one at a time, scanning the whole
+  function per substitution, and a rebuild produces trivial phis in proportion
+  to the function — so every fixpoint round scaled with the square of the
+  function. The substitutions are now composed into a single map (back-to-front,
+  which reproduces the order-sensitive sequential result exactly) and applied in
+  one pass. The repair path had already been corrected for this in 0.4.0; this
+  brings the rebuild path in line.
+
 ## [0.4.0] - 2026-07-25
 
 Memory optimization arrives: a Memory SSA-backed pass doing store-to-load

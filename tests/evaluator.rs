@@ -578,3 +578,80 @@ fn evaluate_with_trace_resolves_complex_path() {
     let trace = eval.evaluate_with_trace(d, 10);
     assert_eq!(trace, Some(40));
 }
+
+/// A checkpoint must restore every kind of state the evaluator tracks, not
+/// just the value map: overwrites, first-time definitions, removals, local
+/// mirroring and the phi predecessor all have to come back.
+#[test]
+fn checkpoint_rollback_restores_evaluator_state() {
+    let mut ssa = SsaFunction::new(0, 0);
+    let a = local(&mut ssa, 0, 0, 0);
+    let b = local(&mut ssa, 1, 0, 1);
+    let sum = local(&mut ssa, 2, 0, 2);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Add {
+        dest: sum,
+        left: a,
+        right: b,
+        flags: None,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: Some(sum) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
+    eval.set_concrete(a, ConstValue::I32(5));
+    eval.set_concrete(b, ConstValue::I32(3));
+    eval.set_predecessor(Some(7));
+
+    let mark = eval.checkpoint();
+
+    // Speculate: overwrite a known value, define a new one, drop another, and
+    // move the predecessor.
+    eval.set_concrete(a, ConstValue::I32(99));
+    eval.evaluate_block(0);
+    eval.set_unknown(b);
+    eval.set_predecessor(Some(11));
+    assert_eq!(eval.get_concrete(a).and_then(|cv| cv.as_i64()), Some(99));
+    assert_eq!(eval.get_concrete(sum).and_then(|cv| cv.as_i64()), Some(102));
+    assert!(eval.get(b).is_none());
+
+    eval.rollback(mark);
+
+    assert_eq!(eval.get_concrete(a).and_then(|cv| cv.as_i64()), Some(5));
+    assert_eq!(eval.get_concrete(b).and_then(|cv| cv.as_i64()), Some(3));
+    assert!(eval.get(sum).is_none(), "speculative definition survived");
+    assert_eq!(eval.predecessor(), Some(7));
+}
+
+/// Rolling back to an outer mark must subsume any marks taken inside it, so a
+/// depth-first exploration can abandon a whole subtree in one step.
+#[test]
+fn checkpoint_rollback_nests() {
+    let mut ssa = SsaFunction::new(0, 0);
+    let a = local(&mut ssa, 0, 0, 0);
+    let b = local(&mut ssa, 1, 0, 1);
+    ssa.add_block(SsaBlock::new(0));
+    ssa.recompute_uses();
+
+    let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
+    eval.set_concrete(a, ConstValue::I32(1));
+
+    let outer = eval.checkpoint();
+    eval.set_concrete(a, ConstValue::I32(2));
+
+    let inner = eval.checkpoint();
+    eval.set_concrete(a, ConstValue::I32(3));
+    eval.set_concrete(b, ConstValue::I32(4));
+
+    eval.rollback(inner);
+    assert_eq!(eval.get_concrete(a).and_then(|cv| cv.as_i64()), Some(2));
+    assert!(eval.get(b).is_none());
+
+    // Re-explore from the inner point, then discard everything at once.
+    eval.set_concrete(b, ConstValue::I32(8));
+    eval.rollback(outer);
+    assert_eq!(eval.get_concrete(a).and_then(|cv| cv.as_i64()), Some(1));
+    assert!(eval.get(b).is_none());
+}

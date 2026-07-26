@@ -333,6 +333,39 @@ impl<T: Target> ExecutionTrace<T> {
     }
 }
 
+/// A position in an evaluator's undo journal.
+///
+/// Produced by [`SsaEvaluator::checkpoint`] and consumed by
+/// [`SsaEvaluator::rollback`]. Marks are only meaningful for the evaluator that
+/// issued them.
+#[derive(Debug, Clone)]
+pub struct EvaluatorMark<T: Target> {
+    /// Journal length when the mark was taken.
+    len: usize,
+    /// Memory state and execution path at mark time.
+    ///
+    /// Both are only written when the corresponding config flag is set, so for
+    /// the default configuration this is `None` and costs nothing. When
+    /// tracking is on they are small enough to copy outright, which keeps them
+    /// out of the per-mutation journal.
+    tracked: Option<Box<(MemoryState<T>, Vec<usize>)>>,
+}
+
+/// A single reversible mutation of evaluator state.
+#[derive(Debug, Clone)]
+enum Undo<T: Target> {
+    /// `values` entry as it was before the change.
+    Value(SsaVarId, Option<SymbolicExpr<T>>),
+    /// `local_state` entry as it was before the change.
+    Local(u16, Option<SymbolicExpr<T>>),
+    /// `arg_state` entry as it was before the change.
+    Arg(u16, Option<SymbolicExpr<T>>),
+    /// `constraints` entry as it was before the change.
+    Constraints(SsaVarId, Option<Vec<Constraint<T>>>),
+    /// `predecessor` as it was before the change.
+    Predecessor(Option<usize>),
+}
+
 /// SSA evaluator with hybrid concrete/symbolic value tracking.
 ///
 /// This evaluator interprets SSA operations to compute values without needing
@@ -375,6 +408,16 @@ pub struct SsaEvaluator<'a, T: Target> {
     /// Updated whenever a variable with `Argument(N)` origin receives a value,
     /// and read by `LoadArg` instructions.
     arg_state: BTreeMap<u16, SymbolicExpr<T>>,
+    /// Undo records for speculative evaluation, oldest first.
+    ///
+    /// Empty and unused until the first [`checkpoint`](Self::checkpoint); see
+    /// that method for the rationale.
+    journal: Vec<Undo<T>>,
+    /// Whether mutations are being recorded into [`journal`](Self::journal).
+    ///
+    /// Latched on by the first checkpoint so that evaluators which never
+    /// explore alternatives pay nothing.
+    journaling: bool,
 }
 
 impl<'a, T: Target> SsaEvaluator<'a, T> {
@@ -416,6 +459,8 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             pointer_size: ptr_size,
             local_state: BTreeMap::new(),
             arg_state: BTreeMap::new(),
+            journal: Vec::new(),
+            journaling: false,
         }
     }
 
@@ -464,6 +509,8 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             pointer_size: ptr_size,
             local_state: BTreeMap::new(),
             arg_state: BTreeMap::new(),
+            journal: Vec::new(),
+            journaling: false,
         }
     }
 
@@ -502,6 +549,144 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         self.config.track_memory
     }
 
+    // Speculative Evaluation
+
+    /// Marks the current state so it can be restored later with
+    /// [`rollback`](Self::rollback).
+    ///
+    /// # Why this exists
+    ///
+    /// Consumers that explore alternative executions — a symbolic executor
+    /// following both arms of a branch, a control-flow deobfuscator tracing
+    /// every path through a dispatcher — need to evaluate from the same state
+    /// more than once. Cloning the evaluator does that, but the copy is
+    /// proportional to everything learned so far, and the state only grows as
+    /// evaluation proceeds. An exploration that forks *f* times over a function
+    /// with *v* variables therefore costs `O(f · v)` in copying alone, which
+    /// comes to dominate the evaluation it exists to support.
+    ///
+    /// A checkpoint costs nothing, and rolling back to it costs one entry per
+    /// mutation made since — the change actually being undone, not the state it
+    /// was applied to.
+    ///
+    /// # Usage
+    ///
+    /// Marks nest, and rolling back to an outer mark subsumes any inner ones,
+    /// so an abandoned branch does not have to be unwound level by level:
+    ///
+    /// ```ignore
+    /// let mark = evaluator.checkpoint();
+    /// evaluator.evaluate_op(&taken_branch);
+    /// // ... explore, checkpoint again, rollback, whatever ...
+    /// evaluator.rollback(mark);   // back to exactly the state above
+    /// ```
+    ///
+    /// Marks must be rolled back in reverse order of creation (last taken,
+    /// first released), which is the natural discipline for a depth-first
+    /// exploration. Recording is enabled by the first checkpoint, so evaluators
+    /// that never explore alternatives are unaffected.
+    pub fn checkpoint(&mut self) -> EvaluatorMark<T> {
+        self.journaling = true;
+        EvaluatorMark {
+            len: self.journal.len(),
+            tracked: (self.config.track_memory || self.config.track_path)
+                .then(|| Box::new((self.memory.clone(), self.path.clone()))),
+        }
+    }
+
+    /// Restores the state captured by `mark`, discarding every change made
+    /// since.
+    ///
+    /// Undoing a mark that was already undone, or one taken before a mark that
+    /// has since been rolled back, leaves the state unchanged rather than
+    /// corrupting it.
+    pub fn rollback(&mut self, mark: EvaluatorMark<T>) {
+        while self.journal.len() > mark.len {
+            let Some(entry) = self.journal.pop() else {
+                break;
+            };
+            match entry {
+                Undo::Value(var, previous) => match previous {
+                    Some(expr) => {
+                        self.values.insert(var, expr);
+                    }
+                    None => {
+                        self.values.remove(&var);
+                    }
+                },
+                Undo::Local(idx, previous) => match previous {
+                    Some(expr) => {
+                        self.local_state.insert(idx, expr);
+                    }
+                    None => {
+                        self.local_state.remove(&idx);
+                    }
+                },
+                Undo::Arg(idx, previous) => match previous {
+                    Some(expr) => {
+                        self.arg_state.insert(idx, expr);
+                    }
+                    None => {
+                        self.arg_state.remove(&idx);
+                    }
+                },
+                Undo::Constraints(var, previous) => match previous {
+                    Some(list) => {
+                        self.constraints.insert(var, list);
+                    }
+                    None => {
+                        self.constraints.remove(&var);
+                    }
+                },
+                Undo::Predecessor(previous) => self.predecessor = previous,
+            }
+        }
+        if let Some(tracked) = mark.tracked {
+            let (memory, path) = *tracked;
+            self.memory = memory;
+            self.path = path;
+        }
+    }
+
+    /// Records the pre-change value of `var` and writes `expr` in its place.
+    ///
+    /// Every write to `values` goes through here so that the journal cannot
+    /// fall out of step with the map it describes.
+    fn put_value(&mut self, var: SsaVarId, expr: SymbolicExpr<T>) {
+        if self.journaling {
+            let previous = self.values.get(&var).cloned();
+            self.journal.push(Undo::Value(var, previous));
+        }
+        self.values.insert(var, expr);
+    }
+
+    /// Records the pre-change value of `var` and removes it.
+    fn drop_value(&mut self, var: SsaVarId) {
+        if self.journaling {
+            let previous = self.values.get(&var).cloned();
+            self.journal.push(Undo::Value(var, previous));
+        }
+        self.values.remove(&var);
+    }
+
+    /// Records the pre-change value of local slot `idx` and writes `expr`.
+    fn put_local(&mut self, idx: u16, expr: SymbolicExpr<T>) {
+        if self.journaling {
+            let previous = self.local_state.get(&idx).cloned();
+            self.journal.push(Undo::Local(idx, previous));
+        }
+        self.local_state.insert(idx, expr);
+    }
+
+    /// Records the pre-change value of argument slot `idx` and writes `expr`.
+    fn put_arg(&mut self, idx: u16, expr: SymbolicExpr<T>) {
+        if self.journaling {
+            let previous = self.arg_state.get(&idx).cloned();
+            self.journal.push(Undo::Arg(idx, previous));
+        }
+        self.arg_state.insert(idx, expr);
+    }
+
     // Value Setting
 
     /// Sets a concrete (known) value for a variable.
@@ -510,7 +695,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     /// that matches the variable's type in the SSA function.
     pub fn set_concrete(&mut self, var: SsaVarId, value: ConstValue<T>) {
         let expr = SymbolicExpr::constant(value);
-        self.values.insert(var, expr.clone());
+        self.put_value(var, expr.clone());
         self.track_origin_state(var, &expr);
     }
 
@@ -520,24 +705,24 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     /// as symbolic with descriptive names.
     pub fn set_symbolic(&mut self, var: SsaVarId, name: impl Into<String>) {
         let expr = SymbolicExpr::named(name);
-        self.values.insert(var, expr.clone());
+        self.put_value(var, expr.clone());
         self.track_origin_state(var, &expr);
     }
 
     /// Sets a symbolic value for a variable using an expression.
     pub fn set_symbolic_expr(&mut self, var: SsaVarId, expr: SymbolicExpr<T>) {
-        self.values.insert(var, expr.clone());
+        self.put_value(var, expr.clone());
         self.track_origin_state(var, &expr);
     }
 
     /// Sets a variable as unknown by removing it from the values map.
     pub fn set_unknown(&mut self, var: SsaVarId) {
-        self.values.remove(&var);
+        self.drop_value(var);
     }
 
     /// Sets an expression for a variable.
     pub fn set(&mut self, var: SsaVarId, value: SymbolicExpr<T>) {
-        self.values.insert(var, value.clone());
+        self.put_value(var, value.clone());
         self.track_origin_state(var, &value);
     }
 
@@ -613,6 +798,20 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
 
     /// Clears all tracked values.
     pub fn clear(&mut self) {
+        if self.journaling {
+            let dropped: Vec<_> = self
+                .values
+                .iter()
+                .map(|(k, v)| Undo::Value(*k, Some(v.clone())))
+                .chain(
+                    self.constraints
+                        .iter()
+                        .map(|(k, v)| Undo::Constraints(*k, Some(v.clone()))),
+                )
+                .chain(std::iter::once(Undo::Predecessor(self.predecessor)))
+                .collect();
+            self.journal.extend(dropped);
+        }
         self.values.clear();
         self.predecessor = None;
         self.constraints.clear();
@@ -628,10 +827,14 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // If it's an equality constraint, we can directly set the value
         if let Constraint::Equal(ref v) = constraint {
             let expr = SymbolicExpr::constant(v.clone());
-            self.values.insert(var, expr.clone());
+            self.put_value(var, expr.clone());
             self.track_origin_state(var, &expr);
         }
 
+        if self.journaling {
+            let previous = self.constraints.get(&var).cloned();
+            self.journal.push(Undo::Constraints(var, previous));
+        }
         self.constraints.entry(var).or_default().push(constraint);
     }
 
@@ -649,6 +852,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
 
     /// Clears constraints for a specific variable.
     pub fn clear_constraints(&mut self, var: SsaVarId) {
+        if self.journaling {
+            let previous = self.constraints.get(&var).cloned();
+            self.journal.push(Undo::Constraints(var, previous));
+        }
         self.constraints.remove(&var);
     }
 
@@ -968,6 +1175,9 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ///
     /// * `pred` - The predecessor block index, or `None` to clear.
     pub fn set_predecessor(&mut self, pred: Option<usize>) {
+        if self.journaling {
+            self.journal.push(Undo::Predecessor(self.predecessor));
+        }
         self.predecessor = pred;
     }
 
@@ -1024,11 +1234,11 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // Phase 2: Write all results
         for (result, value) in phi_results {
             if let Some(v) = value {
-                self.values.insert(result, v.clone());
+                self.put_value(result, v.clone());
                 self.track_origin_state(result, &v);
             } else {
                 // No predecessor or no operand from predecessor = no value
-                self.values.remove(&result);
+                self.drop_value(result);
             }
         }
     }
@@ -1217,7 +1427,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
 
             // Mark phi results as unknown (they depend on loop iteration)
             for phi in block.phi_nodes() {
-                self.values.remove(&phi.result());
+                self.drop_value(phi.result());
             }
 
             // Check instructions for variables that might not have stabilized
@@ -1229,7 +1439,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         && !expr.is_constant()
                     {
                         // Symbolic values that didn't stabilize become unknown
-                        self.values.remove(&dest);
+                        self.drop_value(dest);
                     }
                 }
             }
@@ -1271,16 +1481,16 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 let converted = T::evaluate_int_conv(v, target, unsigned, ptr_bytes)
                     .unwrap_or(ConstValue::I64(v));
                 let result = SymbolicExpr::constant(converted);
-                self.values.insert(dest, result.clone());
+                self.put_value(dest, result.clone());
                 self.track_origin_state(dest, &result);
                 Some(result)
             } else {
-                self.values.insert(dest, expr.clone());
+                self.put_value(dest, expr.clone());
                 self.track_origin_state(dest, &expr);
                 Some(expr)
             }
         } else {
-            self.values.remove(&dest);
+            self.drop_value(dest);
             None
         }
     }
@@ -1294,7 +1504,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         match op {
             SsaOp::Const { dest, value } => {
                 let expr = SymbolicExpr::constant(value.clone());
-                self.values.insert(*dest, expr.clone());
+                self.put_value(*dest, expr.clone());
                 self.track_origin_state(*dest, &expr);
                 Some(expr)
             }
@@ -1302,11 +1512,11 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             SsaOp::Copy { dest, src } => {
                 let value = self.values.get(src).cloned();
                 if let Some(v) = value {
-                    self.values.insert(*dest, v.clone());
+                    self.put_value(*dest, v.clone());
                     self.track_origin_state(*dest, &v);
                     Some(v)
                 } else {
-                    self.values.remove(dest);
+                    self.drop_value(*dest);
                     None
                 }
             }
@@ -1314,10 +1524,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             SsaOp::LoadLocal { dest, local_index } => {
                 let value = self.local_state.get(local_index).cloned();
                 if let Some(v) = value {
-                    self.values.insert(*dest, v.clone());
+                    self.put_value(*dest, v.clone());
                     Some(v)
                 } else {
-                    self.values.remove(dest);
+                    self.drop_value(*dest);
                     None
                 }
             }
@@ -1325,10 +1535,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             SsaOp::LoadArg { dest, arg_index } => {
                 let value = self.arg_state.get(arg_index).cloned();
                 if let Some(v) = value {
-                    self.values.insert(*dest, v.clone());
+                    self.put_value(*dest, v.clone());
                     Some(v)
                 } else {
-                    self.values.remove(dest);
+                    self.drop_value(*dest);
                     None
                 }
             }
@@ -1436,12 +1646,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 match folded {
                     Some(value) => {
                         let expr = SymbolicExpr::constant(value);
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     None => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1452,7 +1662,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             // Folding them as plain rotates is wrong whenever the rotated-out
             // bit differs from the incoming carry, so the value becomes unknown.
             SsaOp::Rcl { dest, .. } | SsaOp::Rcr { dest, .. } => {
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 None
             }
 
@@ -1463,12 +1673,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     Some(v) => {
                         let result = (v as u32).swap_bytes();
                         let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1480,12 +1690,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     Some(v) => {
                         let result = (v as u32).reverse_bits();
                         let expr = SymbolicExpr::constant(ConstValue::I32(result as i32));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1502,12 +1712,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                             v32.trailing_zeros() as i32
                         };
                         let expr = SymbolicExpr::constant(ConstValue::I32(result));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1524,12 +1734,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                             31u32.saturating_sub(v32.leading_zeros()) as i32
                         };
                         let expr = SymbolicExpr::constant(ConstValue::I32(result));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1541,12 +1751,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     Some(v) => {
                         let result = (v as u32).count_ones() as i32;
                         let expr = SymbolicExpr::constant(ConstValue::I32(result));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1562,12 +1772,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                             0
                         };
                         let expr = SymbolicExpr::constant(ConstValue::I32(result));
-                        self.values.insert(*dest, expr.clone());
+                        self.put_value(*dest, expr.clone());
                         self.track_origin_state(*dest, &expr);
                         Some(expr)
                     }
                     _ => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1584,26 +1794,26 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 match cond {
                     Some(c) if c != 0 => {
                         if let Some(expr) = self.values.get(true_val).cloned() {
-                            self.values.insert(*dest, expr.clone());
+                            self.put_value(*dest, expr.clone());
                             self.track_origin_state(*dest, &expr);
                             Some(expr)
                         } else {
-                            self.values.remove(dest);
+                            self.drop_value(*dest);
                             None
                         }
                     }
                     Some(_) => {
                         if let Some(expr) = self.values.get(false_val).cloned() {
-                            self.values.insert(*dest, expr.clone());
+                            self.put_value(*dest, expr.clone());
                             self.track_origin_state(*dest, &expr);
                             Some(expr)
                         } else {
-                            self.values.remove(dest);
+                            self.drop_value(*dest);
                             None
                         }
                     }
                     None => {
-                        self.values.remove(dest);
+                        self.drop_value(*dest);
                         None
                     }
                 }
@@ -1684,7 +1894,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             | SsaOp::CallVirt { dest, .. }
             | SsaOp::CallIndirect { dest, .. } => {
                 if let Some(d) = dest {
-                    self.values.remove(d);
+                    self.drop_value(*d);
                 }
                 None
             }
@@ -1696,7 +1906,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     if let Some(stored_var) = self.memory.load(&location) {
                         // Propagate the stored value
                         if let Some(expr) = self.values.get(&stored_var).cloned() {
-                            self.values.insert(*dest, expr.clone());
+                            self.put_value(*dest, expr.clone());
                             return Some(expr);
                         }
                         self.values
@@ -1704,7 +1914,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         return Some(SymbolicExpr::variable(stored_var));
                     }
                 }
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 None
             }
 
@@ -1726,7 +1936,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                     let location = MemoryLocation::InstanceField(*object, field.clone());
                     if let Some(stored_var) = self.memory.load(&location) {
                         if let Some(expr) = self.values.get(&stored_var).cloned() {
-                            self.values.insert(*dest, expr.clone());
+                            self.put_value(*dest, expr.clone());
                             return Some(expr);
                         }
                         self.values
@@ -1734,7 +1944,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                         return Some(SymbolicExpr::variable(stored_var));
                     }
                 }
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 None
             }
 
@@ -1763,14 +1973,14 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             SsaOp::LoadLocalAddr {
                 dest, local_index, ..
             } => {
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 self.local_state.remove(local_index);
                 None
             }
             SsaOp::LoadArgAddr {
                 dest, arg_index, ..
             } => {
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 self.arg_state.remove(arg_index);
                 None
             }
@@ -1797,7 +2007,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             | SsaOp::LoadStaticFieldAddr { dest, .. }
             | SsaOp::LoadElementAddr { dest, .. }
             | SsaOp::LoadObj { dest, .. } => {
-                self.values.remove(dest);
+                self.drop_value(*dest);
                 None
             }
 
@@ -1825,7 +2035,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             || right_expr.reaches_recursive_depth_limit()
         {
             let result = SymbolicExpr::variable(dest);
-            self.values.insert(dest, result.clone());
+            self.put_value(dest, result.clone());
             self.track_origin_state(dest, &result);
             return Some(result);
         }
@@ -1837,7 +2047,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // Mask native int/uint results to target pointer width
         let result = self.mask_symbolic_native(result);
 
-        self.values.insert(dest, result.clone());
+        self.put_value(dest, result.clone());
         self.track_origin_state(dest, &result);
         Some(result)
     }
@@ -1852,7 +2062,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         let operand_expr = self.values.get(&operand)?;
         if operand_expr.reaches_recursive_depth_limit() {
             let result = SymbolicExpr::variable(dest);
-            self.values.insert(dest, result.clone());
+            self.put_value(dest, result.clone());
             self.track_origin_state(dest, &result);
             return Some(result);
         }
@@ -1863,7 +2073,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // Mask native int/uint results to target pointer width
         let result = self.mask_symbolic_native(result);
 
-        self.values.insert(dest, result.clone());
+        self.put_value(dest, result.clone());
         self.track_origin_state(dest, &result);
         Some(result)
     }
@@ -1875,10 +2085,10 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         if let Some(ssa_var) = self.ssa.variable(var) {
             match ssa_var.origin() {
                 VariableOrigin::Local(idx) => {
-                    self.local_state.insert(idx, value.clone());
+                    self.put_local(idx, value.clone());
                 }
                 VariableOrigin::Argument(idx) => {
-                    self.arg_state.insert(idx, value.clone());
+                    self.put_arg(idx, value.clone());
                 }
                 _ => {}
             }
@@ -1938,7 +2148,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 && let Some(resolved) =
                     self.resolve_with_trace(operand, max_depth.saturating_sub(1))
             {
-                self.values.insert(operand, resolved);
+                self.put_value(operand, resolved);
             }
         }
 

@@ -706,9 +706,45 @@ impl<T: Target> SsaFunction<T> {
                 // with no remaining definition.
             } else {
                 // Rebuild mode: replace uses and remove unconditionally.
-                for (phi_result, source) in &trivial_phis {
-                    if *phi_result != *source {
-                        self.replace_uses_including_phis(*phi_result, *source);
+                //
+                // The substitutions are composed into one map and applied in a
+                // single pass. Doing them one at a time meant a whole-function
+                // scan per trivial phi, and a rebuild produces trivial phis in
+                // proportion to the function, so every fixpoint round was
+                // quadratic — the same defect the repair branch above was
+                // already corrected for.
+                //
+                // Sequential application is order-sensitive: each substitution
+                // only sees the values left by the ones before it, so `p2 -> p1`
+                // applied after `p1 -> x` leaves `p1`, not `x`. Composing the
+                // map back-to-front reproduces that exactly — when an entry is
+                // resolved every later entry is already final, and earlier ones
+                // must not be followed.
+                let resolved = {
+                    let mut resolved: BTreeMap<SsaVarId, SsaVarId> = BTreeMap::new();
+                    for (result, source) in trivial_phis.iter().rev() {
+                        if result == source {
+                            continue;
+                        }
+                        let target = resolved.get(source).copied().unwrap_or(*source);
+                        resolved.insert(*result, target);
+                    }
+                    resolved
+                };
+                if !resolved.is_empty() {
+                    for block in &mut self.blocks {
+                        for instr in block.instructions_mut() {
+                            instr
+                                .op_mut()
+                                .replace_uses_with(|var| resolved.get(&var).copied());
+                        }
+                        for phi in block.phi_nodes_mut() {
+                            for operand in phi.operands_mut() {
+                                if let Some(&target) = resolved.get(&operand.value()) {
+                                    *operand = PhiOperand::new(target, operand.predecessor());
+                                }
+                            }
+                        }
                     }
                 }
 
