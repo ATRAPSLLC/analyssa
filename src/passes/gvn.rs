@@ -323,7 +323,17 @@ where
     );
 
     if edit_result.is_err() {
-        return 0;
+        // The rollback policy differs by build: debug restores the function, so
+        // nothing changed and zero is the truth. Release runs under
+        // `SsaRollbackPolicy::Never`, where the edits stay applied — reporting
+        // zero there would make the pass-group transaction skip both
+        // verification and rollback, keeping damaged IR and keeping it
+        // unchecked. Report the change so the transaction handles it.
+        return if matches!(rollback, SsaRollbackPolicy::OnFailure) {
+            0
+        } else {
+            total_replaced.max(1)
+        };
     }
 
     total_replaced

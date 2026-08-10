@@ -152,7 +152,16 @@ impl<T: Target> PassTransaction<T> {
 
         match outcome {
             Ok(changed) => {
-                if !changed {
+                // `changed` is what the pass *claims*. A pass whose edit session
+                // ran under `SsaRollbackPolicy::Never` and whose boundary repair
+                // failed has left its edits applied, and several passes have
+                // reported "unchanged" in exactly that case — which would take
+                // the early return below and skip both verification and
+                // rollback, keeping damaged IR unchecked. `take_edit_dirty`
+                // reports what actually happened to the function, so the claim
+                // cannot suppress the check.
+                let mutated = ssa.take_edit_dirty();
+                if !changed && !mutated {
                     return GroupOutcome::Unchanged;
                 }
                 if SsaVerifier::new(ssa)
@@ -207,7 +216,7 @@ impl<T: Target> PassTransaction<T> {
 mod tests {
     use super::*;
     use crate::{
-        ir::{instruction::SsaInstruction, ops::SsaOp},
+        ir::{function::SsaEditOptions, instruction::SsaInstruction, ops::SsaOp},
         testing::{self, MockTarget},
     };
 
@@ -249,6 +258,38 @@ mod tests {
 
         assert_eq!(outcome, GroupOutcome::Applied);
         assert!(outcome.changed());
+        assert_eq!(ssa.validate(), Ok(()));
+    }
+
+    /// A pass that mutates through a checked edit and then reports "unchanged"
+    /// must not escape verification.
+    ///
+    /// `SsaEditOptions::new()` defaults to `SsaRollbackPolicy::Never`, so the
+    /// edits stay applied when the session fails. Several passes have returned
+    /// `false` in exactly that case, which — before the function tracked its own
+    /// mutation — took the `Unchanged` path and kept the damaged IR without
+    /// verifying it.
+    #[test]
+    fn a_pass_that_mutates_then_claims_unchanged_is_still_verified() {
+        let mut ssa = testing::const_i32_return(7);
+        let original_blocks = ssa.block_count();
+        let mut transaction = PassTransaction::<MockTarget>::new();
+
+        let outcome = transaction.run_group(&mut ssa, |ssa| {
+            let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+                editor.insert_before_terminator(0, SsaInstruction::new((), SsaOp::Nop))?;
+                Ok(())
+            });
+            // The lie under test.
+            false
+        });
+
+        assert_ne!(
+            outcome,
+            GroupOutcome::Unchanged,
+            "a mutated function must not be reported as unchanged"
+        );
+        assert_eq!(ssa.block_count(), original_blocks);
         assert_eq!(ssa.validate(), Ok(()));
     }
 

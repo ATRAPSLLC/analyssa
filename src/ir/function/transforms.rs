@@ -721,13 +721,33 @@ impl<T: Target> SsaFunction<T> {
                 // resolved every later entry is already final, and earlier ones
                 // must not be followed.
                 let resolved = {
+                    // Every substitution target must be a variable that survives
+                    // this round. Composing back-to-front only resolves a source
+                    // through entries already inserted, so a chain
+                    // `p1 -> p2 -> x` can leave `p1 -> p2` while `p2` is retired
+                    // in the same round — the rewrite then points uses of `p1` at
+                    // `p2`, which is deleted moments later, and those uses are
+                    // stranded on a variable nothing defines. Walk each chain to
+                    // its end instead, exactly as the repair branch above does.
+                    let direct: BTreeMap<SsaVarId, SsaVarId> = trivial_phis
+                        .iter()
+                        .filter(|(result, source)| result != source)
+                        .copied()
+                        .collect();
                     let mut resolved: BTreeMap<SsaVarId, SsaVarId> = BTreeMap::new();
-                    for (result, source) in trivial_phis.iter().rev() {
-                        if result == source {
-                            continue;
+                    for (result, source) in &direct {
+                        let mut current = *source;
+                        let mut visited: BTreeSet<SsaVarId> = BTreeSet::new();
+                        visited.insert(*result);
+                        while let Some(&next) = direct.get(&current) {
+                            if !visited.insert(current) {
+                                break;
+                            }
+                            current = next;
                         }
-                        let target = resolved.get(source).copied().unwrap_or(*source);
-                        resolved.insert(*result, target);
+                        if current != *result {
+                            resolved.insert(*result, current);
+                        }
                     }
                     resolved
                 };
@@ -748,9 +768,23 @@ impl<T: Target> SsaFunction<T> {
                     }
                 }
 
+                // A self-referential phi is recorded as `(result, result)` and is
+                // deliberately absent from `resolved` — there is no other value
+                // to rewrite its uses to. Removing it regardless strands every
+                // one of those uses on a variable nothing defines. Retire it
+                // only once nothing reads it; a later fixpoint round collects it
+                // after its readers go away. The repair branch already applies
+                // exactly this condition.
+                let still_read = self.collect_read_variables();
                 let mut trivial_set = BitSet::new(variable_count);
-                for (result, _) in &trivial_phis {
+                for (result, source) in &trivial_phis {
+                    if result == source && still_read.contains_checked(result.index()) {
+                        continue;
+                    }
                     trivial_set.insert(result.index());
+                }
+                if trivial_set.is_empty() {
+                    break;
                 }
                 total_eliminated = total_eliminated.saturating_add(trivial_set.count());
                 for block in &mut self.blocks {
@@ -818,7 +852,18 @@ impl<T: Target> SsaFunction<T> {
         read
     }
 
-    pub(in crate::ir::function) fn refresh_def_sites(&mut self) {
+    /// Recomputes every variable's definition site from its current position.
+    ///
+    /// A definition site names the block and the index of the phi or
+    /// instruction that produces the variable. Any edit that inserts, removes,
+    /// or reorders instructions invalidates those indices, and a stale index
+    /// that runs past the end of its block is rejected by index-bounds
+    /// verification. This restores them from the IR as it actually stands.
+    ///
+    /// Variables with no remaining definition are reset to an entry site unless
+    /// something still reads them, so a destroyed definition is not disguised as
+    /// a legitimate entry value.
+    pub fn refresh_def_sites(&mut self) {
         let variable_count = self.var_id_capacity();
         let mut active_defs = BitSet::new(variable_count);
 

@@ -243,6 +243,23 @@ pub struct SsaFunction<T: Target> {
     /// Defaults to [`FunctionKind::Normal`]. Set during SSA construction by
     /// frontends that need to mark functions as interrupt service routines.
     kind: FunctionKind,
+
+    /// Whether a checked edit has mutated this function since the flag was last
+    /// taken.
+    ///
+    /// [`Self::edit`] sets this the moment an edit session reports a change,
+    /// *before* boundary repair can fail. A session running under
+    /// [`SsaRollbackPolicy::Never`](crate::ir::function::SsaRollbackPolicy::Never)
+    /// leaves its edits applied when repair fails, so the caller's own
+    /// "did anything change" return cannot be trusted to say so — and a pass
+    /// group that believes nothing changed skips both verification and
+    /// rollback. Consumers read this instead of trusting that return; see
+    /// [`Self::take_edit_dirty`].
+    ///
+    /// A rollback replaces the whole function with its pre-edit clone, which
+    /// restores this to whatever it was before the edit, so a restored failure
+    /// correctly reports clean.
+    edit_dirty: bool,
 }
 
 impl<T: Target> Clone for SsaFunction<T> {
@@ -261,6 +278,7 @@ impl<T: Target> Clone for SsaFunction<T> {
             exception_handlers,
             rename_groups,
             kind,
+            edit_dirty,
         } = self;
         Self {
             blocks: blocks.clone(),
@@ -276,6 +294,7 @@ impl<T: Target> Clone for SsaFunction<T> {
             exception_handlers: exception_handlers.clone(),
             rename_groups: rename_groups.clone(),
             kind: *kind,
+            edit_dirty: *edit_dirty,
         }
     }
 
@@ -306,6 +325,7 @@ impl<T: Target> Clone for SsaFunction<T> {
             exception_handlers,
             rename_groups,
             kind,
+            edit_dirty,
         } = source;
         self.blocks.clone_from(blocks);
         self.variables.clone_from(variables);
@@ -321,6 +341,7 @@ impl<T: Target> Clone for SsaFunction<T> {
         self.exception_handlers.clone_from(exception_handlers);
         self.rename_groups.clone_from(rename_groups);
         self.kind = *kind;
+        self.edit_dirty = *edit_dirty;
     }
 }
 
@@ -351,6 +372,7 @@ impl<T: Target> SsaFunction<T> {
             exception_handlers: Vec::new(),
             rename_groups: Vec::new(),
             kind: FunctionKind::Normal,
+            edit_dirty: false,
         }
     }
 
@@ -387,6 +409,7 @@ impl<T: Target> SsaFunction<T> {
             exception_handlers: Vec::new(),
             rename_groups: Vec::with_capacity(var_capacity),
             kind: FunctionKind::Normal,
+            edit_dirty: false,
         }
     }
 
@@ -1076,6 +1099,24 @@ impl<T: Target> SsaFunction<T> {
     #[must_use]
     pub fn kind(&self) -> FunctionKind {
         self.kind
+    }
+
+    /// Returns whether a checked edit has mutated this function, clearing the
+    /// flag.
+    ///
+    /// A pass group must treat a `true` result as "changed" regardless of what
+    /// the pass itself reported: under
+    /// [`SsaRollbackPolicy::Never`](crate::ir::function::SsaRollbackPolicy::Never)
+    /// a failed boundary repair leaves the edits applied, and a pass that
+    /// returns "unchanged" would otherwise have its damaged IR kept without
+    /// verification.
+    pub fn take_edit_dirty(&mut self) -> bool {
+        core::mem::replace(&mut self.edit_dirty, false)
+    }
+
+    /// Marks this function as mutated by a checked edit.
+    pub(in crate::ir::function) fn mark_edit_dirty(&mut self) {
+        self.edit_dirty = true;
     }
 
     /// Sets the function kind.

@@ -283,11 +283,18 @@ impl<T: Target> SsaFunction<T> {
             }
         };
 
-        if report.changed
-            && let Err(error) = finish_edit_scope(self, report.scope)
-        {
-            restore_on_failure(self, original);
-            return Err(error);
+        if report.changed {
+            // Set before boundary repair can fail. Under
+            // `SsaRollbackPolicy::Never` a failed repair leaves these edits
+            // applied, and the caller's own "changed" return has repeatedly
+            // been written to say otherwise — so the pass group reads this
+            // instead of trusting it. A rollback below replaces the whole
+            // function with its pre-edit clone, which clears the flag.
+            self.mark_edit_dirty();
+            if let Err(error) = finish_edit_scope(self, report.scope) {
+                restore_on_failure(self, original);
+                return Err(error);
+            }
         }
 
         if options.verify {
@@ -922,9 +929,9 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         let Some(block) = self.ssa.block_mut(block_idx) else {
             return Err(Error::new(format!("missing block B{block_idx}")));
         };
-        let Some((&first_pred, extra_preds)) = new_preds.split_first() else {
+        if new_preds.is_empty() {
             return Ok(0);
-        };
+        }
 
         let mut updated = 0usize;
         for phi in block.phi_nodes_mut() {
@@ -937,16 +944,33 @@ impl<'a, T: Target> SsaEditor<'a, T> {
                 continue;
             };
 
-            if let Some(operand) = phi
-                .operands_mut()
-                .iter_mut()
-                .find(|operand| operand.predecessor() == old_pred)
-            {
-                operand.set_predecessor(first_pred);
-                updated = updated.saturating_add(1);
-            }
+            // Drop the edge being replaced, then re-add one operand per new
+            // predecessor — but never for a predecessor the phi already names.
+            //
+            // A predecessor can reach this block *both* directly and through the
+            // block being bypassed; redirecting then collapses the two paths onto
+            // one edge. Adding an operand regardless leaves two operands for that
+            // single edge, which has no defined meaning and which consumers
+            // disagree about: `PhiNode::operand_from` returns the first and
+            // discards the rest, while SCCP meets them all and yields Bottom.
+            // `retarget_phi_predecessor` already guards this case; this is the
+            // same guard for the one-to-many form.
+            //
+            // When an operand for that predecessor already exists it is kept as
+            // it stands: it describes the direct edge, which is the edge that
+            // survives.
+            phi.operands_mut()
+                .retain(|operand| operand.predecessor() != old_pred);
+            updated = updated.saturating_add(1);
 
-            for &pred in extra_preds {
+            for &pred in new_preds {
+                if phi
+                    .operands()
+                    .iter()
+                    .any(|operand| operand.predecessor() == pred)
+                {
+                    continue;
+                }
                 phi.add_operand(PhiOperand::new(value, pred));
                 updated = updated.saturating_add(1);
             }

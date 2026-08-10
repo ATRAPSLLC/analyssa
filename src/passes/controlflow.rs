@@ -145,7 +145,24 @@ where
     });
 
     if result.is_err() {
-        return 0;
+        // The session runs under [`SsaRollbackPolicy::Never`], so a failure in
+        // boundary repair or rebuild leaves the edits already applied — the
+        // function is mutated, and possibly mid-repair.
+        //
+        // Reporting zero here would say the opposite. `run` would then report
+        // `changed == false` to its caller, and a pass-group transaction treats
+        // "nothing changed" as "nothing to check": its `Unchanged` arm returns
+        // **without verifying and without rolling back**, on the reasoning that a
+        // pass which changed nothing cannot have broken anything. That reasoning
+        // holds only while this return value is truthful, so a zero here keeps
+        // damaged IR and hides it from the one check that would have caught it.
+        //
+        // Report the edits that were applied instead. `total_changes` is exact —
+        // the closure itself is infallible, so any error comes from the repair
+        // that runs *after* the counted mutations — and the floor of one covers
+        // a mutation no counter observed. Non-zero is what makes the transaction
+        // verify this function and roll it back.
+        return total_changes.max(1);
     }
 
     total_changes
