@@ -249,7 +249,7 @@ pub struct SsaFunction<T: Target> {
     ///
     /// [`Self::edit`] sets this the moment an edit session reports a change,
     /// *before* boundary repair can fail. A session running under
-    /// [`SsaRollbackPolicy::Never`](crate::ir::function::SsaRollbackPolicy::Never)
+    /// [`SsaRollbackPolicy::Never`]
     /// leaves its edits applied when repair fails, so the caller's own
     /// "did anything change" return cannot be trusted to say so — and a pass
     /// group that believes nothing changed skips both verification and
@@ -1106,7 +1106,7 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// A pass group must treat a `true` result as "changed" regardless of what
     /// the pass itself reported: under
-    /// [`SsaRollbackPolicy::Never`](crate::ir::function::SsaRollbackPolicy::Never)
+    /// [`SsaRollbackPolicy::Never`]
     /// a failed boundary repair leaves the edits applied, and a pass that
     /// returns "unchanged" would otherwise have its damaged IR kept without
     /// verification.
