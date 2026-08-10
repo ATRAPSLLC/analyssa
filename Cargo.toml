@@ -2,10 +2,10 @@
 name = "analyssa"
 version = "0.5.0"
 edition = "2024"
-authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "Target-agnostic SSA IR, analyses, and optimization pipeline"
+repository = "https://github.com/ATRAPSLLC/analyssa"
 documentation = "https://docs.rs/analyssa"
 readme = "README.md"
 keywords = ["ssa", "ir", "compiler", "analysis", "optimization"]

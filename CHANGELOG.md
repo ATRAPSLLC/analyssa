@@ -130,6 +130,17 @@ repair applied on one path and not its sibling.
   and kept unchecked. Both now report the applied edits, which lets the
   transaction verify the function and roll it back.
 
+### Ownership
+
+- Recorded ATRAPS LLC as copyright holder and added a `NOTICE` file. The Apache-2.0
+  appendix was never filled in — it still carried the literal
+  `[yyyy] [name of copyright owner]` placeholder, so nothing in this repo stated
+  who owned it.
+- Added a `repository` field. The manifest declared `documentation` but no
+  repository, so crates.io showed no source link for any published version.
+- Dropped the deprecated `authors` field.
+- Publishing now uses crates.io trusted publishing instead of a stored registry token.
+
 ## [0.4.1] - 2026-07-26
 
 Speculative evaluation for `SsaEvaluator`. Consumers that explore alternative
