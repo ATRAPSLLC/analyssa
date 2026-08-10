@@ -248,6 +248,9 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
     /// May panic on internal assertion failures (debug builds) if intermediate
     /// invariants are violated, indicating a bug in a preceding pass.
     pub fn rebuild(&mut self) -> Result<()> {
+        // Before any phase runs: is the SSA the pass handed us already carrying
+        // a dangling phi operand? The earlier `PREREBUILD` probe scanned
+        // instruction operands only and could not see one.
         // Stage 1: Pre-clean
         self.pre_clean_unreachable(); // Phase 1
         self.recompute_groups_from_connectivity(); // Phase 2
@@ -500,7 +503,29 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
         // Apply replacements: substitute phi result uses with the single operand
         if !replacements.is_empty() {
-            let replacement_map: BTreeMap<SsaVarId, SsaVarId> = replacements.into_iter().collect();
+            let direct: BTreeMap<SsaVarId, SsaVarId> = replacements.into_iter().collect();
+            // Resolve chains before substituting. A phi inlined to `first` can
+            // name another phi being inlined in the same pass, and applying the
+            // map entry-by-entry leaves that intermediate in place — a use then
+            // names a phi this loop has already removed, which is `UndefinedUse`.
+            // Iterating a `BTreeMap` makes it order-dependent rather than
+            // reliably wrong, so it survives wherever key order happens to
+            // resolve the chain.
+            let replacement_map: BTreeMap<SsaVarId, SsaVarId> = direct
+                .iter()
+                .filter_map(|(from, to)| {
+                    let mut current = *to;
+                    let mut visited: BTreeSet<SsaVarId> = BTreeSet::new();
+                    visited.insert(*from);
+                    while let Some(&next) = direct.get(&current) {
+                        if !visited.insert(current) {
+                            break;
+                        }
+                        current = next;
+                    }
+                    (current != *from).then_some((*from, current))
+                })
+                .collect();
             for block in &mut self.ssa.blocks {
                 for instr in block.instructions_mut() {
                     for (&old_var, &new_var) in &replacement_map {
@@ -1316,11 +1341,33 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             self.defs.entry(group).or_default().insert(0);
         }
 
-        // Collect defs from instructions using group IDs.
+        // Collect defs from instructions and phi results using group IDs.
+        //
+        // A phi result is a definition of its group in its block, and it has to
+        // seed the def set like any other: `place_phis` derives phi placement
+        // from the iterated dominance frontier *of these blocks*, and
+        // `clear_all_phis` has already dissolved the phis themselves by then.
+        //
+        // Omitting them means a group whose only definition reaching some region
+        // was a phi contributes no block there, so no phi is re-placed where one
+        // is still needed — and the uses of the dissolved result are left naming
+        // a variable nothing defines. That is `UndefinedUse`, and it is what
+        // `rename` was observed to introduce on 4,237 functions of the reference
+        // sample despite the IR being valid on entry to the rebuild.
+        //
+        // Cytron places a phi wherever a definition's dominance frontier reaches,
+        // and treats a phi as a definition for exactly this reason: phi placement
+        // is a fixpoint, so a phi can be what justifies the next one.
         for block in &self.ssa.blocks {
             let block_idx = block.id();
             if !self.reachable.contains(block_idx) {
                 continue;
+            }
+            for phi in block.phi_nodes() {
+                let group = self.ssa.rename_group(phi.result());
+                if group != u32::MAX {
+                    self.defs.entry(group).or_default().insert(block_idx);
+                }
             }
             for instr in block.instructions() {
                 for dest in instr.defs() {
@@ -1358,6 +1405,33 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             let block_idx = block.id();
             if !self.reachable.contains(block_idx) {
                 continue;
+            }
+            // A phi operand is a use, recorded against the **predecessor** it
+            // arrives on: the value must be live at the end of that edge, not at
+            // the head of this block.
+            //
+            // Without this, a group consumed only by phi operands is live-in
+            // nowhere, so `place_pruned_phis` — which places a phi only where the
+            // group is live-in — places none for it. `clear_all_phis` has already
+            // dissolved the original by then, leaving the phi-operand uses naming
+            // a variable nothing defines: `UndefinedUse`. Recording phi results in
+            // `collect_defs` alone does not help, because this liveness gate still
+            // suppresses the placement.
+            for phi in block.phi_nodes() {
+                for operand in phi.operands() {
+                    let group = self.ssa.rename_group(operand.value());
+                    if group == u32::MAX {
+                        continue;
+                    }
+                    let pred = operand.predecessor();
+                    if !self.reachable.contains_checked(pred) {
+                        continue;
+                    }
+                    use_sites
+                        .entry(group)
+                        .or_insert_with(|| BitSet::new(block_count))
+                        .insert(pred);
+                }
             }
             for instr in block.instructions() {
                 instr.op().for_each_use(|use_var| {
@@ -1418,10 +1492,45 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         );
     }
 
-    /// Clears all phi nodes from all blocks before fresh placement.
+    /// Clears the phi nodes this rebuild will re-place, before fresh placement.
+    ///
+    /// A phi whose result carries **no rename group** (`u32::MAX`) is kept,
+    /// because nothing downstream can restore it:
+    ///
+    /// - [`Self::recompute_groups_from_connectivity`] skips such a phi when it
+    ///   unions operands into groups, and its splitting step only ever
+    ///   subdivides *existing* groups — so an ungrouped result is never given
+    ///   one.
+    /// - [`Self::place_phis`] places phis per rename group, so it will not
+    ///   re-create a phi belonging to none.
+    /// - [`Self::rename`] skips ungrouped variables outright, so no rename-map
+    ///   entry is produced and [`Self::apply_rename_map`] has nothing to rewrite
+    ///   the surviving uses with.
+    ///
+    /// Clearing it therefore deletes a definition whose uses remain, and the
+    /// function reaches the verifier with `UndefinedUse` on each one. The
+    /// CFG-modifying edit path runs under `SsaRollbackPolicy::Never`, so the
+    /// caller keeps that damaged IR rather than restoring it — which is why this
+    /// one line accounted for the great majority of reverted optimization passes
+    /// across `controlflow`, `blockmerge` and `loopcanon`.
+    ///
+    /// The rebuild reconstructs SSA *for rename groups*. A phi outside every
+    /// group is not part of that model, so it is not this pass's to destroy.
     fn clear_all_phis(&mut self) {
+        let ungrouped: BTreeSet<SsaVarId> = self
+            .ssa
+            .blocks
+            .iter()
+            .flat_map(|block| block.phi_nodes().iter().map(|phi| phi.result()))
+            .filter(|result| {
+                let group = self.ssa.rename_group(*result);
+                group == u32::MAX || !self.defs.contains_key(&group)
+            })
+            .collect();
         for block in &mut self.ssa.blocks {
-            block.phi_nodes_mut().clear();
+            block
+                .phi_nodes_mut()
+                .retain(|phi| ungrouped.contains(&phi.result()));
         }
     }
 
@@ -1623,10 +1732,27 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                                 existing.insert(op.predecessor());
                             }
                             let group = self.ssa.rename_group(phi.result());
+                            // The version-0 entry for this phi's group is the
+                            // natural filler. A phi belonging to no group has no
+                            // such entry — [`Self::clear_all_phis`] retains
+                            // exactly those, because nothing here can re-create
+                            // them — so fall back to a value the phi already
+                            // carries on another edge.
+                            //
+                            // Skipping instead leaves the phi short an operand for
+                            // a real predecessor, which is `MissingPhiOperand`;
+                            // a CFG edit that adds a predecessor to such a block
+                            // is precisely what exposes it. Every operand of a phi
+                            // names the same variable, so reusing one is the same
+                            // choice `expand_phi_predecessor` makes when it
+                            // propagates a value onto newly-redirected edges.
+                            let filler = version_stacks
+                                .get(&group)
+                                .and_then(|stack| stack.first().copied())
+                                .or_else(|| phi.operands().first().map(PhiOperand::value));
                             for &pred in &preds {
                                 if !existing.contains(pred)
-                                    && let Some(&v0) =
-                                        version_stacks.get(&group).and_then(|stack| stack.first())
+                                    && let Some(v0) = filler
                                 {
                                     fixes.push((block_idx, phi_idx, pred, v0));
                                 }
@@ -1750,7 +1876,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
     }
 
     /// Replaces instruction operands that point at definitions later in the same block.
-    fn repair_same_block_future_uses(&mut self) {
+    pub(in crate::ir::function) fn repair_same_block_future_uses(&mut self) {
         let mut future_uses: Vec<(usize, usize, SsaVarId)> = Vec::new();
         let mut repairs: Vec<(usize, usize, SsaVarId, SsaVarId)> = Vec::new();
         let mut entry_replacements: BTreeMap<u32, SsaVarId> = BTreeMap::new();
@@ -1838,11 +1964,13 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         let group = self.ssa.rename_group(var);
         if group == u32::MAX {
             let source = self.ssa.variable(var)?;
-            let origin = source.origin();
             let var_type = source.var_type().clone();
-            let replacement = self
-                .ssa
-                .create_variable(origin, 0, DefSite::entry(), var_type);
+            let replacement = self.ssa.create_variable(
+                VariableOrigin::EntryLiveIn,
+                0,
+                DefSite::entry(),
+                var_type,
+            );
             let new_group = self.next_group;
             self.next_group = self.next_group.saturating_add(1);
             self.ssa.set_rename_group(replacement, new_group);
@@ -1868,11 +1996,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         }
 
         let source = self.ssa.variable(var)?;
-        let origin = source.origin();
         let var_type = source.var_type().clone();
-        let replacement = self
-            .ssa
-            .create_variable(origin, 0, DefSite::entry(), var_type);
+        let replacement =
+            self.ssa
+                .create_variable(VariableOrigin::EntryLiveIn, 0, DefSite::entry(), var_type);
         self.ssa.set_rename_group(replacement, group);
         replacements.insert(group, replacement);
         Some(replacement)

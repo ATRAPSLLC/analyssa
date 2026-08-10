@@ -4,6 +4,132 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-04
+
+Correctness of the SSA rebuild and the phi transforms. On a 125 MB x86-64
+reference binary (50,000 functions), pass rollbacks went from 6,094 to **0** and
+verifier-reported undefined uses from ~28,960 to **0**; no function is now
+floored by normalization. Output is 6% leaner (10,089,320 to 9,490,820 lowered
+rows) while landing 4% more rewrites (94,257 to 98,467), because rejected work is
+no longer discarded wholesale.
+
+Every defect below shares a shape: a value substitution or a definition record
+that was *stated* rather than *established* — a chain composed without resolving
+to a surviving target, a label asserting a definition that did not exist, or a
+repair applied on one path and not its sibling.
+
+### Changed
+
+- **A pass group no longer trusts a pass's own "changed" return.**
+  `SsaFunction` now tracks whether a checked edit mutated it, and
+  `PassTransaction::run_group` treats a mutated function as changed regardless of
+  what the pass reported. The precondition that made this necessary — a pass
+  editing under `SsaRollbackPolicy::Never` must report the change when the edit
+  fails, or the group skips both verification and rollback — was unstated,
+  unenforced, and had been got wrong by eight passes. It is now structural
+  rather than a convention: a pass that mutates and then claims otherwise is
+  still verified and still rolled back.
+
+### Added
+
+- **`SsaFunction::take_edit_dirty`** — reports whether a checked edit mutated the
+  function, clearing the flag. For consumers driving their own pass groups, who
+  need the same guarantee `PassTransaction` now provides.
+
+- **`SsaFunction::refresh_def_sites` is public.** It recomputes every variable's
+  definition site from the IR as it actually stands. Front ends that build SSA
+  incrementally cannot always know an instruction's final index while lowering,
+  and a stale index that runs past the end of its block fails index-bounds
+  verification. This is the routine `repair_ssa` already used internally.
+
+### Fixed
+
+- **Trivial-phi substitution chains in rebuild mode resolved to a deleted
+  value.** The back-to-front composition introduced in 0.4.1 resolves each source
+  only through entries already inserted, so for `[(p2, x), (p1, p2)]` it records
+  `p1 -> p2` while `p2` is retired in the same round. Uses of `p1` were rewritten
+  to a phi deleted moments later. Each chain is now walked to a target that is
+  not itself being replaced, with a cycle guard — the repair path had always done
+  this. The 0.4.1 change remains correct as a performance fix; only its
+  composition order was wrong.
+
+- **Self-referential phis were removed without rewriting their uses.** A phi
+  recorded as `(result, result)` has no other value to substitute and is
+  deliberately absent from the substitution map, but rebuild mode retired it
+  anyway, stranding every use on a variable nothing defined. It is now retired
+  only once nothing reads it, which is the condition the repair path already
+  applied.
+
+- **`pre_clean_unreachable` inlined trivial phis without resolving chains.** Its
+  replacement map was applied entry by entry, so a phi inlined to a value that
+  was itself another phi being inlined in the same pass left the intermediate in
+  place — a use naming a phi the same loop had already removed. Because the map
+  is a `BTreeMap`, whether the chain resolved depended on key order, which made
+  the failure rare and order-dependent rather than reliably reproducible.
+
+- **`repair_ssa` did not repair same-block future uses.** An instruction-scope
+  edit can leave a use naming a definition later in its own block. The rebuild
+  path repairs exactly this; the repair path did not, so the transactional guard
+  rejected the result as `IntraBlockCycle` and discarded the pass's work.
+
+- **Entry replacements were labelled as phi-defined.** The stand-in
+  `repair_same_block_future_uses` fabricates for a use with no prior definition
+  is undefined by construction — it represents the value incoming to the
+  function. Copying the source variable's origin labelled it `Phi`, asserting
+  that a phi defined it. It now carries `EntryLiveIn`, whose contract is exactly
+  that the caller supplies it.
+
+- **`clear_all_phis` discarded phis the rebuild could not reconstruct.** A phi
+  whose result belongs to no rename group, or to a group with no recorded
+  definition, cannot be re-placed by `place_phis`; clearing it destroyed its
+  definition outright. Such phis are now retained.
+
+- **Phi results and phi-operand uses were invisible to the rebuild's def/use
+  collection.** `collect_defs` did not record a phi result as a definition of its
+  group, so a group whose only definition reaching a region was a phi contributed
+  no block there and no phi was re-placed where one was still needed.
+  `collect_uses_and_liveness` did not attribute a phi operand to the predecessor
+  it flows from, understating liveness on that edge.
+
+- **`expand_phi_predecessor` could leave two operands on one edge.** A
+  predecessor reaching a block both directly and through the block being bypassed
+  had an operand added for an edge it already named. Duplicate operands have no
+  defined meaning and consumers disagree — `PhiNode::operand_from` returns the
+  first, SCCP meets them all and yields Bottom. The replaced edge is now dropped
+  and operands are added only for predecessors the phi does not already name.
+
+- **Seven passes reported "unchanged" after applying edits.** `SsaEditOptions::new()`
+  defaults to `SsaRollbackPolicy::Never`, so a failed edit or boundary repair
+  leaves the edits applied. Returning `false`/`0` then tells the pass-group
+  transaction nothing changed, and its `Unchanged` arm returns *without verifying
+  and without rolling back* — so damaged IR was kept, and kept unchecked. On a
+  125 MB reference binary seven edit sessions failed this way and produced zero
+  rollbacks, meaning seven functions carried mutated, unverified IR.
+  `algebraic`, `ranges`, `reassociate`, `strength` and `threading` now report the
+  change so the transaction verifies and rolls back, as do `controlflow` and
+  `blockmerge` (below).
+
+  The mixed policy across passes is deliberate and unchanged: passes that verify
+  inside their own edit session (`copying`, `predicates`, `licm`) need
+  `OnFailure` for that verification to mean anything, while passes that delegate
+  to the transaction use `Never` to avoid a second snapshot — the transaction
+  already clones once per pass, where `OnFailure` clones per edit session. What
+  was missing was the unstated precondition that a `Never` pass must report the
+  change on failure.
+
+- **`gvn` reported "unchanged" only correctly in debug builds.** Its rollback
+  policy is `OnFailure` under `debug_assertions` and `Never` otherwise, so
+  `return 0` on failure was true under test and false in release — the one
+  configuration where the damaged IR would ship. The return now depends on which
+  policy actually ran.
+
+- **`controlflow` and `blockmerge` reported "unchanged" after applying edits.**
+  Under `SsaRollbackPolicy::Never` a failed boundary repair leaves the edits in
+  place. Reporting zero told the caller nothing had changed, and a pass-group
+  transaction treats "unchanged" as "nothing to verify" — so damaged IR was kept,
+  and kept unchecked. Both now report the applied edits, which lets the
+  transaction verify the function and roll it back.
+
 ## [0.4.1] - 2026-07-26
 
 Speculative evaluation for `SsaEvaluator`. Consumers that explore alternative

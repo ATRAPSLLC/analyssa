@@ -183,7 +183,13 @@ where
         Ok(())
     });
     if result.is_err() {
-        return 0;
+        // The session runs under [`SsaRollbackPolicy::Never`], so a failed
+        // boundary repair leaves these edits applied. Reporting zero would say
+        // nothing changed, and a pass-group transaction skips both verification
+        // and rollback on that report — so damaged IR is kept, and kept
+        // unchecked. Report the applied edits (floor of one) so the transaction
+        // verifies this function and rolls it back.
+        return redirected.saturating_add(cleared).max(1);
     }
     redirected.saturating_add(cleared)
 }
@@ -355,7 +361,11 @@ where
             Ok(())
         });
         if result.is_err() {
-            return false;
+            // Edits already applied and not rolled back (see the session policy
+            // above). `false` here means "unchanged" to the caller, which makes
+            // the pass-group transaction skip verification and keep the damaged
+            // IR. Report the change so it is verified and rolled back instead.
+            return true;
         }
         let event = crate::events::Event {
             kind: EventKind::BlockRemoved,

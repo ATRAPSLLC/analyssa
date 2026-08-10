@@ -32,7 +32,7 @@
 //! | CFG-modifying (add/remove blocks, change branches) | `rebuild_ssa` |
 
 use crate::{
-    ir::function::{SsaFunction, TrivialPhiOptions},
+    ir::function::{SsaFunction, TrivialPhiOptions, rebuild::SsaRebuilder},
     target::Target,
 };
 
@@ -72,5 +72,11 @@ impl<T: Target> SsaFunction<T> {
         self.eliminate_trivial_phis(&TrivialPhiOptions { reachable: None });
         self.eliminate_dead_phis();
         self.compact_variables();
+        // An instruction-scope edit can leave a use naming a definition that
+        // sits later in the same block. The rebuild path repairs exactly this
+        // (Phases 17b/18b); without it here, `repair_ssa` returns IR the
+        // transactional guard rejects as `IntraBlockCycle` and the pass is
+        // rolled back with its work discarded.
+        SsaRebuilder::new(self).repair_same_block_future_uses();
     }
 }

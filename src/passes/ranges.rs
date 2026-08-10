@@ -412,7 +412,13 @@ where
     });
 
     if result.is_err() {
-        return false;
+        // The session runs under `SsaRollbackPolicy::Never`, so a failed edit or
+        // boundary repair leaves the edits applied — the function is mutated and
+        // possibly mid-repair. Reporting "unchanged" would make the pass-group
+        // transaction skip **both** verification and rollback, keeping damaged
+        // IR and keeping it unchecked. Report the change so the transaction
+        // verifies this function and rolls it back.
+        return true;
     }
 
     changed
