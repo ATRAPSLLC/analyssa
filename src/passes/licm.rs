@@ -41,6 +41,7 @@ use crate::{
     analysis::{loop_analyzer::LoopAnalyzer, loops::LoopInfo},
     bitset::BitSet,
     events::{EventKind, EventListener},
+    graph::NodeId,
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         instruction::SsaInstruction,
@@ -639,7 +640,17 @@ fn back_edge_tainted_vars<T: Target>(
             continue;
         };
         let site = var.def_site();
-        if !loop_info.body.contains(site.block) {
+        // A def site is variable *metadata*, not a fact about the current CFG:
+        // it can name a block this function no longer has, or never had. The
+        // lookup below already treats that as "no such instruction" — the block
+        // fetch is fallible — so the membership test has to be equally tolerant
+        // rather than asserting one line earlier.
+        //
+        // It asserted, and a `BitSet` bounds assert is a **panic**: measured over
+        // 21,600 binaries it fired 8 times, each one unwinding out of LICM into
+        // `guard_pass`, which rolled the whole pass back and left the function
+        // unoptimised with nothing upstream the wiser.
+        if !loop_info.contains(NodeId::new(site.block)) {
             continue;
         }
         let Some(instr_idx) = site.instruction else {
@@ -670,7 +681,7 @@ fn phi_back_edge_operands<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo)
             for operand in phi.operands() {
                 // Raw phi-operand predecessor: may name a block that does not
                 // exist, which is trivially not in the loop body.
-                if loop_info.body.contains_checked(operand.predecessor()) {
+                if loop_info.contains(NodeId::new(operand.predecessor())) {
                     operands.insert(operand.value());
                 }
             }

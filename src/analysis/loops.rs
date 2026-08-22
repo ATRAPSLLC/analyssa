@@ -265,7 +265,7 @@ impl LoopInfo {
     /// Returns true if this loop contains the given block.
     #[must_use]
     pub fn contains(&self, node: NodeId) -> bool {
-        self.body.contains(node.index())
+        self.body.contains_checked(node.index())
     }
 
     /// Returns the number of blocks in the loop.
@@ -424,7 +424,7 @@ impl LoopInfo {
             // Find operands from inside vs outside the loop
             let (inside_ops, outside_ops): (Vec<&_>, Vec<&_>) = operands
                 .iter()
-                .partition(|op| self.body.contains(op.predecessor()));
+                .partition(|op| self.contains(NodeId::new(op.predecessor())));
 
             // Classic induction variable: 1 init from outside, 1+ updates from inside
             if outside_ops.len() == 1 && !inside_ops.is_empty() {
@@ -779,7 +779,7 @@ fn expand_loop_body<G>(graph: &G, loop_info: &mut LoopInfo, latch: NodeId)
 where
     G: Predecessors,
 {
-    if loop_info.body.contains(latch.index()) {
+    if loop_info.contains(latch) {
         return;
     }
 
@@ -913,12 +913,7 @@ fn compute_nesting(loops: &mut [LoopInfo]) {
         // previous behaviour for equally-sized candidates, which matters because
         // the downstream similarity pipeline requires a deterministic result.
         let parent_idx = (0..n)
-            .filter(|&j| {
-                j != i
-                    && loops
-                        .get(j)
-                        .is_some_and(|l| l.body.contains(header.index()))
-            })
+            .filter(|&j| j != i && loops.get(j).is_some_and(|l| l.contains(header)))
             .min_by_key(|&j| (sizes.get(j).copied().unwrap_or(usize::MAX), j));
 
         if let Some(parent_idx) = parent_idx {
@@ -969,6 +964,26 @@ fn compute_nesting(loops: &mut [LoopInfo]) {
 
 #[cfg(test)]
 mod tests {
+    /// A block index the set cannot represent is not in the loop — the answer,
+    /// not a programming error. Callers reach this with indices from variable
+    /// def sites and CFG metadata, which describe the function as it was and can
+    /// name a block it no longer has; asking the `BitSet` directly asserts, and
+    /// a bounds assert is a panic.
+    #[test]
+    fn a_block_index_past_the_end_is_not_in_the_loop() {
+        let mut info = LoopInfo::new(NodeId::new(0), 4);
+        info.body.insert(2);
+
+        assert!(
+            info.contains(NodeId::new(0)),
+            "the header is in its own loop"
+        );
+        assert!(info.contains(NodeId::new(2)));
+        assert!(!info.contains(NodeId::new(3)));
+        assert!(!info.contains(NodeId::new(4)), "one past the end");
+        assert!(!info.contains(NodeId::new(9_999)), "far past the end");
+    }
+
     use super::*;
 
     #[test]
