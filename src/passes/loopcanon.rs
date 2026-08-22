@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use crate::{
     analysis::{loop_analyzer::SsaLoopAnalysis, loops::LoopInfo},
     events::{EventKind, EventListener},
+    graph::NodeId,
     ir::{
         block::SsaBlock,
         function::{SsaEditOptions, SsaFunction},
@@ -149,7 +150,7 @@ fn get_non_loop_predecessors(predecessors: &[Vec<usize>], loop_info: &LoopInfo) 
         .into_iter()
         .flatten()
         .copied()
-        .filter(|block_idx| !loop_info.body.contains(*block_idx))
+        .filter(|block_idx| !loop_info.contains(NodeId::new(*block_idx)))
         .collect()
 }
 
@@ -165,7 +166,12 @@ fn insert_preheader<T, L>(
 {
     let header_idx = loop_info.header.index();
     let preheader_idx = ssa.block_count();
-    let phi_info: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
+    // Keyed by the header phi's *result*, not its origin. `VariableOrigin::Phi`
+    // is a unit variant, so every phi that merges earlier phis — the ordinary
+    // shape in lifted native code — carries the same origin. Keying on it made
+    // one preheader phi stand for all of them and rewrote every header phi to
+    // that single value, which is a dominance violation for all but one.
+    let phi_info: Vec<(SsaVarId, VariableOrigin, Vec<PhiOperand>)> = ssa
         .block(header_idx)
         .map(|header| {
             header
@@ -179,7 +185,7 @@ fn insert_preheader<T, L>(
                         .copied()
                         .collect();
                     if non_loop_operands.len() > 1 {
-                        Some((phi.origin(), non_loop_operands))
+                        Some((phi.result(), phi.origin(), non_loop_operands))
                     } else {
                         None
                     }
@@ -187,7 +193,7 @@ fn insert_preheader<T, L>(
                 .collect()
         })
         .unwrap_or_default();
-    let header_phi_operands: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
+    let header_phi_operands: Vec<(SsaVarId, Vec<PhiOperand>)> = ssa
         .block(header_idx)
         .map(|header| {
             header
@@ -200,7 +206,7 @@ fn insert_preheader<T, L>(
                         .filter(|op| non_loop_preds.contains(&op.predecessor()))
                         .copied()
                         .collect();
-                    (phi.origin(), non_loop_operands)
+                    (phi.result(), non_loop_operands)
                 })
                 .collect()
         })
@@ -208,16 +214,16 @@ fn insert_preheader<T, L>(
 
     let result = ssa.edit(SsaEditOptions::new(), |editor| {
         let mut preheader = SsaBlock::new(preheader_idx);
-        let mut preheader_phi_map: HashMap<VariableOrigin, SsaVarId> = HashMap::new();
+        let mut preheader_phi_map: HashMap<SsaVarId, SsaVarId> = HashMap::new();
 
-        for (origin, operands) in &phi_info {
+        for (header_result, origin, operands) in &phi_info {
             let new_var =
                 editor.create_variable_for_origin(*origin, 0, DefSite::phi(preheader_idx));
             let mut preheader_phi = PhiNode::new(new_var, *origin);
             for op in operands {
                 preheader_phi.add_operand(*op);
             }
-            preheader_phi_map.insert(*origin, new_var);
+            preheader_phi_map.insert(*header_result, new_var);
             preheader.phi_nodes_mut().push(preheader_phi);
         }
 
@@ -230,20 +236,20 @@ fn insert_preheader<T, L>(
             editor.redirect_terminator_target_structured(pred_idx, header_idx, preheader_idx)?;
         }
 
-        for (origin, non_loop_values) in &header_phi_operands {
+        for (header_result, non_loop_values) in &header_phi_operands {
             if non_loop_values.is_empty() {
                 continue;
             }
             let replacement = if let [single] = non_loop_values.as_slice() {
                 single.value()
-            } else if let Some(&preheader_var) = preheader_phi_map.get(origin) {
+            } else if let Some(&preheader_var) = preheader_phi_map.get(header_result) {
                 preheader_var
             } else {
                 continue;
             };
-            editor.replace_phi_predecessor_group_for_origin(
+            editor.replace_phi_predecessor_group_for_result(
                 header_idx,
-                *origin,
+                *header_result,
                 non_loop_preds,
                 PhiOperand::new(replacement, preheader_idx),
             )?;
@@ -277,7 +283,12 @@ fn unify_latches<T, L>(
     let header_idx = loop_info.header.index();
     let latches: Vec<usize> = loop_info.latches.iter().map(|n| n.index()).collect();
     let unified_latch_idx = ssa.block_count();
-    let phi_info: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
+    // Keyed by the header phi's *result*, not its origin. `VariableOrigin::Phi`
+    // is a unit variant, so every phi that merges earlier phis — the ordinary
+    // shape in lifted native code — carries the same origin. Keying on it made
+    // one unified-latch phi stand for all of them and rewrote every header phi
+    // to that single value, which is a dominance violation for all but one.
+    let phi_info: Vec<(SsaVarId, VariableOrigin, Vec<PhiOperand>)> = ssa
         .block(header_idx)
         .map(|header| {
             header
@@ -290,7 +301,7 @@ fn unify_latches<T, L>(
                         .filter(|op| latches.contains(&op.predecessor()))
                         .copied()
                         .collect();
-                    (phi.origin(), latch_operands)
+                    (phi.result(), phi.origin(), latch_operands)
                 })
                 .collect()
         })
@@ -298,9 +309,9 @@ fn unify_latches<T, L>(
 
     let result = ssa.edit(SsaEditOptions::new(), |editor| {
         let mut unified_latch = SsaBlock::new(unified_latch_idx);
-        let mut latch_phi_vars: HashMap<VariableOrigin, SsaVarId> = HashMap::new();
+        let mut latch_phi_vars: HashMap<SsaVarId, SsaVarId> = HashMap::new();
 
-        for (origin, latch_operands) in &phi_info {
+        for (header_result, origin, latch_operands) in &phi_info {
             if latch_operands.len() > 1 {
                 let new_var =
                     editor.create_variable_for_origin(*origin, 0, DefSite::phi(unified_latch_idx));
@@ -308,10 +319,10 @@ fn unify_latches<T, L>(
                 for op in latch_operands {
                     latch_phi.add_operand(*op);
                 }
-                latch_phi_vars.insert(*origin, new_var);
+                latch_phi_vars.insert(*header_result, new_var);
                 unified_latch.phi_nodes_mut().push(latch_phi);
             } else if let [single] = latch_operands.as_slice() {
-                latch_phi_vars.insert(*origin, single.value());
+                latch_phi_vars.insert(*header_result, single.value());
             }
         }
 
@@ -328,11 +339,11 @@ fn unify_latches<T, L>(
             )?;
         }
 
-        for (origin, _) in &phi_info {
-            if let Some(&var) = latch_phi_vars.get(origin) {
-                editor.replace_phi_predecessor_group_for_origin(
+        for (header_result, _, _) in &phi_info {
+            if let Some(&var) = latch_phi_vars.get(header_result) {
+                editor.replace_phi_predecessor_group_for_result(
                     header_idx,
-                    *origin,
+                    *header_result,
                     &latches,
                     PhiOperand::new(var, unified_latch_idx),
                 )?;

@@ -1232,6 +1232,51 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         Ok(changed)
     }
 
+    /// Replaces the operands of **one** phi — identified by its result — that
+    /// come from `old_preds`, with a single `new_operand`.
+    ///
+    /// Prefer this over
+    /// [`replace_phi_predecessor_group_for_origin`](Self::replace_phi_predecessor_group_for_origin)
+    /// whenever the caller means a specific phi. A [`VariableOrigin`] does not
+    /// identify one: [`VariableOrigin::Phi`] is a unit variant, so every phi
+    /// merging earlier phis — the common shape in lifted native code — shares
+    /// it, and the origin-keyed form rewrites all of them to the same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `block_idx` names no block.
+    pub fn replace_phi_predecessor_group_for_result(
+        &mut self,
+        block_idx: usize,
+        phi_result: SsaVarId,
+        old_preds: &[usize],
+        new_operand: PhiOperand,
+    ) -> Result<bool> {
+        let Some(block) = self.ssa.block_mut(block_idx) else {
+            return Err(Error::new(format!("missing block B{block_idx}")));
+        };
+
+        let mut changed = false;
+        if let Some(phi) = block
+            .phi_nodes_mut()
+            .iter_mut()
+            .find(|phi| phi.result() == phi_result)
+        {
+            let before = phi.operands().len();
+            phi.operands_mut()
+                .retain(|operand| !old_preds.contains(&operand.predecessor()));
+            if phi.operands().len() != before {
+                phi.add_operand(new_operand);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.mark_changed(SsaEditScope::CfgModifying);
+        }
+        Ok(changed)
+    }
+
     /// Replaces one origin's phi operands from a predecessor group.
     ///
     /// Only the phi node whose [`PhiNode::origin`] equals `origin` is updated.
