@@ -107,11 +107,16 @@ impl Target for MockTarget {
     type MethodRef = u32;
     type FieldRef = u32;
     type SigRef = u32;
+    type SymbolRef = u32;
     type ExceptionKind = u32;
     type Type = MockType;
     type OriginalInstruction = ();
     type LocalSignature = ();
     type Capability = ();
+
+    fn symbol_address(symbol: &Self::SymbolRef) -> Option<i64> {
+        Some(i64::from(*symbol))
+    }
 
     fn ptr_bytes(&self) -> u32 {
         8

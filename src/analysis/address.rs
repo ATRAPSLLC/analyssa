@@ -298,11 +298,20 @@ pub fn const_u64<T: Target>(ir: &SsaFunction<T>, value: SsaVarId) -> Option<u64>
 /// Converts a [`ConstValue`] to an `i64`, widening smaller integers and
 /// fallibly narrowing larger ones.
 ///
-/// Covers every integer and native-int width plus the boolean `True` (`1`) /
-/// `False` (`0`) constants; non-integer constants return `None`.
+/// Covers every integer and native-int width, the boolean `True` (`1`) /
+/// `False` (`0`) constants, and a [`ConstValue::Symbol`] that denotes an
+/// address; everything else returns `None`.
+///
+/// The symbol arm is what keeps this — and therefore
+/// [`normalize_address`], [`AliasKey`], and every range/interval analysis built
+/// on them — working once a host stops emitting materialised addresses as
+/// integer constants. Without it a symbolic address would simply vanish from
+/// the numeric analyses, which reads as "points-to got worse" rather than as
+/// the representation change it actually is.
 #[must_use]
 pub fn const_value_i64<T: Target>(value: &ConstValue<T>) -> Option<i64> {
     match value {
+        ConstValue::Symbol(symbol) => T::symbol_address(symbol),
         ConstValue::I8(value) => Some(i64::from(*value)),
         ConstValue::I16(value) => Some(i64::from(*value)),
         ConstValue::I32(value) => Some(i64::from(*value)),

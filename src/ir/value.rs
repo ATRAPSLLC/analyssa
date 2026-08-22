@@ -82,10 +82,10 @@ use crate::{
     derive(serde::Serialize, serde::Deserialize),
     serde(bound(
         serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
-                     T::FieldRef: serde::Serialize",
+                     T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize",
         deserialize = "T::TypeRef: serde::Deserialize<'de>, \
                        T::MethodRef: serde::Deserialize<'de>, \
-                       T::FieldRef: serde::Deserialize<'de>"
+                       T::FieldRef: serde::Deserialize<'de>, T::SymbolRef: serde::Deserialize<'de>"
     ))
 )]
 pub enum ConstValue<T: Target> {
@@ -162,6 +162,17 @@ pub enum ConstValue<T: Target> {
     /// Runtime field handle (result of `ldtoken` for a field).
     FieldHandle(T::FieldRef),
 
+    /// A located or named entity used as a value: the address of a function, a
+    /// global, an import, or a metadata member.
+    ///
+    /// Distinct from the integer arms so a symbolic address survives constant
+    /// propagation, GVN and any lowering **as a symbol**, instead of degrading
+    /// to a number a consumer would have to re-resolve. Folds like the other
+    /// reference constants — that is, not at all: address arithmetic is the
+    /// address model's job, and it reaches the number through
+    /// [`Target::symbol_address`].
+    Symbol(T::SymbolRef),
+
     /// Decrypted array data from deobfuscation.
     ///
     /// Stores the raw bytes and element type of an array that was decrypted
@@ -202,6 +213,7 @@ impl<T: Target> PartialEq for ConstValue<T> {
             (Self::Type(a), Self::Type(b)) => a == b,
             (Self::MethodHandle(a), Self::MethodHandle(b)) => a == b,
             (Self::FieldHandle(a), Self::FieldHandle(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::DecryptedArray(a), Self::DecryptedArray(b)) => a == b,
             _ => false,
         }
@@ -237,6 +249,7 @@ impl<T: Target> Hash for ConstValue<T> {
             Self::Type(v) => v.hash(state),
             Self::MethodHandle(v) => v.hash(state),
             Self::FieldHandle(v) => v.hash(state),
+            Self::Symbol(v) => v.hash(state),
             Self::DecryptedArray(v) => v.hash(state),
         }
     }
@@ -1421,6 +1434,7 @@ where
     T::TypeRef: fmt::Display,
     T::MethodRef: fmt::Display,
     T::FieldRef: fmt::Display,
+    T::SymbolRef: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1466,6 +1480,7 @@ where
             Self::Type(t) => write!(f, "typeof({t})"),
             Self::MethodHandle(m) => write!(f, "methodof({m})"),
             Self::FieldHandle(fl) => write!(f, "fieldof({fl})"),
+            Self::Symbol(sym) => write!(f, "sym({sym})"),
         }
     }
 }
@@ -1483,10 +1498,10 @@ where
     derive(serde::Serialize, serde::Deserialize),
     serde(bound(
         serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
-                     T::FieldRef: serde::Serialize",
+                     T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize",
         deserialize = "T::TypeRef: serde::Deserialize<'de>, \
                        T::MethodRef: serde::Deserialize<'de>, \
-                       T::FieldRef: serde::Deserialize<'de>"
+                       T::FieldRef: serde::Deserialize<'de>, T::SymbolRef: serde::Deserialize<'de>"
     ))
 )]
 pub enum AbstractValue<T: Target> {
@@ -1645,6 +1660,7 @@ where
     T::TypeRef: fmt::Display,
     T::MethodRef: fmt::Display,
     T::FieldRef: fmt::Display,
+    T::SymbolRef: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
