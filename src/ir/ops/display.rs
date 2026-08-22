@@ -23,6 +23,7 @@ where
     T::TypeRef: fmt::Display,
     T::MethodRef: fmt::Display,
     T::FieldRef: fmt::Display,
+    T::SymbolRef: fmt::Display,
     T::SigRef: fmt::Display,
     T::Type: fmt::Display,
 {

@@ -1008,6 +1008,7 @@ where
     T::TypeRef: fmt::Display,
     T::MethodRef: fmt::Display,
     T::FieldRef: fmt::Display,
+    T::SymbolRef: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let depth = self.depth();

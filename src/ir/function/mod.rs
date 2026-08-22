@@ -148,11 +148,11 @@ mod map_as_pairs {
     derive(serde::Serialize, serde::Deserialize),
     serde(bound(
         serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
-                     T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, \
+                     T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize, \
                      T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize, \
                      T::ExceptionKind: serde::Serialize, T::LocalSignature: serde::Serialize",
         deserialize = "T::Type: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>, \
-                       T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, T::SymbolRef: serde::Deserialize<'de>, \
                        T::SigRef: serde::Deserialize<'de>, \
                        T::OriginalInstruction: serde::Deserialize<'de>, \
                        T::ExceptionKind: serde::Deserialize<'de>, \

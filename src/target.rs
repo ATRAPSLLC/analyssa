@@ -676,6 +676,14 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
     /// Reference to a standalone signature in the host's metadata.
     type SigRef: Clone + Eq + Hash + Debug;
 
+    /// Reference to a located or named entity in the host's address space — a
+    /// function, a global, an import, a metadata member.
+    ///
+    /// Distinct from [`Self::MethodRef`], which names a *callable* and carries
+    /// call-site identity: a symbol constant is a **value**, and most of the
+    /// things it names are not callable at all.
+    type SymbolRef: Clone + Eq + Hash + Debug;
+
     /// Host-defined exception-handler kind (e.g. EXCEPTION/FINALLY/FILTER on CIL).
     type ExceptionKind: Clone + Eq + Debug;
 
@@ -698,6 +706,19 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
     /// enum so generic analyssa passes can declare provides/requires using
     /// the shared deobfuscation vocabulary.
     type Capability: Copy + Eq + Hash + Debug + 'static;
+
+    /// The numeric address a symbol denotes, when it has one.
+    ///
+    /// **Required for numeric analyses not to regress when an address stops
+    /// being an integer constant.** Once a host emits
+    /// [`ConstValue::Symbol`] for a materialised
+    /// address, `const_value_i64` — and therefore address normalisation, alias
+    /// keys, and the interval lattice — can only still see the address by
+    /// asking here. Hosts whose symbols are not addresses (bytecode metadata
+    /// tokens) correctly return `None`.
+    fn symbol_address(_symbol: &Self::SymbolRef) -> Option<i64> {
+        None
+    }
 
     /// Pointer width in bytes (typically 4 or 8). Runtime so bi-arch hosts
     /// can vary it per-instance.
