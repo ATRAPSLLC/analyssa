@@ -30,6 +30,15 @@ confidence-threshold = 0.9
 multiple-versions = "warn"
 wildcards = "deny"
 
+# Supply-chain: `arrayref` 0.3.10 was published as part of an ongoing attack on
+# crates.io. This crate's tree does not contain it today — the ban is
+# prophylactic, so that a future dependency (or a `cargo update` on one) cannot
+# pull the compromised release in silently. The range is open-ended rather than
+# `=0.3.10` because the publishing account is compromised, so any *later* version
+# is equally untrusted until ownership is confirmed recovered. Revisit then.
+[[bans.deny]]
+crate = "arrayref:>=0.3.10"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
