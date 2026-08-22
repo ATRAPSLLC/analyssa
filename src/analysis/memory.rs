@@ -1479,14 +1479,20 @@ impl<T: Target> MemoryState<T> {
             return Some(*value);
         }
 
-        // Check for aliasing locations
-        for (loc, (_, value)) in &self.values {
-            if location.must_alias(loc) {
-                return Some(*value);
-            }
-        }
-
-        None
+        // Check for aliasing locations.
+        //
+        // More than one stored location can must-alias the query, and they can
+        // hold different values. Returning whichever the map yielded first made
+        // the answer a function of the hasher's per-instance seed, so the same
+        // bytes could lift to different SSA on consecutive runs. The most
+        // recently stored version wins, with the lower variable id breaking a
+        // tie — a rule that is both deterministic and the one a load actually
+        // wants.
+        self.values
+            .iter()
+            .filter(|(loc, _)| location.must_alias(loc))
+            .max_by_key(|(_, (version, value))| (*version, std::cmp::Reverse(*value)))
+            .map(|(_, (_, value))| *value)
     }
 
     /// Returns the current version for a location, if known.
