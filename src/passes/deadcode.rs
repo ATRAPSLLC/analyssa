@@ -242,17 +242,24 @@ fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<
         reachable.insert(n.index());
     }
 
+    // A handler region is exception-table *metadata*, not a fact about the
+    // current CFG: a front end can name a block it has not built yet, and a
+    // block-removing edit can leave a region naming one the function no longer
+    // has. The checked accessors treat such an index as "not a block here",
+    // which is the answer; the asserting ones would panic out of DCE and roll
+    // the whole pass back. `verifier::runtime_supplied_vars` already reads these
+    // same two fields that way.
     let mut exception_roots = BitSet::new(ssa.block_count());
     for handler in ssa.exception_handlers() {
         if let Some(handler_block) = handler.handler_start_block
-            && !reachable.contains(handler_block)
+            && !reachable.contains_checked(handler_block)
         {
-            exception_roots.insert(handler_block);
+            exception_roots.insert_checked(handler_block);
         }
         if let Some(filter_block) = handler.filter_start_block
-            && !reachable.contains(filter_block)
+            && !reachable.contains_checked(filter_block)
         {
-            exception_roots.insert(filter_block);
+            exception_roots.insert_checked(filter_block);
         }
     }
 
