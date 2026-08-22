@@ -48,7 +48,10 @@ use std::collections::HashMap;
 use crate::{
     analysis::cfg::SsaCfg,
     events::{EventKind, EventListener},
-    graph::{RootedGraph, algorithms::compute_dominators},
+    graph::{
+        NodeId, RootedGraph,
+        algorithms::{DominatorTree, compute_dominators},
+    },
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         ops::{BinaryOpKind, OperandRole, SsaOp, UnaryOpKind},
@@ -222,6 +225,20 @@ impl<T: Target> ValueKey<T> {
 /// destination genuinely is `v0`.
 const GVN_DEF_SENTINEL: SsaVarId = SsaVarId::PLACEHOLDER;
 
+/// Returns whether `leader`'s definition dominates `block_idx`, so a redundant
+/// computation there can be forwarded to it.
+fn leader_dominates<T: Target>(
+    ssa: &SsaFunction<T>,
+    dominators: &DominatorTree,
+    leader: SsaVarId,
+    block_idx: usize,
+) -> bool {
+    let Some(def_block) = ssa.variable(leader).map(|var| var.def_site().block) else {
+        return false;
+    };
+    def_block == block_idx || dominators.dominates(NodeId::new(def_block), NodeId::new(block_idx))
+}
+
 /// Internal GVN driver. Returns the number of uses replaced (used by tests).
 fn run_gvn<T, L>(ssa: &mut SsaFunction<T>, method: &T::MethodRef, events: &L) -> usize
 where
@@ -231,14 +248,34 @@ where
     let mut value_map: HashMap<ValueKey<T>, SsaVarId> = HashMap::new();
     let mut redundant: Vec<(SsaVarId, SsaVarId, usize, usize)> = Vec::new();
 
+    // A leader is only a leader where it is *available*, and availability is
+    // dominance. Blocks are visited in index order, which says nothing about
+    // dominance: two sibling branches both computing `x + 1` would make the
+    // lower-numbered one the leader and forward the other's uses to a
+    // definition that does not reach them. Measured on the MIPS fixture, that
+    // produced `DominanceViolation { def_block: 1, use_block: 7 }` — the last
+    // remaining reason a debug and a release build lifted the same bytes
+    // differently, since only debug verified the edit and rolled it back.
+    let dominators = {
+        let cfg = SsaCfg::from_ssa(ssa);
+        compute_dominators(&cfg, cfg.entry())
+    };
+
     for block in ssa.blocks() {
         let block_idx = block.id();
         for (instr_idx, instr) in block.instructions().iter().enumerate() {
             if let Some((key, dest)) = ValueKey::from_op(instr.op()) {
-                if let Some(&original) = value_map.get(&key) {
-                    redundant.push((dest, original, block_idx, instr_idx));
-                } else {
-                    value_map.insert(key, dest);
+                match value_map.get(&key).copied() {
+                    Some(original) if leader_dominates(ssa, &dominators, original, block_idx) => {
+                        redundant.push((dest, original, block_idx, instr_idx));
+                    }
+                    // A recurrence of the key whose leader does not reach it.
+                    // Leave the leader in place: replacing it with this one
+                    // would only move the problem to whatever it does dominate.
+                    Some(_) => {}
+                    None => {
+                        value_map.insert(key, dest);
+                    }
                 }
             }
         }
