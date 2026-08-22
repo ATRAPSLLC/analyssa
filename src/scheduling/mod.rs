@@ -31,11 +31,13 @@
 //!   on subsequent iterations, unless a pass declares
 //!   [`requires_full_scan`](SsaPass::requires_full_scan).
 
+mod analyses;
 mod capability;
 mod pass;
 mod scheduler;
 mod transaction;
 
+pub use analyses::{AnalysisCache, CacheStats};
 pub use capability::DeobfuscationCapability;
 pub use pass::{ModificationScope, SsaPass, SsaPassHost};
 pub use scheduler::{PassScheduler, PipelineConfig};

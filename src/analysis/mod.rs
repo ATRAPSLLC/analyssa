@@ -90,6 +90,7 @@
 
 pub mod address;
 pub mod algebraic;
+pub mod cache;
 pub mod cfg;
 pub mod constraints;
 pub mod consts;

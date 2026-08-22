@@ -81,6 +81,21 @@ pub struct PointsTo {
 }
 
 impl PointsTo {
+    /// The empty relation — every location points nowhere known.
+    ///
+    /// `const` so a consumer that has no relation to offer can borrow a
+    /// `'static` one instead of owning an instance, which is what lets an alias
+    /// oracle borrow its relation from [`FunctionAnalyses`] in the common case
+    /// and still have an empty fallback.
+    ///
+    /// [`FunctionAnalyses`]: crate::analysis::cache::FunctionAnalyses
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            sets: BTreeMap::new(),
+        }
+    }
+
     /// Returns the points-to set of `loc`, empty when the location points
     /// nowhere known.
     #[must_use]
