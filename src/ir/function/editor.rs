@@ -1487,13 +1487,29 @@ fn restore_on_failure<T: Target>(ssa: &mut SsaFunction<T>, original: Option<SsaF
 }
 
 /// Applies boundary cleanup for an edit scope.
+///
+/// Every scope leaves the def sites and the use index **exact**. `repair_ssa`
+/// and `rebuild_ssa` rewrite instructions and variables without restoring the
+/// index, so an edit that declared anything above `UsesOnly` used to end with a
+/// use index that no longer described the function.
+///
+/// That matters because the index is not merely metadata: it is the candidate
+/// list `replace_uses_checked_indexed` iterates, so the next pass's rewrites are
+/// chosen from it.
+///
+/// The scope-specific work below therefore does *not* recompute uses itself —
+/// the unconditional pair afterwards supersedes it, and doing both would scan
+/// the function twice for one edit.
 fn finish_edit_scope<T: Target>(ssa: &mut SsaFunction<T>, scope: SsaEditScope) -> Result<()> {
     match scope {
-        SsaEditScope::None => {}
-        SsaEditScope::UsesOnly => ssa.recompute_uses(),
+        SsaEditScope::None => return Ok(()),
+        SsaEditScope::UsesOnly => {}
         SsaEditScope::InstructionsOnly => ssa.repair_ssa(),
         SsaEditScope::CfgModifying => ssa.rebuild_ssa()?,
     }
+
+    ssa.refresh_def_sites();
+    ssa.recompute_uses();
     Ok(())
 }
 
