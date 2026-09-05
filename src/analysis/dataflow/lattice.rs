@@ -211,6 +211,7 @@ impl JoinSemiLattice for BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::dataflow::{JoinSemiLattice, Lattice, MeetSemiLattice};
 
     /// The lattice traits must stay reachable from `analysis::dataflow` directly,
     /// like every other trait the module's header advertises — not only via the
@@ -307,8 +308,6 @@ mod tests {
 
     #[test]
     fn lattice_traits_are_re_exported_from_dataflow() {
-        use crate::analysis::dataflow::{JoinSemiLattice, Lattice, MeetSemiLattice};
-
         fn assert_meet<T: MeetSemiLattice>() {}
         fn assert_join<T: JoinSemiLattice>() {}
         fn assert_lattice<T: Lattice>() {}

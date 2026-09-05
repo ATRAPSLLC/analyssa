@@ -4,15 +4,15 @@ use analyssa::{
     analysis::{SsaVerifier, VerifierError, VerifyLevel},
     ir::{
         block::SsaBlock,
+        exception::{BlockRange, ClausePart, ExceptionTableError, SsaExceptionHandler},
         function::SsaFunction,
         instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, ControlEffect, FlagsMask,
-            MemoryAccessSemantics, MemoryEffectLocation, NativeClobber, NativeOpaqueData,
-            NativeRegister, NativeStateAccess, NativeStateAccessKind, NativeStateLocation,
-            SsaEffectKind, SsaEffects, SsaOp, TrapClass, VectorBinaryKind, VectorBitmaskKind,
-            VectorCompareKind, VectorElement, VectorFaultMode, VectorMaskBinaryKind,
-            VectorMaskMode, VectorReduceKind, VectorSegmentLayout,
+            AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, ControlEffect, FlagAdjustKind,
+            FlagsMask, KindedVecData, MemoryAccessSemantics, MemoryEffectLocation,
+            NativeOpaqueData, SsaEffectKind, SsaEffects, SsaOp, TrapClass, VectorBinaryKind,
+            VectorBitmaskKind, VectorCompareKind, VectorElement, VectorFaultMode,
+            VectorMaskBinaryKind, VectorMaskMode, VectorReduceKind, VectorSegmentLayout,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
@@ -821,7 +821,7 @@ fn verifier_rejects_phi_in_entry_block() {
     assert!(
         errors
             .iter()
-            .any(|err| matches!(err, VerifierError::PhiInEntryBlock { block: 0, .. }))
+            .any(|err| matches!(err, VerifierError::PhiWithoutPredecessors { block: 0, .. }))
     );
 }
 
@@ -1750,73 +1750,6 @@ fn verifier_rejects_wide_divide_width_mismatch() {
 }
 
 #[test]
-fn verifier_rejects_pure_native_opaque_with_clobbers() {
-    let mut ssa = SsaFunction::new(0, 1);
-    let input = typed_local(&mut ssa, 0, 0, 0, MockType::I32);
-
-    let mut block = SsaBlock::new(0);
-    block.add_instruction(instr(SsaOp::Const {
-        dest: input,
-        value: ConstValue::I32(1),
-    }));
-    block.add_instruction(instr(SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
-        mnemonic: "clobber_flags".to_string(),
-        metadata: None,
-        outputs: Vec::new(),
-        inputs: vec![input],
-        clobbers: vec![NativeClobber::Flags("eflags".to_string())],
-        effects: SsaEffects::pure(),
-    }))));
-    ssa.add_block(block);
-    ssa.recompute_uses();
-
-    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. }))
-    );
-}
-
-#[test]
-fn verifier_rejects_invalid_native_machine_state_descriptor() {
-    let mut ssa = SsaFunction::new(0, 1);
-    let invalid_register = NativeRegister {
-        architecture: "x86_64".to_string(),
-        bank: "gpr".to_string(),
-        base: "rax".to_string(),
-        name: "rax".to_string(),
-        bit_offset: 0,
-        bit_width: 0,
-    };
-    let invalid_access = NativeStateAccess {
-        location: NativeStateLocation::Register(invalid_register),
-        kind: NativeStateAccessKind::ReadWrite,
-        width_bits: Some(0),
-        implicit: true,
-    };
-
-    let mut block = SsaBlock::new(0);
-    block.add_instruction(instr(SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
-        mnemonic: "bad_state".to_string(),
-        metadata: None,
-        outputs: Vec::new(),
-        inputs: Vec::new(),
-        clobbers: vec![NativeClobber::MachineState(invalid_access)],
-        effects: SsaEffects::new(SsaEffectKind::Opaque, false),
-    }))));
-    ssa.add_block(block);
-    ssa.recompute_uses();
-
-    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-    assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. }))
-    );
-}
-
-#[test]
 fn verifier_rejects_inconsistent_native_effect_summary() {
     let mut ssa = SsaFunction::new(0, 1);
     let effects = SsaEffects {
@@ -1836,7 +1769,6 @@ fn verifier_rejects_inconsistent_native_effect_summary() {
         metadata: None,
         outputs: Vec::new(),
         inputs: Vec::new(),
-        clobbers: Vec::new(),
         effects,
     }))));
     ssa.add_block(block);
@@ -1877,18 +1809,16 @@ fn verifier_accepts_runtime_supplied_exception_object() {
     handler.add_instruction(instr(SsaOp::Return { value: None }));
     ssa.add_block(handler);
 
-    ssa.set_exception_handlers(vec![analyssa::ir::exception::SsaExceptionHandler {
+    ssa.set_exception_handlers(vec![SsaExceptionHandler {
         flags: 0,
         try_offset: 0,
         try_length: 1,
         handler_offset: 1,
         handler_length: 1,
         class_token_or_filter: 0,
-        try_start_block: Some(0),
-        try_end_block: Some(1),
-        handler_start_block: Some(1),
-        handler_end_block: Some(2),
-        filter_start_block: None,
+        protected_range: BlockRange::new(0, 1),
+        handler_range: BlockRange::new(1, 2),
+        filter_range: None,
     }]);
     ssa.recompute_uses();
 
@@ -1915,5 +1845,206 @@ fn verifier_accepts_runtime_supplied_exception_object() {
             .iter()
             .any(|e| matches!(e, VerifierError::UndefinedUse { var, .. } if *var == stray)),
         "only the exception object the handler pops is runtime-supplied; got {errors:?}"
+    );
+}
+
+/// A mask naming a flag the crate does not define is reported rather than
+/// silently narrowed.
+///
+/// `FlagsMask::from_bits` is unmasked so a persisted mask round-trips, which
+/// means a blob written by an older or a buggy producer can carry a bit nothing
+/// downstream can interpret. Reporting it as `InvalidNativeOperation` is what
+/// turns that into a named failure instead of a mask that quietly selects
+/// fewer flags than it says.
+#[test]
+fn verifier_rejects_a_read_flags_mask_with_undefined_bits() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let flags = local(&mut ssa, 0, 0, 0);
+    let dest = local(&mut ssa, 1, 0, 1);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: flags,
+        value: ConstValue::I32(0),
+    }));
+    block.add_instruction(instr(SsaOp::ReadFlags {
+        dest,
+        flags,
+        mask: FlagsMask::from_bits(FlagsMask::CARRY.bits() | (1 << 15)),
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: Some(dest) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })),
+        "an undefined flag bit must be reported; got {errors:?}"
+    );
+
+    // Every defined bit together is still a legal mask, so the check reports
+    // the malformed shape rather than flag masks in general.
+    if let Some(block) = ssa.block_mut(0)
+        && let Some(op) = block.instructions_mut().get_mut(1)
+    {
+        *op = instr(SsaOp::ReadFlags {
+            dest,
+            flags,
+            mask: FlagsMask::ALL,
+        });
+    }
+    ssa.recompute_uses();
+    let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })),
+        "FlagsMask::ALL names only defined flags; got {errors:?}"
+    );
+}
+
+/// A flag adjustment carries exactly the outputs its kind declares, for every
+/// kind.
+///
+/// The dangerous direction is a kind that declares a result and carries none:
+/// the architectural write then has no SSA value modelling it, and an effect
+/// summary derived from the kind alone calls the operation pure — which, with
+/// no definitions, is what dead-code elimination deletes.
+#[test]
+fn flag_adjust_defining_a_register_has_exactly_one_output() {
+    for (kind, outputs) in [
+        (FlagAdjustKind::StoreStatusToReg, 0usize),
+        (FlagAdjustKind::LoadStatusFromReg, 0),
+        (FlagAdjustKind::ClearInterrupt, 1),
+        (FlagAdjustKind::SetDirection, 1),
+    ] {
+        let mut ssa = SsaFunction::new(0, 1);
+        let value = local(&mut ssa, 0, 0, 0);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: value,
+            value: ConstValue::I32(0),
+        }));
+        block.add_instruction(instr(SsaOp::FlagAdjust(Box::new(KindedVecData {
+            kind,
+            outputs: vec![value; outputs],
+            inputs: Vec::new(),
+        }))));
+        block.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })),
+            "{kind:?} with {outputs} output(s) must be reported; got {errors:?}"
+        );
+    }
+
+    // The well-formed shapes pass: one output where the kind declares a result,
+    // none where it declares `FlagAdjustResult::None`.
+    for (kind, outputs) in [
+        (FlagAdjustKind::StoreStatusToReg, 1usize),
+        (FlagAdjustKind::ClearInterrupt, 0),
+    ] {
+        let mut ssa = SsaFunction::new(0, 1);
+        let value = local(&mut ssa, 0, 0, 1);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Nop));
+        block.add_instruction(instr(SsaOp::FlagAdjust(Box::new(KindedVecData {
+            kind,
+            outputs: vec![value; outputs],
+            inputs: Vec::new(),
+        }))));
+        block.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, VerifierError::InvalidNativeOperation { .. })),
+            "{kind:?} with {outputs} output(s) is well formed; got {errors:?}"
+        );
+    }
+}
+
+/// A two-block function whose single clause is `handlers`.
+fn function_with_clauses(
+    handlers: Vec<SsaExceptionHandler<MockTarget>>,
+) -> SsaFunction<MockTarget> {
+    let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+    for index in 0..2 {
+        let mut block = SsaBlock::new(index);
+        block.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(block);
+    }
+    ssa.set_exception_handlers(handlers);
+    ssa.recompute_uses();
+    ssa
+}
+
+/// One clause, three verdicts.
+///
+/// A clause naming a block the function does not have is reported at Quick --
+/// it is corruption every later check would then reason from. A clause whose
+/// handler lives in another function is legal and silent: on Windows x64 a
+/// handler is a funclet, which is 28 of the 29 clauses on the corpus fixture.
+/// And a clause that fits is silent too.
+#[test]
+fn verifier_reports_a_malformed_exception_clause() {
+    let mut clause = SsaExceptionHandler::<MockTarget> {
+        flags: 0,
+        try_offset: 0,
+        try_length: 0,
+        handler_offset: 0,
+        handler_length: 0,
+        class_token_or_filter: 0,
+        protected_range: BlockRange::new(0, 1),
+        handler_range: BlockRange::new(1, 9),
+        filter_range: None,
+    };
+
+    let errors =
+        SsaVerifier::new(&function_with_clauses(vec![clause.clone()])).verify(VerifyLevel::Quick);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            VerifierError::MalformedExceptionClause {
+                clause: 0,
+                reason: ExceptionTableError::OutOfRange {
+                    part: ClausePart::Handler,
+                    end: 9,
+                    block_count: 2,
+                },
+            }
+        )),
+        "a handler range past the last block is reportable at Quick; got {errors:?}"
+    );
+
+    clause.handler_range = None;
+    let errors =
+        SsaVerifier::new(&function_with_clauses(vec![clause.clone()])).verify(VerifyLevel::Full);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::MalformedExceptionClause { .. })),
+        "a handler in another function is legal at every level; got {errors:?}"
+    );
+
+    clause.handler_range = BlockRange::new(1, 2);
+    let errors = SsaVerifier::new(&function_with_clauses(vec![clause])).verify(VerifyLevel::Full);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, VerifierError::MalformedExceptionClause { .. })),
+        "and a clause that fits raises nothing; got {errors:?}"
     );
 }

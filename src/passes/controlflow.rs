@@ -174,7 +174,7 @@ fn find_same_target_branches<T: Target>(
 ) -> Vec<(usize, usize)> {
     ssa.iter_blocks()
         .filter_map(|(block_idx, block)| {
-            block.terminator_op().and_then(|op| match op {
+            block.control_terminator().and_then(|op| match op {
                 SsaOp::Branch {
                     true_target,
                     false_target,

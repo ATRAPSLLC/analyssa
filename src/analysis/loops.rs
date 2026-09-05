@@ -96,14 +96,14 @@
 //!
 //! ```rust
 //! use analyssa::{
-//!     analysis::{detect_loops, SsaCfg},
+//!     analysis::{detect_loops, exceptions::EhCfg},
 //!     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
 //!     testing,
 //! };
 //!
 //! // Works with any graph implementing the traits
 //! let ssa = testing::loop_counter_fixture();
-//! let graph = SsaCfg::from_ssa(&ssa);
+//! let graph = EhCfg::from_ssa(&ssa);
 //!
 //! let dominators = compute_dominators(&graph, graph.entry());
 //! let forest = detect_loops(&graph, &dominators);
@@ -367,7 +367,7 @@ impl LoopInfo {
     pub fn find_condition_in_body<T: Target>(&self, ssa: &SsaFunction<T>) -> Option<NodeId> {
         for block_idx in self.body.iter() {
             if let Some(block) = ssa.block(block_idx)
-                && matches!(block.terminator_op(), Some(SsaOp::Branch { .. }))
+                && matches!(block.control_terminator(), Some(SsaOp::Branch { .. }))
             {
                 return Some(NodeId::new(block_idx));
             }
@@ -385,7 +385,7 @@ impl LoopInfo {
             .iter()
             .filter(|&block_idx| {
                 ssa.block(block_idx)
-                    .is_some_and(|b| matches!(b.terminator_op(), Some(SsaOp::Branch { .. })))
+                    .is_some_and(|b| matches!(b.control_terminator(), Some(SsaOp::Branch { .. })))
             })
             .map(NodeId::new)
             .collect()
@@ -460,25 +460,16 @@ impl LoopInfo {
         update_var: SsaVarId,
         phi_result: SsaVarId,
     ) -> (InductionUpdateKind, Option<i64>) {
-        // Find the instruction that defines update_var
-        let Some(var) = ssa.variable(update_var) else {
-            return (InductionUpdateKind::Unknown, None);
-        };
-        let def_site = var.def_site();
-
-        if def_site.is_phi() {
-            return (InductionUpdateKind::Unknown, None);
-        }
-
-        let Some(block) = ssa.block(def_site.block) else {
-            return (InductionUpdateKind::Unknown, None);
-        };
-
-        let Some(instr_idx) = def_site.instruction else {
-            return (InductionUpdateKind::Unknown, None);
-        };
-
-        let Some(instr) = block.instruction(instr_idx) else {
+        // Find the instruction that defines update_var.
+        //
+        // Recovering lookup: this runs once per induction candidate, so the
+        // fallback scan is bounded by the number of candidates, and what a
+        // stale def site would otherwise cost is a *stride* — the loop's trip
+        // count and every consumer of it. The failure policy is
+        // `InductionUpdateKind::Unknown`, which is what this already answers
+        // for an update it cannot read, so recovery only adds answers; it never
+        // turns an unknown stride into a wrong one.
+        let Some(instr) = ssa.get_definition_instruction(update_var) else {
             return (InductionUpdateKind::Unknown, None);
         };
 
@@ -649,13 +640,13 @@ impl LoopForest {
 ///
 /// ```rust
 /// use analyssa::{
-///     analysis::{detect_loops, SsaCfg},
+///     analysis::{detect_loops, exceptions::EhCfg},
 ///     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
 ///     testing,
 /// };
 ///
 /// let ssa = testing::loop_counter_fixture();
-/// let graph = SsaCfg::from_ssa(&ssa);
+/// let graph = EhCfg::from_ssa(&ssa);
 ///
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// let forest = detect_loops(&graph, &dominators);
@@ -739,20 +730,20 @@ where
 ///
 /// ```rust
 /// use analyssa::{
-///     analysis::{loops::has_back_edges, SsaCfg},
+///     analysis::{exceptions::EhCfg, loops::has_back_edges},
 ///     graph::{algorithms::compute_dominators, RootedGraph},
 ///     testing,
 /// };
 ///
 /// // A loop fixture has a back edge...
 /// let looping = testing::loop_counter_fixture();
-/// let graph = SsaCfg::from_ssa(&looping);
+/// let graph = EhCfg::from_ssa(&looping);
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// assert!(has_back_edges(&graph, &dominators));
 ///
 /// // ...while an acyclic diamond CFG does not.
 /// let diamond = testing::diamond_phi_fixture();
-/// let graph = SsaCfg::from_ssa(&diamond);
+/// let graph = EhCfg::from_ssa(&diamond);
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// assert!(!has_back_edges(&graph, &dominators));
 /// ```
@@ -808,12 +799,16 @@ where
     let mut non_loop_preds: Vec<NodeId> = Vec::new();
 
     for pred in graph.predecessors(loop_info.header) {
-        if !loop_info.body.contains_checked(pred.index()) {
+        if !loop_info.body.contains_checked(pred.index()) && !non_loop_preds.contains(&pred) {
             non_loop_preds.push(pred);
         }
     }
 
-    // Preheader exists only if there's exactly one non-loop predecessor
+    // A preheader is a *block* that reaches the header and nothing else does,
+    // so the question is how many distinct blocks enter from outside — not how
+    // many edges. A block entering twice, as `Branch c, header, header` does,
+    // is still one preheader: there is one place to put loop-invariant code and
+    // one terminator to redirect.
     loop_info.preheader = if non_loop_preds.len() == 1 {
         non_loop_preds.first().copied()
     } else {
@@ -985,6 +980,69 @@ mod tests {
     }
 
     use super::*;
+    use crate::{
+        analysis::cfg::SsaCfg,
+        ir::{SsaFunction, SsaVarId, block::SsaBlock, instruction::SsaInstruction, ops::SsaOp},
+        testing::MockTarget,
+    };
+
+    /// A single-instruction block, for edge-shape fixtures.
+    fn block(id: usize, op: SsaOp<MockTarget>) -> SsaBlock<MockTarget> {
+        let mut block = SsaBlock::new(id);
+        block.add_instruction(SsaInstruction::synthetic(op));
+        block
+    }
+
+    /// A header entered twice from one outside block still has a preheader.
+    ///
+    /// `Branch c, header, header` is two edges from one block. There is one
+    /// place to hoist loop-invariant code to and one terminator to redirect, so
+    /// counting edges rather than blocks would refuse a canonical loop.
+    #[test]
+    fn a_doubled_branch_arm_into_a_header_is_one_preheader() {
+        // B0 branches both ways into the header B1; B1 loops to itself and exits.
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+        ssa.add_block(block(
+            0,
+            SsaOp::Branch {
+                condition: SsaVarId::from_index(0),
+                true_target: 1,
+                false_target: 1,
+            },
+        ));
+        ssa.add_block(block(
+            1,
+            SsaOp::Branch {
+                condition: SsaVarId::from_index(0),
+                true_target: 1,
+                false_target: 2,
+            },
+        ));
+        ssa.add_block(block(2, SsaOp::Return { value: None }));
+
+        // The terminator relation, deliberately: the question is how many edges
+        // a branch takes into the header. `compute_dominators` takes its entry
+        // explicitly, so this graph does not need to be rooted.
+        let cfg = SsaCfg::from_ssa(&ssa);
+        assert_eq!(
+            cfg.block_predecessors(1),
+            &[0, 0, 1],
+            "two edges from B0 and the latch"
+        );
+
+        let dominators = crate::graph::algorithms::compute_dominators(&cfg, NodeId::new(0));
+        let forest = detect_loops(&cfg, &dominators);
+        let loop_info = forest
+            .loops()
+            .iter()
+            .find(|info| info.header == NodeId::new(1));
+        assert!(loop_info.is_some(), "the self-loop is a loop");
+        assert_eq!(
+            loop_info.and_then(|info| info.preheader),
+            Some(NodeId::new(0)),
+            "one distinct block enters from outside, so it is the preheader"
+        );
+    }
 
     #[test]
     fn test_loop_info_creation() {

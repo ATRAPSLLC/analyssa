@@ -42,7 +42,7 @@ use std::{
 
 use crate::{
     analysis::{
-        cfg::SsaCfg,
+        exceptions::EhCfg,
         range::{IntervalRange, ValueRange},
     },
     bitset::BitSet,
@@ -147,7 +147,7 @@ impl ValueRanges {
             condition,
             true_target,
             false_target,
-        } = block.terminator_op()?
+        } = block.control_terminator()?
         else {
             return None;
         };
@@ -319,7 +319,7 @@ where
             condition,
             true_target,
             false_target,
-        }) = block.terminator_op()
+        }) = block.control_terminator()
             && let Some(range) = result.get_range(*condition)
         {
             if let Some(is_true) = range.always_equal_to(0)
@@ -539,9 +539,9 @@ impl<T: Target> RangeAnalysis<T> {
     }
 
     fn analyze(&mut self, ssa: &SsaFunction<T>) -> RangeResult {
-        let cfg = SsaCfg::from_ssa(ssa);
-        self.initialize(ssa, &cfg);
-        let converged = self.propagate(ssa, &cfg);
+        let eh = EhCfg::from_ssa(ssa);
+        self.initialize(ssa, &eh);
+        let converged = self.propagate(ssa, &eh);
         RangeResult {
             ranges: std::mem::take(&mut self.ranges),
             converged,
@@ -691,7 +691,7 @@ impl<T: Target> RangeAnalysis<T> {
     where
         G: RootedGraph + Successors,
     {
-        match block.terminator_op() {
+        match block.control_terminator() {
             Some(SsaOp::Branch {
                 condition,
                 true_target,

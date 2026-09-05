@@ -4,8 +4,14 @@
 //! Split from [`super::kinds`] because the vector surface is large enough to
 //! read on its own and is consulted as a unit when adding lane semantics.
 
-use super::*;
-use crate::ir::variable::SsaVarId;
+use crate::ir::{
+    ops::{
+        effects::{SsaEffectKind, SsaEffects},
+        native::FlagsMask,
+        operands::impl_kinded_payload,
+    },
+    variable::SsaVarId,
+};
 
 /// Structured identity of a hardware **vector cryptographic** operation
 /// ([`SsaOp::VectorCrypto`]) — the first-class, named replacement for the
@@ -14,6 +20,8 @@ use crate::ir::variable::SsaVarId;
 /// intrinsic model): the lifter never decomposes a round into primitive bit
 /// ops nor carries it as an opaque blob. Every variant is a pure function of
 /// its vector inputs.
+///
+/// [`SsaOp::VectorCrypto`]: crate::ir::ops::def::SsaOp::VectorCrypto
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u16)]
@@ -213,6 +221,8 @@ pub enum TileDotKind {
 /// operation ([`SsaOp::TileOp`]). Tiles are 2-D matrix registers, distinct
 /// from 1-D SIMD vectors; the kind names the exact tile operation and drives a
 /// precise effect summary.
+///
+/// [`SsaOp::TileOp`]: crate::ir::ops::def::SsaOp::TileOp
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TileOpKind {
@@ -274,6 +284,9 @@ impl TileOpKind {
 /// static). The `inputs` are the data source vector(s) followed by the index
 /// vector (`[src, index]` for single-source `vpermd`/`vpshufb`, `[src1, src2,
 /// index]` for the two-source `vpermt2*`/`vpermi2*`). Pure.
+///
+/// [`SsaOp::VectorPermute`]: crate::ir::ops::def::SsaOp::VectorPermute
+/// [`SsaOp::VectorShuffle`]: crate::ir::ops::def::SsaOp::VectorShuffle
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorPermuteData {
@@ -285,6 +298,8 @@ pub struct VectorPermuteData {
 
 /// The specific fused multiply-then-horizontal-add operation named by a
 /// [`SsaOp::VectorMultiplyAdd`].
+///
+/// [`SsaOp::VectorMultiplyAdd`]: crate::ir::ops::def::SsaOp::VectorMultiplyAdd
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u16)]
@@ -356,6 +371,8 @@ pub enum VectorMaddKind {
 /// The specific complex-number floating-point multiply named by a
 /// [`SsaOp::VectorComplexMul`]. Each lane pair holds a `(real, imag)` complex
 /// value.
+///
+/// [`SsaOp::VectorComplexMul`]: crate::ir::ops::def::SsaOp::VectorComplexMul
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u16)]
@@ -391,6 +408,8 @@ impl ComplexMulKind {
 /// and which destination lanes receive the broadcast result (low nibble);
 /// `element_bits` is the lane width (32 for `*ps`, 64 for `*pd`). The `inputs`
 /// are the two source vectors `[a, b]` (the destination doubles as `a`). Pure.
+///
+/// [`SsaOp::VectorDotProduct`]: crate::ir::ops::def::SsaOp::VectorDotProduct
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorDotProductData {
@@ -411,6 +430,8 @@ pub struct VectorDotProductData {
 /// lane. `signed_a`/`signed_b` give the per-operand sign-extension (they differ
 /// only for the mixed `usdot`). The `inputs` are `[acc, a, b]` (the destination
 /// accumulator and the two source vectors). Pure.
+///
+/// [`SsaOp::VectorIntDotProduct`]: crate::ir::ops::def::SsaOp::VectorIntDotProduct
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorIntDotProductData {
@@ -432,6 +453,8 @@ pub struct VectorIntDotProductData {
 /// `vpshufbitqmb`: for each byte it gathers the source bit at the position
 /// named by the corresponding control byte into a mask. The `outputs` are the
 /// result mask; the `inputs` are the source and the control vectors. Pure.
+///
+/// [`SsaOp::VectorShuffleBits`]: crate::ir::ops::def::SsaOp::VectorShuffleBits
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorShuffleBitsData {
@@ -446,6 +469,8 @@ pub struct VectorShuffleBitsData {
 /// marks which elements of the first source also appear in the second, the
 /// second marks the converse. The `outputs` are the two mask registers; the
 /// `inputs` are the two source vectors. Pure.
+///
+/// [`SsaOp::VectorIntersect`]: crate::ir::ops::def::SsaOp::VectorIntersect
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorIntersectData {
@@ -461,6 +486,8 @@ pub struct VectorIntersectData {
 /// `length` are the bit position and width for the immediate-controlled forms
 /// (both zero for the register-controlled forms, whose control vector is an
 /// additional input). Pure.
+///
+/// [`SsaOp::VectorBitfield`]: crate::ir::ops::def::SsaOp::VectorBitfield
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorBitfieldData {
@@ -480,6 +507,8 @@ pub struct VectorBitfieldData {
 /// Per-byte condition selecting which lanes a [`SsaOp::VectorConditionalMove`]
 /// updates (Cyrix EMMI `pmv*` family). The exact test reference is part of the
 /// underdocumented EMMI semantics; the variant names the documented predicate.
+///
+/// [`SsaOp::VectorConditionalMove`]: crate::ir::ops::def::SsaOp::VectorConditionalMove
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ByteMoveCondition {
@@ -510,6 +539,8 @@ impl ByteMoveCondition {
 /// conditional move (`pmvzb`/`pmvnzb`/`pmvlzb`/`pmvgezb`): selected bytes of the
 /// source replace the destination under the [`ByteMoveCondition`]. The `inputs`
 /// are the destination and source vectors. Pure.
+///
+/// [`SsaOp::VectorConditionalMove`]: crate::ir::ops::def::SsaOp::VectorConditionalMove
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorConditionalMoveData {
@@ -530,6 +561,8 @@ pub struct VectorConditionalMoveData {
 /// `*stri` forms from the mask-result `*strm` forms. The `inputs` are the two
 /// string vectors (plus the two length registers for the explicit forms); the
 /// `outputs` are the result register and the comparison flags. Pure.
+///
+/// [`SsaOp::VectorStringCompare`]: crate::ir::ops::def::SsaOp::VectorStringCompare
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorStringCompareData {
@@ -553,6 +586,8 @@ pub struct VectorStringCompareData {
 /// of the single source, placing that minimum in the low word of the result
 /// and its source index in the next field (remaining lanes zeroed). The single
 /// input is the source vector. Pure.
+///
+/// [`SsaOp::VectorHorizontalMinPos`]: crate::ir::ops::def::SsaOp::VectorHorizontalMinPos
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorHorizontalMinPosData {
@@ -567,6 +602,8 @@ pub struct VectorHorizontalMinPosData {
 /// the sum (or difference) of a contiguous group of `dest_bits / source_bits`
 /// input lanes, widened from `source_bits` to `dest_bits`. The single input is
 /// the source vector. Pure.
+///
+/// [`SsaOp::VectorHorizontalReduce`]: crate::ir::ops::def::SsaOp::VectorHorizontalReduce
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorHorizontalReduceData {
@@ -589,6 +626,8 @@ pub struct VectorHorizontalReduceData {
 /// lanes are narrowed to half width with signed or unsigned saturation, the
 /// first source filling the low half of each 128-bit granule and the second the
 /// high half. The `inputs` are `[src1, src2]`. Pure.
+///
+/// [`SsaOp::VectorPackNarrow`]: crate::ir::ops::def::SsaOp::VectorPackNarrow
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorPackNarrowData {
@@ -602,6 +641,8 @@ pub struct VectorPackNarrowData {
 }
 
 /// The SVE data-movement operation for [`SsaOp::VectorSvePermute`].
+///
+/// [`SsaOp::VectorSvePermute`]: crate::ir::ops::def::SsaOp::VectorSvePermute
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SvePermuteKind {
@@ -625,6 +666,8 @@ pub enum SvePermuteKind {
 
 /// The floating-point helper operation for [`SsaOp::VectorFpHelper`] (SVE
 /// transcendental-acceleration primitives).
+///
+/// [`SsaOp::VectorFpHelper`]: crate::ir::ops::def::SsaOp::VectorFpHelper
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FpHelperKind {
@@ -643,6 +686,8 @@ pub enum FpHelperKind {
 }
 
 /// The predicate-generating operation for [`SsaOp::VectorPredicateGen`].
+///
+/// [`SsaOp::VectorPredicateGen`]: crate::ir::ops::def::SsaOp::VectorPredicateGen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PredicateGenKind {
@@ -673,6 +718,8 @@ pub enum PredicateGenKind {
 /// `sumopa` and the subtracting `*mops`). The ZA tile is the accumulator
 /// (`inputs[0]`), followed by the governing predicates and the two source
 /// vectors; the result is the updated tile. Pure.
+///
+/// [`SsaOp::VectorSmeOuterProduct`]: crate::ir::ops::def::SsaOp::VectorSmeOuterProduct
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorSmeOuterProductData {
@@ -694,6 +741,8 @@ pub struct VectorSmeOuterProductData {
 /// multiply-accumulate over vector registers (AArch64 `smmla`/`ummla`/`usmmla`/
 /// `fmmla`/`bfmmla`): two source matrices are multiplied and accumulated into the
 /// destination. The `inputs` are `[acc, a, b]`. Pure.
+///
+/// [`SsaOp::VectorMatrixMulAcc`]: crate::ir::ops::def::SsaOp::VectorMatrixMulAcc
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorMatrixMulAccData {
@@ -714,6 +763,8 @@ pub struct VectorMatrixMulAccData {
 /// `revb`/`revh`/`revw`/`revd`: byte/halfword/word/doubleword order reversal). The
 /// element width comes from the operand register shape. The `inputs` are `[src]`.
 /// Pure.
+///
+/// [`SsaOp::VectorReverseChunks`]: crate::ir::ops::def::SsaOp::VectorReverseChunks
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorReverseChunksData {
@@ -731,6 +782,8 @@ pub struct VectorReverseChunksData {
 /// `decp`/…). The count is symbolic (the vector length is runtime-defined); the op
 /// names the adjustment so no concrete materialization is needed. `inputs[0]` is
 /// the value being adjusted, optionally followed by the governing predicate. Pure.
+///
+/// [`SsaOp::VectorCountAdjust`]: crate::ir::ops::def::SsaOp::VectorCountAdjust
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorCountAdjustData {
@@ -756,6 +809,8 @@ pub struct VectorCountAdjustData {
 /// (AArch64 SVE predicated `sxtb`/`uxtb`/`sxth`/`uxth`/`sxtw`/`uxtw`, and the
 /// `sxtw`/`uxtw` index extension performed by SVE `adr`). `inputs[0]` is the
 /// source vector, optionally followed by a governing predicate. Pure.
+///
+/// [`SsaOp::VectorExtendInLane`]: crate::ir::ops::def::SsaOp::VectorExtendInLane
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorExtendInLaneData {
@@ -776,6 +831,8 @@ pub struct VectorExtendInLaneData {
 /// a scalar register (AArch64 SVE `cntb`/`cnth`/`cntw`/`cntd`). The count is
 /// symbolic (the vector length is runtime-defined); the op names the granularity
 /// so no concrete materialization is needed. Pure.
+///
+/// [`SsaOp::VectorElementCount`]: crate::ir::ops::def::SsaOp::VectorElementCount
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorElementCountData {
@@ -792,6 +849,8 @@ pub struct VectorElementCountData {
 /// `inputs[0]` is the base vector, `inputs[1]` the index vector. The optional
 /// 32→64 index extension and the left-shift amount are named on the op so the
 /// per-lane address computation stays lossless. Pure.
+///
+/// [`SsaOp::VectorSveAddressGen`]: crate::ir::ops::def::SsaOp::VectorSveAddressGen
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorSveAddressGenData {
@@ -860,6 +919,8 @@ pub enum SveComputeKind {
 /// Boxed payload for [`SsaOp::VectorSveCompute`] — an SVE2/NEON compute op named
 /// precisely by its [`SveComputeKind`]. `rotation` carries the complex-op rotation
 /// in degrees (0/90/180/270; 0 otherwise); `element_bits` is the lane width. Pure.
+///
+/// [`SsaOp::VectorSveCompute`]: crate::ir::ops::def::SsaOp::VectorSveCompute
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorSveComputeData {
@@ -891,6 +952,8 @@ pub enum PredicateOpKind {
 
 /// Boxed payload for [`SsaOp::VectorPredicateOp`] — an SVE predicate/first-fault
 /// register operation named by its [`PredicateOpKind`]. Pure.
+///
+/// [`SsaOp::VectorPredicateOp`]: crate::ir::ops::def::SsaOp::VectorPredicateOp
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorPredicateOpData {
@@ -918,6 +981,8 @@ pub enum SmeMiscKind {
 
 /// Boxed payload for [`SsaOp::VectorSmeMisc`] — an SME ZA-tile accumulate/zero
 /// operation named by its [`SmeMiscKind`]. Pure (models ZA as explicit operands).
+///
+/// [`SsaOp::VectorSmeMisc`]: crate::ir::ops::def::SsaOp::VectorSmeMisc
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorSmeMiscData {
@@ -937,6 +1002,9 @@ pub struct VectorSmeMiscData {
 ///
 /// Reads memory through its address base and may fault, so it classifies as
 /// [`SsaEffectKind::Read`] with [`TrapClass::MemoryFault`] — never pure.
+///
+/// [`SsaOp::VectorStructLoadReplicate`]: crate::ir::ops::def::SsaOp::VectorStructLoadReplicate
+/// [`TrapClass::MemoryFault`]: crate::ir::ops::effects::TrapClass::MemoryFault
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorStructLoadReplicateData {
@@ -952,6 +1020,18 @@ pub struct VectorStructLoadReplicateData {
 
 /// The condition-flag (PSTATE) manipulation named by [`KindedVecData`]. Mirrors
 /// the cleaned-IR `FlagAdjustKind`.
+///
+/// **Partition rule against [`MachineStateOp`].** This enum is the home for an
+/// operation whose *entire* effect is writing bits of the flags register
+/// [`FlagsMask`] models. IF is EFLAGS bit 9 exactly as DF is bit 10 and AC is
+/// bit 18, so `cli` and `sti` belong here beside `cld`/`std` and `clac`/`stac`.
+/// Everything else is a [`MachineStateOp`]: `clui`/`stui` toggle UIF, which is
+/// separate user-interrupt state [`FlagsMask`] cannot express, and MIPS
+/// `di`/`ei` optionally return the prior status register.
+///
+/// [`MachineStateOp`]: super::MachineStateOp
+///
+/// [`KindedVecData`]: crate::ir::ops::kinds::KindedVecData
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u16)]
@@ -969,12 +1049,230 @@ pub enum FlagAdjustKind {
     ConvertToFpFlags,
     /// `xaflag` — convert alternative (FP) flags back to PSTATE format.
     ConvertFromFpFlags,
+    /// Clear the carry flag (`clc`).
+    ClearCarry,
+    /// Set the carry flag (`stc`).
+    SetCarry,
+    /// Clear the string-direction flag (`cld`) — string operations advance.
+    ClearDirection,
+    /// Set the string-direction flag (`std`) — string operations retreat.
+    SetDirection,
+    /// Clear the alignment-check flag (`clac`).
+    ClearAlignCheck,
+    /// Set the alignment-check flag (`stac`).
+    SetAlignCheck,
+    /// Clear the interrupt-enable flag (`cli`) — maskable interrupts are held
+    /// off until IF is set again.
+    ClearInterrupt,
+    /// Set the interrupt-enable flag (`sti`).
+    SetInterrupt,
+    /// Load the low status-flag byte from a register (`sahf`) — the input
+    /// register supplies `SF`, `ZF`, `AF`, `PF` and `CF`; the output is the
+    /// updated flags value.
+    LoadStatusFromReg,
+    /// Store the low status-flag byte into a register (`lahf`) — the input is
+    /// the flags value and the output is the written register, so this is the
+    /// one adjustment whose result is not a flags value.
+    StoreStatusToReg,
+    /// Set every bit of a register from the carry flag (`salc`) — the input is
+    /// the flags value and the output is the written register.
+    SetRegFromCarry,
+}
+
+impl FlagAdjustKind {
+    /// Returns the architectural flag bits this adjustment writes.
+    ///
+    /// Callers use it to decide whether a pending comparison survives the
+    /// adjustment: an op that writes only control flags (`cld`, `cli`, `stac`)
+    /// leaves a `cmp`/`jcc` pair foldable, while one that touches the status
+    /// flags does not.
+    #[must_use]
+    pub const fn flags_written(self) -> FlagsMask {
+        match self {
+            Self::InvertCarry | Self::ClearCarry | Self::SetCarry => FlagsMask::CARRY,
+            Self::ClearDirection | Self::SetDirection => FlagsMask::DIRECTION,
+            Self::ClearAlignCheck | Self::SetAlignCheck => FlagsMask::ALIGN_CHECK,
+            Self::ClearInterrupt | Self::SetInterrupt => FlagsMask::INTERRUPT,
+            // `sahf` restores SF/ZF/AF/PF/CF; OF is not in the byte it loads.
+            Self::LoadStatusFromReg => FlagsMask::SIGN
+                .union(FlagsMask::ZERO)
+                .union(FlagsMask::ADJUST)
+                .union(FlagsMask::PARITY)
+                .union(FlagsMask::CARRY),
+            // AArch64 `setf8`/`setf16` (FEAT_FlagM) write N, Z **and V**, and
+            // leave C alone. V is the point of the instruction: it is set from
+            // `op<msb+1> EOR op<msb>`, which is how a narrow add's overflow is
+            // recovered. Omitting it here reports a stale V as still live, so a
+            // caller folds a `b.vs` against a flag `setf8` had overwritten.
+            Self::SetNzFrom8 | Self::SetNzFrom16 => FlagsMask::SIGN
+                .union(FlagsMask::ZERO)
+                .union(FlagsMask::OVERFLOW),
+            Self::RotateMaskInsert | Self::ConvertToFpFlags | Self::ConvertFromFpFlags => {
+                FlagsMask::x86_status()
+            }
+            // Both read the flags and write a register instead.
+            Self::StoreStatusToReg | Self::SetRegFromCarry => FlagsMask::from_bits(0),
+        }
+    }
+
+    /// Returns `true` when the adjustment's result is a general-purpose
+    /// register rather than a flags value (`lahf`, `salc`).
+    #[must_use]
+    pub const fn defines_register(self) -> bool {
+        matches!(self, Self::StoreStatusToReg | Self::SetRegFromCarry)
+    }
+
+    /// What SSA value, if any, captures this adjustment's architectural write.
+    ///
+    /// Exhaustive on purpose: a new variant does not compile until its author
+    /// decides whether the IR can represent what it writes. That decision is
+    /// what [`Self::effects`] is derived from, so getting it wrong is a visible
+    /// choice rather than an inherited default.
+    #[must_use]
+    pub const fn result(self) -> FlagAdjustResult {
+        match self {
+            // Status flags: the SSA result *is* the whole write.
+            Self::InvertCarry
+            | Self::ClearCarry
+            | Self::SetCarry
+            | Self::RotateMaskInsert
+            | Self::SetNzFrom8
+            | Self::SetNzFrom16
+            | Self::ConvertToFpFlags
+            | Self::ConvertFromFpFlags
+            | Self::LoadStatusFromReg => FlagAdjustResult::Flags,
+            // A general-purpose register (`lahf`, `salc`).
+            Self::StoreStatusToReg | Self::SetRegFromCarry => FlagAdjustResult::Register,
+            // Control flags. DF, AC and IF are architectural state no SSA
+            // operand models, so nothing downstream can observe the write and
+            // nothing can be forwarded from it.
+            Self::ClearDirection
+            | Self::SetDirection
+            | Self::ClearAlignCheck
+            | Self::SetAlignCheck
+            | Self::ClearInterrupt
+            | Self::SetInterrupt => FlagAdjustResult::None,
+        }
+    }
+
+    /// How many SSA outputs a well-formed adjustment of this kind declares.
+    #[must_use]
+    pub const fn output_arity(self) -> usize {
+        match self.result() {
+            FlagAdjustResult::Flags | FlagAdjustResult::Register => 1,
+            FlagAdjustResult::None => 0,
+        }
+    }
+
+    /// The effect class implied by this kind alone.
+    ///
+    /// An adjustment whose whole architectural write is its SSA result is a
+    /// pure function of its operands. One that writes a control flag the IR
+    /// cannot name is [`SsaEffectKind::Opaque`] — the same treatment
+    /// `FpuControl` gets, and for the same reason: `Pure` plus no definition
+    /// means dead-code elimination removes it outright, and `cld`, `std`,
+    /// `clac` and `stac` change what the program does.
+    #[must_use]
+    pub const fn effects(self) -> SsaEffects {
+        match self.result() {
+            FlagAdjustResult::Flags | FlagAdjustResult::Register => {
+                SsaEffects::new(SsaEffectKind::Pure, false)
+            }
+            FlagAdjustResult::None => SsaEffects::new(SsaEffectKind::Opaque, false),
+        }
+    }
+
+    /// The effect class for an operation of this kind carrying `output_count`
+    /// outputs.
+    ///
+    /// A kind that declares a result but carries none has written architectural
+    /// state and handed back nothing to represent it, so the write is
+    /// unobservable and must not be treated as pure — the malformed shape gets
+    /// the conservative answer rather than the deletable one. The verifier
+    /// reports the arity separately; this makes the effect safe meanwhile.
+    #[must_use]
+    pub const fn effects_for_outputs(self, output_count: usize) -> SsaEffects {
+        if output_count == 0 && self.output_arity() != 0 {
+            return SsaEffects::new(SsaEffectKind::Opaque, false);
+        }
+        self.effects()
+    }
+
+    /// The stable `flags.*` fingerprint key for this adjustment.
+    ///
+    /// `KindedVecData` carries no mnemonic, so the kind is the operation's only
+    /// identity: without this every flag adjustment renders and fingerprints
+    /// identically and `std` cannot be told from `clc`.
+    #[must_use]
+    pub const fn kind_str(self) -> &'static str {
+        match self {
+            Self::InvertCarry => "flags.cfinv",
+            Self::RotateMaskInsert => "flags.rmif",
+            Self::SetNzFrom8 => "flags.setf8",
+            Self::SetNzFrom16 => "flags.setf16",
+            Self::ConvertToFpFlags => "flags.axflag",
+            Self::ConvertFromFpFlags => "flags.xaflag",
+            Self::ClearCarry => "flags.clear.carry",
+            Self::SetCarry => "flags.set.carry",
+            Self::ClearDirection => "flags.clear.direction",
+            Self::SetDirection => "flags.set.direction",
+            Self::ClearAlignCheck => "flags.clear.aligncheck",
+            Self::SetAlignCheck => "flags.set.aligncheck",
+            Self::ClearInterrupt => "flags.clear.interrupt",
+            Self::SetInterrupt => "flags.set.interrupt",
+            Self::LoadStatusFromReg => "flags.load.reg",
+            Self::StoreStatusToReg => "flags.store.reg",
+            Self::SetRegFromCarry => "flags.carry.toreg",
+        }
+    }
+
+    /// The native mnemonic this adjustment lifts from.
+    #[must_use]
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::InvertCarry => "cfinv",
+            Self::RotateMaskInsert => "rmif",
+            Self::SetNzFrom8 => "setf8",
+            Self::SetNzFrom16 => "setf16",
+            Self::ConvertToFpFlags => "axflag",
+            Self::ConvertFromFpFlags => "xaflag",
+            Self::ClearCarry => "clc",
+            Self::SetCarry => "stc",
+            Self::ClearDirection => "cld",
+            Self::SetDirection => "std",
+            Self::ClearAlignCheck => "clac",
+            Self::SetAlignCheck => "stac",
+            Self::ClearInterrupt => "cli",
+            Self::SetInterrupt => "sti",
+            Self::LoadStatusFromReg => "sahf",
+            Self::StoreStatusToReg => "lahf",
+            Self::SetRegFromCarry => "salc",
+        }
+    }
+}
+
+/// What SSA value captures a [`FlagAdjustKind`]'s architectural write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FlagAdjustResult {
+    /// A flags value, which is the whole of what the operation writes.
+    Flags,
+    /// A general-purpose register (`lahf`, `salc`).
+    Register,
+    /// Nothing the IR can name: the write lands in a control flag (DF, AC, IF).
+    ///
+    /// Not deletable. There is no SSA value to make the write observable, so a
+    /// pure classification plus an empty definition list is exactly what
+    /// dead-code elimination removes.
+    None,
 }
 
 /// Boxed payload for [`SsaOp::VectorComplexAdd`] — a complex-number add with a
 /// 90° or 270° rotation of one operand's imaginary lane (AArch64 `fcadd` and the
 /// integer `cadd`/`sqcadd`). The `inputs` are the two complex source vectors.
 /// Pure.
+///
+/// [`SsaOp::VectorComplexAdd`]: crate::ir::ops::def::SsaOp::VectorComplexAdd
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorComplexAddData {
@@ -994,6 +1292,8 @@ pub struct VectorComplexAddData {
 /// `*s` peers). `after` keeps the element that triggered the break (`brka*`);
 /// `pair` selects the two-source `brkp*` forms; `propagate` selects `brkn`.
 /// The `inputs` are the source predicate(s). Pure.
+///
+/// [`SsaOp::VectorPredicateBreak`]: crate::ir::ops::def::SsaOp::VectorPredicateBreak
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorPredicateBreakData {
@@ -1013,6 +1313,8 @@ pub struct VectorPredicateBreakData {
 /// comparing an incrementing index from a scalar base against a scalar limit
 /// (AArch64 SVE `whilelt`/`whilele`/`whilege`/`whilegt` signed and `whilelo`/
 /// `whilels`/`whilehs`/`whilehi` unsigned). The `inputs` are `[first, last]`. Pure.
+///
+/// [`SsaOp::VectorPredicateWhile`]: crate::ir::ops::def::SsaOp::VectorPredicateWhile
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorPredicateWhileData {
@@ -1033,6 +1335,8 @@ pub struct VectorPredicateWhileData {
 /// to the narrow destination range — signed when `unsigned_dst` is false, to the
 /// unsigned range when true — interpreting the source as signed when `signed_src`.
 /// The `inputs` are `[src]`. Pure.
+///
+/// [`SsaOp::VectorNarrowSaturate`]: crate::ir::ops::def::SsaOp::VectorNarrowSaturate
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorNarrowSaturateData {
@@ -1432,4 +1736,37 @@ pub enum VectorSegmentLayout {
     Interleaved,
     /// Consecutive structure layout, with each segment stored contiguously.
     Consecutive,
+}
+
+impl_kinded_payload! {
+    VectorPermuteData { outputs, inputs };
+    VectorDotProductData { imm8, element_bits, outputs, inputs };
+    VectorIntDotProductData { signed_a, signed_b, source_bits, dest_bits, outputs, inputs };
+    VectorShuffleBitsData { outputs, inputs };
+    VectorIntersectData { outputs, inputs };
+    VectorBitfieldData { insert, index, length, outputs, inputs };
+    VectorConditionalMoveData { condition, outputs, inputs };
+    VectorStringCompareData { imm8, explicit_length, result_index, outputs, inputs };
+    VectorHorizontalMinPosData { outputs, inputs };
+    VectorHorizontalReduceData {
+        subtract, unsigned, source_bits, dest_bits, outputs, inputs
+    };
+    VectorPackNarrowData { unsigned, outputs, inputs };
+    VectorSmeOuterProductData { subtract, signed_a, signed_b, float, outputs, inputs };
+    VectorMatrixMulAccData { signed_a, signed_b, float, outputs, inputs };
+    VectorReverseChunksData { chunk_bits, outputs, inputs };
+    VectorCountAdjustData {
+        decrement, saturate, signed, by_predicate, element_bits, outputs, inputs
+    };
+    VectorExtendInLaneData { signed, source_bits, element_bits, outputs, inputs };
+    outputs_only VectorElementCountData { element_bits, multiplier, outputs };
+    VectorSveAddressGenData { signed_extend, shift, outputs, inputs };
+    VectorSveComputeData { op, element_bits, rotation, outputs, inputs };
+    VectorPredicateOpData { op, element_bits, outputs, inputs };
+    VectorSmeMiscData { op, element_bits, outputs, inputs };
+    VectorStructLoadReplicateData { count, element_bits, outputs, inputs };
+    VectorComplexAddData { rotate_270, saturate, outputs, inputs };
+    VectorPredicateBreakData { after, pair, propagate, outputs, inputs };
+    VectorPredicateWhileData { kind, unsigned, outputs, inputs };
+    VectorNarrowSaturateData { signed_src, unsigned_dst, rounding, shift, outputs, inputs };
 }

@@ -111,7 +111,7 @@ fn counted_loop() -> SsaFunction<MockTarget> {
 /// Returns `true` when block 1 still ends in a conditional branch.
 fn exit_branch_survives(ssa: &SsaFunction<MockTarget>) -> bool {
     ssa.block(1)
-        .and_then(|block| block.terminator_op())
+        .and_then(|block| block.control_terminator())
         .is_some_and(|op| matches!(op, SsaOp::Branch { .. }))
 }
 
@@ -330,13 +330,13 @@ fn guarded_dispatch() -> (SsaFunction<MockTarget>, SsaVarId) {
 #[test]
 fn a_dominating_guard_bounds_the_value_on_its_arm() {
     use analyssa::{
-        analysis::SsaCfg,
+        analysis::exceptions::EhCfg,
         graph::{RootedGraph, algorithms::compute_dominators},
         passes::ranges::analyze,
     };
 
     let (ssa, idx) = guarded_dispatch();
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let dominators = compute_dominators(&cfg, cfg.entry());
     let converged = analyze(&ssa, 64);
     assert!(
@@ -384,8 +384,8 @@ fn a_dominating_guard_bounds_the_value_on_its_arm() {
 fn the_solver_widening_hook_terminates_an_interval_analysis() {
     use analyssa::{
         analysis::{
-            SsaCfg,
             dataflow::{DataFlowAnalysis, DataFlowSolver, Direction},
+            exceptions::EhCfg,
             range::ValueRange,
         },
         ir::{block::SsaBlock as Block, function::SsaFunction as Func},
@@ -435,7 +435,7 @@ fn the_solver_widening_hook_terminates_an_interval_analysis() {
     }
 
     let ssa = counted_loop();
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let analysis = Countingnalysis { widen_after: 3 };
     let solver = DataFlowSolver::new(analysis);
 

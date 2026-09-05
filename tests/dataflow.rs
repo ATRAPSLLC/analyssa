@@ -3,13 +3,13 @@
 use analyssa::{
     PointerSize,
     analysis::{
-        cfg::SsaCfg,
         dataflow::{
             liveness::{LiveVariables, LivenessResult},
             reaching::ReachingDefinitions,
             sccp::{ConstantPropagation, ScalarValue},
             solver::DataFlowSolver,
         },
+        exceptions::EhCfg,
     },
     ir::{
         block::SsaBlock,
@@ -71,7 +71,7 @@ fn sccp_propagates_simple_constants() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
@@ -98,7 +98,7 @@ fn sccp_propagates_through_copies() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
@@ -138,7 +138,7 @@ fn sccp_respects_control_flow_with_unexecutable_blocks() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
@@ -153,7 +153,7 @@ fn sccp_empty_function_is_handled() {
     let ssa = SsaFunction::<MockTarget>::new(0, 0);
     // Empty function has no blocks, so SCCP should not panic
     if ssa.block_count() > 0 {
-        let cfg = SsaCfg::from_ssa(&ssa);
+        let cfg = EhCfg::from_ssa(&ssa);
         let mut cp = ConstantPropagation::new(PointerSize::Bit64);
         let result = cp.analyze(&ssa, &cfg);
         assert_eq!(result.constant_count(), 0);
@@ -219,7 +219,7 @@ fn sccp_propagates_through_phi_in_diamond() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
@@ -305,7 +305,7 @@ fn sccp_converges_in_loop_to_fixpoint() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let mut cp = ConstantPropagation::new(PointerSize::Bit64);
     let result = cp.analyze(&ssa, &cfg);
 
@@ -358,7 +358,7 @@ fn live_variables_analysis_runs_without_panicking() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let analysis = LiveVariables::new(&ssa);
     let solver = DataFlowSolver::new(analysis);
     let _result = solver.solve(&ssa, &cfg);
@@ -387,7 +387,7 @@ fn reaching_definitions_runs_without_panicking() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let analysis = ReachingDefinitions::new(&ssa);
     let solver = DataFlowSolver::new(analysis);
     let _result = solver.solve(&ssa, &cfg);
@@ -396,7 +396,7 @@ fn reaching_definitions_runs_without_panicking() {
 #[test]
 fn reaching_definitions_empty_function_handled() {
     let ssa = SsaFunction::<MockTarget>::new(0, 0);
-    let cfg = SsaCfg::from_ssa(&ssa);
+    let cfg = EhCfg::from_ssa(&ssa);
     let analysis = ReachingDefinitions::new(&ssa);
     let solver = DataFlowSolver::new(analysis);
     let _result = solver.solve(&ssa, &cfg);

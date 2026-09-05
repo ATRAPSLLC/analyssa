@@ -17,6 +17,8 @@
 //! single run over immutable IR nothing needs to call it — the borrow already
 //! guarantees freshness — so it exists for the iterative case, where the program
 //! changes underneath the analyses.
+//!
+//! [`FunctionAnalyses`]: crate::analysis::cache::FunctionAnalyses
 
 use std::{
     collections::HashMap,

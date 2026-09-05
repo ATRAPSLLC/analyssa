@@ -118,7 +118,7 @@ use std::collections::HashMap;
 
 use crate::{
     BitSet, PointerSize,
-    analysis::{evaluator::SsaEvaluator, symbolic::SymbolicExpr},
+    analysis::{cfg::SsaCfg, evaluator::SsaEvaluator, symbolic::SymbolicExpr},
     ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
     target::Target,
 };
@@ -168,7 +168,7 @@ impl<'a, T: Target> PatternDetector<'a, T> {
     pub fn find_dispatchers(&self) -> Vec<DispatcherPattern<T>> {
         // One predecessor relation for the whole function, reused by every
         // candidate's reachability query.
-        let predecessors = self.ssa.compute_predecessors();
+        let predecessors = SsaCfg::from_ssa(self.ssa).to_predecessor_sets();
         let mut dispatchers: Vec<_> = (0..self.ssa.block_count())
             .filter_map(|block_idx| self.analyze_potential_dispatcher(block_idx, &predecessors))
             .collect();
@@ -185,8 +185,8 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         let block = self.ssa.block(block_idx)?;
 
         // Look for Switch instruction at the end
-        let terminator = block.terminator()?;
-        let (switch_var, targets, default) = match terminator.op() {
+        let terminator = block.control_terminator()?;
+        let (switch_var, targets, default) = match terminator {
             SsaOp::Switch {
                 value,
                 targets,
@@ -277,7 +277,7 @@ impl<'a, T: Target> PatternDetector<'a, T> {
     /// Gets the successor blocks of a given block.
     fn block_successors(&self, block_idx: usize) -> Option<Vec<usize>> {
         let block = self.ssa.block(block_idx)?;
-        block.terminator()?;
+        block.control_terminator()?;
         Some(block.successors())
     }
 
@@ -374,8 +374,8 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         let block = self.ssa.block(block_idx)?;
 
         // Check if this block has a jump or branch that leads to dispatcher
-        let terminator = block.terminator()?;
-        let (leads_to_dispatcher, is_conditional) = match terminator.op() {
+        let terminator = block.control_terminator()?;
+        let (leads_to_dispatcher, is_conditional) = match terminator {
             SsaOp::Jump { target } => (*target == dispatcher.block, false),
             SsaOp::Branch {
                 true_target,
@@ -508,8 +508,8 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         let block = self.ssa.block(block_idx)?;
 
         // Look for Branch instruction
-        let terminator = block.terminator()?;
-        let (condition_var, true_target, false_target) = match terminator.op() {
+        let terminator = block.control_terminator()?;
+        let (condition_var, true_target, false_target) = match terminator {
             SsaOp::Branch {
                 condition,
                 true_target,

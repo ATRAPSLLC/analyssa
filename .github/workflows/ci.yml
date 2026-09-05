@@ -1,14 +1,26 @@
 name: CI
 
+# Every branch this crate is developed on, not just the one it lands on: work
+# on a release branch has to meet the gates below before it is merged, not
+# after.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'release/**'
   pull_request:
-    branches: [main]
+
+# A force-push should not leave a stale run competing with the new one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
+# Every job runs `scripts/check.sh <gate>`. The command strings live in that one
+# file, so a local run is the same run as CI and neither can drift from the other.
 jobs:
   test:
     name: Test
@@ -21,10 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      # Run both ways: the default build must stay serde-free, and the feature
-      # must actually be exercised on every supported toolchain.
-      - run: cargo test
-      - run: cargo test --all-features
+      - run: scripts/check.sh test
 
   clippy:
     name: Clippy
@@ -40,7 +49,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: clippy
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: scripts/check.sh clippy
 
   deny:
     name: Advisories and licences
@@ -51,7 +60,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       # Without this, a RUSTSEC advisory against dashmap, rayon, boxcar or
       # num_enum would never surface here.
-      - run: cargo deny check
+      - run: scripts/check.sh deny
 
   fmt:
     name: Format
@@ -61,7 +70,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo fmt --check
+      # The gate pins `cargo +nightly fmt`: rustfmt.toml's group_imports and
+      # imports_granularity are nightly-only, and a stable rustfmt ignores
+      # unknown options and exits 0.
+      - run: scripts/check.sh fmt
 
   doc:
     name: Docs
@@ -69,9 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo doc --no-deps --all-features --document-private-items
-        env:
-          RUSTDOCFLAGS: -D warnings -D missing-docs
+      - run: scripts/check.sh doc
 
   doctest:
     name: Doctests
@@ -79,9 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --doc --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - run: scripts/check.sh doctest
 
   # Fuzzing is deliberately not a CI job. Coverage-guided fuzzing only pays off
   # with an accumulated corpus, and a runner starts from an empty one every
@@ -102,4 +110,4 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-targets --all-features --fail-under-lines 70 --summary-only
+      - run: scripts/check.sh coverage

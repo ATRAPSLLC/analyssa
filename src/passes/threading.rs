@@ -85,7 +85,7 @@ where
             condition,
             true_target,
             false_target,
-        }) = block.terminator_op()
+        }) = block.control_terminator()
         else {
             continue;
         };
@@ -105,7 +105,7 @@ where
                 ptr_size,
             ) {
                 let pred_target = ssa.block(*pred_idx).and_then(|b| {
-                    b.terminator_op().and_then(|op| match op {
+                    b.control_terminator().and_then(|op| match op {
                         SsaOp::Jump { target } | SsaOp::Leave { target } => Some(*target),
                         _ => None,
                     })
@@ -150,7 +150,7 @@ fn is_safe_to_bypass_branch_block<T: Target>(
         return false;
     };
 
-    if !matches!(block.terminator_op(), Some(SsaOp::Branch { .. })) {
+    if !matches!(block.control_terminator(), Some(SsaOp::Branch { .. })) {
         return false;
     }
 

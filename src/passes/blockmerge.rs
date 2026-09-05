@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
+    analysis::cfg::SsaCfg,
     bitset::BitSet,
     events::{EventKind, EventListener},
     ir::{
@@ -108,19 +109,20 @@ where
 ///
 /// Together with [`exception_region_ends`] these are the exception-region
 /// boundaries. Every path that removes or bypasses a block has to respect them:
-/// nothing in the crate rewrites `handler_start_block` / `filter_start_block`
-/// after a block is emptied, so a boundary block that is silently dropped leaves
-/// the exception edge pointing at a block with no terminator, and the real
-/// handler body loses its only root.
+/// nothing in the crate rewrites a clause's block ranges after a block is
+/// emptied, so a boundary block that is silently dropped leaves the exception
+/// edge pointing at a block with no terminator, and the real handler body loses
+/// its only root.
+///
+/// Read through [`parts`](crate::ir::exception::SsaExceptionHandler::parts),
+/// which validates nothing. A
+/// barrier has to fence for a clause that cannot be laid out just as much as for
+/// one that can — more so, since that clause is the one nobody has checked.
 fn exception_region_starts<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
     let mut starts = BitSet::new(ssa.block_count());
     for handler in ssa.exception_handlers() {
-        for block in [handler.try_start_block, handler.handler_start_block]
-            .into_iter()
-            .chain(std::iter::once(handler.filter_start_block))
-            .flatten()
-        {
-            starts.insert_checked(block);
+        for (_, range) in handler.parts() {
+            starts.insert_checked(range.start());
         }
     }
     starts
@@ -128,14 +130,15 @@ fn exception_region_starts<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
 
 /// Blocks that must not be merged *from* — a region end absorbing its successor
 /// would extend the region past its boundary.
+///
+/// Every part's exclusive end, the filter's included: a filter expression is as
+/// much a bounded range of blocks as the protected region is, and a merge at its
+/// tail extends it just the same.
 fn exception_region_ends<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
     let mut ends = BitSet::new(ssa.block_count());
     for handler in ssa.exception_handlers() {
-        for block in [handler.try_end_block, handler.handler_end_block]
-            .into_iter()
-            .flatten()
-        {
-            ends.insert_checked(block);
+        for (_, range) in handler.parts() {
+            ends.insert_checked(range.end());
         }
     }
     ends
@@ -164,7 +167,7 @@ where
     // already refuses to merge across. `find_trampoline_blocks` only skips the
     // entry block, so without this a handler or filter entry that happens to be
     // a bare forwarding jump has its predecessors redirected past it and is then
-    // cleared — leaving `handler_start_block` pointing at an empty block.
+    // cleared — leaving the clause's handler range pointing at an empty block.
     let region_starts = exception_region_starts(ssa);
     let region_ends = exception_region_ends(ssa);
     trampolines.retain(|block, _| {
@@ -223,7 +226,7 @@ where
         let Some(old_targets) = editor
             .function()
             .block(block_idx)
-            .and_then(|block| block.terminator_op())
+            .and_then(|block| block.control_terminator())
             .map(SsaOp::successors)
         else {
             continue;
@@ -253,7 +256,7 @@ where
             let new_targets = editor
                 .function()
                 .block(block_idx)
-                .and_then(|block| block.terminator_op())
+                .and_then(|block| block.control_terminator())
                 .map(SsaOp::successors)
                 .unwrap_or_default();
             let event = crate::events::Event {
@@ -322,7 +325,32 @@ where
         None => return false,
     };
 
-    let preds = ssa.block_predecessors(target);
+    // Inlining the target into B0 erases the boundary between them, so refuse
+    // when either is one the exception table names: a handler entry, or the
+    // start or end of a protected region. This was previously prevented by
+    // accident, through a phantom predecessor the CFG no longer draws.
+    let exception_blocks = ssa.exception_blocks();
+    let is_boundary = |block: usize| {
+        exception_blocks.is_runtime_entry(block)
+            || exception_blocks.is_region_start(block)
+            || exception_blocks.is_region_end(block)
+    };
+    if is_boundary(0) || is_boundary(target) {
+        return false;
+    }
+    drop(exception_blocks);
+
+    // The target's own back edge is not an *external* predecessor, and the
+    // redirect below exists precisely to rewrite it. Filtering it here is the
+    // one place `SsaCfg`'s relation and the question being asked differ:
+    // `SsaCfg` records a self-loop, and without this filter a self-looping
+    // trampoline would never reach the redirect that handles it.
+    let cfg = SsaCfg::from_ssa(ssa);
+    let preds: Vec<usize> = cfg
+        .predecessor_blocks(target)
+        .filter(|predecessor| *predecessor != target)
+        .collect();
+    drop(cfg);
     let target_has_phis = ssa.block(target).is_none_or(|b| !b.phi_nodes().is_empty());
 
     if preds.len() == 1 && preds.first().copied() == Some(0) && !target_has_phis {
@@ -422,7 +450,7 @@ where
         for idx in 0..block_count {
             let successors = ssa
                 .block(idx)
-                .and_then(|b| b.terminator_op())
+                .and_then(|b| b.control_terminator())
                 .map(SsaOp::successors)
                 .unwrap_or_default();
             for succ in successors {
@@ -446,7 +474,7 @@ where
             if consumed.contains(a_idx) {
                 continue;
             }
-            let b_idx = match ssa.block(a_idx).and_then(|b| b.terminator_op()) {
+            let b_idx = match ssa.block(a_idx).and_then(|b| b.control_terminator()) {
                 Some(SsaOp::Jump { target }) => *target,
                 _ => continue,
             };
@@ -515,7 +543,7 @@ fn block_reaches<T: Target>(ssa: &SsaFunction<T>, start: usize, target: usize) -
     while let Some(block_idx) = worklist.pop_front() {
         let successors = ssa
             .block(block_idx)
-            .and_then(|block| block.terminator_op())
+            .and_then(|block| block.control_terminator())
             .map(SsaOp::successors)
             .unwrap_or_default();
         for successor in successors {
@@ -538,7 +566,7 @@ mod tests {
         events::EventLog,
         ir::{
             block::SsaBlock,
-            exception::SsaExceptionHandler,
+            exception::{BlockRange, SsaExceptionHandler},
             instruction::SsaInstruction,
             ops::SsaOp,
             phi::{PhiNode, PhiOperand},
@@ -570,7 +598,7 @@ mod tests {
     /// trampoline pass. `coalesce_blocks` already refuses to merge across an
     /// exception-region boundary; the trampoline path had no such guard, so it
     /// redirected the region's predecessors past the handler entry and cleared
-    /// it. Nothing in the crate rewrites `handler_start_block` afterwards, so the
+    /// it. Nothing in the crate rewrites the clause's handler range afterwards, so the
     /// exception edge would still point at a now-empty block and the real handler
     /// body would lose its only root.
     #[test]
@@ -601,11 +629,9 @@ mod tests {
             handler_offset: 2,
             handler_length: 1,
             class_token_or_filter: 0,
-            try_start_block: Some(0),
-            try_end_block: Some(1),
-            handler_start_block: Some(2),
-            handler_end_block: Some(3),
-            filter_start_block: None,
+            protected_range: BlockRange::new(0, 1),
+            handler_range: BlockRange::new(2, 3),
+            filter_range: None,
         }]);
         ssa.recompute_uses();
 
@@ -614,17 +640,71 @@ mod tests {
 
         let handler_entry = ssa.block(2).expect("handler entry block must still exist");
         assert!(
-            handler_entry.terminator_op().is_some(),
-            "the handler entry must keep its terminator; `handler_start_block` \
-             still points here and nothing rewrites it"
+            handler_entry.control_terminator().is_some(),
+            "the handler entry must keep its terminator; the clause's handler \
+             range still starts here and nothing rewrites it"
         );
         // Coalescing the entry with its body is fine — the entry keeps a
         // terminator and still roots the handler. What must never happen is the
         // entry being *emptied*, which is what the trampoline path did.
         assert!(
             !handler_entry.instructions().is_empty(),
-            "the handler entry must not be cleared out from under \
-             `handler_start_block`"
+            "the handler entry must not be cleared out from under the clause's \
+             handler range"
+        );
+    }
+
+    /// A filter expression's exclusive end fences a merge, exactly as a
+    /// protected region's and a handler's do.
+    ///
+    /// A filter is a bounded range of blocks like any other clause part: a merge
+    /// at its tail extends the filter over code that was never part of it, and
+    /// codegen would then write the wider range back out. The barrier is
+    /// computed from every part the clause maps, so there is no part it can
+    /// forget.
+    ///
+    /// `B0 -> B1 -> B2 -> B3 -> B4`, with protected `[0, 1)`, handler `[1, 2)`
+    /// and filter `[2, 3)`. Only B3, the filter's exclusive end, stands between
+    /// B4 and a merge.
+    #[test]
+    fn a_filter_end_fences_a_merge() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        for index in 0..4 {
+            let mut block = SsaBlock::new(index);
+            block.add_instruction(instr(SsaOp::Jump {
+                target: index.saturating_add(1),
+            }));
+            ssa.add_block(block);
+        }
+        let mut last = SsaBlock::new(4);
+        last.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(last);
+
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 1, // `MockTarget` reads 1 as a filter handler.
+            try_offset: 0,
+            try_length: 1,
+            handler_offset: 1,
+            handler_length: 1,
+            class_token_or_filter: 0,
+            protected_range: BlockRange::new(0, 1),
+            handler_range: BlockRange::new(1, 2),
+            filter_range: BlockRange::new(2, 3),
+        }]);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        run(&mut ssa, &0u32, &log, 8);
+
+        assert!(
+            ssa.block(4).is_some_and(|b| !b.instructions().is_empty()),
+            "B4 must not be absorbed into B3: B3 is where the filter ends"
+        );
+        assert!(
+            ssa.block(3)
+                .and_then(SsaBlock::control_terminator)
+                .is_some_and(|op| matches!(op, SsaOp::Jump { target: 4 })),
+            "and B3 must still jump to it"
         );
     }
 
@@ -867,5 +947,84 @@ mod tests {
             run(ssa, &method, &log, 10)
         });
         assert!(changed, "trampoline with phi successor should be handled");
+    }
+
+    /// Inlining an entry trampoline into B0 erases the boundary between them,
+    /// so a target the exception table names must be refused.
+    ///
+    /// Nothing in the terminator relation marks such a block, so the guard has
+    /// to consult the table directly.
+    #[test]
+    fn an_entry_trampoline_targeting_a_handler_entry_is_not_inlined() {
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(entry);
+        let mut handler = SsaBlock::new(1);
+        handler.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        ssa.add_block(handler);
+
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 0,
+            try_offset: 0,
+            try_length: 0,
+            handler_offset: 0,
+            handler_length: 0,
+            class_token_or_filter: 0,
+            protected_range: None,
+            handler_range: BlockRange::new(1, 2),
+            filter_range: None,
+        }]);
+        ssa.recompute_uses();
+
+        let events = EventLog::<MockTarget>::new();
+        assert!(
+            !simplify_entry_trampoline(&mut ssa, &0u32, &events),
+            "B1 is a handler entry; folding it into B0 loses where the runtime dispatches"
+        );
+        assert!(ssa.block(1).is_some_and(|b| !b.instructions().is_empty()));
+    }
+
+    /// A trampoline whose target loops back to itself is still inlined.
+    ///
+    /// The target's own back edge is not an *external* predecessor, and the
+    /// self-reference redirect exists precisely to rewrite it. Counting that
+    /// edge as a predecessor would make the redirect unreachable.
+    #[test]
+    fn an_entry_trampoline_whose_target_self_loops_is_still_inlined() {
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 1);
+        let condition = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(entry);
+
+        let mut target = SsaBlock::new(1);
+        target.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: condition,
+            value: ConstValue::I32(1),
+        }));
+        target.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(target);
+
+        let mut exit = SsaBlock::new(2);
+        exit.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        ssa.add_block(exit);
+        ssa.recompute_uses();
+
+        let events = EventLog::<MockTarget>::new();
+        assert!(
+            simplify_entry_trampoline(&mut ssa, &0u32, &events),
+            "the self-loop is B1's own edge, not a second block entering it"
+        );
     }
 }

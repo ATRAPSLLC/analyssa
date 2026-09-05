@@ -6,8 +6,94 @@
 
 use std::fmt;
 
-use super::*;
-use crate::target::Target;
+use crate::{
+    ir::{
+        ops::{
+            def::SsaOp,
+            kinds::{
+                BcdAdjustData, BcdAdjustKind, KindedVecData, NativeInstructionMetadata,
+                NativeKindedData, NativeOpaqueData, VecImm8Data,
+            },
+            native::{BlockStringOpData, WideCmpXchgData},
+            vector::{
+                VectorBitfieldData, VectorComplexAddData, VectorConditionalMoveData,
+                VectorCountAdjustData, VectorDotProductData, VectorElementCountData,
+                VectorExtendInLaneData, VectorHorizontalMinPosData, VectorHorizontalReduceData,
+                VectorIntDotProductData, VectorIntersectData, VectorMatrixMulAccData,
+                VectorNarrowSaturateData, VectorPackNarrowData, VectorPermuteData,
+                VectorPredicateBreakData, VectorPredicateOpData, VectorPredicateWhileData,
+                VectorReverseChunksData, VectorShuffleBitsData, VectorSmeMiscData,
+                VectorSmeOuterProductData, VectorStringCompareData, VectorStructLoadReplicateData,
+                VectorSveAddressGenData, VectorSveComputeData,
+            },
+        },
+        variable::SsaVarId,
+    },
+    target::Target,
+};
+
+/// Writes an operation's definitions as its rendered prefix -- `v1, v2 = ` --
+/// or nothing when it defines nothing.
+///
+/// Every rendered operation that defines a variable opens this way, so the
+/// prefix is written once. An arm that spelled it itself could disagree about
+/// the separator, or emit a bare `" = "` for an empty definition list.
+fn write_defs(f: &mut fmt::Formatter<'_>, defs: &[SsaVarId]) -> fmt::Result {
+    if defs.is_empty() {
+        return Ok(());
+    }
+    for (i, def) in defs.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{def}")?;
+    }
+    write!(f, " = ")?;
+    Ok(())
+}
+
+/// Writes an operation's operand list after its mnemonic -- ` v1, v2` -- or
+/// nothing when it reads nothing.
+///
+/// Takes no separator argument on purpose. A separator parameter is the 45-way
+/// choice this helper exists to close: every call site would have to decide
+/// again, and the answer would drift apart across the variants exactly as it
+/// did when each arm wrote its own loop.
+fn write_inputs(f: &mut fmt::Formatter<'_>, inputs: &[SsaVarId]) -> fmt::Result {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    write!(f, " ")?;
+    for (i, input) in inputs.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{input}")?;
+    }
+    Ok(())
+}
+
+/// Writes the provenance suffix a lifted native instruction carries --
+/// architecture, original address, and encoded length -- omitting each part
+/// that is absent.
+fn write_native_metadata(
+    f: &mut fmt::Formatter<'_>,
+    metadata: Option<&NativeInstructionMetadata>,
+) -> fmt::Result {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    if let Some(architecture) = &metadata.architecture {
+        write!(f, " arch={architecture}")?;
+    }
+    if let Some(address) = metadata.address {
+        write!(f, " addr=0x{address:x}")?;
+    }
+    if !metadata.raw_bytes.is_empty() {
+        write!(f, " bytes={}", metadata.raw_bytes.len())?;
+    }
+    Ok(())
+}
 
 /// Writes an `addrspace(N)` qualifier prefix, or nothing for the default
 /// (flat) space.
@@ -350,20 +436,14 @@ where
                 write!(f, "{dest} = readflags {flags}, {mask}")
             }
             Self::ComputeFlags { dest, inputs } => {
-                write!(f, "{dest} = flags.compute")?;
-                for (i, input) in inputs.iter().enumerate() {
-                    write!(f, "{} {input}", if i == 0 { "" } else { "," })?;
-                }
+                write_defs(f, std::slice::from_ref(dest))?;
+                write!(f, "flags.compute")?;
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::CallClobber { outputs } => {
-                for (i, output) in outputs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{output}")?;
-                }
-                write!(f, " = call.clobber")
+                write_defs(f, outputs)?;
+                write!(f, "call.clobber")
             }
             Self::VectorUnary {
                 dest, value, kind, ..
@@ -567,15 +647,16 @@ where
                 segments,
                 layout,
             } => {
+                write_defs(f, dests)?;
                 if let Some(mask) = mask {
                     write!(
                         f,
-                        "{dests:?} = vload.segment.{layout:?}.{segments}.{vector_type} {base}, {mask}"
+                        "vload.segment.{layout:?}.{segments}.{vector_type} {base}, {mask}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dests:?} = vload.segment.{layout:?}.{segments}.{vector_type} {base}"
+                        "vload.segment.{layout:?}.{segments}.{vector_type} {base}"
                     )
                 }
             }
@@ -993,87 +1074,12 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                     effects,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "native.opaque {mnemonic}")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
-                write!(f, " effects={:?}", effects.kind)
-            }
-            Self::NativeIntrinsic(data) => {
-                let NativeIntrinsicData {
-                    id,
-                    mnemonic,
-                    metadata,
-                    outputs,
-                    inputs,
-                    clobbers,
-                    effects,
-                } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
-                write!(f, "native.intrinsic.{id:?} {mnemonic}")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", effects.kind)
             }
             Self::SystemOp(data) => {
@@ -1083,41 +1089,11 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{} {mnemonic}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::ComputeOp(data) => {
@@ -1127,41 +1103,11 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{} {mnemonic}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::BcdAdjust(data) => {
@@ -1172,17 +1118,8 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{} {mnemonic}", kind.kind_str())?;
                 if matches!(
                     kind,
@@ -1190,29 +1127,8 @@ where
                 ) {
                     write!(f, " base={base}")?;
                 }
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::VectorCrypto(data) => {
@@ -1221,25 +1137,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::TileOp(data) => {
@@ -1248,48 +1148,16 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::VectorPermute(data) => {
                 let VectorPermuteData { outputs, inputs } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.permute")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorMultiplyAdd(data) => {
@@ -1298,200 +1166,72 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorSvePermute(data) => {
                 let KindedVecData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.sve.perm")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorFpHelper(data) => {
                 let KindedVecData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.fphelper")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorPredicateGen(data) => {
                 let KindedVecData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.pgen")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorSmeOuterProduct(data) => {
                 let VectorSmeOuterProductData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.sme.mopa")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorMatrixMulAcc(data) => {
                 let VectorMatrixMulAccData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.mmla")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorReverseChunks(data) => {
                 let VectorReverseChunksData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.revchunks")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorCountAdjust(data) => {
                 let VectorCountAdjustData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.countadj")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorExtendInLane(data) => {
@@ -1502,20 +1242,10 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 let kind = if *signed { "sxt" } else { "uxt" };
                 write!(f, "vector.{kind} i{source_bits}->i{element_bits}")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorElementCount(data) => {
@@ -1524,15 +1254,7 @@ where
                     multiplier,
                     outputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.cnt e{element_bits} x{multiplier}")?;
                 Ok(())
             }
@@ -1543,224 +1265,88 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 let ext = match signed_extend {
                     Some(true) => "sxtw",
                     Some(false) => "uxtw",
                     None => "lsl",
                 };
                 write!(f, "vector.adr {ext} #{shift}")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::FlagAdjust(data) => {
                 let KindedVecData {
-                    outputs, inputs, ..
+                    kind,
+                    outputs,
+                    inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
-                write!(f, "flags.adjust")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_defs(f, outputs)?;
+                write!(f, "{}", kind.kind_str())?;
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorStructLoadReplicate(data) => {
                 let VectorStructLoadReplicateData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.ldNr")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorSmeMisc(data) => {
                 let VectorSmeMiscData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.sme.misc")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorPredicateOp(data) => {
                 let VectorPredicateOpData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.predop")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorSveCompute(data) => {
                 let VectorSveComputeData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.sve.compute")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorComplexAdd(data) => {
                 let VectorComplexAddData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.cadd")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorPredicateBreak(data) => {
                 let VectorPredicateBreakData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.break")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorPredicateWhile(data) => {
                 let VectorPredicateWhileData {
                     outputs, inputs, ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.while")?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorNarrowSaturate(data) => {
@@ -1770,15 +1356,7 @@ where
                     inputs,
                     ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(
                     f,
                     "{}",
@@ -1788,15 +1366,7 @@ where
                         "vector.narrow.saturate.s"
                     }
                 )?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorPackNarrow(data) => {
@@ -1805,15 +1375,7 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(
                     f,
                     "{}",
@@ -1823,15 +1385,7 @@ where
                         "vector.pack.narrow.s"
                     }
                 )?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorTernaryLogic(data) => {
@@ -1840,19 +1394,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.ternlog")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " imm={imm8:#04x}")
             }
             Self::VectorDotProduct(data) => {
@@ -1862,19 +1406,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.dotproduct.{element_bits}")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " imm={imm8:#04x}")
             }
             Self::VectorMultiSad(data) => {
@@ -1883,19 +1417,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.mpsadbw")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " imm={imm8:#04x}")
             }
             Self::VectorIntDotProduct(data) => {
@@ -1907,19 +1431,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.intdot")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(
                     f,
                     " s_a={signed_a} s_b={signed_b} src={source_bits} dst={dest_bits}"
@@ -1933,24 +1447,14 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(
                     f,
                     "vector.pcmp{}str{}",
                     if *explicit_length { "e" } else { "i" },
                     if *result_index { "i" } else { "m" }
                 )?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " imm={imm8:#04x}")
             }
             Self::VectorBitfield(data) => {
@@ -1961,53 +1465,23 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.{}", if *insert { "insertq" } else { "extrq" })?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " index={index} length={length}")
             }
             Self::VectorIntersect(data) => {
                 let VectorIntersectData { outputs, inputs } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.p2intersect")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorShuffleBits(data) => {
                 let VectorShuffleBitsData { outputs, inputs } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.shufbitqmb")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorConditionalMove(data) => {
@@ -2016,36 +1490,16 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.condmove.{}", condition.kind_str())?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorHorizontalMinPos(data) => {
                 let VectorHorizontalMinPosData { outputs, inputs } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.phminposuw")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorComplexMul(data) => {
@@ -2054,19 +1508,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{}", kind.kind_str())?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::VectorClassify(data) => {
@@ -2075,19 +1519,9 @@ where
                     outputs,
                     inputs,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "vector.fpclass")?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 write!(f, " imm={imm8:#04x}")
             }
             Self::VectorHorizontalReduce(data) => {
@@ -2099,15 +1533,7 @@ where
                     inputs,
                     ..
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(
                     f,
                     "vector.hreduce.{} {}->{}",
@@ -2115,9 +1541,7 @@ where
                     source_bits,
                     dest_bits
                 )?;
-                for input in inputs {
-                    write!(f, " {input}")?;
-                }
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::BlockString(data) => {
@@ -2129,42 +1553,12 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                     reverse: _,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(f, "{} {mnemonic}", kind.kind_str())?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
             Self::WideCompareExchange(data) => {
@@ -2174,17 +1568,8 @@ where
                     metadata,
                     outputs,
                     inputs,
-                    clobbers,
                 } = data.as_ref();
-                if !outputs.is_empty() {
-                    for (i, output) in outputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{output}")?;
-                    }
-                    write!(f, " = ")?;
-                }
+                write_defs(f, outputs)?;
                 write!(
                     f,
                     "{} {mnemonic}",
@@ -2194,61 +1579,30 @@ where
                         "atomic.cmpxchg8b"
                     }
                 )?;
-                if !inputs.is_empty() {
-                    write!(f, " ")?;
-                    for (i, input) in inputs.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{input}")?;
-                    }
-                }
-                if let Some(metadata) = metadata {
-                    if let Some(architecture) = &metadata.architecture {
-                        write!(f, " arch={architecture}")?;
-                    }
-                    if let Some(address) = metadata.address {
-                        write!(f, " addr=0x{address:x}")?;
-                    }
-                    if !metadata.raw_bytes.is_empty() {
-                        write!(f, " bytes={}", metadata.raw_bytes.len())?;
-                    }
-                }
-                if !clobbers.is_empty() {
-                    write!(f, " clobbers={}", clobbers.len())?;
-                }
+                write_inputs(f, inputs)?;
+                write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects=Atomic")
             }
             Self::FpTranscendental(data) => {
-                for (i, dest) in data.outputs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{dest}")?;
-                }
-                if !data.outputs.is_empty() {
-                    write!(f, " = ")?;
-                }
-                write!(f, "fp.transcendental.{:?}", data.kind)?;
-                for arg in &data.inputs {
-                    write!(f, " {arg}")?;
-                }
+                let KindedVecData {
+                    kind,
+                    outputs,
+                    inputs,
+                } = data.as_ref();
+                write_defs(f, outputs)?;
+                write!(f, "fp.transcendental.{kind:?}")?;
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::FpuControl(data) => {
-                for (i, dest) in data.outputs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{dest}")?;
-                }
-                if !data.outputs.is_empty() {
-                    write!(f, " = ")?;
-                }
-                write!(f, "fpu.control.{:?}", data.kind)?;
-                for arg in &data.inputs {
-                    write!(f, " {arg}")?;
-                }
+                let KindedVecData {
+                    kind,
+                    outputs,
+                    inputs,
+                } = data.as_ref();
+                write_defs(f, outputs)?;
+                write!(f, "fpu.control.{kind:?}")?;
+                write_inputs(f, inputs)?;
                 Ok(())
             }
             Self::CmpXchg {
@@ -2444,7 +1798,7 @@ where
             Self::Ckfinite { dest, operand } => write!(f, "{dest} = ckfinite {operand}"),
             Self::FpClassify { dest, operand } => write!(f, "{dest} = fpclassify {operand}"),
             Self::Nop => write!(f, "nop"),
-            Self::Break => write!(f, "break"),
+            Self::Break(op) => write!(f, "{}", op.mnemonic()),
             Self::Phi { dest, operands } => {
                 write!(f, "{dest} = phi(")?;
                 for (i, (block, var)) in operands.iter().enumerate() {

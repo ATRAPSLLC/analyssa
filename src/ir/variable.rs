@@ -660,6 +660,24 @@ impl<T: Target> SsaVariable<T> {
     }
 
     /// Returns where this variable is defined.
+    ///
+    /// # Correctness
+    ///
+    /// A def site is *metadata about* the definition, not the definition. Every
+    /// edit that inserts, removes or reorders an instruction has to restate it,
+    /// and one that does not leaves the site naming whatever instruction now
+    /// occupies that index — very often a real instruction defining a different
+    /// variable. Dereferencing it unchecked therefore does not fail loudly; it
+    /// answers with a foreign operation.
+    ///
+    /// So do not index a block with it. Ask
+    /// [`SsaFunction::recorded_definition`](crate::ir::function::SsaFunction::recorded_definition),
+    /// which performs the same O(1) dereference and then confirms the
+    /// instruction really defines the variable, or
+    /// [`SsaFunction::get_definition`](crate::ir::function::SsaFunction::get_definition),
+    /// which additionally recovers from a stale site by scanning. This accessor
+    /// remains public for the passes that *maintain* def sites and for queries
+    /// about the site itself, such as [`DefSite::is_phi`].
     #[must_use]
     pub const fn def_site(&self) -> DefSite {
         self.def_site

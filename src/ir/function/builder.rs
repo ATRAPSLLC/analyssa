@@ -16,12 +16,12 @@ use crate::{
         function::SsaFunction,
         instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind, CmpKind, FenceKind,
-            FlagCondition, FlagsMask, NativeClobber, NativeInstructionMetadata, NativeOpaqueData,
-            SsaEffects, SsaOp, UnaryOpKind, VectorBinaryKind, VectorBitmaskKind, VectorCastKind,
-            VectorCompareKind, VectorElement, VectorFaultMode, VectorMaskBinaryKind,
-            VectorMaskMode, VectorMaskUnaryKind, VectorReduceKind, VectorSegmentLayout,
-            VectorTernaryKind, VectorUnaryKind,
+            AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind, BreakpointOp, CmpKind,
+            FenceKind, FlagAdjustKind, FlagCondition, FlagsMask, KindedVecData,
+            NativeInstructionMetadata, NativeOpaqueData, SsaEffects, SsaOp, UnaryOpKind,
+            VectorBinaryKind, VectorBitmaskKind, VectorCastKind, VectorCompareKind, VectorElement,
+            VectorFaultMode, VectorMaskBinaryKind, VectorMaskMode, VectorMaskUnaryKind,
+            VectorReduceKind, VectorSegmentLayout, VectorTernaryKind, VectorUnaryKind,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
@@ -1504,17 +1504,92 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         })
     }
 
-    /// Emits a read-flags operation.
+    /// Emits a flag adjustment whose whole architectural write is a value.
+    ///
+    /// For a kind whose [`FlagAdjustKind::result`] is
+    /// [`FlagAdjustResult::Flags`] or [`FlagAdjustResult::Register`] — `clc`,
+    /// `stc`, `sahf`, `lahf`, `setf8` and friends. Use
+    /// [`flag_adjust_state`](Self::flag_adjust_state) for one that writes a
+    /// control flag instead.
+    ///
+    /// [`FlagAdjustResult::Flags`]: crate::ir::ops::FlagAdjustResult::Flags
+    /// [`FlagAdjustResult::Register`]: crate::ir::ops::FlagAdjustResult::Register
     ///
     /// # Errors
     ///
-    /// Returns an error if instruction insertion fails.
+    /// Returns an error if `kind` declares no SSA result, or if instruction
+    /// insertion fails.
+    pub fn flag_adjust(
+        &mut self,
+        def: SsaDefSpec<T>,
+        kind: FlagAdjustKind,
+        inputs: Vec<SsaVarId>,
+    ) -> Result<SsaVarId> {
+        if kind.output_arity() == 0 {
+            return Err(Error::new(format!(
+                "{} writes a control flag and defines no value; use flag_adjust_state",
+                kind.kind_str()
+            )));
+        }
+        self.emit_def(def, |dest| {
+            SsaOp::FlagAdjust(Box::new(KindedVecData {
+                kind,
+                outputs: vec![dest],
+                inputs,
+            }))
+        })
+    }
+
+    /// Emits a flag adjustment that writes a control flag the IR cannot name.
+    ///
+    /// `cld`, `std`, `clac`, `stac`, `cli`, `sti`. These define no SSA value —
+    /// there is nothing to represent DF, AC or IF with — which is why they are
+    /// classified [`SsaEffectKind::Opaque`] rather than pure: a pure operation
+    /// with no definition is one dead-code elimination deletes.
+    ///
+    /// [`SsaEffectKind::Opaque`]: crate::ir::ops::SsaEffectKind::Opaque
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `kind` declares an SSA result, or if instruction
+    /// insertion fails.
+    pub fn flag_adjust_state(&mut self, kind: FlagAdjustKind) -> Result<()> {
+        if kind.output_arity() != 0 {
+            return Err(Error::new(format!(
+                "{} defines a value; use flag_adjust",
+                kind.kind_str()
+            )));
+        }
+        self.emit_no_defs(SsaOp::FlagAdjust(Box::new(KindedVecData {
+            kind,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+        })))
+    }
+
+    /// Emits a read-flags operation.
+    ///
+    /// The mask must name only flags [`FlagsMask::NAMED`] defines. A bit
+    /// outside that table selects a flag nothing downstream can interpret, and
+    /// refusing it here is what keeps such a mask out of the IR in the first
+    /// place — the verifier's matching check exists for the masks that arrive
+    /// from a persisted blob rather than from this builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `mask` names an undefined flag bit, or if
+    /// instruction insertion fails.
     pub fn read_flags(
         &mut self,
         def: SsaDefSpec<T>,
         flags: SsaVarId,
         mask: FlagsMask,
     ) -> Result<SsaVarId> {
+        if !mask.is_valid() {
+            return Err(Error::new(format!(
+                "flag mask {mask} selects bits that name no defined flag"
+            )));
+        }
         self.emit_def(def, |dest| SsaOp::ReadFlags { dest, flags, mask })
     }
 
@@ -2175,7 +2250,6 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         mnemonic: impl Into<String>,
         metadata: Option<NativeInstructionMetadata>,
         inputs: Vec<SsaVarId>,
-        clobbers: Vec<NativeClobber>,
         effects: SsaEffects,
     ) -> Result<Vec<SsaVarId>> {
         let mnemonic = mnemonic.into();
@@ -2185,7 +2259,6 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                 metadata,
                 outputs: outputs.to_vec(),
                 inputs,
-                clobbers,
                 effects,
             }))
         })
@@ -2995,8 +3068,8 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     /// # Errors
     ///
     /// Returns an error if instruction insertion fails.
-    pub fn break_(&mut self) -> Result<()> {
-        self.emit_no_defs(SsaOp::Break)
+    pub fn break_(&mut self, op: BreakpointOp) -> Result<()> {
+        self.emit_no_defs(SsaOp::Break(op))
     }
 
     /// Emits a constrained-call prefix.
@@ -3157,9 +3230,9 @@ mod tests {
             ConstValue, SsaDefSpec, SsaFunctionBuilder,
             function::VectorFaultingLoadSpec,
             ops::{
-                AtomicAccessWidth, AtomicOrdering, FlagCondition, FlagsMask, SsaEffectKind,
-                SsaEffects, VectorBinaryKind, VectorCompareKind, VectorElement, VectorFaultMode,
-                VectorMaskMode, VectorSegmentLayout,
+                AtomicAccessWidth, AtomicOrdering, FlagAdjustKind, FlagCondition, FlagsMask,
+                SsaEffectKind, SsaEffects, VectorBinaryKind, VectorCompareKind, VectorElement,
+                VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
             },
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
@@ -3365,7 +3438,6 @@ mod tests {
                     "opaque",
                     None,
                     vec![zero],
-                    Vec::new(),
                     SsaEffects::new(SsaEffectKind::Opaque, false),
                 )?;
                 block.branch_flags(flags, FlagCondition::Zero, 1, 1)?;
@@ -3381,6 +3453,73 @@ mod tests {
 
         let ssa = builder.finish_verified(VerifyLevel::Standard).unwrap();
         assert_eq!(ssa.variable_count(), 10);
+    }
+
+    /// The builder refuses a mask naming a flag the crate does not define.
+    ///
+    /// Enforcement at the point of construction is what keeps such a mask from
+    /// entering the IR at all; the verifier's matching check covers the masks
+    /// that arrive from a persisted blob rather than from here.
+    #[test]
+    fn read_flags_builder_rejects_an_invalid_mask() {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
+        let outcome = builder.in_block(0, |block| {
+            let left = block.const_i32(i32_tmp(), 1)?;
+            let right = block.const_i32(i32_tmp(), 2)?;
+            let (_sum, flags) = block.binary_op_with_flags(
+                i32_tmp(),
+                i32_tmp(),
+                crate::ir::BinaryOpKind::Add,
+                left,
+                right,
+                false,
+            )?;
+            // Every defined bit is accepted.
+            let _all = block.read_flags(i32_tmp(), flags, FlagsMask::ALL)?;
+            // One bit past them is not.
+            let _bad = block.read_flags(i32_tmp(), flags, FlagsMask::from_bits(1 << 15))?;
+            block.ret(None)?;
+            Ok(())
+        });
+        assert!(
+            outcome.is_err(),
+            "a mask with an undefined bit must not reach the IR"
+        );
+    }
+
+    /// `flag_adjust` and `flag_adjust_state` each refuse the other's kinds, so
+    /// the output count an operation carries is the one its kind declares.
+    #[test]
+    fn flag_adjust_builders_split_on_the_kind_declared_result() {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
+        builder
+            .in_block(0, |block| {
+                let flags = block.const_i32(i32_tmp(), 0)?;
+                // `lahf` writes a register, so it defines a value.
+                let _reg =
+                    block.flag_adjust(i32_tmp(), FlagAdjustKind::StoreStatusToReg, vec![flags])?;
+                // `cli` writes IF, which no SSA value models.
+                block.flag_adjust_state(FlagAdjustKind::ClearInterrupt)?;
+                block.ret(None)?;
+                Ok(())
+            })
+            .unwrap();
+        let ssa = builder.finish_verified(VerifyLevel::Standard).unwrap();
+        assert_eq!(ssa.block(0).map(|b| b.instructions().len()), Some(4));
+
+        let mut wrong = SsaFunctionBuilder::<MockTarget>::new(0, 0);
+        let outcome = wrong.in_block(0, |block| {
+            block.flag_adjust_state(FlagAdjustKind::StoreStatusToReg)?;
+            Ok(())
+        });
+        assert!(outcome.is_err(), "`lahf` defines a value");
+
+        let mut wrong = SsaFunctionBuilder::<MockTarget>::new(0, 0);
+        let outcome = wrong.in_block(0, |block| {
+            let _ = block.flag_adjust(i32_tmp(), FlagAdjustKind::ClearInterrupt, Vec::new())?;
+            Ok(())
+        });
+        assert!(outcome.is_err(), "`cli` defines no value");
     }
 
     #[test]

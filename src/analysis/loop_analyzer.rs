@@ -25,10 +25,10 @@
 
 use crate::{
     analysis::{
-        cfg::SsaCfg,
+        exceptions::EhCfg,
         loops::{LoopForest, detect_loops},
     },
-    graph::{RootedGraph, algorithms},
+    graph::{NodeId, algorithms},
     ir::function::SsaFunction,
     target::Target,
 };
@@ -46,16 +46,24 @@ use crate::{
 /// This is a thin wrapper around the generic `detect_loops` function,
 /// providing a convenient SSA-specific interface.
 pub struct LoopAnalyzer<'a, T: Target> {
-    /// The SSA-based control flow graph used for dominance computation and loop detection.
-    cfg: SsaCfg<'a, T>,
+    /// The exception-aware flow view used for dominance and back-edge detection.
+    ///
+    /// A back edge is one whose target dominates its source, and
+    /// `DominatorTree::dominates` answers `false` whenever either endpoint is
+    /// unreachable. Under a terminator-only graph both endpoints of a loop
+    /// inside a handler are unreachable, so such a loop is invisible: no
+    /// `LoopInfo` is created and every loop pass silently declines to act on
+    /// it. Rooting here makes handler loops ordinary loops.
+    eh: EhCfg<'a, T>,
 }
 
 impl<'a, T: Target> LoopAnalyzer<'a, T> {
     /// Creates a new loop analyzer for the given SSA function.
     #[must_use]
     pub fn new(ssa: &'a SsaFunction<T>) -> Self {
-        let cfg = SsaCfg::from_ssa(ssa);
-        Self { cfg }
+        Self {
+            eh: EhCfg::from_ssa(ssa),
+        }
     }
 
     /// Analyzes all loops and returns a [`LoopForest`].
@@ -64,8 +72,8 @@ impl<'a, T: Target> LoopAnalyzer<'a, T> {
     /// back edge detection and computes preheaders, exits, loop types, and nesting.
     #[must_use]
     pub fn analyze(&self) -> LoopForest {
-        let dominators = algorithms::compute_dominators(&self.cfg, self.cfg.entry());
-        detect_loops(&self.cfg, &dominators)
+        let dominators = algorithms::compute_dominators(&self.eh, NodeId::new(0));
+        detect_loops(&self.eh, &dominators)
     }
 }
 

@@ -1,11 +1,25 @@
-//! Native machine-state modeling — registers, state accesses, clobbers, and
-//! condition-flag semantics — plus the structural binary / unary operation
+//! Native machine-state modeling — block-string streams, wide compare-exchange,
+//! and condition-flag semantics — plus the structural binary / unary operation
 //! views used by generic passes.
+//!
+//! State an operation touches is named by the operation: registers it writes
+//! are its `outputs`, flags it defines are the flags value it produces, and
+//! anything genuinely unmodelled is declared through
+//! [`SsaEffectKind::Opaque`], which is what
+//! actually constrains motion and elimination.
+//!
+//! [`SsaEffectKind::Opaque`]: super::SsaEffectKind::Opaque
 
 use std::fmt;
 
-use super::*;
-use crate::ir::variable::SsaVarId;
+use crate::ir::{
+    ops::{
+        effects::{SsaEffectKind, SsaEffects},
+        kinds::{AtomicRmwOp, NativeInstructionMetadata},
+        operands::impl_kinded_payload,
+    },
+    variable::SsaVarId,
+};
 
 /// Structured identity of a typed native **block-string** operation
 /// ([`SsaOp::BlockString`]) — the first-class replacement for the
@@ -13,8 +27,12 @@ use crate::ir::variable::SsaVarId;
 /// opaquely by `NativeOpaque`. (`rep movs`/`rep stos` already lower to the
 /// structured `CopyBlk`/`InitBlk` ops and are not represented here.) The kind
 /// drives a precise effect summary and a distinct similarity class.
+///
+/// [`SsaOp::BlockString`]: crate::ir::ops::def::SsaOp::BlockString
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u16)]
+#[derive(num_enum::IntoPrimitive, num_enum::TryFromPrimitive)]
 pub enum BlockStringKind {
     /// `rep`/`repe`/`repne cmps*` — streamed element compare (reads two
     /// buffers, sets flags). Reads and writes machine state (counter/pointers).
@@ -41,6 +59,8 @@ impl BlockStringKind {
 
     /// Stable display / fingerprint key for this block-string op (used by
     /// [`SsaOp::opcode_name`]).
+    ///
+    /// [`SsaOp::opcode_name`]: crate::ir::ops::def::SsaOp::opcode_name
     #[must_use]
     pub const fn kind_str(self) -> &'static str {
         match self {
@@ -67,10 +87,12 @@ pub enum BlockStringPrefix {
 
 /// Boxed payload for [`SsaOp::BlockString`]. Mirrors the native-op operand
 /// shape — explicit SSA inputs/outputs (advanced counter/pointers, loaded
-/// accumulator), clobbered architectural state (memory, flags), and optional
-/// source provenance — but the effect summary and similarity class derive from
-/// the [`BlockStringKind`], not an echoed opaque blob. Carries the repeat
-/// prefix and element width so the native mnemonic round-trips losslessly.
+/// accumulator) and optional source provenance — with the effect summary and
+/// similarity class derived from the [`BlockStringKind`] rather than from an
+/// echoed opaque blob. Carries the repeat prefix and element width so the
+/// native mnemonic round-trips losslessly.
+///
+/// [`SsaOp::BlockString`]: crate::ir::ops::def::SsaOp::BlockString
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockStringOpData {
@@ -89,8 +111,6 @@ pub struct BlockStringOpData {
     pub outputs: Vec<SsaVarId>,
     /// Explicit SSA inputs used by the operation (buffer addresses, count).
     pub inputs: Vec<SsaVarId>,
-    /// Architectural state the operation clobbers (block memory, flags).
-    pub clobbers: Vec<NativeClobber>,
     /// `true` when the operation proceeds from high to low addresses (x86 `rep
     /// cmps`/`scas`/`lods` with the direction flag set); `false` is forward.
     pub reverse: bool,
@@ -103,6 +123,9 @@ pub struct BlockStringOpData {
 /// it carries explicit `EDX:EAX`-vs-memory expected / `ECX:EBX` desired inputs
 /// and `EDX:EAX` readback outputs, with a precise sequentially-consistent
 /// atomic effect (never opaque).
+///
+/// [`SsaOp::WideCompareExchange`]: crate::ir::ops::def::SsaOp::WideCompareExchange
+/// [`SsaOp::CmpXchg`]: crate::ir::ops::def::SsaOp::CmpXchg
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WideCmpXchgData {
@@ -116,284 +139,6 @@ pub struct WideCmpXchgData {
     pub outputs: Vec<SsaVarId>,
     /// Explicit SSA inputs (memory address, expected low/high, desired low/high).
     pub inputs: Vec<SsaVarId>,
-    /// Architectural state the operation clobbers (ZF / flags).
-    pub clobbers: Vec<NativeClobber>,
-}
-
-/// Target register or subregister identity used by native machine-state effects.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct NativeRegister {
-    /// Architecture or target family that owns the register.
-    pub architecture: String,
-    /// Register bank or class, such as `gpr`, `xmm`, `zmm`, `p`, or `csr`.
-    pub bank: String,
-    /// Canonical full-register name used for alias comparisons.
-    pub base: String,
-    /// Specific architectural spelling, such as `al`, `eax`, `rax`, or `x0`.
-    pub name: String,
-    /// Bit offset within the canonical full register.
-    pub bit_offset: u32,
-    /// Bit width of this register view.
-    pub bit_width: u32,
-}
-
-impl NativeRegister {
-    /// Creates a native register descriptor.
-    ///
-    /// Returns `None` when any identity field is empty or `bit_width` is zero.
-    #[must_use]
-    pub fn new(
-        architecture: impl Into<String>,
-        bank: impl Into<String>,
-        base: impl Into<String>,
-        name: impl Into<String>,
-        bit_offset: u32,
-        bit_width: u32,
-    ) -> Option<Self> {
-        let architecture = architecture.into();
-        let bank = bank.into();
-        let base = base.into();
-        let name = name.into();
-        if architecture.is_empty() || bank.is_empty() || base.is_empty() || name.is_empty() {
-            return None;
-        }
-        if bit_width == 0 {
-            return None;
-        }
-        Some(Self {
-            architecture,
-            bank,
-            base,
-            name,
-            bit_offset,
-            bit_width,
-        })
-    }
-
-    /// Returns `true` when this register view overlaps `other`.
-    #[must_use]
-    pub fn aliases(&self, other: &Self) -> bool {
-        if self.architecture != other.architecture
-            || self.bank != other.bank
-            || self.base != other.base
-        {
-            return false;
-        }
-        let self_end = self.bit_offset.saturating_add(self.bit_width);
-        let other_end = other.bit_offset.saturating_add(other.bit_width);
-        self.bit_offset < other_end && other.bit_offset < self_end
-    }
-
-    /// Returns `true` when this register descriptor has valid identity and width fields.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        !self.architecture.is_empty()
-            && !self.bank.is_empty()
-            && !self.base.is_empty()
-            && !self.name.is_empty()
-            && self.bit_width != 0
-    }
-}
-
-/// Abstract native machine-state location.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum NativeStateLocation {
-    /// Concrete architectural register or subregister.
-    Register(NativeRegister),
-    /// Register class whose concrete member is unknown or intentionally grouped.
-    RegisterClass(String),
-    /// Target flag register or named flag set.
-    Flags(String),
-    /// Architectural stack pointer state.
-    StackPointer,
-    /// Architectural program counter or instruction pointer state.
-    ProgramCounter,
-    /// Runtime vector-length configuration, such as AArch64 SVE `VL` or RISC-V `vl`.
-    VectorLength,
-    /// Runtime vector type/configuration state, such as RISC-V `vtype`.
-    VectorConfig,
-    /// Predicate or mask architectural state not represented as an SSA value.
-    PredicateState(String),
-    /// Control or status register.
-    ControlRegister(String),
-    /// Abstract memory location or memory class.
-    Memory(String),
-    /// Target-specific state not otherwise categorized.
-    Other(String),
-}
-
-/// Access mode for a native machine-state location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum NativeStateAccessKind {
-    /// Reads the prior state value.
-    Read,
-    /// Writes the state without reading the prior value.
-    Write,
-    /// Reads and writes the state.
-    ReadWrite,
-    /// Clobbers the state with an unknown value.
-    Clobber,
-}
-
-impl NativeStateAccessKind {
-    /// Returns `true` when the access reads prior state.
-    #[must_use]
-    pub const fn reads(self) -> bool {
-        matches!(self, Self::Read | Self::ReadWrite)
-    }
-
-    /// Returns `true` when the access writes or clobbers state.
-    #[must_use]
-    pub const fn writes(self) -> bool {
-        matches!(self, Self::Write | Self::ReadWrite | Self::Clobber)
-    }
-}
-
-/// Explicit native machine-state access for opaque and native operations.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct NativeStateAccess {
-    /// Machine-state location being accessed.
-    pub location: NativeStateLocation,
-    /// Access mode for the location.
-    pub kind: NativeStateAccessKind,
-    /// Optional access width when the state has a meaningful bit width.
-    pub width_bits: Option<u32>,
-    /// Whether the access is implicit in the native instruction encoding.
-    pub implicit: bool,
-}
-
-impl NativeStateAccess {
-    /// Creates a native machine-state access descriptor.
-    ///
-    /// Returns `None` when `width_bits` is present but zero.
-    #[must_use]
-    pub fn new(
-        location: NativeStateLocation,
-        kind: NativeStateAccessKind,
-        width_bits: Option<u32>,
-        implicit: bool,
-    ) -> Option<Self> {
-        if let Some(0) = width_bits {
-            return None;
-        }
-        Some(Self {
-            location,
-            kind,
-            width_bits,
-            implicit,
-        })
-    }
-
-    /// Creates an implicit read of a machine-state location.
-    #[must_use]
-    pub fn implicit_read(location: NativeStateLocation, width_bits: Option<u32>) -> Option<Self> {
-        Self::new(location, NativeStateAccessKind::Read, width_bits, true)
-    }
-
-    /// Creates an implicit write of a machine-state location.
-    #[must_use]
-    pub fn implicit_write(location: NativeStateLocation, width_bits: Option<u32>) -> Option<Self> {
-        Self::new(location, NativeStateAccessKind::Write, width_bits, true)
-    }
-
-    /// Creates an implicit read-write access to a machine-state location.
-    #[must_use]
-    pub fn implicit_read_write(
-        location: NativeStateLocation,
-        width_bits: Option<u32>,
-    ) -> Option<Self> {
-        Self::new(location, NativeStateAccessKind::ReadWrite, width_bits, true)
-    }
-
-    /// Returns `true` when this access reads prior machine state.
-    #[must_use]
-    pub const fn reads(&self) -> bool {
-        self.kind.reads()
-    }
-
-    /// Returns `true` when this access writes or clobbers machine state.
-    #[must_use]
-    pub const fn writes(&self) -> bool {
-        self.kind.writes()
-    }
-
-    /// Returns `true` when this machine-state access is structurally valid.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        if let Some(0) = self.width_bits {
-            return false;
-        }
-        match &self.location {
-            NativeStateLocation::Register(register) => register.is_valid(),
-            NativeStateLocation::RegisterClass(name)
-            | NativeStateLocation::Flags(name)
-            | NativeStateLocation::PredicateState(name)
-            | NativeStateLocation::ControlRegister(name)
-            | NativeStateLocation::Memory(name)
-            | NativeStateLocation::Other(name) => !name.is_empty(),
-            NativeStateLocation::StackPointer
-            | NativeStateLocation::ProgramCounter
-            | NativeStateLocation::VectorLength
-            | NativeStateLocation::VectorConfig => true,
-        }
-    }
-}
-
-/// Abstract location clobbered by an opaque native operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum NativeClobber {
-    /// Structured machine-state access.
-    MachineState(NativeStateAccess),
-    /// Concrete target register or subregister.
-    Register(NativeRegister),
-    /// A target register or register alias class.
-    RegisterClass(String),
-    /// A target flag set such as x86 `eflags`.
-    Flags(String),
-    /// An abstract memory location or memory class.
-    Memory(String),
-    /// Target-specific state not represented by data or memory operands.
-    Other(String),
-}
-
-impl NativeClobber {
-    /// Returns `true` when this clobber touches register state.
-    #[must_use]
-    pub fn touches_registers(&self) -> bool {
-        match self {
-            Self::MachineState(access) => matches!(
-                access.location,
-                NativeStateLocation::Register(_) | NativeStateLocation::RegisterClass(_)
-            ),
-            Self::Register(_) | Self::RegisterClass(_) => true,
-            Self::Flags(_) | Self::Memory(_) | Self::Other(_) => false,
-        }
-    }
-
-    /// Returns `true` when this clobber touches flags or condition-code state.
-    #[must_use]
-    pub fn touches_flags(&self) -> bool {
-        match self {
-            Self::MachineState(access) => matches!(access.location, NativeStateLocation::Flags(_)),
-            Self::Flags(_) => true,
-            Self::Register(_) | Self::RegisterClass(_) | Self::Memory(_) | Self::Other(_) => false,
-        }
-    }
-
-    /// Returns `true` when this clobber touches memory state.
-    #[must_use]
-    pub fn touches_memory(&self) -> bool {
-        match self {
-            Self::MachineState(access) => matches!(access.location, NativeStateLocation::Memory(_)),
-            Self::Memory(_) => true,
-            Self::Register(_) | Self::RegisterClass(_) | Self::Flags(_) | Self::Other(_) => false,
-        }
-    }
 }
 
 impl fmt::Display for AtomicRmwOp {
@@ -432,10 +177,81 @@ impl FlagsMask {
     pub const SIGN: Self = Self(1 << 4);
     /// Overflow flag bit.
     pub const OVERFLOW: Self = Self(1 << 5);
+    /// String-direction flag bit (x86 `DF`). A control flag, not a status flag:
+    /// no comparison produces it and no condition code reads it, so it is
+    /// deliberately outside [`Self::x86_status`].
+    pub const DIRECTION: Self = Self(1 << 6);
+    /// Interrupt-enable flag bit (x86 `IF`).
+    pub const INTERRUPT: Self = Self(1 << 7);
+    /// Alignment-check / access-control flag bit (x86 `AC`).
+    pub const ALIGN_CHECK: Self = Self(1 << 8);
 
-    /// Creates a flag mask from raw bits.
+    /// Every defined flag bit paired with its display name, in bit order.
+    ///
+    /// The single table [`Self::ALL`], [`Self::is_valid`] and the
+    /// [`Display`](fmt::Display) impl are all derived from. A bit added here
+    /// becomes valid, printable and round-trippable in one edit; a bit added as
+    /// a bare constant and not listed here stays *undefined*, which the
+    /// verifier and the block builder both reject — so the table is the
+    /// definition of the mask, not a copy of it.
+    pub const NAMED: &'static [(Self, &'static str)] = &[
+        (Self::CARRY, "CF"),
+        (Self::PARITY, "PF"),
+        (Self::ADJUST, "AF"),
+        (Self::ZERO, "ZF"),
+        (Self::SIGN, "SF"),
+        (Self::OVERFLOW, "OF"),
+        (Self::DIRECTION, "DF"),
+        (Self::INTERRUPT, "IF"),
+        (Self::ALIGN_CHECK, "AC"),
+    ];
+
+    /// The union of every defined flag bit.
+    pub const ALL: Self = Self::union_of(Self::NAMED);
+
+    /// Folds a slice of named bits into their union.
+    ///
+    /// Written as a recursion over slice patterns because a `const` context has
+    /// no iterators, and indexing is denied crate-wide.
+    const fn union_of(named: &[(Self, &'static str)]) -> Self {
+        match named {
+            [] => Self(0),
+            [(first, _), rest @ ..] => Self(first.0 | Self::union_of(rest).0),
+        }
+    }
+
+    /// Creates a flag mask from raw bits, defined or not.
+    ///
+    /// Deliberately unmasked: a mask read back from a persisted blob must equal
+    /// the one written, so undefined bits survive to be *reported* rather than
+    /// being silently dropped here. [`Self::from_bits_checked`] is the
+    /// validating constructor, and [`Self::is_valid`] the predicate.
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
+    }
+
+    /// Creates a flag mask from raw bits, rejecting undefined ones.
+    ///
+    /// `None` when `bits` names a flag this crate does not model — which is a
+    /// diagnosable input error, not a mask with fewer bits.
+    #[must_use]
+    pub const fn from_bits_checked(bits: u16) -> Option<Self> {
+        let mask = Self(bits);
+        if mask.is_valid() { Some(mask) } else { None }
+    }
+
+    /// Returns `true` when every bit set in this mask is a defined flag.
+    ///
+    /// The empty mask is valid: selecting no flags is a legal thing to ask for.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.0 & !Self::ALL.0 == 0
+    }
+
+    /// Returns the bits set in this mask that name no defined flag.
+    #[must_use]
+    pub const fn undefined_bits(self) -> u16 {
+        self.0 & !Self::ALL.0
     }
     /// Returns the raw flag bits.
     pub const fn bits(self) -> u16 {
@@ -449,6 +265,12 @@ impl FlagsMask {
     /// Returns `true` when all bits in `other` are selected by this mask.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// Returns `true` when this mask and `other` select at least one bit in
+    /// common.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
     }
 
     /// Returns the union of two flag masks.
@@ -477,53 +299,38 @@ impl FlagsMask {
             NativeFlagBit::Zero => Self::ZERO,
             NativeFlagBit::Sign => Self::SIGN,
             NativeFlagBit::Overflow => Self::OVERFLOW,
+            NativeFlagBit::Direction => Self::DIRECTION,
+            NativeFlagBit::Interrupt => Self::INTERRUPT,
+            NativeFlagBit::AlignCheck => Self::ALIGN_CHECK,
         }
     }
 }
 
 impl fmt::Display for FlagsMask {
+    /// Renders the selected flags as `CF,ZF`, and `none` when nothing is
+    /// selected.
+    ///
+    /// Bits outside [`FlagsMask::NAMED`] are appended as `?0x…` rather than
+    /// dropped, so an invalid mask cannot render as `none` or as a truncated
+    /// but plausible-looking list — the two spellings that would make a
+    /// malformed mask read as a well-formed one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
-        if self.0 & Self::CARRY.0 != 0 {
-            if !first {
-                write!(f, ",")?;
+        for (bit, name) in Self::NAMED {
+            if self.intersects(*bit) {
+                if !first {
+                    write!(f, ",")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
             }
-            write!(f, "CF")?;
-            first = false;
         }
-        if self.0 & Self::PARITY.0 != 0 {
+        let undefined = self.undefined_bits();
+        if undefined != 0 {
             if !first {
                 write!(f, ",")?;
             }
-            write!(f, "PF")?;
-            first = false;
-        }
-        if self.0 & Self::ADJUST.0 != 0 {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "AF")?;
-            first = false;
-        }
-        if self.0 & Self::ZERO.0 != 0 {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "ZF")?;
-            first = false;
-        }
-        if self.0 & Self::SIGN.0 != 0 {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "SF")?;
-            first = false;
-        }
-        if self.0 & Self::OVERFLOW.0 != 0 {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "OF")?;
+            write!(f, "?0x{undefined:x}")?;
             first = false;
         }
         if first {
@@ -549,6 +356,13 @@ pub enum NativeFlagBit {
     Sign,
     /// Signed overflow flag, such as x86 `OF` or AArch64 `V`.
     Overflow,
+    /// String-direction control flag (x86 `DF`) — selects whether the string
+    /// operations advance or retreat. Not a status flag.
+    Direction,
+    /// Interrupt-enable control flag (x86 `IF`).
+    Interrupt,
+    /// Alignment-check / access-control flag (x86 `AC`).
+    AlignCheck,
 }
 
 /// Describes how an instruction writes one native status flag.
@@ -1109,4 +923,11 @@ pub struct UnaryOpInfo {
     pub dest: SsaVarId,
     /// The operand.
     pub operand: SsaVarId,
+}
+
+impl_kinded_payload! {
+    BlockStringOpData {
+        kind, prefix, element_bits, mnemonic, metadata, outputs, inputs, reverse
+    };
+    WideCmpXchgData { wide, mnemonic, metadata, outputs, inputs };
 }

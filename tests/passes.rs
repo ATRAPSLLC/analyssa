@@ -10,9 +10,8 @@ use analyssa::{
         function::SsaFunction,
         instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, FenceKind, FlagsMask, NativeClobber,
-            NativeOpaqueData, SsaEffectKind, SsaEffects, SsaOp, VectorFaultMode, VectorMaskMode,
-            VectorSegmentLayout,
+            AtomicAccessWidth, AtomicOrdering, FenceKind, FlagsMask, NativeOpaqueData,
+            SsaEffectKind, SsaEffects, SsaOp, VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
@@ -351,7 +350,6 @@ fn build_native_side_effect_fixture() -> SsaFunction<MockTarget> {
         metadata: None,
         outputs: vec![native_out],
         inputs: vec![value],
-        clobbers: vec![NativeClobber::Flags("rflags".to_string())],
         effects: SsaEffects::new(SsaEffectKind::Write, false),
     }))));
     block.add_instruction(instr(SsaOp::AtomicExchange {
@@ -681,7 +679,7 @@ fn jump_threading_uses_incoming_phi_values_to_redirect_predecessors() {
 
     assert!(matches!(terminator_at(&ssa, 0), SsaOp::Jump { target: 3 }));
     if let Some(block) = ssa.block(1)
-        && let Some(terminator) = block.terminator_op()
+        && let Some(terminator) = block.control_terminator()
     {
         assert!(matches!(terminator, SsaOp::Jump { target: 4 }));
     }
@@ -1452,7 +1450,6 @@ fn dead_code_elimination_keeps_effectful_native_opaque_when_unused() {
         metadata: None,
         outputs: vec![output],
         inputs: vec![input],
-        clobbers: Vec::new(),
         effects: SsaEffects::new(SsaEffectKind::Write, false),
     }))));
     block.add_instruction(instr(SsaOp::Return { value: None }));

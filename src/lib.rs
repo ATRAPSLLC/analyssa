@@ -18,14 +18,16 @@
 //!
 //! **Graph Infrastructure** (`graph`): A generic directed graph with node,
 //! edge, and indexed-graph abstractions, plus algorithms for dominators,
-//! strongly-connected components, cycle detection, topological sort, and
-//! traversal (BFS/DFS).
+//! post-dominance and control dependence, strongly-connected components, cycle
+//! detection, topological sort, and traversal (BFS/DFS).
 //!
 //! **Analyses** (`analysis`): A suite of SSA analyses including control-flow
 //! graph computation, constant propagation, def-use chains, liveness analysis,
 //! memory SSA, pattern matching, phi placement, range analysis, symbolic
 //! execution via an abstract evaluator, a dataflow-analysis framework (lattice,
-//! solver, SCCP, reaching definitions, dataflow liveness), and a verifier.
+//! solver, SCCP, reaching definitions, dataflow liveness), structured
+//! control-flow recovery and its IR bridge
+//! ([`crate::analysis::recovery::structure_ssa`]), and a verifier.
 //!
 //! **Transformation Passes** (`passes`): Optimization and deobfuscation passes
 //! including algebraic simplification, block merging, control-flow
@@ -55,9 +57,8 @@
 //!   IR data model — the operation-kind taxonomy
 //!   ([`crate::ir::ops::AtomicRmwOp`], the `Vector*Kind` family,
 //!   [`crate::ir::ops::SystemOpKind`], [`crate::ir::ops::SsaOpClass`], …), the
-//!   native descriptors ([`crate::ir::ops::NativeRegister`],
-//!   [`crate::ir::ops::NativeStateLocation`],
-//!   [`crate::ir::ops::NativeInstructionMetadata`]), and the SSA graph itself:
+//!   native descriptors ([`crate::ir::ops::NativeInstructionMetadata`],
+//!   [`crate::ir::ops::FlagsMask`]), and the SSA graph itself:
 //!   [`crate::ir::SsaFunction`] and everything reachable from it
 //!   ([`crate::ir::SsaBlock`], [`crate::ir::SsaInstruction`],
 //!   [`crate::ir::SsaOp`], [`crate::ir::PhiNode`], [`crate::ir::SsaVariable`],
@@ -73,7 +74,7 @@
 //!   `(key, value)` sequences so the IR round-trips in formats that only accept
 //!   string map keys (JSON among them).
 //!
-//!   Not covered: borrowed views ([`crate::ir::ops::SsaDefs`],
+//!   Not covered: derived views ([`crate::ir::ops::SsaDefs`],
 //!   [`crate::ir::ops::MemoryEffect`]), transient pass machinery (builders,
 //!   editors, edit reports), and [`crate::ir::ops::SsaFeatureToken`] — its
 //!   `&'static str` opcode can serialize but cannot deserialize.

@@ -417,7 +417,7 @@ impl<'a, T: Target> PhiAnalyzer<'a, T> {
 }
 
 /// Callback type for resolving Leave targets in exception handler blocks.
-pub(crate) type LeaveTargetFn<'a, T> = dyn Fn(usize, &[SsaBlock<T>]) -> Option<usize> + 'a;
+type LeaveTargetFn<'a, T> = dyn Fn(usize, &[SsaBlock<T>]) -> Option<usize> + 'a;
 
 /// Input sets and callbacks used when placing pruned phi nodes.
 pub struct PhiPlacementConfig<'a, T: Target> {

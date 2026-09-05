@@ -1675,7 +1675,7 @@ impl<T: Target> OpaquePredicatePass<T> {
                 condition,
                 true_target,
                 false_target,
-            }) = block.terminator_op()
+            }) = block.control_terminator()
             {
                 // Check phi constants first
                 if let Some(const_val) = phi_constants.get(condition) {

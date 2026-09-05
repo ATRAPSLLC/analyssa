@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    analysis::{loop_analyzer::SsaLoopAnalysis, loops::LoopInfo},
+    analysis::{cfg::SsaCfg, loop_analyzer::SsaLoopAnalysis, loops::LoopInfo},
     events::{EventKind, EventListener},
     graph::NodeId,
     ir::{
@@ -112,9 +112,32 @@ where
         // One predecessor relation per round, shared by every loop. Deriving it
         // per loop would be O(blocks) each, so a function with many loops would
         // pay O(loops x blocks).
-        let predecessors = ssa.compute_predecessors();
+        let predecessors = SsaCfg::from_ssa(ssa).to_predecessor_sets();
+
+        // A loop whose header the runtime dispatches to cannot be canonicalised
+        // by splicing a block in front of it. A preheader works by redirecting
+        // the terminators that name the header, and no terminator names this
+        // one -- so the preheader would sit between nothing and the header
+        // while the runtime kept entering the header directly.
+        //
+        // Loops inside handlers are now detected, so this is reachable where it
+        // previously was not. LICM needs no matching guard: `plan_loop_hoist`
+        // already returns `None` unless the preheader's terminator names the
+        // header, which is false by construction for such a loop.
+        let exception_entries = ssa.exception_blocks();
+        let is_runtime_entry: Vec<bool> = (0..ssa.block_count())
+            .map(|block| exception_entries.is_runtime_entry(block))
+            .collect();
+        drop(exception_entries);
 
         for loop_info in forest.by_depth_descending() {
+            if is_runtime_entry
+                .get(loop_info.header.index())
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if !loop_info.has_preheader() {
                 let non_loop_preds = get_non_loop_predecessors(&predecessors, loop_info);
                 if non_loop_preds.len() > 1 {
@@ -141,8 +164,13 @@ where
 /// Returns the loop header's predecessors that lie outside the loop body.
 ///
 /// Reads the precomputed predecessor relation rather than re-deriving it by
-/// scanning every block's terminator. Besides being O(preds) instead of
-/// O(blocks), this sees exception edges, which a terminator scan cannot.
+/// scanning every block's terminator, which is O(preds) instead of O(blocks).
+///
+/// These are the blocks a preheader would have to be spliced in front of, so
+/// they must be blocks whose terminator really does transfer to the header —
+/// exactly what the relation records. A block the runtime dispatches to
+/// carries no such transfer and must not be counted here, or the preheader is
+/// inserted for an edge no terminator can be redirected along.
 fn get_non_loop_predecessors(predecessors: &[Vec<usize>], loop_info: &LoopInfo) -> Vec<usize> {
     let header_idx = loop_info.header.index();
     predecessors

@@ -38,7 +38,7 @@ use std::hint::black_box;
 
 use analyssa::{
     PointerSize,
-    analysis::{DefUseIndex, LoopAnalyzer, SsaCfg, memory::MemorySsa},
+    analysis::{DefUseIndex, LoopAnalyzer, exceptions::EhCfg, memory::MemorySsa},
     events::NullListener,
     graph::{RootedGraph, algorithms::compute_dominators},
     ir::function::SsaFunction,
@@ -221,7 +221,7 @@ fn bench_scaling(c: &mut Criterion) {
 ///
 /// Within one fixpoint iteration each scheduled pass reconstructs what the
 /// previous pass discarded. `src/passes/` has 93 `count_uses` /
-/// `recompute_uses` call sites, 6 `SsaCfg::from_ssa`, and 4
+/// `recompute_uses` call sites, 6 `EhCfg::from_ssa`, and 4
 /// `DefUseIndex::build*` — so the per-variable use lists, not the heavier
 /// indexes, are what the pipeline rebuilds most.
 ///
@@ -235,8 +235,8 @@ fn bench_analysis_construction(c: &mut Criterion) {
 
     for scale in SCALES {
         for (id, ssa) in scaled(scale) {
-            group.bench_with_input(BenchmarkId::new("SsaCfg::from_ssa", &id), &ssa, |b, ssa| {
-                b.iter(|| black_box(SsaCfg::from_ssa(black_box(ssa))));
+            group.bench_with_input(BenchmarkId::new("EhCfg::from_ssa", &id), &ssa, |b, ssa| {
+                b.iter(|| black_box(EhCfg::from_ssa(black_box(ssa))));
             });
 
             group.bench_with_input(BenchmarkId::new("DefUseIndex", &id), &ssa, |b, ssa| {
@@ -244,8 +244,7 @@ fn bench_analysis_construction(c: &mut Criterion) {
             });
 
             group.bench_with_input(BenchmarkId::new("MemorySsa", &id), &ssa, |b, ssa| {
-                let cfg = SsaCfg::from_ssa(ssa);
-                b.iter(|| black_box(MemorySsa::build(black_box(ssa), &cfg, PointerSize::Bit64)));
+                b.iter(|| black_box(MemorySsa::build(black_box(ssa), PointerSize::Bit64)));
             });
 
             // The pipeline's most-rebuilt analysis by call-site count.
@@ -256,7 +255,7 @@ fn bench_analysis_construction(c: &mut Criterion) {
             // CFG + dominator tree, as GVN and range propagation build it.
             group.bench_with_input(BenchmarkId::new("cfg+dominators", &id), &ssa, |b, ssa| {
                 b.iter(|| {
-                    let cfg = SsaCfg::from_ssa(black_box(ssa));
+                    let cfg = EhCfg::from_ssa(black_box(ssa));
                     let entry = cfg.entry();
                     black_box(compute_dominators(&cfg, entry))
                 });

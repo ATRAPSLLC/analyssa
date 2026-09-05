@@ -100,7 +100,7 @@
 //! // an indirect store and an atomic exchange.
 //! let ssa = testing::memory_effect_fixture();
 //! let cfg = SsaCfg::from_ssa(&ssa);
-//! let mem_ssa = MemorySsa::build(&ssa, &cfg, PointerSize::Bit64);
+//! let mem_ssa = MemorySsa::build(&ssa, PointerSize::Bit64);
 //!
 //! // The store and the load are attributed to the same memory location.
 //! let object = SsaVarId::from_index(0);
@@ -146,7 +146,7 @@ const MAX_MEMORY_SSA_CELLS: usize = 4_000_000;
 use crate::{
     analysis::{
         address::{const_i64, normalize_address},
-        cfg::SsaCfg,
+        exceptions::EhCfg,
     },
     graph::{
         GraphBase, NodeId, RootedGraph, Successors,
@@ -734,6 +734,19 @@ pub enum MemoryDefSite {
         /// The block containing the phi node.
         block: usize,
     },
+    /// Defined by entry into an exception handler or filter.
+    ///
+    /// The runtime dispatches here from *somewhere* inside the protected
+    /// region, not from the end of it, so a store the region performs may or
+    /// may not have run. This version stands for "unknown, because the region
+    /// was interrupted", and it is deliberately not a [`Self::Store`]: the
+    /// forwarding in `passes::memory` matches only `Store`, so it declines to
+    /// forward across an exceptional edge by construction rather than by a
+    /// check somebody has to remember to write.
+    ExceptionEntry {
+        /// The handler or filter entry block.
+        block: usize,
+    },
 }
 
 /// One step of the dominator-tree walk in
@@ -831,7 +844,8 @@ impl<T: Target> MemorySsa<T> {
     ///
     /// A complete Memory SSA representation.
     #[must_use]
-    pub fn build(ssa: &SsaFunction<T>, cfg: &SsaCfg<'_, T>, ptr_size: PointerSize) -> Self {
+    pub fn build(ssa: &SsaFunction<T>, ptr_size: PointerSize) -> Self {
+        let eh = EhCfg::from_ssa(ssa);
         let mut mem_ssa = Self::new();
 
         // Phase 1: Identify all memory operations
@@ -862,10 +876,10 @@ impl<T: Target> MemorySsa<T> {
         }
 
         // Phase 2: Place memory phi nodes
-        mem_ssa.place_memory_phis(cfg);
+        mem_ssa.place_memory_phis(&eh);
 
         // Phase 3: Rename memory versions
-        mem_ssa.rename_memory_versions(ssa, cfg, ptr_size);
+        mem_ssa.rename_memory_versions(ssa, &eh, ptr_size);
 
         mem_ssa
     }
@@ -933,7 +947,29 @@ impl<T: Target> MemorySsa<T> {
     }
 
     /// Classifies an SSA operation as a memory operation, if applicable.
-    fn classify_memory_operation(
+    ///
+    /// Public because the classification — not the versioning built on top of
+    /// it — is what a consumer needs to ask "does this operation touch memory,
+    /// and which cell". Everything whose effect is not modelled classifies to a
+    /// [`MemoryOp::Barrier`] or [`MemoryOp::ReadWrite`] over
+    /// [`MemoryLocation::Unknown`], which may-aliases every location, so a
+    /// consumer that consults [`MemoryLocation::may_alias`] is conservative by
+    /// construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` — The function, for resolving address expressions and constant
+    ///   array indices.
+    /// * `op` — The operation to classify.
+    /// * `block` / `instr` — Position recorded on the returned [`MemoryOp`].
+    /// * `ptr_size` — Pointer width, for normalizing indirect addresses.
+    ///
+    /// # Returns
+    ///
+    /// The classified memory operation, or `None` when the operation touches no
+    /// memory.
+    #[must_use]
+    pub fn classify_memory_operation(
         ssa: &SsaFunction<T>,
         op: &SsaOp<T>,
         block: usize,
@@ -1126,15 +1162,15 @@ impl<T: Target> MemorySsa<T> {
     }
 
     /// Phase 2: Place memory phi nodes at dominance frontiers.
-    fn place_memory_phis(&mut self, cfg: &SsaCfg<'_, T>) {
-        let block_count = cfg.node_count();
+    fn place_memory_phis(&mut self, eh: &EhCfg<'_, T>) {
+        let block_count = eh.node_count();
         if block_count == 0 {
             return;
         }
 
         // Compute dominators and dominance frontiers
-        let dom_tree = compute_dominators(cfg, cfg.entry());
-        let frontiers = compute_dominance_frontiers(cfg, &dom_tree);
+        let dom_tree = compute_dominators(eh, eh.entry());
+        let frontiers = compute_dominance_frontiers(eh, &dom_tree);
 
         // A definition of `L` is also a definition of every location it may
         // alias. Memory versions are per-location, so without this a store to
@@ -1223,16 +1259,16 @@ impl<T: Target> MemorySsa<T> {
     fn rename_memory_versions(
         &mut self,
         ssa: &SsaFunction<T>,
-        cfg: &SsaCfg<'_, T>,
+        eh: &EhCfg<'_, T>,
         ptr_size: PointerSize,
     ) {
-        let block_count = cfg.node_count();
+        let block_count = eh.node_count();
         if block_count == 0 {
             return;
         }
 
         // Compute dominators for traversal order
-        let dom_tree = compute_dominators(cfg, cfg.entry());
+        let dom_tree = compute_dominators(eh, eh.entry());
 
         // Live version stack per location; the top is the version reaching the
         // block currently being renamed.
@@ -1254,7 +1290,7 @@ impl<T: Target> MemorySsa<T> {
 
         // Rename in dominator-tree preorder, restoring scope on the way out.
         let mut visited = vec![false; block_count];
-        let mut worklist = vec![RenameStep::Enter(cfg.entry().index())];
+        let mut worklist = vec![RenameStep::Enter(eh.entry().index())];
 
         while let Some(step) = worklist.pop() {
             match step {
@@ -1268,7 +1304,7 @@ impl<T: Target> MemorySsa<T> {
                     }
 
                     let pushed =
-                        self.rename_block(block_idx, ssa, cfg, &mut version_stacks, ptr_size);
+                        self.rename_block(block_idx, ssa, eh, &mut version_stacks, ptr_size);
 
                     // Pushed before the children so it pops after all of them:
                     // the subtree runs with this block's definitions live.
@@ -1290,6 +1326,74 @@ impl<T: Target> MemorySsa<T> {
         }
     }
 
+    /// Gives every location the protected region may have written a fresh
+    /// version at an exception root, standing for "unknown".
+    ///
+    /// Block dominance says the guard executed wholly before the handler; the
+    /// runtime leaves it part-way. Without this, renaming pushes the guard's
+    /// version into the handler and a later pass reads a store that the throw
+    /// may have pre-empted.
+    ///
+    /// A location whose live version was **not** defined inside the region is
+    /// left alone: a store completed before the region started is as visible in
+    /// the handler as anywhere else. When the region's extent is unknown, every
+    /// location is killed, which is the conservative direction.
+    ///
+    /// Returns the locations pushed, for the caller to pop on the way out.
+    fn kill_at_exception_root(
+        &mut self,
+        block_idx: usize,
+        eh: &EhCfg<'_, T>,
+        version_stacks: &mut HashMap<MemoryLocation<T>, Vec<u32>>,
+    ) -> Vec<MemoryLocation<T>> {
+        let region = eh.roots().region_of(block_idx);
+        let mut killed: Vec<MemoryLocation<T>> = Vec::new();
+
+        for location in &self.ordered_locations {
+            let live = version_stacks
+                .get(location)
+                .and_then(|stack| stack.last().copied());
+            let Some(live) = live else {
+                continue;
+            };
+            let defined_in_region = match self
+                .definitions
+                .get(&MemoryVersion::new(location.clone(), live))
+            {
+                // An unknown extent could have written anything.
+                None => true,
+                Some(MemoryDefSite::Store { block, .. }) => {
+                    region.as_ref().is_none_or(|range| range.contains(block))
+                }
+                Some(MemoryDefSite::Phi { block }) => {
+                    region.as_ref().is_none_or(|range| range.contains(block))
+                }
+                // Already unknown, or the function-entry state, which the
+                // region cannot have disturbed without a store.
+                Some(MemoryDefSite::ExceptionEntry { .. }) => false,
+                Some(MemoryDefSite::Entry) => false,
+            };
+            if !defined_in_region {
+                continue;
+            }
+            killed.push(location.clone());
+        }
+
+        for location in &killed {
+            let version = self.allocate_version(location);
+            version_stacks
+                .entry(location.clone())
+                .or_default()
+                .push(version);
+            self.definitions.insert(
+                MemoryVersion::new(location.clone(), version),
+                MemoryDefSite::ExceptionEntry { block: block_idx },
+            );
+        }
+
+        killed
+    }
+
     /// Renames memory versions within a single block.
     ///
     /// Returns one entry per version pushed onto [`version_stacks`], which the
@@ -1301,11 +1405,18 @@ impl<T: Target> MemorySsa<T> {
         &mut self,
         block_idx: usize,
         ssa: &SsaFunction<T>,
-        cfg: &SsaCfg<'_, T>,
+        eh: &EhCfg<'_, T>,
         version_stacks: &mut HashMap<MemoryLocation<T>, Vec<u32>>,
         ptr_size: PointerSize,
     ) -> Vec<MemoryLocation<T>> {
         let mut pushed: Vec<MemoryLocation<T>> = Vec::new();
+
+        // Entering a handler or filter: the region it protects was interrupted
+        // part-way, so any store the region made is not known to have run.
+        // Those locations get a fresh version standing for "unknown".
+        if eh.roots().is_flow_root(block_idx) {
+            pushed.extend(self.kill_at_exception_root(block_idx, eh, version_stacks));
+        }
 
         // Record entry versions. Every location was seeded with a stack, so
         // iterating the stacks covers `self.locations` without cloning it.
@@ -1380,7 +1491,7 @@ impl<T: Target> MemorySsa<T> {
         }
 
         // Fill in phi operands for successors
-        for succ_id in cfg.successors(NodeId::new(block_idx)) {
+        for succ_id in eh.successors(NodeId::new(block_idx)) {
             let succ_idx = succ_id.index();
             if let Some(phis) = self.memory_phis.get_mut(&succ_idx) {
                 for phi in phis {

@@ -51,7 +51,7 @@ use crate::{
 ///
 /// The function follows predecessor chains through removed blocks until it
 /// finds blocks that are being kept (have entries in `block_remap`).
-pub(crate) fn find_kept_predecessors(
+fn find_kept_predecessors(
     removed_block: usize,
     predecessors: &BTreeMap<usize, Vec<usize>>,
     block_remap: &[Option<usize>],
@@ -107,28 +107,20 @@ impl<T: Target> SsaFunction<T> {
         let block_count = self.blocks.len();
         let mut protected_blocks = BitSet::new(block_count);
 
-        // Protect exception handler entry blocks
+        // Protect the first block of every clause part. Read through the total
+        // `parts()` view, so a clause the verifier would reject still keeps its
+        // boundaries alive.
         for handler in &self.exception_handlers {
-            if let Some(try_block) = handler.try_start_block
-                && try_block < block_count
-            {
-                protected_blocks.insert(try_block);
-            }
-            if let Some(handler_block) = handler.handler_start_block
-                && handler_block < block_count
-            {
-                protected_blocks.insert(handler_block);
-            }
-            if let Some(filter_block) = handler.filter_start_block
-                && filter_block < block_count
-            {
-                protected_blocks.insert(filter_block);
+            for (_, range) in handler.parts() {
+                if range.start() < block_count {
+                    protected_blocks.insert(range.start());
+                }
             }
         }
 
         // Protect Leave targets (exception handler exit blocks)
         for block in &self.blocks {
-            if let Some(SsaOp::Leave { target }) = block.terminator_op()
+            if let Some(SsaOp::Leave { target }) = block.control_terminator()
                 && *target < block_count
             {
                 protected_blocks.insert(*target);
@@ -404,7 +396,7 @@ impl<T: Target> SsaFunction<T> {
             let block = self.blocks.get(current)?;
 
             // Get the terminator's target
-            let terminator = block.terminator_op();
+            let terminator = block.control_terminator();
             let target = terminator.and_then(|op| match op {
                 SsaOp::Jump { target } => Some(*target),
                 // For branches, we can't simplify - the block isn't truly empty

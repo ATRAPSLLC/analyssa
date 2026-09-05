@@ -873,25 +873,20 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ///
     /// `true` if constraints were successfully derived, `false` otherwise.
     pub fn apply_branch_constraint(&mut self, condition: SsaVarId, took_true_branch: bool) -> bool {
-        // Find the definition of the condition variable to understand what comparison it represents
-        let Some(ssa_var) = self.ssa.variable(condition) else {
+        // Scan-free lookup, and `false` is the failure policy. A stale def site
+        // costs one branch its constraint — the evaluator already answers
+        // `false` for every condition it cannot read — where the recovering
+        // form would walk the whole function on each miss, and this runs once
+        // per branch *per fixed-point iteration*. Entry-defined variables make
+        // that concrete: they carry no instruction index and no phi to confirm,
+        // so a recovering lookup scans the function and still answers nothing.
+        // Deriving a constraint from a foreign instruction, by contrast, is not
+        // a weaker answer but a wrong one.
+        let Some(definition) = self.ssa.recorded_definition(condition) else {
             return false;
         };
 
-        let def_site = ssa_var.def_site();
-        let Some(block) = self.ssa.block(def_site.block) else {
-            return false;
-        };
-
-        let Some(instr_idx) = def_site.instruction else {
-            return false;
-        };
-
-        let Some(instr) = block.instruction(instr_idx) else {
-            return false;
-        };
-
-        self.derive_constraints_from_comparison(instr.op(), took_true_branch)
+        self.derive_constraints_from_comparison(definition.op(), took_true_branch)
     }
 
     /// Derives constraints from a comparison operation.
@@ -1045,12 +1040,14 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // Check if constraints imply a value
         // For now, we handle the case where we have conflicting constraints
         // which would indicate dead code
-        let ssa_var = self.ssa.variable(condition)?;
-        let def_site = ssa_var.def_site();
-        let block = self.ssa.block(def_site.block)?;
-        let instr_idx = def_site.instruction?;
-        let instr = block.instruction(instr_idx)?;
-        self.check_condition_against_constraints(instr.op())
+        //
+        // Scan-free lookup, and `None` — "cannot be determined" — is the
+        // failure policy, which is what this query already answers for a
+        // condition it cannot read. The alternative is not a weaker answer but
+        // a wrong one: a comparison belonging to another variable would decide
+        // this branch. See `apply_branch_constraint` for why the recovering
+        // form is the wrong trade here.
+        self.check_condition_against_constraints(self.ssa.recorded_definition(condition)?.op())
     }
 
     /// Checks if a comparison's result can be determined from constraints.
@@ -2133,14 +2130,16 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             return None;
         }
 
-        // Find the definition of this variable
-        let ssa_var = self.ssa.variable(var)?;
-        let def_site = ssa_var.def_site();
-        let block = self.ssa.block(def_site.block)?;
-        // Is it defined by a phi node? Without path context, it's unknown
-        let instr_idx = def_site.instruction?;
-        let instr = block.instruction(instr_idx)?;
-        let op = instr.op();
+        // Find the definition of this variable.
+        //
+        // Scan-free lookup, and `None` — one unresolved leaf in the symbolic
+        // tree — is the failure policy. This recurses through operands under
+        // `max_depth`, so a recovering lookup would multiply a whole-function
+        // scan by the traversal, and it bottoms out on arguments, whose entry
+        // def site has no instruction index for the scan to confirm. A phi is
+        // unknown here for the same reason it always was: without path context
+        // there is no single incoming op.
+        let op = self.ssa.recorded_definition(var)?.op();
 
         // Recursively resolve operands first
         for operand in op.uses() {

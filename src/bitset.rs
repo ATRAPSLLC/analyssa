@@ -285,17 +285,13 @@ impl BitSet {
 
     /// Clears all bits.
     pub fn clear(&mut self) {
-        for word in &mut self.words {
-            *word = 0;
-        }
+        self.words.fill(0);
     }
 
     /// Sets all bits.
     pub fn fill(&mut self) {
         self.materialize();
-        for word in &mut self.words {
-            *word = u64::MAX;
-        }
+        self.words.fill(u64::MAX);
         // Clear excess bits in last word
         if !self.len.is_multiple_of(64)
             && let Some(last) = self.words.last_mut()
@@ -429,6 +425,8 @@ impl Iterator for BitSetIter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{BuildHasher, RandomState};
+
     use super::*;
 
     #[test]
@@ -527,8 +525,6 @@ mod tests {
     /// alike or a lazy set and an eager set would land in different buckets.
     #[test]
     fn equal_sets_hash_equally_regardless_of_representation() {
-        use std::hash::{BuildHasher, RandomState};
-
         let hasher = RandomState::new();
         let mut lazy = BitSet::lazy(200);
         let mut eager = BitSet::new(200);

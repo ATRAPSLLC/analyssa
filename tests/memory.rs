@@ -2,15 +2,13 @@
 
 use analyssa::{
     PointerSize,
-    analysis::{
-        SsaCfg,
-        memory::{
-            AliasResult, ArrayIndex, IndirectLocation, MemoryDefSite, MemoryLocation, MemoryOp,
-            MemorySsa, MemorySsaStats, MemoryVersion, analyze_alias,
-        },
+    analysis::memory::{
+        AliasResult, ArrayIndex, IndirectLocation, MemoryDefSite, MemoryLocation, MemoryOp,
+        MemorySsa, MemorySsaStats, MemoryVersion, analyze_alias,
     },
     ir::{
         block::SsaBlock,
+        exception::{BlockRange, SsaExceptionHandler},
         function::SsaFunction,
         instruction::SsaInstruction,
         ops::{AtomicAccessWidth, AtomicOrdering, FenceKind, MemoryAccessSemantics, SsaOp},
@@ -19,6 +17,26 @@ use analyssa::{
     },
     testing::{MockTarget, MockType},
 };
+
+/// One exception clause over block ranges, with no filter.
+fn handler_clause(
+    try_start: usize,
+    try_end: usize,
+    handler_start: usize,
+    handler_end: usize,
+) -> SsaExceptionHandler<MockTarget> {
+    SsaExceptionHandler {
+        flags: 0,
+        try_offset: 0,
+        try_length: 0,
+        handler_offset: 0,
+        handler_length: 0,
+        class_token_or_filter: 0,
+        protected_range: BlockRange::new(try_start, try_end),
+        handler_range: BlockRange::new(handler_start, handler_end),
+        filter_range: None,
+    }
+}
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
     ssa.create_variable(
@@ -304,8 +322,7 @@ fn alias_result_equality() {
 #[test]
 fn memory_ssa_empty_function_stats() {
     let ssa = SsaFunction::<MockTarget>::new(0, 0);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let stats: MemorySsaStats = mem_ssa.stats();
     assert_eq!(stats.store_count, 0);
@@ -346,8 +363,7 @@ fn memory_ssa_with_field_loads_and_stores() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let stats: MemorySsaStats = mem_ssa.stats();
     assert_eq!(stats.store_count, 1);
@@ -395,8 +411,7 @@ fn memory_ssa_classifies_atomic_and_fence_effects() {
     ssa.add_block(block);
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
     let stats = mem_ssa.stats();
 
     assert_eq!(stats.store_count, 1);
@@ -457,8 +472,7 @@ fn memory_ssa_handles_store_in_branch() {
 
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let stats: MemorySsaStats = mem_ssa.stats();
     assert!(
@@ -556,8 +570,7 @@ fn diamond_over_one_field(store_in_arm2: bool) -> (SsaFunction<MockTarget>, SsaV
 #[test]
 fn sibling_subtrees_do_not_leak_memory_versions() {
     let (ssa, obj) = diamond_over_one_field(true);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
     let loc = MemoryLocation::<MockTarget>::InstanceField(obj, 5u32);
 
     let b0_exit = mem_ssa.version_at_exit(&loc, 0);
@@ -596,8 +609,7 @@ fn sibling_subtrees_do_not_leak_memory_versions() {
 #[test]
 fn merge_phi_operands_track_each_predecessor_exit() {
     let (ssa, obj) = diamond_over_one_field(true);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
     let loc = MemoryLocation::<MockTarget>::InstanceField(obj, 5u32);
 
     let phis = mem_ssa.memory_phis(3);
@@ -641,8 +653,7 @@ fn merge_phi_operands_track_each_predecessor_exit() {
 #[test]
 fn non_storing_arm_contributes_its_inherited_version() {
     let (ssa, obj) = diamond_over_one_field(false);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
     let loc = MemoryLocation::<MockTarget>::InstanceField(obj, 5u32);
 
     let b0_exit = mem_ssa.version_at_exit(&loc, 0);
@@ -698,8 +709,7 @@ fn non_storing_arm_contributes_its_inherited_version() {
 #[test]
 fn every_live_memory_version_has_a_definition_site() {
     let (ssa, obj) = diamond_over_one_field(true);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
     let loc = MemoryLocation::<MockTarget>::InstanceField(obj, 5u32);
 
     for block in 0..4usize {
@@ -789,8 +799,7 @@ fn stores_through_ptradd_offsets(offsets: &[i64]) -> SsaFunction<MockTarget> {
 #[test]
 fn distinct_stack_slots_get_disjoint_memory_locations() {
     let ssa = stores_through_ptradd_offsets(&[0, 8]);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let locations: Vec<_> = mem_ssa
         .locations()
@@ -834,8 +843,7 @@ fn distinct_stack_slots_get_disjoint_memory_locations() {
 #[test]
 fn identical_addresses_from_separate_ptradds_are_one_location() {
     let ssa = stores_through_ptradd_offsets(&[16, 16]);
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let locations: Vec<_> = mem_ssa
         .locations()
@@ -906,8 +914,7 @@ fn constant_array_indices_fold_and_separate() {
     ssa.add_block(b0);
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     let elem0 = MemoryLocation::<MockTarget>::ArrayElement(array, ArrayIndex::Constant(0));
     let elem1 = MemoryLocation::<MockTarget>::ArrayElement(array, ArrayIndex::Constant(1));
@@ -1112,8 +1119,7 @@ fn a_function_past_the_memory_ssa_budget_degrades_instead_of_growing() {
     }
     ssa.recompute_uses();
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg, PointerSize::Bit64);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
 
     assert!(
         mem_ssa.locations().is_empty(),
@@ -1124,4 +1130,223 @@ fn a_function_past_the_memory_ssa_budget_degrades_instead_of_growing() {
     // so nothing can be proved forwardable.
     let unknown = MemoryLocation::<MockTarget>::Unknown;
     assert_eq!(mem_ssa.version_at_entry(&unknown, 1), None);
+}
+
+/// A store inside an exception handler must get a merge point where the handler
+/// rejoins the normal path.
+///
+/// ```text
+///   B0  obj, v_try                    clause: try [1,2), handler B2..B6
+///   B1  StoreField obj.f = v_try      (protected)   ->  B3
+///   B2  v_catch = const               (handler entry) ->  B4
+///   B4  StoreField obj.f = v_catch    ->  B5
+///   B5  (nothing)                     ->  B3
+///   B3  LoadField obj.f; Return
+/// ```
+///
+/// The handler's store is deliberately **two** hops from the join. A store in a
+/// block that is itself an immediate predecessor of the join still lands in the
+/// join's frontier -- `compute_dominance_frontiers` inserts before it notices
+/// the unreachable-node sentinel and stops -- so a depth-1 handler gets its phi
+/// by accident and stays correct. That is why the existing suite is green.
+///
+/// One hop further and the truncated walk never reaches the join: no memory phi
+/// is placed, `seed_from_dominator` finds the block's entry version is the
+/// try-path store, and `passes::memory` forwards that value into the load. On
+/// the path that actually threw, `obj.f` holds the handler's value.
+#[test]
+fn a_store_in_a_handler_gets_a_phi_at_the_rejoin() {
+    let mut ssa = SsaFunction::<MockTarget>::new(0, 6);
+    let obj = local(&mut ssa, 0, 0, 0);
+    let try_value = local(&mut ssa, 1, 0, 1);
+    let catch_value = local(&mut ssa, 2, 2, 0);
+    let loaded = local(&mut ssa, 3, 3, 0);
+
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: obj,
+        value: ConstValue::I32(42),
+    }));
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: try_value,
+        value: ConstValue::I32(1),
+    }));
+    b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+    ssa.add_block(b0);
+
+    let mut b1 = SsaBlock::new(1);
+    b1.add_instruction(instr(SsaOp::StoreField {
+        object: obj,
+        field: 1u32,
+        value: try_value,
+    }));
+    b1.add_instruction(instr(SsaOp::Jump { target: 3 }));
+    ssa.add_block(b1);
+
+    let mut b2 = SsaBlock::new(2);
+    b2.add_instruction(instr(SsaOp::Const {
+        dest: catch_value,
+        value: ConstValue::I32(2),
+    }));
+    b2.add_instruction(instr(SsaOp::Jump { target: 4 }));
+    ssa.add_block(b2);
+
+    let mut b3 = SsaBlock::new(3);
+    b3.add_instruction(instr(SsaOp::LoadField {
+        dest: loaded,
+        object: obj,
+        field: 1u32,
+    }));
+    b3.add_instruction(instr(SsaOp::Return {
+        value: Some(loaded),
+    }));
+    ssa.add_block(b3);
+
+    let mut b4 = SsaBlock::new(4);
+    b4.add_instruction(instr(SsaOp::StoreField {
+        object: obj,
+        field: 1u32,
+        value: catch_value,
+    }));
+    b4.add_instruction(instr(SsaOp::Jump { target: 5 }));
+    ssa.add_block(b4);
+
+    let mut b5 = SsaBlock::new(5);
+    b5.add_instruction(instr(SsaOp::Jump { target: 3 }));
+    ssa.add_block(b5);
+
+    ssa.set_exception_handlers(vec![handler_clause(1, 2, 2, 6)]);
+    ssa.recompute_uses();
+
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
+
+    assert!(
+        !mem_ssa.memory_phis(3).is_empty(),
+        "the rejoin block must carry a memory phi; without one the try-path \
+         store is forwarded across the exception edge into the load"
+    );
+}
+/// A store the protected region performs is **not** visible in the handler.
+///
+/// Block dominance says the guard ran wholly before the handler; the runtime
+/// leaves it part-way. So the region's store may or may not have happened, and
+/// the handler's entry version has to say "unknown" rather than name that
+/// store — otherwise a later pass forwards a value the throw pre-empted.
+#[test]
+fn a_store_before_a_handler_is_not_visible_inside_it() {
+    let mut ssa = SsaFunction::<MockTarget>::new(0, 3);
+    let obj = local(&mut ssa, 0, 0, 0);
+    let inside = local(&mut ssa, 1, 0, 1);
+    let loaded = local(&mut ssa, 2, 2, 0);
+
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: obj,
+        value: ConstValue::I32(42),
+    }));
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: inside,
+        value: ConstValue::I32(7),
+    }));
+    b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+    ssa.add_block(b0);
+
+    // B1 is the protected region, and its store is the one in question.
+    let mut b1 = SsaBlock::new(1);
+    b1.add_instruction(instr(SsaOp::StoreField {
+        object: obj,
+        field: 1u32,
+        value: inside,
+    }));
+    b1.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(b1);
+
+    let mut b2 = SsaBlock::new(2);
+    b2.add_instruction(instr(SsaOp::LoadField {
+        dest: loaded,
+        object: obj,
+        field: 1u32,
+    }));
+    b2.add_instruction(instr(SsaOp::Return {
+        value: Some(loaded),
+    }));
+    ssa.add_block(b2);
+
+    ssa.set_exception_handlers(vec![handler_clause(1, 2, 2, 3)]);
+    ssa.recompute_uses();
+
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
+    let location = MemoryLocation::<MockTarget>::InstanceField(obj, 1u32);
+
+    let version = mem_ssa.version_at_entry(&location, 2);
+    assert!(
+        version.is_some(),
+        "the handler must be renamed at all -- it was unreachable before"
+    );
+
+    let definition =
+        version.and_then(|version| mem_ssa.definition(&MemoryVersion::new(location, version)));
+    assert!(
+        matches!(definition, Some(MemoryDefSite::ExceptionEntry { block: 2 })),
+        "the region's store must not be assumed to have run: the runtime \
+         dispatched here from part-way through it, got {definition:?}"
+    );
+}
+
+/// The precision half of the same rule: a store that completed *before* the
+/// protected region started is as visible in the handler as anywhere else, and
+/// must not be discarded along with the region's own writes.
+#[test]
+fn a_store_completed_before_the_region_is_still_visible_in_the_handler() {
+    let mut ssa = SsaFunction::<MockTarget>::new(0, 3);
+    let obj = local(&mut ssa, 0, 0, 0);
+    let early = local(&mut ssa, 1, 0, 1);
+    let loaded = local(&mut ssa, 2, 2, 0);
+
+    let mut b0 = SsaBlock::new(0);
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: obj,
+        value: ConstValue::I32(42),
+    }));
+    b0.add_instruction(instr(SsaOp::Const {
+        dest: early,
+        value: ConstValue::I32(7),
+    }));
+    b0.add_instruction(instr(SsaOp::StoreField {
+        object: obj,
+        field: 1u32,
+        value: early,
+    }));
+    b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
+    ssa.add_block(b0);
+
+    let mut b1 = SsaBlock::new(1);
+    b1.add_instruction(instr(SsaOp::Return { value: None }));
+    ssa.add_block(b1);
+
+    let mut b2 = SsaBlock::new(2);
+    b2.add_instruction(instr(SsaOp::LoadField {
+        dest: loaded,
+        object: obj,
+        field: 1u32,
+    }));
+    b2.add_instruction(instr(SsaOp::Return {
+        value: Some(loaded),
+    }));
+    ssa.add_block(b2);
+
+    ssa.set_exception_handlers(vec![handler_clause(1, 2, 2, 3)]);
+    ssa.recompute_uses();
+
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, PointerSize::Bit64);
+    let location = MemoryLocation::<MockTarget>::InstanceField(obj, 1u32);
+
+    let definition = mem_ssa
+        .version_at_entry(&location, 2)
+        .and_then(|version| mem_ssa.definition(&MemoryVersion::new(location, version)));
+    assert!(
+        matches!(definition, Some(MemoryDefSite::Store { block: 0, .. })),
+        "a store outside the region completed, so it survives into the handler, \
+         got {definition:?}"
+    );
 }

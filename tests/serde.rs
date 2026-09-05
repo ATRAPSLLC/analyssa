@@ -10,7 +10,7 @@
 //! via `#[serde(bound(...))]`. `MockTarget` satisfies that, so a full
 //! `SsaFunction<MockTarget>` round trip exercises the real generic path.
 //!
-//! Deliberately excluded: borrowed views (`SsaDefs<'a>`, `MemoryEffect<'a, T>`),
+//! Deliberately excluded: derived views (`SsaDefs`, `MemoryEffect<'a, T>`),
 //! transient pass machinery (builders, editors, edit reports), and
 //! `SsaFeatureToken` (its `&'static str` opcode can serialize but cannot
 //! deserialize).
@@ -21,17 +21,17 @@ use analyssa::{
     Endianness, PointerSize,
     ir::{
         block::SsaBlock,
-        exception::NativeExceptionKind,
+        exception::{BlockRange, ClausePart, HandlerKind},
         function::{FunctionKind, SsaFunction},
         instruction::SsaInstruction,
         ops::{
-            AtomicOrdering, AtomicRmwOp, BcdAdjustKind, BinaryOpKind, BlockStringKind, CmpKind,
-            ComplexMulKind, ComputeKind, ControlEffect, FenceKind, FlagAdjustKind, FpuControlKind,
-            KindedVecData, MemoryAccessSemantics, MemoryEffectLocation, NativeClobber,
-            NativeInstructionMetadata, NativeIntrinsicId, NativeRegister, NativeStateAccess,
-            NativeStateAccessKind, NativeStateLocation, OperandRole, PacKind, PredicateGenKind,
-            PredicateOpKind, Signedness, SmeMiscKind, SsaEffectKind, SsaEffects, SsaOp, SsaOpClass,
-            SsaSimilarityClass, SveComputeKind, SystemOpKind, TileOpKind, TranscendentalKind,
+            AtomicOrdering, AtomicRmwOp, BarrierOp, BcdAdjustKind, BinaryOpKind, BlockStringKind,
+            BreakpointOp, CmpKind, ComplexMulKind, ComputeKind, ControlEffect, FenceKind,
+            FlagAdjustKind, FlagAdjustResult, FlagsMask, FpuControlKind, HintOp, KindedVecData,
+            MachineStateOp, MemoryAccessSemantics, MemoryEffectLocation, NativeInstructionMetadata,
+            OperandRole, PacKind, PredicateGenKind, PredicateOpKind, Signedness, SmeMiscKind,
+            SsaEffectKind, SsaEffects, SsaOp, SsaOpClass, SsaSimilarityClass, SveComputeKind,
+            SysRegOp, SystemOpKind, SystemTransactionKind, TileOpKind, TranscendentalKind,
             TrapClass, UnaryOpKind, VectorBinaryKind, VectorCastKind, VectorCompareKind,
             VectorCryptoKind, VectorElement, VectorElementKind, VectorMaddKind, VectorPackKind,
             VectorReduceKind, VectorTernaryKind, VectorUnaryKind,
@@ -103,20 +103,81 @@ fn vector_kind_enums_round_trip() {
 
 #[test]
 fn native_kind_enums_round_trip() {
-    round_trip(SystemOpKind::Barrier);
+    round_trip(SystemOpKind::Barrier(BarrierOp::Serialize));
     round_trip(ComputeKind::BitDeposit);
     round_trip(BcdAdjustKind::DecimalAddAdjust);
     round_trip(TranscendentalKind::SinCos);
     round_trip(FpuControlKind::Save);
     round_trip(FlagAdjustKind::InvertCarry);
     round_trip(BlockStringKind::Compare);
-    round_trip(NativeIntrinsicId::Cpuid);
-    round_trip(NativeIntrinsicId::PointerAuth(PacKind::Sign));
+}
+
+/// Every payload enum the system and compute taxonomies carry, through the
+/// composite that carries it.
+///
+/// A kind enum reachable only as a payload is the one a round-trip suite is
+/// likeliest to miss: the derive is there, and nothing proves a value survives.
+/// These are also the enums whose `#[repr(u16)]` discriminants back
+/// `OpKindTable::from_index`, so a variant inserted mid-enum has to keep
+/// deserializing by *name*.
+#[test]
+fn payload_kind_enums_round_trip_through_their_carrier() {
+    round_trip(SysRegOp::ReadModelSpecific);
+    round_trip(SystemOpKind::ControlRegister(SysRegOp::WriteDebugRegister));
+
+    round_trip(HintOp::IndirectBranchLandingPad);
+    round_trip(SystemOpKind::Hint(HintOp::SpinWait));
+
+    round_trip(SystemTransactionKind::SuspendLoadTracking);
+    round_trip(SystemOpKind::Transaction(SystemTransactionKind::Commit));
+
+    round_trip(MachineStateOp::Halt);
+    round_trip(SystemOpKind::MachineState(
+        MachineStateOp::UserInterruptTest,
+    ));
+
+    round_trip(PacKind::Authenticate);
+    round_trip(ComputeKind::PointerAuth(PacKind::GenericMac));
+
+    // The two data-carrying identities: the field is part of what the value
+    // means, so it has to survive as well as the discriminant.
+    round_trip(SystemOpKind::Timestamp { aux: true });
+    round_trip(ComputeKind::Random { from_entropy: true });
+    round_trip(SystemOpKind::Trap {
+        op: analyssa::ir::ops::TrapOp::SoftwareInterrupt,
+        vector: Some(0x80),
+    });
+
+    round_trip(FlagAdjustKind::ClearInterrupt);
+    round_trip(FlagAdjustResult::None);
+}
+
+/// `FlagsMask` stores raw bits, so the wire form must carry bits the crate does
+/// not define rather than masking them away — a mask that came back with fewer
+/// bits than it went in with would turn a diagnosable error into silent data
+/// loss.
+#[test]
+fn flags_mask_round_trips_undefined_bits() {
+    round_trip(FlagsMask::from_bits(0));
+    round_trip(FlagsMask::ALL);
+    round_trip(FlagsMask::x86_status());
+
+    let undefined = FlagsMask::from_bits(FlagsMask::CARRY.bits() | 0x8000);
+    assert!(!undefined.is_valid());
+    round_trip(undefined);
+
+    let encoded = serde_json::to_string(&undefined).unwrap_or_default();
+    let decoded = serde_json::from_str::<FlagsMask>(&encoded).ok();
+    assert_eq!(
+        decoded.map(FlagsMask::bits),
+        Some(undefined.bits()),
+        "undefined bits must survive so the verifier can report them"
+    );
 }
 
 #[test]
 fn classification_and_effect_enums_round_trip() {
-    round_trip(SsaOpClass::NativeIntrinsic);
+    round_trip(SsaOpClass::NativeOpaque);
     round_trip(SsaSimilarityClass::Synthetic);
     round_trip(SsaEffectKind::Fence);
     round_trip(TrapClass::MemoryFault);
@@ -124,7 +185,11 @@ fn classification_and_effect_enums_round_trip() {
     round_trip(MemoryEffectLocation::None);
     round_trip(MemoryAccessSemantics::Atomic);
     round_trip(OperandRole::Def);
-    round_trip(NativeExceptionKind::Catch);
+    round_trip(HandlerKind::Catch);
+    round_trip(ClausePart::Filter);
+    if let Some(range) = BlockRange::new(2, 5) {
+        round_trip(range);
+    }
     round_trip(FunctionKind::InterruptHandler);
     round_trip(PointerSize::Bit64);
     round_trip(Endianness::Little);
@@ -147,33 +212,10 @@ fn effect_summary_round_trips() {
     round_trip(op.effects());
 }
 
-/// Native descriptors carry `String`/`Vec`/`Option` fields — likelier to break
-/// than fieldless enums, and previously untested.
+/// Native descriptors carry `String`/`Vec`/`Option` fields, which are likelier
+/// to break across a round trip than fieldless enums.
 #[test]
 fn native_descriptors_round_trip() {
-    let register = NativeRegister {
-        architecture: "x86_64".into(),
-        bank: "gpr".into(),
-        base: "rax".into(),
-        name: "eax".into(),
-        bit_offset: 0,
-        bit_width: 32,
-    };
-    round_trip(register.clone());
-
-    round_trip(NativeStateLocation::Register(register.clone()));
-    round_trip(NativeStateLocation::Flags("eflags".into()));
-    round_trip(NativeStateLocation::StackPointer);
-
-    let access = NativeStateAccess {
-        location: NativeStateLocation::Register(register),
-        kind: NativeStateAccessKind::ReadWrite,
-        width_bits: Some(32),
-        implicit: true,
-    };
-    round_trip(access.clone());
-    round_trip(NativeClobber::MachineState(access));
-
     round_trip(NativeInstructionMetadata {
         architecture: Some("aarch64".into()),
         address: Some(0x1000),
@@ -263,6 +305,10 @@ fn ssa_op_round_trips() {
         address_space: Some(1),
     });
     round_trip(SsaOp::<MockTarget>::CallClobber { outputs: vec![v0] });
+    // The kind is the only identity a `Break` carries, so it must survive the wire.
+    round_trip(SsaOp::<MockTarget>::Break(
+        BreakpointOp::UndefinedInstruction,
+    ));
     round_trip(SsaOp::<MockTarget>::Nop);
     round_trip(SsaOp::<MockTarget>::Branch {
         condition: v0,
@@ -370,4 +416,27 @@ fn kind_enums_serialize_by_name_not_discriminant() {
     // variant is inserted mid-enum, and this crate adds variants routinely.
     let encoded = serde_json::to_string(&AtomicRmwOp::Add).unwrap_or_default();
     assert_eq!(encoded, "\"Add\"");
+}
+
+/// `BlockRange` serializes as its `(start, end)` pair, and deserialization is
+/// the one path that can present a pair no constructor approved. An empty or
+/// reversed pair must be refused there rather than becoming a range the rest of
+/// the crate believes is non-empty.
+#[test]
+fn a_block_range_refuses_to_deserialize_an_empty_pair() {
+    assert_eq!(
+        serde_json::from_str::<BlockRange>("[2,5]")
+            .ok()
+            .map(|range| (range.start(), range.end())),
+        Some((2, 5)),
+        "a non-empty pair is a range"
+    );
+    assert!(
+        serde_json::from_str::<BlockRange>("[5,5]").is_err(),
+        "an empty range is not representable, on any path in"
+    );
+    assert!(
+        serde_json::from_str::<BlockRange>("[5,2]").is_err(),
+        "nor is a reversed one"
+    );
 }

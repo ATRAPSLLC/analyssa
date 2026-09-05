@@ -310,21 +310,39 @@ impl<T: Target> SsaBlock<T> {
         self.instructions.get_mut(index)
     }
 
-    /// Gets the terminator instruction (last instruction in the block).
+    /// Returns the block's last instruction, whatever it is.
     ///
-    /// In well-formed SSA, the last instruction should be a control flow
-    /// instruction (Jump, Branch, Switch, Return, etc.).
+    /// This is a positional question, not a control-flow one: a block whose
+    /// last instruction is an ordinary computation is malformed but
+    /// representable, and this still returns it. Ask
+    /// [`control_terminator`](Self::control_terminator) when the answer must be
+    /// an operation that actually transfers control.
     #[must_use]
-    pub fn terminator(&self) -> Option<&SsaInstruction<T>> {
+    pub fn last_instruction(&self) -> Option<&SsaInstruction<T>> {
         self.instructions.last()
     }
 
-    /// Gets the terminator operation if the block has a terminator instruction.
+    /// Returns the operation of the block's last instruction.
     ///
-    /// This is a convenience method combining `terminator()` and `op()`.
+    /// Convenience for [`last_instruction`](Self::last_instruction) followed by
+    /// [`SsaInstruction::op`], with the same positional meaning.
     #[must_use]
-    pub fn terminator_op(&self) -> Option<&SsaOp<T>> {
+    pub fn last_op(&self) -> Option<&SsaOp<T>> {
         self.instructions.last().map(SsaInstruction::op)
+    }
+
+    /// Returns the block's terminator: its last instruction, if that
+    /// instruction transfers control.
+    ///
+    /// This is the crate's single definition of "the terminator". A block whose
+    /// last instruction is not a terminator has none — it does not fall back to
+    /// an earlier terminator buried in the block, because control would not
+    /// reach it. Such a block is exactly what the verifier reports as
+    /// `TerminatorNotLast`, and it therefore contributes no CFG edges rather
+    /// than edges control cannot take.
+    #[must_use]
+    pub fn control_terminator(&self) -> Option<&SsaOp<T>> {
+        self.last_op().filter(|op| op.is_terminator())
     }
 
     /// Returns the successor block indices for this block.
@@ -336,7 +354,7 @@ impl<T: Target> SsaBlock<T> {
     /// - Return/Throw/etc: no successors
     #[must_use]
     pub fn successors(&self) -> Vec<usize> {
-        self.terminator_op()
+        self.control_terminator()
             .map_or_else(Vec::new, super::SsaOp::successors)
     }
 
@@ -346,7 +364,7 @@ impl<T: Target> SsaBlock<T> {
     where
         F: FnMut(usize),
     {
-        if let Some(op) = self.terminator_op() {
+        if let Some(op) = self.control_terminator() {
             op.for_each_successor(f);
         }
     }
@@ -364,8 +382,13 @@ impl<T: Target> SsaBlock<T> {
     ///
     /// # Returns
     ///
-    /// `true` if any target was changed, `false` otherwise.
+    /// `true` if any target was changed, `false` otherwise. A block with no
+    /// [`control_terminator`](Self::control_terminator) has no targets to
+    /// redirect and answers `false`.
     pub fn redirect_target(&mut self, old_target: usize, new_target: usize) -> bool {
+        if self.control_terminator().is_none() {
+            return false;
+        }
         if let Some(terminator) = self.instructions.last_mut() {
             return terminator.op_mut().redirect_target(old_target, new_target);
         }
@@ -379,12 +402,20 @@ impl<T: Target> SsaBlock<T> {
     /// to the same value. For other terminators (like `Return` or `Throw`),
     /// the terminator is replaced with an unconditional `Jump`.
     ///
-    /// If the block has no terminator, a `Jump` instruction is added.
+    /// If the block has no [`control_terminator`](Self::control_terminator) — an
+    /// empty block, or one whose last instruction is an ordinary computation —
+    /// a `Jump` is **appended**. It is not written over the last instruction,
+    /// because that would delete a computation the block still needs.
     ///
     /// # Arguments
     ///
     /// * `target` - The block index to jump to
     pub fn set_target(&mut self, target: usize) {
+        if self.control_terminator().is_none() {
+            self.instructions
+                .push(SsaInstruction::synthetic(SsaOp::Jump { target }));
+            return;
+        }
         if let Some(terminator) = self.instructions.last_mut() {
             match terminator.op_mut() {
                 SsaOp::Jump { target: t } | SsaOp::Leave { target: t } => {
@@ -412,14 +443,11 @@ impl<T: Target> SsaBlock<T> {
                     }
                 }
                 _ => {
-                    // Other terminators (Return, Throw, etc.) - replace with Jump
+                    // Another terminator (Return, Throw, ...) - replace with a Jump.
+                    // Safe because the guard above established this *is* one.
                     *terminator = SsaInstruction::synthetic(SsaOp::Jump { target });
                 }
             }
-        } else {
-            // No terminator - add a Jump
-            self.instructions
-                .push(SsaInstruction::synthetic(SsaOp::Jump { target }));
         }
     }
 
@@ -845,5 +873,77 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ir::{value::ConstValue, variable::SsaVarId},
+        testing::MockTarget,
+    };
+
+    /// A block ending in an ordinary computation, which is malformed but
+    /// representable and is exactly what `set_target` must not overwrite.
+    fn block_ending_in_a_computation() -> SsaBlock<MockTarget> {
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: SsaVarId::from_index(0),
+            value: ConstValue::I32(7),
+        }));
+        block
+    }
+
+    #[test]
+    fn a_computation_is_not_a_control_terminator() {
+        let block = block_ending_in_a_computation();
+        assert!(
+            block.last_op().is_some(),
+            "it is still the last instruction"
+        );
+        assert!(block.control_terminator().is_none());
+        assert!(block.successors().is_empty());
+    }
+
+    #[test]
+    fn set_target_on_a_block_without_a_control_terminator_appends_rather_than_replaces() {
+        let mut block = block_ending_in_a_computation();
+        block.set_target(5);
+
+        assert_eq!(
+            block.instructions().len(),
+            2,
+            "the computation must survive; overwriting it deletes a definition \
+             the block still needs"
+        );
+        assert!(matches!(
+            block.instructions().first().map(SsaInstruction::op),
+            Some(SsaOp::Const { .. })
+        ));
+        assert!(matches!(
+            block.control_terminator(),
+            Some(SsaOp::Jump { target: 5 })
+        ));
+    }
+
+    #[test]
+    fn set_target_still_rewrites_a_real_terminator_in_place() {
+        let mut block = SsaBlock::<MockTarget>::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        block.set_target(5);
+
+        assert_eq!(block.instructions().len(), 1);
+        assert!(matches!(
+            block.control_terminator(),
+            Some(SsaOp::Jump { target: 5 })
+        ));
+    }
+
+    #[test]
+    fn redirect_target_answers_false_without_a_control_terminator() {
+        let mut block = block_ending_in_a_computation();
+        assert!(!block.redirect_target(1, 2));
+        assert_eq!(block.instructions().len(), 1, "and changes nothing");
     }
 }
