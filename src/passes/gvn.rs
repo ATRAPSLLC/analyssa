@@ -46,10 +46,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    analysis::cfg::SsaCfg,
+    analysis::exceptions::EhCfg,
     events::{EventKind, EventListener},
     graph::{
-        NodeId, RootedGraph,
+        NodeId,
         algorithms::{DominatorTree, compute_dominators},
     },
     ir::{
@@ -257,8 +257,8 @@ where
     // remaining reason a debug and a release build lifted the same bytes
     // differently, since only debug verified the edit and rolled it back.
     let dominators = {
-        let cfg = SsaCfg::from_ssa(ssa);
-        compute_dominators(&cfg, cfg.entry())
+        let eh = EhCfg::from_ssa(ssa);
+        compute_dominators(&eh, NodeId::new(0))
     };
 
     for block in ssa.blocks() {
@@ -301,8 +301,8 @@ where
             // per-pair `replace_uses_checked`, which rebuilt the CFG + dominator
             // tree (and rescanned every block) once per redundant pair.
             let dominators = if editor.function().block_count() > 0 {
-                let cfg = SsaCfg::from_ssa(editor.function());
-                Some(compute_dominators(&cfg, cfg.entry()))
+                let eh = EhCfg::from_ssa(editor.function());
+                Some(compute_dominators(&eh, NodeId::new(0)))
             } else {
                 None
             };

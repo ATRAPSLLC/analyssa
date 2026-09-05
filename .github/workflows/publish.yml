@@ -31,9 +31,21 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main \
             || { echo "::error::release commit $GITHUB_SHA is not contained in main"; exit 1; }
 
+      # The publish job runs the whole gate set, not just `cargo test`. A release
+      # is the last point at which a broken --all-features build or a failing
+      # docs.rs build (Cargo.toml sets all-features = true for docs.rs) can still
+      # be caught, and it is the point at which it matters most.
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt   # rustfmt.toml uses nightly-only options
+      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: scripts/check.sh all
 
+      # `cargo publish` deliberately stays in the workflow rather than moving
+      # into check.sh: its token is minted per-run by the OIDC action below, and
+      # a local `scripts/check.sh` invocation must not be able to publish.
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 

@@ -9,7 +9,7 @@
 //! |----------|---------|
 //! | Variable queries | `argument_variables`, `local_variables`, `variables_from_*`, `versions_of` |
 //! | Counting | `phi_count`, `instruction_count`, `dead_variable_count`, `count_uses` |
-//! | Definition lookup | `get_definition`, `get_definition_instruction`, `find_phi_defining`, `try_constant_value` |
+//! | Definition lookup | `recorded_definition`, `get_definition`, `get_definition_instruction`, `find_phi_defining`, `try_constant_value` |
 //! | Control flow | `block_predecessors`, `block_successors`, `block_has_successor` |
 //! | Analysis | `return_info`, `purity`, `find_trampoline_blocks`, `find_constants`, `trace_to_phi` |
 //! | Checks | `is_var_constant`, `is_parameter_variable`, `is_void_return`, `has_xor_operations` |
@@ -17,8 +17,11 @@
 //! # Performance Notes
 //!
 //! Most query methods use O(1) lookup via dense indexing or the `origin_versions` registry.
-//! Methods like `get_definition` and `get_definition_instruction` attempt an O(1) path
-//! via `DefSite` first, then fall back to an O(n) scan if the DefSite is stale.
+//! `recorded_definition` is the guarded, scan-free def-site dereference every other
+//! definition lookup is built on: it is O(1) whatever the answer, and refuses a stale
+//! site rather than reporting a neighbouring instruction. `get_definition` and
+//! `get_definition_instruction` take that path first, then fall back to an O(n) scan
+//! that recovers from a stale site.
 //! Methods like `block_predecessors` and `count_uses` require O(n) scans of all blocks.
 
 use std::collections::BTreeMap;
@@ -37,6 +40,56 @@ use crate::{
     },
     target::Target,
 };
+
+/// A variable's definition exactly as its own `DefSite` records it.
+///
+/// Produced by [`SsaFunction::recorded_definition`], which is the crate's only
+/// guarded, scan-free way to turn a variable into the instruction that defines
+/// it. Holding it keeps the block and instruction indices alongside the
+/// instruction, so a caller that needs to edit or locate the definition does
+/// not recompute them.
+///
+/// # Correctness
+///
+/// The handle exists only when the recorded site really does define the
+/// variable asked for: [`SsaFunction::recorded_definition`] returns `None`
+/// rather than a neighbouring instruction when the site is stale. Everything
+/// reachable from it therefore describes `var` and nothing else.
+#[derive(Debug)]
+pub struct RecordedDefinition<'a, T: Target> {
+    /// Index of the block holding the defining instruction.
+    block_index: usize,
+    /// Index of the defining instruction within that block.
+    instruction_index: usize,
+    /// The defining instruction itself.
+    instruction: &'a SsaInstruction<T>,
+}
+
+impl<'a, T: Target> RecordedDefinition<'a, T> {
+    /// Returns the index of the block holding the defining instruction.
+    #[must_use]
+    pub const fn block_index(&self) -> usize {
+        self.block_index
+    }
+
+    /// Returns the index of the defining instruction within its block.
+    #[must_use]
+    pub const fn instruction_index(&self) -> usize {
+        self.instruction_index
+    }
+
+    /// Returns the defining instruction.
+    #[must_use]
+    pub const fn instruction(&self) -> &'a SsaInstruction<T> {
+        self.instruction
+    }
+
+    /// Returns the operation performed by the defining instruction.
+    #[must_use]
+    pub fn op(&self) -> &'a SsaOp<T> {
+        self.instruction.op()
+    }
+}
 
 /// Classification of a method's return behavior.
 ///
@@ -369,6 +422,48 @@ impl<T: Target> SsaFunction<T> {
             .any(|instr| matches!(instr.op(), SsaOp::Return { value: None }))
     }
 
+    /// Returns the definition `var`'s own def site records, when that site is
+    /// still exact.
+    ///
+    /// This is the crate's single guarded, scan-free def-site dereference, and
+    /// the primitive [`get_definition`](Self::get_definition),
+    /// [`get_definition_instruction`](Self::get_definition_instruction) and
+    /// [`try_constant_value`](Self::try_constant_value) are all built on. A def
+    /// site is variable *metadata*, so an edit can leave it naming an
+    /// instruction that defines something else; dereferencing it without
+    /// checking reads a foreign instruction's operands and reports them as this
+    /// variable's definition. The check is one `defs()` comparison and it is
+    /// what makes the answer trustworthy.
+    ///
+    /// # Returns
+    ///
+    /// `Some` when the recorded block and instruction exist *and* that
+    /// instruction defines `var`. `None` when the variable is unknown, is
+    /// recorded as phi-defined (a phi has no defining instruction), or the site
+    /// is stale. `None` therefore means "not answerable from the recorded
+    /// site", never "answerable, and the answer is elsewhere" — callers that
+    /// must survive a stale site use
+    /// [`get_definition`](Self::get_definition), which falls back to a scan.
+    ///
+    /// # Complexity
+    ///
+    /// O(1). Never scans, whatever the answer.
+    #[must_use]
+    pub fn recorded_definition(&self, var: SsaVarId) -> Option<RecordedDefinition<'_, T>> {
+        let site = self.variable(var)?.def_site();
+        let instruction_index = site.instruction?;
+        let instruction = self.block(site.block)?.instruction(instruction_index)?;
+        instruction
+            .op()
+            .defs()
+            .any(|def| def == var)
+            .then_some(RecordedDefinition {
+                block_index: site.block,
+                instruction_index,
+                instruction,
+            })
+    }
+
     /// Gets the instruction operation that defines a variable.
     ///
     /// Searches through all blocks and instructions to find where the given
@@ -387,18 +482,9 @@ impl<T: Target> SsaFunction<T> {
     /// is defined by a phi node or not found.
     #[must_use]
     pub fn get_definition(&self, var: SsaVarId) -> Option<&SsaOp<T>> {
-        // Fast path: O(1) via the variable's DefSite
-        if let Some(variable) = self.variable(var) {
-            let def = variable.def_site();
-            if let Some(instr_idx) = def.instruction
-                && let Some(block) = self.block(def.block)
-                && let Some(instr) = block.instructions().get(instr_idx)
-            {
-                let op = instr.op();
-                if op.defs().any(|def| def == var) {
-                    return Some(op);
-                }
-            }
+        // Fast path: O(1) through the crate's single guarded def-site dereference.
+        if let Some(recorded) = self.recorded_definition(var) {
+            return Some(recorded.op());
         }
 
         // A variable whose recorded definition really is a phi has no defining
@@ -445,18 +531,9 @@ impl<T: Target> SsaFunction<T> {
     /// is defined by a phi node or not found.
     #[must_use]
     pub fn get_definition_instruction(&self, var: SsaVarId) -> Option<&SsaInstruction<T>> {
-        // Fast path: O(1) via the variable's DefSite
-        if let Some(variable) = self.variable(var) {
-            let def = variable.def_site();
-            if let Some(instr_idx) = def.instruction
-                && let Some(block) = self.block(def.block)
-                && let Some(instr) = block.instructions().get(instr_idx)
-            {
-                let op = instr.op();
-                if op.defs().any(|def| def == var) {
-                    return Some(instr);
-                }
-            }
+        // Fast path: O(1) through the crate's single guarded def-site dereference.
+        if let Some(recorded) = self.recorded_definition(var) {
+            return Some(recorded.instruction());
         }
 
         // See `get_definition`: a confirmed phi definition has no defining
@@ -566,8 +643,10 @@ impl<T: Target> SsaFunction<T> {
 
     /// Returns the constant value of a variable if it was defined by a `Const` operation.
     ///
-    /// Uses the variable's [`crate::ir::variable::DefSite`] for O(1) lookup without a fallback scan.
-    /// Returns `None` for phi-defined variables or non-constant definitions.
+    /// Resolves the variable through [`recorded_definition`](Self::recorded_definition),
+    /// so the lookup is O(1) with no fallback scan and a stale def site answers
+    /// `None` rather than an unrelated `Const`'s value. Also `None` for
+    /// phi-defined variables and for non-constant definitions.
     ///
     /// # Arguments
     ///
@@ -579,17 +658,10 @@ impl<T: Target> SsaFunction<T> {
     /// `None` otherwise.
     #[must_use]
     pub fn try_constant_value(&self, var: SsaVarId) -> Option<ConstValue<T>> {
-        let variable = self.variable(var)?;
-        let def_site = variable.def_site();
-
-        if def_site.is_phi() {
-            return None;
-        }
-
-        let block = self.block(def_site.block)?;
-        let instr = block.instruction(def_site.instruction?)?;
-
-        match instr.op() {
+        // Scan-free by contract, so the guard is the whole defence: a stale site
+        // that happens to name a `Const` belonging to another variable would
+        // otherwise be reported as this variable's value.
+        match self.recorded_definition(var)?.op() {
             SsaOp::Const { value, .. } => Some(value.clone()),
             _ => None,
         }
@@ -766,143 +838,6 @@ impl<T: Target> SsaFunction<T> {
             // For other operations (including constants), the variable cannot be traced to a PHI
             _ => None,
         }
-    }
-
-    /// Checks if a block has a specific successor in the control flow graph.
-    ///
-    /// This checks if control can flow from block `from_block` to block `to_block`
-    /// through any terminator instruction (Jump, Branch, Switch, etc.).
-    ///
-    /// # Arguments
-    ///
-    /// * `from_block` - The source block index.
-    /// * `to_block` - The target block index to check for.
-    ///
-    /// # Returns
-    ///
-    /// `true` if `to_block` is a successor of `from_block`.
-    #[must_use]
-    pub fn block_has_successor(&self, from_block: usize, to_block: usize) -> bool {
-        let Some(block) = self.block(from_block) else {
-            return false;
-        };
-        let Some(op) = block.terminator_op() else {
-            return false;
-        };
-
-        op.has_successor(to_block)
-    }
-
-    /// Gets all predecessor blocks that can jump to the given block.
-    ///
-    /// This scans all blocks and returns those whose terminator instruction
-    /// has `block_idx` as a successor.
-    ///
-    /// # Arguments
-    ///
-    /// * `block_idx` - The target block index.
-    ///
-    /// # Returns
-    ///
-    /// A vector of block indices that can transfer control to `block_idx`.
-    #[must_use]
-    pub fn block_predecessors(&self, block_idx: usize) -> Vec<usize> {
-        let mut preds: Vec<usize> = self
-            .iter_blocks()
-            .filter(|&(idx, _)| idx != block_idx)
-            .filter_map(|(idx, block)| {
-                block
-                    .terminator_op()
-                    .filter(|op| op.has_successor(block_idx))
-                    .map(|_| idx)
-            })
-            .collect();
-
-        // Include synthetic exception handler edges: try_start -> handler_start.
-        // This matches SsaCfg::from_ssa() which also adds these edges so that
-        // handler blocks appear connected in the CFG.
-        for handler in self.exception_handlers() {
-            if handler.handler_start_block == Some(block_idx)
-                && let Some(try_start) = handler.try_start_block
-                && try_start < self.blocks.len()
-                && !preds.contains(&try_start)
-            {
-                preds.push(try_start);
-            }
-        }
-
-        preds
-    }
-
-    /// Computes the predecessor list for every block in a single pass.
-    ///
-    /// Returns a vector indexed by block, where entry `b` holds the blocks that
-    /// can transfer control to `b` (including synthetic exception-handler
-    /// edges, matching [`block_predecessors`](Self::block_predecessors)).
-    ///
-    /// This is O(V + E); callers that need predecessors of many blocks should
-    /// use it instead of calling `block_predecessors` per block, which is
-    /// O(V) each and thus O(V²) in a loop.
-    #[must_use]
-    pub fn compute_predecessors(&self) -> Vec<Vec<usize>> {
-        let block_count = self.blocks.len();
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); block_count];
-        for (idx, block) in self.iter_blocks() {
-            block.for_each_successor(|succ| {
-                if let Some(slot) = preds.get_mut(succ)
-                    && !slot.contains(&idx)
-                {
-                    slot.push(idx);
-                }
-            });
-        }
-        for handler in self.exception_handlers() {
-            if let (Some(handler_start), Some(try_start)) =
-                (handler.handler_start_block, handler.try_start_block)
-                && try_start < block_count
-                && let Some(slot) = preds.get_mut(handler_start)
-                && !slot.contains(&try_start)
-            {
-                slot.push(try_start);
-            }
-        }
-        preds
-    }
-
-    /// Gets all successor blocks that a given block can jump to.
-    ///
-    /// # Arguments
-    ///
-    /// * `block_idx` - The source block index.
-    ///
-    /// # Returns
-    ///
-    /// A vector of block indices that `block_idx` can transfer control to.
-    #[must_use]
-    pub fn block_successors(&self, block_idx: usize) -> Vec<usize> {
-        let Some(block) = self.block(block_idx) else {
-            return Vec::new();
-        };
-        let Some(op) = block.terminator_op() else {
-            return Vec::new();
-        };
-
-        let mut succs = op.successors();
-
-        // Include synthetic exception handler edges: try_start -> handler_start.
-        // This matches SsaCfg::from_ssa() which also adds these edges so that
-        // handler blocks appear connected in the CFG.
-        for handler in self.exception_handlers() {
-            if handler.try_start_block == Some(block_idx)
-                && let Some(handler_start) = handler.handler_start_block
-                && handler_start < self.blocks.len()
-                && !succs.contains(&handler_start)
-            {
-                succs.push(handler_start);
-            }
-        }
-
-        succs
     }
 
     /// Checks if a variable is a parameter variable.
@@ -1386,6 +1321,96 @@ mod definition_lookup_tests {
             "stale def site must fall through to the recovery scan"
         );
         assert!(ssa.get_definition_instruction(var).is_some());
+    }
+
+    /// Builds a block whose two `Const` instructions define `first` and
+    /// `second`, with `second`'s def site left stale by one — naming `first`'s
+    /// instruction.
+    fn stale_by_one() -> (SsaFunction<MockTarget>, SsaVarId, SsaVarId) {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
+        let first = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let second = ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::new(
+            (),
+            SsaOp::Const {
+                dest: first,
+                value: ConstValue::I32(11),
+            },
+        ));
+        block.add_instruction(SsaInstruction::new(
+            (),
+            SsaOp::Const {
+                dest: second,
+                value: ConstValue::I32(22),
+            },
+        ));
+        block.add_instruction(SsaInstruction::new((), SsaOp::Return { value: None }));
+        ssa.add_block(block);
+        (ssa, first, second)
+    }
+
+    /// The guard is the whole point of the handle: a site stale by one index
+    /// names a real instruction defining a *different* variable, and reporting
+    /// it would hand the caller a foreign operation as this variable's
+    /// definition.
+    #[test]
+    fn recorded_definition_refuses_a_stale_def_site() {
+        let (ssa, first, second) = stale_by_one();
+
+        assert!(
+            ssa.recorded_definition(first).is_some(),
+            "an exact site resolves"
+        );
+        assert!(
+            ssa.recorded_definition(second).is_none(),
+            "a site naming another variable's instruction must be refused"
+        );
+    }
+
+    /// The scan-free handle refuses; the recovering lookup built on it must
+    /// still find the definition, and find the *right* one.
+    #[test]
+    fn get_definition_still_recovers_a_stale_def_site_by_scan() {
+        let (ssa, _first, second) = stale_by_one();
+
+        let recovered = ssa
+            .get_definition(second)
+            .expect("the scan recovers a stale def site");
+        assert!(
+            matches!(recovered, SsaOp::Const { dest, .. } if *dest == second),
+            "the scan must find the instruction that really defines the variable: {recovered:?}"
+        );
+        let instruction = ssa
+            .get_definition_instruction(second)
+            .expect("the scan recovers a stale def site");
+        assert!(matches!(instruction.op(), SsaOp::Const { dest, .. } if *dest == second));
+    }
+
+    /// `try_constant_value` is scan-free by contract, so it inherits the guard
+    /// and nothing else. Before the guard, a site stale by one reported the
+    /// neighbouring `Const`'s value as this variable's.
+    #[test]
+    fn try_constant_value_refuses_a_stale_def_site() {
+        let (ssa, first, second) = stale_by_one();
+
+        assert_eq!(ssa.try_constant_value(first), Some(ConstValue::I32(11)));
+        assert_eq!(
+            ssa.try_constant_value(second),
+            None,
+            "an unknown stride is the safe answer; 11 is the wrong one"
+        );
     }
 
     /// An unknown variable is absent from both lookups.

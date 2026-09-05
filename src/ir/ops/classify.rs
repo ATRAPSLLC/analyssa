@@ -10,24 +10,27 @@
 
 use std::borrow::Cow;
 
-use super::*;
-use crate::target::Target;
+use crate::{
+    ir::ops::{
+        def::SsaOp,
+        kinds::{
+            CmpKind, ComputeKind, Signedness, SsaFeatureToken, SsaOpClass, SsaSimilarityClass,
+        },
+        native::{BinaryOpInfo, BinaryOpKind, BlockStringKind, UnaryOpInfo, UnaryOpKind},
+        operands::KindedOperands,
+        vector::VectorCompareKind,
+    },
+    target::Target,
+};
 
 /// Lowercases and trims a high-cardinality mnemonic for token use.
+///
+/// Applied only where the input is a *host-supplied* string — a native
+/// mnemonic echoed from a decoder. A `kind_str()` is a crate literal already in
+/// this form, pinned by the registry-wide assertion in the test module, so
+/// normalizing one would allocate to produce the string it was handed.
 fn normalize_token_text(value: &str) -> String {
     value.trim().to_ascii_lowercase()
-}
-
-/// Returns the typed `flags.*` label for a direct condition-flag manipulation.
-fn flag_adjust_label(kind: FlagAdjustKind) -> &'static str {
-    match kind {
-        FlagAdjustKind::InvertCarry => "flags.cfinv",
-        FlagAdjustKind::RotateMaskInsert => "flags.rmif",
-        FlagAdjustKind::SetNzFrom8 => "flags.setf8",
-        FlagAdjustKind::SetNzFrom16 => "flags.setf16",
-        FlagAdjustKind::ConvertToFpFlags => "flags.axflag",
-        FlagAdjustKind::ConvertFromFpFlags => "flags.xaflag",
-    }
 }
 
 impl<T: Target> SsaOp<T> {
@@ -141,10 +144,9 @@ impl<T: Target> SsaOp<T> {
             | Self::InterruptReturn
             | Self::Unreachable
             | Self::Leave { .. }
-            | Self::Break => SsaOpClass::Control,
+            | Self::Break(_) => SsaOpClass::Control,
 
             Self::NativeOpaque(_) => SsaOpClass::NativeOpaque,
-            Self::NativeIntrinsic(_) => SsaOpClass::NativeIntrinsic,
             Self::SystemOp(_) => SsaOpClass::Call,
             Self::ComputeOp(_) => SsaOpClass::Scalar,
             Self::BcdAdjust(_) => SsaOpClass::Scalar,
@@ -498,7 +500,7 @@ impl<T: Target> SsaOp<T> {
             | Self::InterruptReturn
             | Self::Unreachable
             | Self::Leave { .. }
-            | Self::Break => SsaSimilarityClass::Control,
+            | Self::Break(_) => SsaSimilarityClass::Control,
 
             Self::VectorUnary { .. }
             | Self::VectorBinary { .. }
@@ -558,7 +560,7 @@ impl<T: Target> SsaOp<T> {
 
             Self::WideMul { .. } | Self::WideDiv { .. } => SsaSimilarityClass::WideArithmetic,
 
-            Self::NativeOpaque(_) | Self::NativeIntrinsic(_) => SsaSimilarityClass::NativeOpaque,
+            Self::NativeOpaque(_) => SsaSimilarityClass::NativeOpaque,
             Self::SystemOp(_) => SsaSimilarityClass::Call,
             Self::ComputeOp(data) => match data.kind {
                 ComputeKind::BitDeposit | ComputeKind::BitExtract | ComputeKind::PointerAuth(_) => {
@@ -726,7 +728,6 @@ impl<T: Target> SsaOp<T> {
             Self::Fence { .. } => "fence",
             Self::FloatCompareFlags { .. } => "float.compare.flags",
             Self::NativeOpaque(_) => "native.opaque",
-            Self::NativeIntrinsic(_) => "native.intrinsic",
             Self::SystemOp(data) => data.kind.kind_str(),
             Self::ComputeOp(data) => data.kind.kind_str(),
             Self::BcdAdjust(data) => data.kind.kind_str(),
@@ -755,7 +756,7 @@ impl<T: Target> SsaOp<T> {
             Self::VectorExtendInLane(_) => "vector.xtl",
             Self::VectorElementCount(_) => "vector.cnt",
             Self::VectorSveAddressGen(_) => "vector.adr",
-            Self::FlagAdjust(_) => "flags.adjust",
+            Self::FlagAdjust(data) => data.kind.kind_str(),
             Self::VectorStructLoadReplicate(_) => "vector.ldNr",
             Self::VectorSmeMisc(_) => "vector.sme.misc",
             Self::VectorPredicateOp(_) => "vector.predop",
@@ -805,7 +806,7 @@ impl<T: Target> SsaOp<T> {
             Self::LoadObj { .. } => "load.obj",
             Self::StoreObj { .. } => "store.obj",
             Self::Nop => "nop",
-            Self::Break => "break",
+            Self::Break(op) => op.kind_str(),
             Self::Ckfinite { .. } => "ckfinite",
             Self::FpClassify { .. } => "fpclassify",
             Self::LocalAlloc { .. } => "local.alloc",
@@ -983,30 +984,15 @@ impl<T: Target> SsaOp<T> {
                 "unsupported:{}",
                 normalize_token_text(&data.mnemonic)
             )),
-            Self::NativeIntrinsic(data) => Cow::Owned(format!(
-                "intrinsic:{}",
-                normalize_token_text(&data.mnemonic)
-            )),
-            Self::SystemOp(data) => Cow::Owned(format!(
-                "system:{}",
-                normalize_token_text(data.kind.kind_str())
-            )),
-            Self::ComputeOp(data) => Cow::Owned(format!(
-                "compute:{}",
-                normalize_token_text(data.kind.kind_str())
-            )),
-            Self::BcdAdjust(data) => Cow::Owned(format!(
-                "compute:{}",
-                normalize_token_text(data.kind.kind_str())
-            )),
-            Self::FlagAdjust(data) => Cow::Owned(format!(
-                "compute:{}",
-                normalize_token_text(flag_adjust_label(data.kind))
-            )),
-            Self::BlockString(data) => Cow::Owned(format!(
-                "blockstring:{}",
-                normalize_token_text(data.kind.kind_str())
-            )),
+            // No `normalize_token_text` on these five: the input is a
+            // `kind_str()` literal, and every registered table's keys are
+            // pinned equal to their own `trim().to_ascii_lowercase()`, so
+            // normalizing is an allocation that cannot change the answer.
+            Self::SystemOp(data) => Cow::Owned(format!("system:{}", data.kind.kind_str())),
+            Self::ComputeOp(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
+            Self::BcdAdjust(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
+            Self::FlagAdjust(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
+            Self::BlockString(data) => Cow::Owned(format!("blockstring:{}", data.kind.kind_str())),
             Self::FloatCompareFlags { .. }
             | Self::Jump { .. }
             | Self::Branch { .. }
@@ -1044,7 +1030,7 @@ impl<T: Target> SsaOp<T> {
             | Self::LocalAlloc { .. }
             | Self::Constrained { .. }
             | Self::Unaligned { .. }
-            | Self::Break
+            | Self::Break(_)
             | Self::EndFinally
             | Self::InterruptReturn
             | Self::Readonly
@@ -1604,7 +1590,7 @@ impl<T: Target> SsaOp<T> {
             | Self::EndFinally
             | Self::Copy { .. }
             | Self::Nop
-            | Self::Break
+            | Self::Break(_)
             | Self::Constrained { .. }
             | Self::Volatile
             | Self::Unaligned { .. }
@@ -1762,326 +1748,53 @@ impl<T: Target> SsaOp<T> {
                 let pops = args.len() as u32;
                 (pops, 1)
             }
-            Self::NativeOpaque(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::NativeIntrinsic(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::SystemOp(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::ComputeOp(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::BcdAdjust(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorCrypto(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::TileOp(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPermute(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorMultiplyAdd(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPackNarrow(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorNarrowSaturate(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPredicateWhile(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPredicateBreak(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorComplexAdd(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorCountAdjust(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorExtendInLane(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorElementCount(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (0, pushes)
-            }
-            Self::VectorSveAddressGen(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::FlagAdjust(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorStructLoadReplicate(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorSmeMisc(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPredicateOp(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorSveCompute(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorReverseChunks(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorMatrixMulAcc(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorSmeOuterProduct(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorPredicateGen(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorFpHelper(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorSvePermute(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorTernaryLogic(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorDotProduct(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorMultiSad(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorIntDotProduct(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorStringCompare(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorBitfield(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorIntersect(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorShuffleBits(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorConditionalMove(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorHorizontalMinPos(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorComplexMul(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorClassify(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::VectorHorizontalReduce(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::BlockString(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::WideCompareExchange(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::FpTranscendental(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
-            Self::FpuControl(data) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = data.inputs.len() as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let pushes = data.outputs.len() as u32;
-                (pops, pushes)
-            }
+            // A boxed payload pops one operand per input and pushes one per
+            // output; the count lives once, in `KindedOperands`.
+            Self::NativeOpaque(data) => data.operand_counts(),
+            Self::SystemOp(data) => data.operand_counts(),
+            Self::ComputeOp(data) => data.operand_counts(),
+            Self::BcdAdjust(data) => data.operand_counts(),
+            Self::VectorCrypto(data) => data.operand_counts(),
+            Self::TileOp(data) => data.operand_counts(),
+            Self::VectorPermute(data) => data.operand_counts(),
+            Self::VectorMultiplyAdd(data) => data.operand_counts(),
+            Self::VectorPackNarrow(data) => data.operand_counts(),
+            Self::VectorNarrowSaturate(data) => data.operand_counts(),
+            Self::VectorPredicateWhile(data) => data.operand_counts(),
+            Self::VectorPredicateBreak(data) => data.operand_counts(),
+            Self::VectorComplexAdd(data) => data.operand_counts(),
+            Self::VectorCountAdjust(data) => data.operand_counts(),
+            Self::VectorExtendInLane(data) => data.operand_counts(),
+            Self::VectorElementCount(data) => data.operand_counts(),
+            Self::VectorSveAddressGen(data) => data.operand_counts(),
+            Self::FlagAdjust(data) => data.operand_counts(),
+            Self::VectorStructLoadReplicate(data) => data.operand_counts(),
+            Self::VectorSmeMisc(data) => data.operand_counts(),
+            Self::VectorPredicateOp(data) => data.operand_counts(),
+            Self::VectorSveCompute(data) => data.operand_counts(),
+            Self::VectorReverseChunks(data) => data.operand_counts(),
+            Self::VectorMatrixMulAcc(data) => data.operand_counts(),
+            Self::VectorSmeOuterProduct(data) => data.operand_counts(),
+            Self::VectorPredicateGen(data) => data.operand_counts(),
+            Self::VectorFpHelper(data) => data.operand_counts(),
+            Self::VectorSvePermute(data) => data.operand_counts(),
+            Self::VectorTernaryLogic(data)
+            | Self::VectorMultiSad(data)
+            | Self::VectorClassify(data) => data.operand_counts(),
+            Self::VectorDotProduct(data) => data.operand_counts(),
+            Self::VectorIntDotProduct(data) => data.operand_counts(),
+            Self::VectorStringCompare(data) => data.operand_counts(),
+            Self::VectorBitfield(data) => data.operand_counts(),
+            Self::VectorIntersect(data) => data.operand_counts(),
+            Self::VectorShuffleBits(data) => data.operand_counts(),
+            Self::VectorConditionalMove(data) => data.operand_counts(),
+            Self::VectorHorizontalMinPos(data) => data.operand_counts(),
+            Self::VectorComplexMul(data) => data.operand_counts(),
+            Self::VectorHorizontalReduce(data) => data.operand_counts(),
+            Self::BlockString(data) => data.operand_counts(),
+            Self::WideCompareExchange(data) => data.operand_counts(),
+            Self::FpTranscendental(data) => data.operand_counts(),
+            Self::FpuControl(data) => data.operand_counts(),
         }
     }
 }

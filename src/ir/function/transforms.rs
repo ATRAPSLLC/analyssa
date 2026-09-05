@@ -43,11 +43,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     BitSet,
-    analysis::cfg::SsaCfg,
-    graph::{RootedGraph, algorithms::compute_dominators},
+    analysis::{cfg::SsaCfg, exceptions::EhCfg},
+    graph::{NodeId, algorithms::compute_dominators},
     ir::{
         block::ReplaceResult,
         function::SsaFunction,
+        instruction::SsaInstruction,
         ops::SsaOp,
         phi::PhiOperand,
         value::ConstValue,
@@ -81,7 +82,99 @@ pub struct CopyPropagationResult {
     pub partially_propagated: BitSet,
 }
 
+fn has_remaining_uses_including_phis<T: Target>(
+    ssa: &SsaFunction<T>,
+    var: SsaVarId,
+    skip_phi: Option<(usize, usize)>,
+) -> bool {
+    ssa.blocks().iter().any(|block| {
+        block.instructions().iter().any(|instr| {
+            let mut found = false;
+            instr.op().for_each_use(|used| found |= used == var);
+            found
+        }) || block
+            .phi_nodes()
+            .iter()
+            .enumerate()
+            .filter(|(phi_idx, _)| skip_phi != Some((block.id(), *phi_idx)))
+            .any(|(_, phi)| phi.operands().iter().any(|operand| operand.value() == var))
+    })
+}
+
 impl<T: Target> SsaFunction<T> {
+    /// Removes every phi from a block the runtime dispatches to, declaring its
+    /// result runtime-supplied instead.
+    ///
+    /// A phi operand names the terminator edge it arrived along. A handler or
+    /// filter entry that no terminator transfers to has no such edges, so a phi
+    /// there is unrepresentable — its operands would name edges that do not
+    /// exist, and the four consumers that walk operands by predecessor would
+    /// read them as if they did.
+    ///
+    /// An entry that *is* also a branch or loop target keeps its phis: the rule
+    /// is about having no terminator predecessors, not about being a handler.
+    ///
+    /// When a removed phi's result is still used, an [`SsaOp::Pop`] is
+    /// prepended in its place. That is the shape the verifier already reads as
+    /// "the runtime supplies this value", so the value stays defined without
+    /// asserting a merge over edges that cannot exist.
+    ///
+    /// # Returns
+    ///
+    /// The number of phis removed.
+    pub fn demote_runtime_entry_phis(&mut self) -> usize {
+        let exception_entries: Vec<usize> = {
+            let blocks = self.exception_blocks();
+            if blocks.is_empty() {
+                return 0;
+            }
+            blocks.runtime_entries().to_vec()
+        };
+
+        let unreachable_entries: Vec<usize> = {
+            let cfg = SsaCfg::from_ssa(self);
+            exception_entries
+                .into_iter()
+                .filter(|entry| cfg.block_predecessors(*entry).is_empty())
+                .collect()
+        };
+
+        let mut demoted: usize = 0;
+        for entry in unreachable_entries {
+            let results: Vec<SsaVarId> = self
+                .block(entry)
+                .map(|block| block.phi_nodes().iter().map(|phi| phi.result()).collect())
+                .unwrap_or_default();
+            if results.is_empty() {
+                continue;
+            }
+
+            if let Some(block) = self.block_mut(entry) {
+                block.phi_nodes_mut().clear();
+            }
+            demoted = demoted.saturating_add(results.len());
+
+            // One use census per entry: `count_uses` is a whole-function walk.
+            let use_counts = self.count_uses();
+            for (offset, result) in results.into_iter().enumerate() {
+                if use_counts.get(&result).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                if let Some(block) = self.block_mut(entry) {
+                    let at = offset.min(block.instructions().len());
+                    block
+                        .instructions_mut()
+                        .insert(at, SsaInstruction::synthetic(SsaOp::Pop { value: result }));
+                }
+                if let Some(variable) = self.variable_mut(result) {
+                    variable.set_def_site(DefSite::phi(entry));
+                }
+            }
+        }
+
+        demoted
+    }
+
     /// Replaces all uses of `old_var` with `new_var` throughout the function.
     ///
     /// This is the core operation for copy propagation - when we know that
@@ -201,8 +294,8 @@ impl<T: Target> SsaFunction<T> {
         // changes any terminator, so it stays valid across every replacement
         // below; rebuilding it per copy would repeat the whole CFG walk.
         let dominators = if self.block_count() > 0 {
-            let cfg = SsaCfg::from_ssa(self);
-            Some(compute_dominators(&cfg, cfg.entry()))
+            let eh = EhCfg::from_ssa(self);
+            Some(compute_dominators(&eh, NodeId::new(0)))
         } else {
             None
         };
@@ -463,7 +556,7 @@ impl<T: Target> SsaFunction<T> {
         // predecessor relation in one O(V+E) pass instead of calling
         // `block_predecessors` per block (which is O(V) each → O(V²)).
         let reachable_preds: Option<BTreeMap<usize, BitSet>> = options.reachable.map(|reachable| {
-            let all_preds = self.compute_predecessors();
+            let all_preds = SsaCfg::from_ssa(self).to_predecessor_sets();
             let mut map = BTreeMap::new();
             for block in &self.blocks {
                 let block_idx = block.id();
@@ -611,8 +704,8 @@ impl<T: Target> SsaFunction<T> {
                 // dominator tree is built once for the whole batch — use
                 // replacement leaves the CFG (and therefore dominance) unchanged.
                 let dominators = if self.block_count() > 0 {
-                    let cfg = SsaCfg::from_ssa(self);
-                    Some(compute_dominators(&cfg, cfg.entry()))
+                    let eh = EhCfg::from_ssa(self);
+                    Some(compute_dominators(&eh, NodeId::new(0)))
                 } else {
                     None
                 };
@@ -1215,28 +1308,7 @@ impl<T: Target> SsaFunction<T> {
         // renumbers `variables` and remaps the ids in blocks afterwards.
         // Dropping them here would break `variables[i].id().index() == i`.
     }
-}
 
-fn has_remaining_uses_including_phis<T: Target>(
-    ssa: &SsaFunction<T>,
-    var: SsaVarId,
-    skip_phi: Option<(usize, usize)>,
-) -> bool {
-    ssa.blocks().iter().any(|block| {
-        block.instructions().iter().any(|instr| {
-            let mut found = false;
-            instr.op().for_each_use(|used| found |= used == var);
-            found
-        }) || block
-            .phi_nodes()
-            .iter()
-            .enumerate()
-            .filter(|(phi_idx, _)| skip_phi != Some((block.id(), *phi_idx)))
-            .any(|(_, phi)| phi.operands().iter().any(|operand| operand.value() == var))
-    })
-}
-
-impl<T: Target> SsaFunction<T> {
     /// Shrinks `num_locals` to the actual maximum local index in use.
     ///
     /// After `compact_variables()` removes unused variables, `num_locals` may
@@ -1471,7 +1543,7 @@ mod tests {
         let returned = ssa
             .blocks()
             .iter()
-            .find_map(|block| match block.terminator_op() {
+            .find_map(|block| match block.control_terminator() {
                 Some(SsaOp::Return { value: Some(v) }) => Some(*v),
                 _ => None,
             });

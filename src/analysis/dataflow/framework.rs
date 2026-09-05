@@ -4,7 +4,7 @@
 //!
 //! - [`DataFlowCfg`]: Trait for control flow graphs usable with the solver.
 //!   Abstracts over CFG implementations so the solver can run on SSA-level
-//!   [`SsaCfg`] graphs and host-provided CFG types.
+//!   [`EhCfg`] and host-provided CFG types.
 //! - [`Direction`]: Forward (entry-to-exit) or backward (exit-to-entry).
 //!   Determines how information propagates and which combining operation is used.
 //! - [`DataFlowAnalysis`]: Trait for a specific analysis. Implementations supply
@@ -17,16 +17,19 @@
 use std::fmt::Debug;
 
 use crate::{
-    analysis::{cfg::SsaCfg, dataflow::lattice::MeetSemiLattice},
-    graph::{NodeId, Predecessors, RootedGraph, Successors},
+    analysis::{dataflow::lattice::MeetSemiLattice, exceptions::EhCfg},
+    graph::{
+        NodeId, Predecessors, RootedGraph, Successors,
+        algorithms::{postorder, reverse_postorder},
+    },
     ir::{block::SsaBlock, function::SsaFunction},
     target::Target,
 };
 
 /// Trait for control flow graphs usable with the dataflow solver.
 ///
-/// Abstracts over CFG implementations so the solver can run on SSA-level
-/// [`SsaCfg`] graphs and host-provided CFG types.
+/// Abstracts over CFG implementations so the solver can run on the crate's
+/// exception-aware [`EhCfg`] and on host-provided CFG types.
 pub trait DataFlowCfg: Predecessors + Successors {
     /// Returns the entry node of the CFG.
     fn entry(&self) -> NodeId;
@@ -169,8 +172,19 @@ impl<L: Clone> AnalysisResults<L> {
     }
 }
 
-// `DataFlowCfg` implementation for analyssa's SSA CFG.
-impl<T: Target> DataFlowCfg for SsaCfg<'_, T> {
+// `DataFlowCfg` for the exception-aware flow view.
+//
+// Deliberately not implemented for `SsaCfg`. A solver seeded from a
+// terminator-only traversal never visits a handler block, so every
+// solver-based analysis would silently answer for the normal path alone --
+// and unlike a dominance query, nothing about the result would look wrong.
+//
+// The extra edges only widen the answers: liveness and reaching definitions
+// are may-analyses, so a value reported live across an exceptional edge is
+// conservative, never incorrect. Phi pruning in the rebuilder needs that
+// widening, since liveness over terminator edges alone would prune a phi the
+// exception-aware frontier legitimately demands.
+impl<T: Target> DataFlowCfg for EhCfg<'_, T> {
     fn entry(&self) -> NodeId {
         RootedGraph::entry(self)
     }
@@ -180,10 +194,10 @@ impl<T: Target> DataFlowCfg for SsaCfg<'_, T> {
     }
 
     fn postorder(&self) -> Vec<NodeId> {
-        self.postorder()
+        postorder(self, RootedGraph::entry(self))
     }
 
     fn reverse_postorder(&self) -> Vec<NodeId> {
-        self.reverse_postorder()
+        reverse_postorder(self, RootedGraph::entry(self))
     }
 }

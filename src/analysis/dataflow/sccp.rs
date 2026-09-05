@@ -95,7 +95,7 @@ use crate::{
 /// use analyssa::{
 ///     analysis::{
 ///         dataflow::{ConstantPropagation, ScalarValue},
-///         SsaCfg,
+///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing, PointerSize,
@@ -103,7 +103,7 @@ use crate::{
 ///
 /// // `const_i32_return(42)` is `v0 = 42; return v0`.
 /// let ssa = testing::const_i32_return(42);
-/// let graph = SsaCfg::from_ssa(&ssa);
+/// let graph = EhCfg::from_ssa(&ssa);
 ///
 /// let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
 /// let results = sccp.analyze(&ssa, &graph);
@@ -162,7 +162,7 @@ impl<T: Target> ConstantPropagation<T> {
     /// - `RootedGraph` for the entry point
     /// - `Successors` for traversing outgoing edges
     ///
-    /// This allows using both `ControlFlowGraph` (from CIL blocks) and `SsaCfg`
+    /// This allows using both `ControlFlowGraph` (from CIL blocks) and `EhCfg`
     /// (from SSA function terminators).
     ///
     /// Returns the analysis results containing the value for each variable.
@@ -370,7 +370,7 @@ impl<T: Target> ConstantPropagation<T> {
         G: RootedGraph + Successors,
     {
         // Find the terminator instruction
-        match block.terminator_op() {
+        match block.control_terminator() {
             Some(SsaOp::Branch {
                 condition,
                 true_target,
@@ -769,7 +769,7 @@ mod tests {
     use super::*;
     use crate::{
         PointerSize,
-        analysis::{cfg::SsaCfg, dataflow::lattice::MeetSemiLattice},
+        analysis::{dataflow::lattice::MeetSemiLattice, exceptions::EhCfg},
         ir::{
             block::SsaBlock,
             function::SsaFunction,
@@ -839,7 +839,7 @@ mod tests {
         ssa.add_block(b3);
         ssa.recompute_uses();
 
-        let cfg = SsaCfg::from_ssa(&ssa);
+        let cfg = EhCfg::from_ssa(&ssa);
         let result = ConstantPropagation::<MockTarget>::new(PointerSize::Bit64).analyze(&ssa, &cfg);
 
         assert_eq!(
@@ -893,7 +893,7 @@ mod tests {
         ssa.add_block(b1);
         ssa.recompute_uses();
 
-        let cfg = SsaCfg::from_ssa(&ssa);
+        let cfg = EhCfg::from_ssa(&ssa);
         let result = ConstantPropagation::<MockTarget>::new(PointerSize::Bit64).analyze(&ssa, &cfg);
 
         assert_eq!(
@@ -1014,7 +1014,7 @@ mod tests {
         ssa.add_block(b1);
         ssa.recompute_uses();
 
-        let cfg = SsaCfg::from_ssa(&ssa);
+        let cfg = EhCfg::from_ssa(&ssa);
         let mut sccp: ConstantPropagation<MockTarget> =
             ConstantPropagation::new(PointerSize::Bit64);
         let result = sccp.analyze(&ssa, &cfg);

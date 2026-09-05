@@ -203,7 +203,7 @@ fn plan_loop_hoist<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> Opt
 
     let header_has_switch = ssa
         .block(header_idx)
-        .and_then(|b| b.terminator_op())
+        .and_then(|b| b.control_terminator())
         .is_some_and(|op| matches!(op, SsaOp::Switch { .. }));
     if header_has_switch {
         return None;
@@ -330,7 +330,7 @@ fn plan_loop_hoist<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> Opt
                         .filter(|i| !i.is_terminator() && !matches!(i.op(), SsaOp::Nop))
                         .count();
                     if hoist_count >= non_term
-                        && let Some(term) = block.terminator_op()
+                        && let Some(term) = block.control_terminator()
                     {
                         term.for_each_successor(|succ| {
                             if let Some(succ_block) = ssa.block(succ)
@@ -636,33 +636,39 @@ fn back_edge_tainted_vars<T: Target>(
     let mut tainted = phi_back_edge_operands.clone();
     let mut worklist: VecDeque<SsaVarId> = phi_back_edge_operands.iter().collect();
     while let Some(value) = worklist.pop_front() {
-        let Some(var) = ssa.variable(value) else {
-            continue;
-        };
-        let site = var.def_site();
-        // A def site is variable *metadata*, not a fact about the current CFG:
-        // it can name a block this function no longer has, or never had. The
-        // lookup below already treats that as "no such instruction" — the block
-        // fetch is fallible — so the membership test has to be equally tolerant
-        // rather than asserting one line earlier.
+        // This set is a *safety* set — `can_hoist` refuses every instruction
+        // whose result is in it — so the two lookups fail in opposite
+        // directions. Dropping a link shrinks the set, and a value that should
+        // have been tainted is one that gets hoisted out of the loop: the
+        // fail-open direction, and a miscompile. Over-tainting only costs a
+        // hoist. So a stale def site is *recovered* by scan here rather than
+        // refused, and a definition the scan finds but cannot place is treated
+        // as in-loop.
+        //
+        // A def site is also variable *metadata*, not a fact about the current
+        // CFG: it can name a block this function no longer has, or never had.
+        // The membership test below therefore has to be as tolerant as the
+        // lookup, rather than asserting one line earlier.
         //
         // It asserted, and a `BitSet` bounds assert is a **panic**: measured over
         // 21,600 binaries it fired 8 times, each one unwinding out of LICM into
         // `guard_pass`, which rolled the whole pass back and left the function
         // unoptimised with nothing upstream the wiser.
-        if !loop_info.contains(NodeId::new(site.block)) {
-            continue;
-        }
-        let Some(instr_idx) = site.instruction else {
-            continue;
+        let op = match ssa.recorded_definition(value) {
+            Some(recorded) => {
+                if !loop_info.contains(NodeId::new(recorded.block_index())) {
+                    continue;
+                }
+                recorded.op()
+            }
+            None => {
+                let Some(instr) = ssa.get_definition_instruction(value) else {
+                    continue;
+                };
+                instr.op()
+            }
         };
-        let Some(instr) = ssa
-            .block(site.block)
-            .and_then(|block| block.instruction(instr_idx))
-        else {
-            continue;
-        };
-        instr.op().for_each_use(|operand| {
+        op.for_each_use(|operand| {
             if tainted.insert(operand) {
                 worklist.push_back(operand);
             }

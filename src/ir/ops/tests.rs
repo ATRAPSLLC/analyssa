@@ -1,6 +1,6 @@
 //! Unit tests for the [`SsaOp`] surface.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, env, fs, path::Path};
 
 use super::*;
 use crate::{
@@ -780,48 +780,6 @@ fn replace_uses_new_ops() {
     assert_eq!(op5.replace_uses(old, new), 1);
 }
 
-/// set_dest works for new dest-bearing ops.
-#[test]
-fn set_dest_new_ops() {
-    let d = SsaVarId::from_index(0);
-    let new_d = SsaVarId::from_index(99);
-    let v = SsaVarId::from_index(1);
-    let a = SsaVarId::from_index(2);
-
-    let mut rol: SsaOp<MockTarget> = SsaOp::Rol {
-        dest: d,
-        value: v,
-        amount: a,
-    };
-    assert!(rol.set_dest(new_d));
-    assert_eq!(rol.dest(), Some(new_d));
-
-    let mut bswap: SsaOp<MockTarget> = SsaOp::BSwap { dest: d, src: v };
-    assert!(bswap.set_dest(new_d));
-    assert_eq!(bswap.dest(), Some(new_d));
-
-    let mut select: SsaOp<MockTarget> = SsaOp::Select {
-        dest: d,
-        condition: v,
-        true_val: a,
-        false_val: d,
-    };
-    assert!(select.set_dest(new_d));
-    assert_eq!(select.dest(), Some(new_d));
-}
-
-/// set_dest returns false for ops without dest.
-#[test]
-fn set_dest_fails_for_no_dest_ops() {
-    assert!(
-        !SsaOp::<MockTarget>::Fence {
-            kind: FenceKind::Full
-        }
-        .set_dest(SsaVarId::from_index(0))
-    );
-    assert!(!SsaOp::<MockTarget>::InterruptReturn.set_dest(SsaVarId::from_index(0)));
-}
-
 /// remap_variables works for new ops.
 #[test]
 fn remap_variables_new_ops() {
@@ -871,6 +829,463 @@ fn atomic_rmw_op_display() {
 }
 
 // -----------------------------------------------------------------------
+// Operation-kind table tests
+// -----------------------------------------------------------------------
+
+/// Per table: the count pin, injective spellings, and the lowercase-literal
+/// precondition `coarse_token` now relies on.
+///
+/// The count is the forcing function. A variant added without bumping `COUNT`
+/// leaves `from_index(COUNT)` resolving, which fails here — so growing a table
+/// is a deliberate two-line edit rather than a silent one that leaves every
+/// registry-wide check quantifying over less than the whole domain.
+#[test]
+fn every_op_kind_table_has_unique_strings_and_a_pinned_count() {
+    use std::collections::BTreeSet;
+
+    for table in super::table::all_tables() {
+        assert!(
+            table.last_index_resolves,
+            "{}: COUNT is {}, but index {} resolves to nothing — the count is too high",
+            table.name,
+            table.count,
+            table.count.saturating_sub(1),
+        );
+        assert!(
+            !table.count_index_resolves,
+            "{}: index {} resolves, so the enum has more variants than COUNT claims",
+            table.name, table.count,
+        );
+        assert_eq!(
+            table.entries.len(),
+            usize::from(table.count),
+            "{}: iteration yielded a different number of variants than COUNT",
+            table.name,
+        );
+
+        let mut kind_strs = BTreeSet::new();
+        let mut mnemonics = BTreeSet::new();
+        for (kind_str, mnemonic) in &table.entries {
+            assert!(
+                kind_strs.insert(*kind_str),
+                "{}: kind_str {kind_str:?} names two variants",
+                table.name,
+            );
+            assert_eq!(
+                *kind_str,
+                kind_str.trim().to_ascii_lowercase(),
+                "{}: kind_str {kind_str:?} is not already trimmed and lowercase, so \
+                 `coarse_token` cannot skip normalizing it",
+                table.name,
+            );
+            if let Some(mnemonic) = mnemonic {
+                assert!(
+                    mnemonics.insert(*mnemonic),
+                    "{}: mnemonic {mnemonic:?} names two variants",
+                    table.name,
+                );
+            }
+        }
+    }
+}
+
+/// One instruction, one home — checked as a multiset over every registered
+/// table at once, because `SsaOp::opcode_name` is one flat namespace.
+///
+/// A per-table check cannot see the defect this exists for: two tables can each
+/// be internally consistent and still name one instruction between them, with
+/// contradictory effects, so which spelling a front-end picks decides what the
+/// operation means. The `kind_str` half additionally spans both composites'
+/// `identities()`, since those are the values that reach `opcode_name`.
+#[test]
+fn no_native_mnemonic_has_two_homes() {
+    use std::collections::BTreeMap;
+
+    let mut mnemonic_homes: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+    let mut kind_str_homes: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+
+    for table in super::table::all_tables() {
+        for (kind_str, mnemonic) in &table.entries {
+            if let Some(mnemonic) = mnemonic {
+                mnemonic_homes.entry(mnemonic).or_default().push(table.name);
+            }
+            kind_str_homes
+                .entry(kind_str)
+                .or_default()
+                .push(table.name.to_owned());
+        }
+    }
+    for kind in SystemOpKind::identities() {
+        kind_str_homes
+            .entry(kind.kind_str())
+            .or_default()
+            .push(format!("SystemOpKind::{kind:?}"));
+    }
+    for kind in ComputeKind::identities() {
+        kind_str_homes
+            .entry(kind.kind_str())
+            .or_default()
+            .push(format!("ComputeKind::{kind:?}"));
+    }
+
+    // A payload table and the composite carrying it legitimately report the
+    // same key: that is delegation, not a second home. Two *tables*, or two
+    // identities of one composite, are not.
+    let duplicate_mnemonics: Vec<String> = mnemonic_homes
+        .iter()
+        .filter(|(_, homes)| homes.len() > 1)
+        .map(|(mnemonic, homes)| format!("{mnemonic} <- {}", homes.join(", ")))
+        .collect();
+    assert!(
+        duplicate_mnemonics.is_empty(),
+        "{} mnemonic(s) with more than one home:\n{}",
+        duplicate_mnemonics.len(),
+        duplicate_mnemonics.join("\n"),
+    );
+
+    let duplicate_keys: Vec<String> = kind_str_homes
+        .iter()
+        .filter(|(_, homes)| homes.len() > 2)
+        .map(|(key, homes)| format!("{key} <- {}", homes.join(", ")))
+        .collect();
+    assert!(
+        duplicate_keys.is_empty(),
+        "{} kind_str key(s) reachable from more than one table plus its carrier:\n{}",
+        duplicate_keys.len(),
+        duplicate_keys.join("\n"),
+    );
+}
+
+/// `SsaOp::opcode_name` is one flat namespace, so two system-op identities
+/// sharing a `kind_str` are two instructions nothing downstream can tell apart.
+///
+/// The shapes that break it: a variant naming a register *file* standing beside
+/// one naming an instruction, so both answer `"system.sysreg.read"`; and a
+/// payload field read as data rather than identity, so `rdtsc` and `rdtscp`
+/// answer `"system.timestamp"` between them.
+#[test]
+fn system_op_kind_str_is_injective_over_every_identity() {
+    assert_kind_strs_are_injective(
+        "SystemOpKind",
+        SystemOpKind::identities()
+            .into_iter()
+            .map(|kind| (kind.kind_str(), format!("{kind:?}"))),
+    );
+}
+
+/// The same invariant for the compute taxonomy, whose `PointerAuth` payload is
+/// four instructions — signing, authenticating, stripping, generic MAC — that
+/// one family-wide spelling would collapse onto a single key.
+#[test]
+fn compute_kind_str_is_injective_over_every_identity() {
+    assert_kind_strs_are_injective(
+        "ComputeKind",
+        ComputeKind::identities()
+            .into_iter()
+            .map(|kind| (kind.kind_str(), format!("{kind:?}"))),
+    );
+}
+
+/// Fails with every colliding key and the identities that produce it, so one
+/// run names the whole repair rather than the first of it.
+fn assert_kind_strs_are_injective(
+    label: &str,
+    identities: impl Iterator<Item = (&'static str, String)>,
+) {
+    use std::collections::BTreeMap;
+
+    let mut seen: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for (key, described) in identities {
+        seen.entry(key).or_default().push(described);
+    }
+    let collisions: Vec<String> = seen
+        .iter()
+        .filter(|(_, kinds)| kinds.len() > 1)
+        .map(|(key, kinds)| format!("{key} <- {}", kinds.join(" | ")))
+        .collect();
+    assert!(
+        collisions.is_empty(),
+        "{} kind_str collision(s) across {label} identities:\n{}",
+        collisions.len(),
+        collisions.join("\n"),
+    );
+}
+
+/// Every family is expanded by `identities()`, so the domain the injectivity
+/// and effect checks quantify over really is the whole domain.
+///
+/// The last link of the chain `family()` starts: a new variant fails to compile
+/// against the exhaustive `family` match, a new family fails to compile against
+/// the pinned `ALL` array, and a family nothing expands fails here.
+#[test]
+fn identity_domains_cover_every_family() {
+    use std::collections::BTreeSet;
+
+    let system: BTreeSet<_> = SystemOpKind::identities()
+        .into_iter()
+        .map(SystemOpKind::family)
+        .collect();
+    assert_eq!(
+        system.len(),
+        super::kinds::SystemOpFamily::ALL.len(),
+        "SystemOpKind::identities() expands {} of {} families",
+        system.len(),
+        super::kinds::SystemOpFamily::ALL.len(),
+    );
+
+    let compute: BTreeSet<_> = ComputeKind::identities()
+        .into_iter()
+        .map(ComputeKind::family)
+        .collect();
+    assert_eq!(
+        compute.len(),
+        super::kinds::ComputeFamily::ALL.len(),
+        "ComputeKind::identities() expands {} of {} families",
+        compute.len(),
+        super::kinds::ComputeFamily::ALL.len(),
+    );
+}
+
+/// `xend`, `xtest`, `xabort` and the load-tracking pair live in exactly one
+/// enum.
+///
+/// Two homes for one instruction means two effect summaries for it: a commit is
+/// a sequentially consistent fence under one spelling and a plain `Write` under
+/// the other, so whether a store may move across `xend` would depend on which
+/// spelling a front-end picks.
+#[test]
+fn transactional_memory_has_one_home() {
+    for op in BarrierOp::all() {
+        assert!(
+            !op.kind_str().contains("txn") && !op.mnemonic().starts_with('x'),
+            "{op:?} is a transactional operation sitting in the barrier family"
+        );
+    }
+
+    assert_eq!(
+        SystemTransactionKind::Commit.effects().kind,
+        SsaEffectKind::Fence,
+        "a commit publishes the transaction's writes"
+    );
+    assert_eq!(
+        SystemTransactionKind::Cancel.effects().kind,
+        SsaEffectKind::Fence,
+    );
+    assert_eq!(
+        SystemTransactionKind::Test.effects().kind,
+        SsaEffectKind::Read,
+        "`xtest` reads transactional status and touches no memory"
+    );
+    for op in [
+        SystemTransactionKind::Start,
+        SystemTransactionKind::ResumeLoadTracking,
+        SystemTransactionKind::SuspendLoadTracking,
+    ] {
+        assert_eq!(
+            op.effects().kind,
+            SsaEffectKind::Write,
+            "{op:?} writes state"
+        );
+    }
+
+    // The carrier reports what the payload reports, so there is one answer.
+    for op in SystemTransactionKind::all() {
+        assert_eq!(
+            SystemOpKind::Transaction(op).effects(),
+            op.effects(),
+            "{op:?} must not gain a second effect summary through its carrier"
+        );
+    }
+}
+
+/// A special-register access reports what the *instruction* does, not what its
+/// operand shape suggests.
+///
+/// `writes_destination_operand` answers a lift-shape question and cannot stand
+/// in for this one: RISC-V `csrrw`/`csrrs`/`csrrc` define a destination *and*
+/// write the CSR, and ARM `ldc` defines no destination operand while only
+/// reading.
+#[test]
+fn sysreg_effects_follow_the_operation() {
+    for op in [
+        SysRegOp::ExchangeSystemRegister,
+        SysRegOp::SetSystemRegisterBits,
+        SysRegOp::ClearSystemRegisterBits,
+    ] {
+        assert_eq!(
+            op.effects().kind,
+            SsaEffectKind::ReadWrite,
+            "{op:?} reads the register and writes it back in one instruction"
+        );
+    }
+    assert_eq!(
+        SysRegOp::CoprocessorLoad.effects().kind,
+        SsaEffectKind::Read,
+        "`ldc` loads a coprocessor register rather than writing machine state"
+    );
+    assert_eq!(
+        SysRegOp::ReadModelSpecific.effects().kind,
+        SsaEffectKind::Read
+    );
+    assert_eq!(
+        SysRegOp::WriteModelSpecific.effects().kind,
+        SsaEffectKind::Write
+    );
+
+    // No access is pure: every one of them touches a register file the IR does
+    // not model as SSA values.
+    for op in SysRegOp::all() {
+        assert!(!op.effects().is_pure(), "{op:?} must not be pure");
+        assert_eq!(
+            SystemOpKind::ControlRegister(op).effects(),
+            op.effects(),
+            "{op:?} must not gain a second effect summary through its carrier"
+        );
+    }
+
+    // `rdmsr` and the ARM/MIPS register move are separate operations with
+    // separate keys, so neither collides with the other.
+    assert_eq!(
+        SysRegOp::ReadModelSpecific.kind_str(),
+        "system.sysreg.msr.read"
+    );
+    assert_eq!(
+        SysRegOp::ReadSystemRegister.kind_str(),
+        "system.sysreg.read"
+    );
+}
+
+/// A hint has a carrier, an identity, and an effect that is never `Pure` — and
+/// never a memory barrier either.
+///
+/// `Pure` would let dead-code elimination delete exactly the hints that matter:
+/// `endbr64` is a control-flow-integrity landing pad and `pause`/`wfe` are
+/// synchronization. Plain `Opaque` carries `MemoryEffectLocation::Unknown`,
+/// which `MemorySsa::classify_memory_operation` turns into a
+/// `MemoryOp::Barrier` — making every lifted `nop` block store forwarding
+/// across instruction padding. Non-removable *and* not a barrier is the only
+/// correct answer, and the location is what pins it.
+#[test]
+fn hint_ops_are_carried_and_never_pure() {
+    for hint in HintOp::all() {
+        let effects = hint.effects();
+        assert!(
+            !effects.is_pure(),
+            "{hint:?} must survive dead-code removal"
+        );
+        assert_eq!(
+            SystemOpKind::Hint(hint).effects(),
+            effects,
+            "{hint:?} must not gain a second effect summary through its carrier"
+        );
+        assert!(
+            hint.kind_str().starts_with("system.hint."),
+            "{hint:?} must be spelled under its carrier's prefix, not `hint.*`"
+        );
+
+        match effects.kind {
+            SsaEffectKind::Read => assert!(
+                hint.mnemonic().starts_with("prefetch"),
+                "{hint:?} reads memory but is not a prefetch"
+            ),
+            SsaEffectKind::Opaque => assert_eq!(
+                effects.memory,
+                MemoryEffectLocation::None,
+                "{hint:?} touches no memory, so it must not classify as a barrier"
+            ),
+            other => panic!("{hint:?} declares an unexpected effect class {other:?}"),
+        }
+    }
+
+    // The carrier is the point: it is what puts a hint's identity into an
+    // operation the IR can hold.
+    let op: SsaOp<MockTarget> = SsaOp::SystemOp(Box::new(NativeKindedData {
+        kind: SystemOpKind::Hint(HintOp::IndirectBranchLandingPad),
+        mnemonic: String::from("endbr64"),
+        metadata: None,
+        outputs: Vec::new(),
+        inputs: Vec::new(),
+    }));
+    assert_eq!(op.opcode_name(), "system.hint.landingpad");
+    assert!(!op.is_pure());
+}
+
+/// The `_ =>` catch-all in `MachineStateOp::effects` must fall to a
+/// conservative class, never to `Pure`.
+///
+/// A machine-state operation that classifies pure and defines nothing is one
+/// dead-code elimination deletes. The catch-all is deliberate — 140 variants —
+/// so what makes it safe is that its default over-approximates, which is what
+/// this pins.
+#[test]
+fn no_machine_state_op_is_pure() {
+    for op in MachineStateOp::all() {
+        assert!(
+            !op.effects().is_pure(),
+            "{op:?} classifies pure, so an operation with no SSA result is deletable"
+        );
+        assert_eq!(
+            SystemOpKind::MachineState(op).effects(),
+            op.effects(),
+            "{op:?} must not gain a second effect summary through its carrier"
+        );
+    }
+}
+
+/// A flag adjustment is pure exactly when its whole architectural write is a
+/// value the IR can name.
+///
+/// Quantified over the table rather than a hand-written list, so a variant
+/// added to the enum is covered as soon as `COUNT` is bumped.
+#[test]
+fn flag_adjust_effects_follow_flags_written() {
+    for kind in FlagAdjustKind::all() {
+        let confined_to_status = FlagsMask::x86_status().contains(kind.flags_written());
+        let has_result = !matches!(kind.result(), FlagAdjustResult::None);
+        assert_eq!(
+            has_result,
+            confined_to_status,
+            "{kind:?} writes {} but declares {:?}",
+            kind.flags_written(),
+            kind.result(),
+        );
+        assert_eq!(kind.output_arity(), usize::from(has_result));
+        assert_eq!(
+            kind.effects().kind,
+            if has_result {
+                SsaEffectKind::Pure
+            } else {
+                SsaEffectKind::Opaque
+            },
+        );
+        assert!(
+            kind.flags_written().is_valid(),
+            "{kind:?} names a flag bit FlagsMask does not define"
+        );
+    }
+}
+
+/// A flag constant with no producer is an unreachable path: the constant, the
+/// `NativeFlagBit` variant and the `from_flag_bit` arm all exist, and nothing
+/// can build a mask that names IF. `cli`/`sti` are what make it reachable.
+#[test]
+fn interrupt_flag_has_a_producer() {
+    let producers: Vec<FlagAdjustKind> = FlagAdjustKind::all()
+        .filter(|kind| kind.flags_written().intersects(FlagsMask::INTERRUPT))
+        .collect();
+    assert_eq!(
+        producers,
+        vec![FlagAdjustKind::ClearInterrupt, FlagAdjustKind::SetInterrupt],
+        "IF is an EFLAGS bit exactly as DF and AC are, so `cli`/`sti` write it here"
+    );
+    assert_eq!(
+        FlagsMask::from_flag_bit(NativeFlagBit::Interrupt),
+        FlagsMask::INTERRUPT
+    );
+    assert!(!FlagsMask::x86_status().contains(FlagsMask::INTERRUPT));
+}
+
+// -----------------------------------------------------------------------
 // FlagsMask tests
 // -----------------------------------------------------------------------
 
@@ -903,6 +1318,74 @@ fn flags_mask_display() {
         "CF,ZF"
     );
     assert_eq!(format!("{}", FlagsMask::from_bits(0)), "none");
+}
+
+/// The rendering is the table, not a second copy of it.
+///
+/// A per-bit `if` chain beside the constants is two statements of the same
+/// list, and the one a reviewer does not re-read is the one that drifts: a bit
+/// added to the constants and not to the renderer prints as nothing at all.
+#[test]
+fn flags_mask_display_matches_the_named_table() {
+    for (bit, name) in FlagsMask::NAMED {
+        assert_eq!(&format!("{bit}"), name, "{name} must render as itself");
+        assert!(
+            FlagsMask::ALL.contains(*bit),
+            "{name} must be part of the derived ALL"
+        );
+        assert!(bit.is_valid());
+    }
+
+    assert_eq!(
+        FlagsMask::NAMED.len(),
+        usize::try_from(FlagsMask::ALL.bits().count_ones()).unwrap_or_default(),
+        "every named entry must contribute exactly one distinct bit to ALL"
+    );
+
+    // Order is CF,PF,AF,ZF,SF,OF,DF,IF,AC — bit order, so the rendering of a
+    // multi-bit mask does not depend on which bits happen to be set.
+    assert_eq!(format!("{}", FlagsMask::ALL), "CF,PF,AF,ZF,SF,OF,DF,IF,AC");
+    assert_eq!(format!("{}", FlagsMask::x86_status()), "CF,PF,AF,ZF,SF,OF");
+}
+
+/// An undefined bit survives the mask and is reported, in both directions.
+///
+/// `from_bits` is unmasked so a persisted mask round-trips exactly; masking
+/// inside it would turn a diagnosable error into silent data loss. What makes
+/// that safe is that the bit is then visible everywhere it matters:
+/// [`FlagsMask::is_valid`] is false, [`FlagsMask::from_bits_checked`] refuses
+/// it, and the rendering appends `?0x…` instead of printing a mask that looks
+/// well-formed.
+#[test]
+fn flags_mask_round_trips_undefined_bits_and_reports_them_invalid() {
+    let undefined_bit = 1u16 << 15;
+    assert_eq!(FlagsMask::ALL.bits() & undefined_bit, 0);
+
+    let mask = FlagsMask::from_bits(FlagsMask::CARRY.bits() | undefined_bit);
+    assert_eq!(
+        mask.bits(),
+        FlagsMask::CARRY.bits() | undefined_bit,
+        "from_bits must not drop the bit it was handed"
+    );
+    assert!(!mask.is_valid());
+    assert_eq!(mask.undefined_bits(), undefined_bit);
+    assert_eq!(format!("{mask}"), "CF,?0x8000");
+
+    // A mask of nothing but undefined bits must not read as `none`.
+    let only_undefined = FlagsMask::from_bits(undefined_bit);
+    assert_eq!(format!("{only_undefined}"), "?0x8000");
+
+    assert_eq!(FlagsMask::from_bits_checked(undefined_bit), None);
+    assert_eq!(
+        FlagsMask::from_bits_checked(FlagsMask::ALL.bits()),
+        Some(FlagsMask::ALL)
+    );
+    // The empty mask selects no flags, which is a legal thing to ask for.
+    assert_eq!(
+        FlagsMask::from_bits_checked(0),
+        Some(FlagsMask::from_bits(0))
+    );
+    assert!(FlagsMask::from_bits(0).is_valid());
 }
 
 // -----------------------------------------------------------------------
@@ -1479,10 +1962,9 @@ fn effect_summaries_classify_pure_memory_atomic_and_call_ops() {
 
     // `dsb`/`dmb`/`isb` order memory: they are fences, not plain writes.
     let barrier = SsaOp::<MockTarget>::SystemOp(Box::new(NativeKindedData {
-        kind: SystemOpKind::Barrier,
+        kind: SystemOpKind::Barrier(BarrierOp::Serialize),
         mnemonic: "dmb".into(),
         metadata: None,
-        clobbers: vec![],
         outputs: vec![],
         inputs: vec![],
     }))
@@ -1526,40 +2008,18 @@ fn effect_summaries_classify_pure_memory_atomic_and_call_ops() {
 /// The `check_native_effects` verifier invariant rejects any op whose
 /// `effects().control` is block-ending (`Terminator`/`Return`/`Throw`)
 /// unless it is a terminator — so **no** system-op kind may declare a
-/// block-ending control effect. Regression guard for `iret`/`eret`
-/// (`SystemOpKind::InterruptReturn`), which formerly declared
-/// `ControlEffect::Return` and made every mid-block `iret` fail lift SSA
-/// verification.
+/// block-ending control effect. `iret`/`eret`
+/// (`SystemOpKind::InterruptReturn`) is the sharp case: declaring
+/// `ControlEffect::Return` for it makes every mid-block `iret` fail lift SSA
+/// verification, so it declares `ControlEffect::Call` — a control transfer to
+/// the interrupted context, exactly like `sysret`.
+///
+/// Quantified over [`SystemOpKind::identities`] rather than over a hand-written
+/// list, because a hand-written list silently omits whole families — every
+/// special-register move, say — and omits each family added after it.
 #[test]
 fn system_op_kinds_never_declare_a_block_ending_control_effect() {
-    let all = [
-        SystemOpKind::CpuId,
-        SystemOpKind::Timestamp { aux: false },
-        SystemOpKind::Timestamp { aux: true },
-        SystemOpKind::ReadSysReg {
-            namespace: SysRegNamespace::X86Msr,
-        },
-        SystemOpKind::WriteSysReg {
-            namespace: SysRegNamespace::Arm64System,
-        },
-        SystemOpKind::ReadPerfCounter,
-        SystemOpKind::SystemCall,
-        SystemOpKind::SystemReturn,
-        SystemOpKind::Trap { vector: None },
-        SystemOpKind::Trap { vector: Some(0x80) },
-        SystemOpKind::InterruptReturn,
-        SystemOpKind::CacheMaintenance,
-        SystemOpKind::TlbMaintenance,
-        SystemOpKind::Barrier,
-        SystemOpKind::Privileged,
-        SystemOpKind::Hypervisor,
-        SystemOpKind::HardwareEngine,
-        SystemOpKind::Transaction(SystemTransactionKind::Start),
-        SystemOpKind::Transaction(SystemTransactionKind::Commit),
-        SystemOpKind::Transaction(SystemTransactionKind::Cancel),
-        SystemOpKind::Transaction(SystemTransactionKind::Test),
-    ];
-    for kind in all {
+    for kind in SystemOpKind::identities() {
         let control = kind.effects().control;
         assert!(
             !matches!(
@@ -1572,17 +2032,18 @@ fn system_op_kinds_never_declare_a_block_ending_control_effect() {
     }
     // `iret`/`eret` specifically transfers control externally like `sysret`.
     assert_eq!(
-        SystemOpKind::InterruptReturn.effects().control,
+        SystemOpKind::InterruptReturn(InterruptReturnOp::ExceptionReturn)
+            .effects()
+            .control,
         ControlEffect::Call,
     );
     assert!(
         !SsaOp::<MockTarget>::SystemOp(Box::new(NativeKindedData {
-            kind: SystemOpKind::InterruptReturn,
+            kind: SystemOpKind::InterruptReturn(InterruptReturnOp::ExceptionReturn),
             mnemonic: String::from("iret"),
             metadata: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
-            clobbers: Vec::new(),
         }))
         .is_terminator()
     );
@@ -1650,195 +2111,273 @@ fn op_class_groups_native_scalar_vector_memory_and_control_ops() {
             metadata: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
-            clobbers: Vec::new(),
             effects: SsaEffects::new(SsaEffectKind::Opaque, true),
         }))
         .class(),
         SsaOpClass::NativeOpaque
     );
-    assert_eq!(
-        SsaOp::<MockTarget>::NativeIntrinsic(Box::new(NativeIntrinsicData {
-            id: NativeIntrinsicId::Rdtsc,
-            mnemonic: "rdtsc".to_string(),
-            metadata: None,
-            outputs: vec![d],
-            inputs: Vec::new(),
-            clobbers: Vec::new(),
-            effects: SsaEffects::new(SsaEffectKind::Opaque, false),
-        }))
-        .class(),
-        SsaOpClass::NativeIntrinsic
-    );
 }
 
-/// Builds a battery of representative ops covering every visitor arm shape.
-fn visitor_battery() -> Vec<SsaOp<MockTarget>> {
+/// Builds a battery of representative ops covering every visitor arm shape,
+/// each paired with the number of definitions and uses it is expected to have.
+///
+/// The counts are written out here by hand, so they are an account of the
+/// operands independent of any walk over the op. `visit_operands`, `defs()` and
+/// `uses()` are all checked against them, which catches an operand nobody
+/// visits as well as one visited in the wrong role -- omission is invisible to
+/// a check that only compares three readers with each other.
+fn visitor_battery() -> Vec<(SsaOp<MockTarget>, usize, usize)> {
     let v: Vec<SsaVarId> = (0..8).map(SsaVarId::from_index).collect();
     vec![
-        SsaOp::Const {
-            dest: v[0],
-            value: ConstValue::I32(7),
-        },
-        SsaOp::Add {
-            dest: v[0],
-            left: v[1],
-            right: v[2],
-            flags: Some(v[3]),
-        },
-        SsaOp::Neg {
-            dest: v[0],
-            operand: v[1],
-            flags: None,
-        },
-        SsaOp::Shr {
-            dest: v[0],
-            value: v[1],
-            amount: v[2],
-            unsigned: true,
-            flags: Some(v[3]),
-        },
-        SsaOp::WideMul {
-            low: v[0],
-            high: v[1],
-            left: v[2],
-            right: v[3],
-            unsigned: false,
-        },
-        SsaOp::WideDiv {
-            quotient: v[0],
-            remainder: v[1],
-            high: v[2],
-            low: v[3],
-            divisor: v[4],
-            unsigned: false,
-        },
-        SsaOp::FloatCompareFlags {
-            flags: v[0],
-            left: v[1],
-            right: v[2],
-            signaling: false,
-        },
-        SsaOp::Select {
-            dest: v[0],
-            condition: v[1],
-            true_val: v[2],
-            false_val: v[3],
-        },
-        SsaOp::StoreIndirect {
-            addr: v[0],
-            value: v[1],
-            value_type: MockType::I32,
-            address_space: None,
-        },
-        SsaOp::AtomicCmpXchg {
-            old: v[0],
-            success: Some(v[1]),
-            addr: v[2],
-            expected: v[3],
-            desired: v[4],
-            success_ordering: AtomicOrdering::SeqCst,
-            failure_ordering: AtomicOrdering::Relaxed,
-            width: AtomicAccessWidth::Bits64,
-            weak: false,
-            volatile: false,
-        },
-        SsaOp::AtomicPairLoad {
-            first: v[0],
-            second: v[1],
-            addr: v[2],
-            first_type: MockType::I64,
-            second_type: MockType::I64,
-            ordering: AtomicOrdering::Acquire,
-            width: AtomicAccessWidth::Bits128,
-            volatile: false,
-        },
-        SsaOp::Call {
-            dest: Some(v[0]),
-            method: 3,
-            args: vec![v[1], v[2], v[3]],
-        },
-        SsaOp::CallIndirect {
-            dest: None,
-            fptr: v[0],
-            signature: 0,
-            args: vec![v[1]],
-        },
-        SsaOp::Return { value: Some(v[0]) },
-        SsaOp::Return { value: None },
-        SsaOp::Phi {
-            dest: v[0],
-            operands: vec![(0, v[1]), (1, v[2])],
-        },
-        SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
-            mnemonic: "ud2".to_string(),
-            metadata: None,
-            outputs: vec![v[0], v[1]],
-            inputs: vec![v[2], v[3]],
-            clobbers: Vec::new(),
-            effects: SsaEffects::new(SsaEffectKind::Opaque, true),
-        })),
-        SsaOp::NativeIntrinsic(Box::new(NativeIntrinsicData {
-            id: NativeIntrinsicId::Cpuid,
-            mnemonic: "cpuid".to_string(),
-            metadata: None,
-            outputs: vec![v[0], v[1]],
-            inputs: vec![v[2]],
-            clobbers: Vec::new(),
-            effects: SsaEffects::new(SsaEffectKind::Opaque, false),
-        })),
-        SsaOp::BcdAdjust(Box::new(BcdAdjustData {
-            kind: BcdAdjustKind::AsciiMulAdjust,
-            base: 10,
-            mnemonic: "aam".to_string(),
-            metadata: None,
-            outputs: vec![v[0], v[1]],
-            inputs: vec![v[2]],
-            clobbers: Vec::new(),
-        })),
-        SsaOp::VectorDotProduct(Box::new(VectorDotProductData {
-            imm8: 0xff,
-            element_bits: 32,
-            outputs: vec![v[0]],
-            inputs: vec![v[1], v[2]],
-        })),
-        SsaOp::VectorMultiSad(Box::new(VecImm8Data {
-            imm8: 0x05,
-            outputs: vec![v[0]],
-            inputs: vec![v[1], v[2]],
-        })),
-        SsaOp::VectorStringCompare(Box::new(VectorStringCompareData {
-            imm8: 0x0c,
-            explicit_length: true,
-            result_index: true,
-            outputs: vec![v[0], v[1]],
-            inputs: vec![v[2], v[3]],
-        })),
-        SsaOp::VectorHorizontalMinPos(Box::new(VectorHorizontalMinPosData {
-            outputs: vec![v[0]],
-            inputs: vec![v[1]],
-        })),
-        SsaOp::VectorConditionalMove(Box::new(VectorConditionalMoveData {
-            condition: ByteMoveCondition::Negative,
-            outputs: vec![v[0]],
-            inputs: vec![v[1], v[2]],
-        })),
-        SsaOp::VectorIntersect(Box::new(VectorIntersectData {
-            outputs: vec![v[0], v[1]],
-            inputs: vec![v[2], v[3]],
-        })),
-        SsaOp::VectorShuffleBits(Box::new(VectorShuffleBitsData {
-            outputs: vec![v[0]],
-            inputs: vec![v[1], v[2]],
-        })),
-        SsaOp::VectorBitfield(Box::new(VectorBitfieldData {
-            insert: false,
-            index: 4,
-            length: 8,
-            outputs: vec![v[0]],
-            inputs: vec![v[1]],
-        })),
-        SsaOp::Jump { target: 4 },
-        SsaOp::Nop,
+        (
+            SsaOp::Const {
+                dest: v[0],
+                value: ConstValue::I32(7),
+            },
+            1,
+            0,
+        ),
+        (
+            SsaOp::Add {
+                dest: v[0],
+                left: v[1],
+                right: v[2],
+                flags: Some(v[3]),
+            },
+            2,
+            2,
+        ),
+        (
+            SsaOp::Neg {
+                dest: v[0],
+                operand: v[1],
+                flags: None,
+            },
+            1,
+            1,
+        ),
+        (
+            SsaOp::Shr {
+                dest: v[0],
+                value: v[1],
+                amount: v[2],
+                unsigned: true,
+                flags: Some(v[3]),
+            },
+            2,
+            2,
+        ),
+        (
+            SsaOp::WideMul {
+                low: v[0],
+                high: v[1],
+                left: v[2],
+                right: v[3],
+                unsigned: false,
+            },
+            2,
+            2,
+        ),
+        (
+            SsaOp::WideDiv {
+                quotient: v[0],
+                remainder: v[1],
+                high: v[2],
+                low: v[3],
+                divisor: v[4],
+                unsigned: false,
+            },
+            2,
+            3,
+        ),
+        (
+            SsaOp::FloatCompareFlags {
+                flags: v[0],
+                left: v[1],
+                right: v[2],
+                signaling: false,
+            },
+            1,
+            2,
+        ),
+        (
+            SsaOp::Select {
+                dest: v[0],
+                condition: v[1],
+                true_val: v[2],
+                false_val: v[3],
+            },
+            1,
+            3,
+        ),
+        (
+            SsaOp::StoreIndirect {
+                addr: v[0],
+                value: v[1],
+                value_type: MockType::I32,
+                address_space: None,
+            },
+            0,
+            2,
+        ),
+        (
+            SsaOp::AtomicCmpXchg {
+                old: v[0],
+                success: Some(v[1]),
+                addr: v[2],
+                expected: v[3],
+                desired: v[4],
+                success_ordering: AtomicOrdering::SeqCst,
+                failure_ordering: AtomicOrdering::Relaxed,
+                width: AtomicAccessWidth::Bits64,
+                weak: false,
+                volatile: false,
+            },
+            2,
+            3,
+        ),
+        (
+            SsaOp::AtomicPairLoad {
+                first: v[0],
+                second: v[1],
+                addr: v[2],
+                first_type: MockType::I64,
+                second_type: MockType::I64,
+                ordering: AtomicOrdering::Acquire,
+                width: AtomicAccessWidth::Bits128,
+                volatile: false,
+            },
+            2,
+            1,
+        ),
+        (
+            SsaOp::Call {
+                dest: Some(v[0]),
+                method: 3,
+                args: vec![v[1], v[2], v[3]],
+            },
+            1,
+            3,
+        ),
+        (
+            SsaOp::CallIndirect {
+                dest: None,
+                fptr: v[0],
+                signature: 0,
+                args: vec![v[1]],
+            },
+            0,
+            2,
+        ),
+        (SsaOp::Return { value: Some(v[0]) }, 0, 1),
+        (SsaOp::Return { value: None }, 0, 0),
+        (
+            SsaOp::Phi {
+                dest: v[0],
+                operands: vec![(0, v[1]), (1, v[2])],
+            },
+            1,
+            2,
+        ),
+        (
+            SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
+                mnemonic: "ud2".to_string(),
+                metadata: None,
+                outputs: vec![v[0], v[1]],
+                inputs: vec![v[2], v[3]],
+                effects: SsaEffects::new(SsaEffectKind::Opaque, true),
+            })),
+            2,
+            2,
+        ),
+        (
+            SsaOp::BcdAdjust(Box::new(BcdAdjustData {
+                kind: BcdAdjustKind::AsciiMulAdjust,
+                base: 10,
+                mnemonic: "aam".to_string(),
+                metadata: None,
+                outputs: vec![v[0], v[1]],
+                inputs: vec![v[2]],
+            })),
+            2,
+            1,
+        ),
+        (
+            SsaOp::VectorDotProduct(Box::new(VectorDotProductData {
+                imm8: 0xff,
+                element_bits: 32,
+                outputs: vec![v[0]],
+                inputs: vec![v[1], v[2]],
+            })),
+            1,
+            2,
+        ),
+        (
+            SsaOp::VectorMultiSad(Box::new(VecImm8Data {
+                imm8: 0x05,
+                outputs: vec![v[0]],
+                inputs: vec![v[1], v[2]],
+            })),
+            1,
+            2,
+        ),
+        (
+            SsaOp::VectorStringCompare(Box::new(VectorStringCompareData {
+                imm8: 0x0c,
+                explicit_length: true,
+                result_index: true,
+                outputs: vec![v[0], v[1]],
+                inputs: vec![v[2], v[3]],
+            })),
+            2,
+            2,
+        ),
+        (
+            SsaOp::VectorHorizontalMinPos(Box::new(VectorHorizontalMinPosData {
+                outputs: vec![v[0]],
+                inputs: vec![v[1]],
+            })),
+            1,
+            1,
+        ),
+        (
+            SsaOp::VectorConditionalMove(Box::new(VectorConditionalMoveData {
+                condition: ByteMoveCondition::Negative,
+                outputs: vec![v[0]],
+                inputs: vec![v[1], v[2]],
+            })),
+            1,
+            2,
+        ),
+        (
+            SsaOp::VectorIntersect(Box::new(VectorIntersectData {
+                outputs: vec![v[0], v[1]],
+                inputs: vec![v[2], v[3]],
+            })),
+            2,
+            2,
+        ),
+        (
+            SsaOp::VectorShuffleBits(Box::new(VectorShuffleBitsData {
+                outputs: vec![v[0]],
+                inputs: vec![v[1], v[2]],
+            })),
+            1,
+            2,
+        ),
+        (
+            SsaOp::VectorBitfield(Box::new(VectorBitfieldData {
+                insert: false,
+                index: 4,
+                length: 8,
+                outputs: vec![v[0]],
+                inputs: vec![v[1]],
+            })),
+            1,
+            1,
+        ),
+        (SsaOp::Jump { target: 4 }, 0, 0),
+        (SsaOp::Nop, 0, 0),
     ]
 }
 
@@ -2007,7 +2546,6 @@ fn bcd_adjust_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a, b],
         inputs: vec![c],
-        clobbers: Vec::new(),
     }));
     assert_eq!(op.defs().collect::<Vec<_>>(), vec![a, b]);
     assert_eq!(op.uses(), vec![c]);
@@ -2036,8 +2574,9 @@ fn bcd_adjust_defs_uses_effects_and_remap() {
 /// build here until it is consciously handled. That is the signal to (1)
 /// classify it in the exhaustive `effects()` match, (2) cover its operands
 /// in `visit_operands` / `visit_operands_mut`, and (3) add a sample to
-/// `visitor_battery` so the invariant tests exercise it. Never executed — it
-/// exists purely for the exhaustiveness check.
+/// `all_sample_ops` — and, for a new operand shape, to `visitor_battery`
+/// with its operand census — so the invariant tests exercise it. Never
+/// executed — it exists purely for the exhaustiveness check.
 #[allow(dead_code)]
 fn op_variant_exhaustiveness_sentinel(op: SsaOp<MockTarget>) {
     match op {
@@ -2168,7 +2707,6 @@ fn op_variant_exhaustiveness_sentinel(op: SsaOp<MockTarget>) {
         SsaOp::CopyBlk { .. } => {}
         SsaOp::Fence { .. } => {}
         SsaOp::NativeOpaque(_) => {}
-        SsaOp::NativeIntrinsic(_) => {}
         SsaOp::SystemOp(_) => {}
         SsaOp::ComputeOp(_) => {}
         SsaOp::BcdAdjust(_) => {}
@@ -2229,7 +2767,7 @@ fn op_variant_exhaustiveness_sentinel(op: SsaOp<MockTarget>) {
         SsaOp::LoadObj { .. } => {}
         SsaOp::StoreObj { .. } => {}
         SsaOp::Nop => {}
-        SsaOp::Break => {}
+        SsaOp::Break(_) => {}
         SsaOp::Ckfinite { .. } => {}
         SsaOp::FpClassify { .. } => {}
         SsaOp::FpTranscendental(_) => {}
@@ -2244,249 +2782,268 @@ fn op_variant_exhaustiveness_sentinel(op: SsaOp<MockTarget>) {
     }
 }
 
-/// Constructs one sample of every `SsaOp` variant (all 200). Field values
-/// are placeholders chosen only to be type-valid; the tests assert
-/// structural invariants, not semantics. Kept complete by
+/// Constructs one sample of every `SsaOp` variant (all 200).
+///
+/// Field values are placeholders chosen only to be type-valid; the tests
+/// assert structural invariants, not semantics. Kept complete by
 /// `op_variant_exhaustiveness_sentinel`: adding a variant breaks the build
 /// there until a sample is added here too.
+///
+/// Every operand is drawn from one of two disjoint id spaces according to its
+/// role: definitions from `{d0, d1}` (90, 91) and uses from `{u0, u1}` (80,
+/// 81). One id for every field would make a transposed role -- an input
+/// reported as a definition, or the reverse -- invisible to every test in this
+/// file, because the transposed operand would carry the id the correct one
+/// carries. Two ids per role additionally make an ordering change visible.
+/// `payload_roles_are_not_transposed` is the universal gate over that
+/// property; it needs no per-variant list.
+///
+/// Every payload-carrying sample gets two outputs and two inputs, so a
+/// truncating definition walk cannot pass by reporting the single output it
+/// happened to see.
 fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
-    let sv = SsaVarId::from_index(1);
+    // Definitions and uses occupy disjoint id spaces, so a transposed role --
+    // an input reported as a definition, or the reverse -- shows up as an id
+    // from the wrong space rather than as the same id in both lists. Two ids
+    // per role make an *ordering* change visible as well.
+    let [d0, d1] = [90, 91].map(SsaVarId::from_index);
+    let [u0, u1] = [80, 81].map(SsaVarId::from_index);
     vec![
         SsaOp::Const {
-            dest: sv,
+            dest: d0,
             value: ConstValue::I32(0),
         },
         SsaOp::Add {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::AddOvf {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::Sub {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::SubOvf {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::Mul {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::MulOvf {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::WideMul {
-            low: sv,
-            high: sv,
-            left: sv,
-            right: sv,
+            low: d0,
+            high: d1,
+            left: u0,
+            right: u1,
             unsigned: false,
         },
         SsaOp::Div {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::Rem {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::FloatCompareFlags {
-            flags: sv,
-            left: sv,
-            right: sv,
+            flags: d0,
+            left: u0,
+            right: u1,
             signaling: false,
         },
         SsaOp::WideDiv {
-            quotient: sv,
-            remainder: sv,
-            high: sv,
-            low: sv,
-            divisor: sv,
+            quotient: d0,
+            remainder: d1,
+            high: u0,
+            low: u1,
+            divisor: u0,
             unsigned: false,
         },
         SsaOp::Neg {
-            dest: sv,
-            operand: sv,
-            flags: Some(sv),
+            dest: d0,
+            operand: u0,
+            flags: Some(d1),
         },
         SsaOp::And {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::Or {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::Xor {
-            dest: sv,
-            left: sv,
-            right: sv,
-            flags: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            flags: Some(d1),
         },
         SsaOp::Not {
-            dest: sv,
-            operand: sv,
-            flags: Some(sv),
+            dest: d0,
+            operand: u0,
+            flags: Some(d1),
         },
         SsaOp::Shl {
-            dest: sv,
-            value: sv,
-            amount: sv,
-            flags: Some(sv),
+            dest: d0,
+            value: u0,
+            amount: u1,
+            flags: Some(d1),
         },
         SsaOp::Shr {
-            dest: sv,
-            value: sv,
-            amount: sv,
+            dest: d0,
+            value: u0,
+            amount: u1,
             unsigned: false,
-            flags: Some(sv),
+            flags: Some(d1),
         },
         SsaOp::Rol {
-            dest: sv,
-            value: sv,
-            amount: sv,
+            dest: d0,
+            value: u0,
+            amount: u1,
         },
         SsaOp::Ror {
-            dest: sv,
-            value: sv,
-            amount: sv,
+            dest: d0,
+            value: u0,
+            amount: u1,
         },
         SsaOp::Rcl {
-            dest: sv,
-            value: sv,
-            amount: sv,
+            dest: d0,
+            value: u0,
+            amount: u1,
         },
         SsaOp::Rcr {
-            dest: sv,
-            value: sv,
-            amount: sv,
+            dest: d0,
+            value: u0,
+            amount: u1,
         },
-        SsaOp::BSwap { dest: sv, src: sv },
-        SsaOp::BRev { dest: sv, src: sv },
-        SsaOp::BitScanForward { dest: sv, src: sv },
-        SsaOp::BitScanReverse { dest: sv, src: sv },
-        SsaOp::Popcount { dest: sv, src: sv },
-        SsaOp::Parity { dest: sv, src: sv },
+        SsaOp::BSwap { dest: d0, src: u0 },
+        SsaOp::BRev { dest: d0, src: u0 },
+        SsaOp::BitScanForward { dest: d0, src: u0 },
+        SsaOp::BitScanReverse { dest: d0, src: u0 },
+        SsaOp::Popcount { dest: d0, src: u0 },
+        SsaOp::Parity { dest: d0, src: u0 },
         SsaOp::Ceq {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
         },
         SsaOp::Clt {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
         },
         SsaOp::Cgt {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             unsigned: false,
         },
         SsaOp::BoolAnd {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
         },
         SsaOp::BoolOr {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
         },
         SsaOp::BoolXor {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
         },
         SsaOp::BoolNot {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
         },
         SsaOp::IntConv {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
             overflow_check: false,
             unsigned: false,
         },
         SsaOp::IntToPtr {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
         },
         SsaOp::PtrToInt {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
         },
         SsaOp::IntToFloat {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
             unsigned: false,
         },
         SsaOp::FloatToInt {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
             overflow_check: false,
             unsigned: false,
         },
         SsaOp::FloatConv {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
         },
         SsaOp::Bitcast {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
             target: MockType::I32,
         },
         SsaOp::Select {
-            dest: sv,
-            condition: sv,
-            true_val: sv,
-            false_val: sv,
+            dest: d0,
+            condition: u0,
+            true_val: u1,
+            false_val: u0,
         },
         SsaOp::ReadFlags {
-            dest: sv,
-            flags: sv,
+            dest: d0,
+            flags: u0,
             mask: FlagsMask::from_bits(0),
         },
         SsaOp::VectorUnary {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             kind: VectorUnaryKind::Neg,
             element: VectorElement {
                 kind: VectorElementKind::Integer,
@@ -2495,9 +3052,9 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             },
         },
         SsaOp::VectorBinary {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             kind: VectorBinaryKind::Add,
             element: VectorElement {
                 kind: VectorElementKind::Integer,
@@ -2506,402 +3063,402 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             },
         },
         SsaOp::VectorTernary {
-            dest: sv,
-            first: sv,
-            second: sv,
-            third: sv,
+            dest: d0,
+            first: u0,
+            second: u1,
+            third: u0,
             kind: VectorTernaryKind::Fma,
         },
         SsaOp::VectorPredicatedUnary {
-            dest: sv,
-            value: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            value: u0,
+            mask: u1,
+            passthrough: Some(u0),
             kind: VectorUnaryKind::Neg,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorPredicatedBinary {
-            dest: sv,
-            left: sv,
-            right: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            left: u0,
+            right: u1,
+            mask: u0,
+            passthrough: Some(u1),
             kind: VectorBinaryKind::Add,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorPredicatedTernary {
-            dest: sv,
-            first: sv,
-            second: sv,
-            third: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            first: u0,
+            second: u1,
+            third: u0,
+            mask: u1,
+            passthrough: Some(u0),
             kind: VectorTernaryKind::Fma,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorCompare {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             kind: VectorCompareKind::Eq,
             unsigned: false,
         },
         SsaOp::VectorLoad {
-            dest: sv,
-            addr: sv,
+            dest: d0,
+            addr: u0,
             vector_type: MockType::I32,
         },
         SsaOp::VectorStore {
-            addr: sv,
-            value: sv,
+            addr: u0,
+            value: u1,
             vector_type: MockType::I32,
         },
         SsaOp::VectorMaskedLoad {
-            dest: sv,
-            addr: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            addr: u0,
+            mask: u1,
+            passthrough: Some(u0),
             vector_type: MockType::I32,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorMaskedStore {
-            addr: sv,
-            value: sv,
-            mask: sv,
+            addr: u0,
+            value: u1,
+            mask: u0,
             vector_type: MockType::I32,
         },
         SsaOp::VectorBroadcastLoad {
-            dest: sv,
-            addr: sv,
+            dest: d0,
+            addr: u0,
             vector_type: MockType::I32,
         },
         SsaOp::VectorGather {
-            dest: sv,
-            base: sv,
-            indices: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            base: u0,
+            indices: u1,
+            mask: u0,
+            passthrough: Some(u1),
             vector_type: MockType::I32,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorFaultingLoad {
-            dest: sv,
-            fault: Some(sv),
-            addr: sv,
-            mask: Some(sv),
-            passthrough: Some(sv),
+            dest: d0,
+            fault: Some(d1),
+            addr: u0,
+            mask: Some(u1),
+            passthrough: Some(u0),
             vector_type: MockType::I32,
             fault_mode: VectorFaultMode::Normal,
             mask_mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorSegmentLoad {
-            dests: vec![sv],
-            base: sv,
-            mask: Some(sv),
+            dests: vec![d0, d1],
+            base: u0,
+            mask: Some(u1),
             vector_type: MockType::I32,
             segments: 0,
             layout: VectorSegmentLayout::Interleaved,
         },
         SsaOp::VectorScatter {
-            base: sv,
-            indices: sv,
-            value: sv,
-            mask: sv,
+            base: u0,
+            indices: u1,
+            value: u0,
+            mask: u1,
             vector_type: MockType::I32,
         },
         SsaOp::VectorSegmentStore {
-            base: sv,
-            values: vec![sv],
-            mask: Some(sv),
+            base: u0,
+            values: vec![u1],
+            mask: Some(u0),
             vector_type: MockType::I32,
             segments: 0,
             layout: VectorSegmentLayout::Interleaved,
         },
         SsaOp::VectorExtract {
-            dest: sv,
-            vector: sv,
+            dest: d0,
+            vector: u0,
             lane: 0,
         },
         SsaOp::VectorInsert {
-            dest: sv,
-            vector: sv,
+            dest: d0,
+            vector: u0,
             lane: 0,
-            value: sv,
+            value: u1,
         },
         SsaOp::VectorSplat {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             vector_type: MockType::I32,
         },
         SsaOp::VectorShuffle {
-            dest: sv,
-            left: sv,
-            right: Some(sv),
+            dest: d0,
+            left: u0,
+            right: Some(u1),
             mask: VectorShuffleMask::new(vec![crate::target::VectorShuffleLane::Zero]),
         },
         SsaOp::VectorCast {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             target_type: MockType::I32,
             kind: VectorCastKind::Signed,
         },
         SsaOp::VectorReinterpret {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             target_type: MockType::I32,
         },
         SsaOp::VectorPack {
-            dest: sv,
-            value: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            value: u0,
+            mask: u1,
+            passthrough: Some(u0),
             vector_type: MockType::I32,
             element_bits: 0,
             kind: VectorPackKind::Compress,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorPackLoad {
-            dest: sv,
-            addr: sv,
-            mask: sv,
-            passthrough: Some(sv),
+            dest: d0,
+            addr: u0,
+            mask: u1,
+            passthrough: Some(u0),
             vector_type: MockType::I32,
             element_bits: 0,
             kind: VectorPackKind::Compress,
             mode: VectorMaskMode::Merge,
         },
         SsaOp::VectorPackStore {
-            addr: sv,
-            value: sv,
-            mask: sv,
+            addr: u0,
+            value: u1,
+            mask: u0,
             vector_type: MockType::I32,
             element_bits: 0,
             kind: VectorPackKind::Compress,
         },
         SsaOp::VectorZeroUpper { all: false },
         SsaOp::VectorMaskUnary {
-            dest: sv,
-            mask: sv,
+            dest: d0,
+            mask: u0,
             kind: VectorMaskUnaryKind::Not,
         },
         SsaOp::VectorMaskBinary {
-            dest: sv,
-            left: sv,
-            right: sv,
+            dest: d0,
+            left: u0,
+            right: u1,
             kind: VectorMaskBinaryKind::And,
         },
         SsaOp::VectorReduce {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             kind: VectorReduceKind::Add,
         },
         SsaOp::VectorBitmask {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             kind: VectorBitmaskKind::LaneMostSignificantBits,
         },
         SsaOp::Jump { target: 0 },
         SsaOp::Branch {
-            condition: sv,
+            condition: u0,
             true_target: 0,
             false_target: 0,
         },
         SsaOp::BranchCmp {
-            left: sv,
-            right: sv,
+            left: u0,
+            right: u1,
             cmp: CmpKind::Eq,
             unsigned: false,
             true_target: 0,
             false_target: 0,
         },
         SsaOp::BranchFlags {
-            flags: sv,
+            flags: u0,
             condition: FlagCondition::Carry,
             true_target: 0,
             false_target: 0,
         },
         SsaOp::Switch {
-            value: sv,
+            value: u0,
             targets: vec![0usize],
             default: 0,
         },
         SsaOp::IndirectBranch {
-            target: sv,
+            target: u0,
             resolved_targets: vec![0usize],
         },
-        SsaOp::Return { value: Some(sv) },
+        SsaOp::Return { value: Some(u0) },
         SsaOp::LoadField {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             field: 0u32,
         },
         SsaOp::StoreField {
-            object: sv,
+            object: u0,
             field: 0u32,
-            value: sv,
+            value: u1,
         },
         SsaOp::LoadStaticField {
-            dest: sv,
+            dest: d0,
             field: 0u32,
         },
         SsaOp::StoreStaticField {
             field: 0u32,
-            value: sv,
+            value: u0,
         },
         SsaOp::LoadFieldAddr {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             field: 0u32,
         },
         SsaOp::LoadStaticFieldAddr {
-            dest: sv,
+            dest: d0,
             field: 0u32,
         },
         SsaOp::LoadElement {
-            dest: sv,
-            array: sv,
-            index: sv,
+            dest: d0,
+            array: u0,
+            index: u1,
             elem_type: MockType::I32,
         },
         SsaOp::StoreElement {
-            array: sv,
-            index: sv,
-            value: sv,
+            array: u0,
+            index: u1,
+            value: u0,
             elem_type: MockType::I32,
         },
         SsaOp::LoadElementAddr {
-            dest: sv,
-            array: sv,
-            index: sv,
+            dest: d0,
+            array: u0,
+            index: u1,
             elem_type: 0u32,
         },
         SsaOp::PtrAdd {
-            dest: sv,
-            base: sv,
-            index: Some(sv),
+            dest: d0,
+            base: u0,
+            index: Some(u1),
             stride: 4,
             offset: 8,
             result_type: MockType::I64,
         },
         SsaOp::ArrayLength {
-            dest: sv,
-            array: sv,
+            dest: d0,
+            array: u0,
         },
         SsaOp::LoadIndirect {
-            dest: sv,
-            addr: sv,
+            dest: d0,
+            addr: u0,
             value_type: MockType::I32,
             address_space: None,
         },
         SsaOp::StoreIndirect {
-            addr: sv,
-            value: sv,
+            addr: u0,
+            value: u1,
             value_type: MockType::I32,
             address_space: None,
         },
         SsaOp::NewObj {
-            dest: sv,
+            dest: d0,
             ctor: 0u32,
-            args: vec![sv],
+            args: vec![u0],
         },
         SsaOp::NewArr {
-            dest: sv,
+            dest: d0,
             elem_type: 0u32,
-            length: sv,
+            length: u0,
         },
         SsaOp::CastClass {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             target_type: 0u32,
         },
         SsaOp::IsInst {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             target_type: 0u32,
         },
         SsaOp::Box {
-            dest: sv,
-            value: sv,
+            dest: d0,
+            value: u0,
             value_type: 0u32,
         },
         SsaOp::Unbox {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             value_type: 0u32,
         },
         SsaOp::UnboxAny {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             value_type: 0u32,
         },
         SsaOp::SizeOf {
-            dest: sv,
+            dest: d0,
             value_type: 0u32,
         },
         SsaOp::LoadToken {
-            dest: sv,
+            dest: d0,
             token: 0u32,
         },
         SsaOp::Call {
-            dest: Some(sv),
+            dest: Some(d0),
             method: 0u32,
-            args: vec![sv],
+            args: vec![u0],
         },
         SsaOp::CallVirt {
-            dest: Some(sv),
+            dest: Some(d0),
             method: 0u32,
-            args: vec![sv],
+            args: vec![u0],
         },
         SsaOp::CallIndirect {
-            dest: Some(sv),
-            fptr: sv,
+            dest: Some(d0),
+            fptr: u0,
             signature: 0u32,
-            args: vec![sv],
+            args: vec![u1],
         },
         SsaOp::LoadFunctionPtr {
-            dest: sv,
+            dest: d0,
             method: 0u32,
         },
         SsaOp::LoadVirtFunctionPtr {
-            dest: sv,
-            object: sv,
+            dest: d0,
+            object: u0,
             method: 0u32,
         },
         SsaOp::LoadArg {
-            dest: sv,
+            dest: d0,
             arg_index: 0,
         },
         SsaOp::LoadLocal {
-            dest: sv,
+            dest: d0,
             local_index: 0,
         },
         SsaOp::LoadArgAddr {
-            dest: sv,
+            dest: d0,
             arg_index: 0,
         },
         SsaOp::LoadLocalAddr {
-            dest: sv,
+            dest: d0,
             local_index: 0,
         },
-        SsaOp::Copy { dest: sv, src: sv },
-        SsaOp::Pop { value: sv },
-        SsaOp::Throw { exception: sv },
+        SsaOp::Copy { dest: d0, src: u0 },
+        SsaOp::Pop { value: u0 },
+        SsaOp::Throw { exception: u0 },
         SsaOp::Rethrow,
         SsaOp::EndFinally,
-        SsaOp::EndFilter { result: sv },
+        SsaOp::EndFilter { result: u0 },
         SsaOp::InterruptReturn,
         SsaOp::Unreachable,
         SsaOp::Leave { target: 0 },
         SsaOp::InitBlk {
-            dest_addr: sv,
-            value: sv,
-            size: sv,
+            dest_addr: u0,
+            value: u1,
+            size: u0,
             reverse: false,
         },
         SsaOp::CopyBlk {
-            dest_addr: sv,
-            src_addr: sv,
-            size: sv,
+            dest_addr: u0,
+            src_addr: u1,
+            size: u0,
             reverse: false,
         },
         SsaOp::Fence {
@@ -2910,95 +3467,82 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
         SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
-            effects: SsaEffects::new(SsaEffectKind::Opaque, false),
-        })),
-        SsaOp::NativeIntrinsic(Box::new(NativeIntrinsicData {
-            id: NativeIntrinsicId::Cpuid,
-            mnemonic: String::new(),
-            metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
             effects: SsaEffects::new(SsaEffectKind::Opaque, false),
         })),
         SsaOp::SystemOp(Box::new(NativeKindedData {
             kind: SystemOpKind::CpuId,
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::ComputeOp(Box::new(NativeKindedData {
             kind: ComputeKind::BitDeposit,
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::BcdAdjust(Box::new(BcdAdjustData {
             kind: BcdAdjustKind::DecimalAddAdjust,
             base: 0,
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorCrypto(Box::new(KindedVecData {
             kind: VectorCryptoKind::AesEncrypt,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::TileOp(Box::new(KindedVecData {
             kind: TileOpKind::Zero,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPermute(Box::new(VectorPermuteData {
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorMultiplyAdd(Box::new(KindedVecData {
             kind: VectorMaddKind::MultiplyAddS16,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPackNarrow(Box::new(VectorPackNarrowData {
             unsigned: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorNarrowSaturate(Box::new(VectorNarrowSaturateData {
             signed_src: false,
             unsigned_dst: false,
             rounding: false,
             shift: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPredicateWhile(Box::new(VectorPredicateWhileData {
             kind: VectorCompareKind::Eq,
             unsigned: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPredicateBreak(Box::new(VectorPredicateBreakData {
             after: false,
             pair: false,
             propagate: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorComplexAdd(Box::new(VectorComplexAddData {
             rotate_270: false,
             saturate: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorCountAdjust(Box::new(VectorCountAdjustData {
             decrement: false,
@@ -3006,164 +3550,164 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             signed: false,
             by_predicate: false,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorExtendInLane(Box::new(VectorExtendInLaneData {
             signed: false,
             source_bits: 0,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorElementCount(Box::new(VectorElementCountData {
             element_bits: 0,
             multiplier: 0,
-            outputs: vec![sv],
+            outputs: vec![d0, d1],
         })),
         SsaOp::VectorSveAddressGen(Box::new(VectorSveAddressGenData {
             signed_extend: Some(false),
             shift: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::FlagAdjust(Box::new(KindedVecData {
             kind: FlagAdjustKind::InvertCarry,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorStructLoadReplicate(Box::new(VectorStructLoadReplicateData {
             count: 0,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorSmeMisc(Box::new(VectorSmeMiscData {
             op: SmeMiscKind::AddHorizontal,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPredicateOp(Box::new(VectorPredicateOpData {
             op: PredicateOpKind::CountActive,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorSveCompute(Box::new(VectorSveComputeData {
             op: SveComputeKind::AddCarryBottom,
             element_bits: 0,
             rotation: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorReverseChunks(Box::new(VectorReverseChunksData {
             chunk_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorMatrixMulAcc(Box::new(VectorMatrixMulAccData {
             signed_a: false,
             signed_b: false,
             float: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorSmeOuterProduct(Box::new(VectorSmeOuterProductData {
             subtract: false,
             signed_a: false,
             signed_b: false,
             float: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorPredicateGen(Box::new(KindedVecData {
             kind: PredicateGenKind::True,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorFpHelper(Box::new(KindedVecData {
             kind: FpHelperKind::ReciprocalExponent,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorSvePermute(Box::new(KindedVecData {
             kind: SvePermuteKind::Index,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorTernaryLogic(Box::new(VecImm8Data {
             imm8: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorDotProduct(Box::new(VectorDotProductData {
             imm8: 0,
             element_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorMultiSad(Box::new(VecImm8Data {
             imm8: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorIntDotProduct(Box::new(VectorIntDotProductData {
             signed_a: false,
             signed_b: false,
             source_bits: 0,
             dest_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorStringCompare(Box::new(VectorStringCompareData {
             imm8: 0,
             explicit_length: false,
             result_index: false,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorBitfield(Box::new(VectorBitfieldData {
             insert: false,
             index: 0,
             length: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorIntersect(Box::new(VectorIntersectData {
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorShuffleBits(Box::new(VectorShuffleBitsData {
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorConditionalMove(Box::new(VectorConditionalMoveData {
             condition: ByteMoveCondition::Zero,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorHorizontalMinPos(Box::new(VectorHorizontalMinPosData {
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorComplexMul(Box::new(KindedVecData {
             kind: ComplexMulKind::Multiply,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorClassify(Box::new(VecImm8Data {
             imm8: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::VectorHorizontalReduce(Box::new(VectorHorizontalReduceData {
             subtract: false,
             unsigned: false,
             source_bits: 0,
             dest_bits: 0,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::BlockString(Box::new(BlockStringOpData {
             kind: BlockStringKind::Compare,
@@ -3171,56 +3715,56 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             element_bits: 0,
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
             reverse: false,
         })),
         SsaOp::WideCompareExchange(Box::new(WideCmpXchgData {
             wide: false,
             mnemonic: String::new(),
             metadata: None,
-            outputs: vec![sv],
-            inputs: vec![sv],
-            clobbers: Vec::new(),
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::ComputeFlags {
-            dest: sv,
-            inputs: vec![sv],
+            dest: d0,
+            inputs: vec![u0, u1],
         },
-        SsaOp::CallClobber { outputs: vec![sv] },
+        SsaOp::CallClobber {
+            outputs: vec![d0, d1],
+        },
         SsaOp::CmpXchg {
-            dest: sv,
-            addr: sv,
-            expected: sv,
-            desired: sv,
+            dest: d0,
+            addr: u0,
+            expected: u1,
+            desired: u0,
         },
         SsaOp::AtomicRmw {
-            dest: sv,
-            addr: sv,
-            value: sv,
+            dest: d0,
+            addr: u0,
+            value: u1,
             op: AtomicRmwOp::Xchg,
         },
         SsaOp::AtomicLoad {
-            dest: sv,
-            addr: sv,
+            dest: d0,
+            addr: u0,
             value_type: MockType::I32,
             ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
             volatile: false,
         },
         SsaOp::AtomicStore {
-            addr: sv,
-            value: sv,
+            addr: u0,
+            value: u1,
             value_type: MockType::I32,
             ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
             volatile: false,
         },
         SsaOp::AtomicStoreConditional {
-            status: sv,
-            addr: sv,
-            value: sv,
+            status: d0,
+            addr: u0,
+            value: u1,
             value_type: MockType::I32,
             success_ordering: AtomicOrdering::Relaxed,
             failure_ordering: AtomicOrdering::Relaxed,
@@ -3228,9 +3772,9 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             volatile: false,
         },
         SsaOp::AtomicPairLoad {
-            first: sv,
-            second: sv,
-            addr: sv,
+            first: d0,
+            second: d1,
+            addr: u0,
             first_type: MockType::I32,
             second_type: MockType::I32,
             ordering: AtomicOrdering::Relaxed,
@@ -3238,10 +3782,10 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             volatile: false,
         },
         SsaOp::AtomicPairStoreConditional {
-            status: sv,
-            addr: sv,
-            first_value: sv,
-            second_value: sv,
+            status: d0,
+            addr: u0,
+            first_value: u1,
+            second_value: u0,
             first_type: MockType::I32,
             second_type: MockType::I32,
             success_ordering: AtomicOrdering::Relaxed,
@@ -3250,28 +3794,28 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             volatile: false,
         },
         SsaOp::AtomicExchange {
-            dest: sv,
-            addr: sv,
-            value: sv,
+            dest: d0,
+            addr: u0,
+            value: u1,
             ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
             volatile: false,
         },
         SsaOp::AtomicLockRmw {
-            dest: sv,
-            addr: sv,
-            value: sv,
+            dest: d0,
+            addr: u0,
+            value: u1,
             op: AtomicRmwOp::Xchg,
             ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
             volatile: false,
         },
         SsaOp::AtomicCmpXchg {
-            old: sv,
-            success: Some(sv),
-            addr: sv,
-            expected: sv,
-            desired: sv,
+            old: d0,
+            success: Some(d1),
+            addr: u0,
+            expected: u1,
+            desired: u0,
             success_ordering: AtomicOrdering::Relaxed,
             failure_ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
@@ -3279,13 +3823,13 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             volatile: false,
         },
         SsaOp::AtomicPairCmpXchg {
-            old_first: sv,
-            old_second: sv,
-            addr: sv,
-            expected_first: sv,
-            expected_second: sv,
-            desired_first: sv,
-            desired_second: sv,
+            old_first: d0,
+            old_second: d1,
+            addr: u0,
+            expected_first: u1,
+            expected_second: u0,
+            desired_first: u1,
+            desired_second: u0,
             success_ordering: AtomicOrdering::Relaxed,
             failure_ordering: AtomicOrdering::Relaxed,
             width: AtomicAccessWidth::Bits8,
@@ -3293,45 +3837,45 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
             volatile: false,
         },
         SsaOp::InitObj {
-            dest_addr: sv,
+            dest_addr: u0,
             value_type: 0u32,
         },
         SsaOp::CopyObj {
-            dest_addr: sv,
-            src_addr: sv,
+            dest_addr: u0,
+            src_addr: u1,
             value_type: 0u32,
         },
         SsaOp::LoadObj {
-            dest: sv,
-            src_addr: sv,
+            dest: d0,
+            src_addr: u0,
             value_type: 0u32,
         },
         SsaOp::StoreObj {
-            dest_addr: sv,
-            value: sv,
+            dest_addr: u0,
+            value: u1,
             value_type: 0u32,
         },
         SsaOp::Nop,
-        SsaOp::Break,
+        SsaOp::Break(BreakpointOp::UndefinedInstruction),
         SsaOp::Ckfinite {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
         },
         SsaOp::FpClassify {
-            dest: sv,
-            operand: sv,
+            dest: d0,
+            operand: u0,
         },
         SsaOp::FpTranscendental(Box::new(KindedVecData {
             kind: TranscendentalKind::Sin,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
         SsaOp::FpuControl(Box::new(KindedVecData {
             kind: FpuControlKind::LoadControlWord,
-            outputs: vec![sv],
-            inputs: vec![sv],
+            outputs: vec![d0, d1],
+            inputs: vec![u0, u1],
         })),
-        SsaOp::LocalAlloc { dest: sv, size: sv },
+        SsaOp::LocalAlloc { dest: d0, size: u0 },
         SsaOp::Constrained {
             constraint_type: 0u32,
         },
@@ -3340,13 +3884,13 @@ fn all_sample_ops() -> Vec<SsaOp<MockTarget>> {
         SsaOp::TailPrefix,
         SsaOp::Readonly,
         SsaOp::Phi {
-            dest: sv,
-            operands: vec![(0usize, sv)],
+            dest: d0,
+            operands: vec![(0usize, u0)],
         },
     ]
 }
 
-/// Across ALL 200 variants: the operand visitor agrees with `defs()` /
+/// Across ALL 199 variants: the operand visitor agrees with `defs()` /
 /// `uses()`, the primary `dest()` is the first `Def`-role operand, and
 /// `opcode_name()` is unique per variant. This is the runtime half of the
 /// completeness guarantee (the sentinel is the compile-time half).
@@ -3355,7 +3899,7 @@ fn all_variants_visitor_defs_uses_and_opcode_are_consistent() {
     let ops = all_sample_ops();
     assert_eq!(
         ops.len(),
-        200,
+        199,
         "every SsaOp variant must have exactly one sample"
     );
     let mut names = std::collections::HashSet::new();
@@ -3386,7 +3930,73 @@ fn all_variants_visitor_defs_uses_and_opcode_are_consistent() {
             op.opcode_name()
         );
     }
-    assert_eq!(names.len(), 200, "opcode_name must be unique per variant");
+    assert_eq!(names.len(), 199, "opcode_name must be unique per variant");
+}
+
+/// How many samples in `all_sample_ops` both pop two operands and push two.
+///
+/// Every one of the boxed-payload variants is built with two inputs and two
+/// outputs, so this is their count plus the handful of non-payload variants
+/// that happen to have the same shape. Pinning it makes
+/// `payload_variants_report_all_outputs_as_defs` notice a variant that quietly
+/// leaves the population.
+const PAYLOAD_SAMPLE_COUNT: usize = 46;
+
+/// No sample reports an operand in the wrong role.
+///
+/// `all_sample_ops` draws definitions from `{d0, d1}` and uses from `{u0, u1}`,
+/// two disjoint id spaces, so this one assertion covers every variant at once:
+/// a definition that is really an input, or an input reported as a definition,
+/// lands an id from the wrong space. It replaces a per-variant list of expected
+/// operands, which would have to be extended by hand for variant 201 and would
+/// silently omit anything nobody remembered to add.
+#[test]
+fn payload_roles_are_not_transposed() {
+    let defs_space = [SsaVarId::from_index(90), SsaVarId::from_index(91)];
+    let uses_space = [SsaVarId::from_index(80), SsaVarId::from_index(81)];
+    for op in all_sample_ops() {
+        let defs: Vec<SsaVarId> = op.defs().collect();
+        let uses = op.uses();
+        for def in &defs {
+            assert!(
+                defs_space.contains(def),
+                "{op} reports {def:?} as a definition, but it is an input"
+            );
+        }
+        for used in &uses {
+            assert!(
+                uses_space.contains(used),
+                "{op} reports {used:?} as a use, but it is an output"
+            );
+        }
+        assert!(
+            !defs.iter().any(|d| uses.contains(d)),
+            "{op} reports the same variable as both a definition and a use"
+        );
+    }
+}
+
+/// Every payload-carrying sample reports both of its outputs as definitions and
+/// both of its inputs as uses.
+///
+/// `all_sample_ops` gives each of them two of each, so a definition walk that
+/// truncates after the first output -- the failure mode a `_` fallback arm
+/// hides -- shows up here as a count of one. The population is pinned rather
+/// than listed: a new payload variant changes the number and forces a look.
+#[test]
+fn payload_variants_report_all_outputs_as_defs() {
+    let mut two_by_two = 0_usize;
+    for op in all_sample_ops() {
+        if op.stack_effect() == (2, 2) {
+            assert_eq!(op.defs().count(), 2, "{op} loses a definition");
+            assert_eq!(op.uses().len(), 2, "{op} loses a use");
+            two_by_two += 1;
+        }
+    }
+    assert_eq!(
+        two_by_two, PAYLOAD_SAMPLE_COUNT,
+        "the population of two-in/two-out samples changed"
+    );
 }
 
 /// Cross-checks the classification methods against each other for every op
@@ -3413,10 +4023,21 @@ fn classification_methods_are_self_consistent() {
 }
 
 /// The visitor must agree with `defs()` (definition set and order) and
-/// `uses()` (use set and order) for every representative op shape.
+/// `uses()` (use set and order) for every representative op shape, and the
+/// `visitor_battery` entries must additionally match the operand census that
+/// battery states.
+///
+/// `defs()`, `uses()` and `visit_operands` are three readers of one walk, so
+/// agreement between them cannot catch an operand the walk never reaches. The
+/// hand-written census is the independent account that can.
 #[test]
 fn visit_operands_agrees_with_defs_and_uses() {
-    for op in all_sample_ops().into_iter().chain(visitor_battery()) {
+    let census = visitor_battery();
+    let all = all_sample_ops()
+        .into_iter()
+        .map(|op| (op, None))
+        .chain(census.into_iter().map(|(op, d, u)| (op, Some((d, u)))));
+    for (op, expected) in all {
         let mut visited_defs = Vec::new();
         let mut visited_uses = Vec::new();
         op.visit_operands(|role, var| match role {
@@ -3427,6 +4048,18 @@ fn visit_operands_agrees_with_defs_and_uses() {
         let defs: Vec<SsaVarId> = op.defs().collect();
         assert_eq!(visited_defs, defs, "defs mismatch for {op}");
         assert_eq!(visited_uses, op.uses(), "uses mismatch for {op}");
+        if let Some((expected_defs, expected_uses)) = expected {
+            assert_eq!(
+                defs.len(),
+                expected_defs,
+                "{op} does not have the {expected_defs} definitions the battery declares"
+            );
+            assert_eq!(
+                visited_uses.len(),
+                expected_uses,
+                "{op} does not have the {expected_uses} uses the battery declares"
+            );
+        }
         if matches!(op, SsaOp::FloatCompareFlags { .. }) {
             // Defines only a flags bundle; there is no primary destination.
             assert_eq!(op.dest(), None);
@@ -3456,7 +4089,8 @@ fn visit_operands_agrees_with_defs_and_uses() {
 /// (`flags: None`) that exercise the visitors' skip paths.
 #[test]
 fn visit_operands_mut_agrees_with_visit_operands() {
-    for mut op in all_sample_ops().into_iter().chain(visitor_battery()) {
+    let battery = visitor_battery().into_iter().map(|(op, _, _)| op);
+    for mut op in all_sample_ops().into_iter().chain(battery) {
         let mut shared = Vec::new();
         op.visit_operands(|role, var| shared.push((role, var)));
 
@@ -3470,23 +4104,41 @@ fn visit_operands_mut_agrees_with_visit_operands() {
     }
 }
 
-/// `replace_def` rewrites secondary outputs uniformly, across every op that has
-/// them — the native-intrinsic output list as well as `NativeOpaque`.
+/// `first_use` is the allocation-free spelling of `uses().first()`, so the two
+/// must agree on every variant — including the ops that read nothing, where the
+/// `Vec` spelling answers `None` from an empty vector and this one answers it
+/// without building the vector at all.
+///
+/// Runs over both batteries: `all_sample_ops()` reaches all 200 variants with
+/// their optional operands populated, `visitor_battery()` adds the absent
+/// shapes (`flags: None`) that shift which operand comes first.
 #[test]
-fn replace_def_covers_native_intrinsic_outputs() {
+fn first_use_agrees_with_uses_first() {
+    let battery = visitor_battery().into_iter().map(|(op, _, _)| op);
+    for op in all_sample_ops().into_iter().chain(battery) {
+        assert_eq!(
+            op.first_use(),
+            op.uses().first().copied(),
+            "first_use disagrees with uses().first() for {op}"
+        );
+    }
+}
+
+/// `replace_def` rewrites secondary outputs uniformly, across every op that has
+/// them — a typed system op's output list as well as `NativeOpaque`'s.
+#[test]
+fn replace_def_covers_secondary_outputs() {
     let old = SsaVarId::from_index(1);
     let new = SsaVarId::from_index(9);
-    let mut op: SsaOp<MockTarget> = SsaOp::NativeIntrinsic(Box::new(NativeIntrinsicData {
-        id: NativeIntrinsicId::Rdtsc,
-        mnemonic: "rdtsc".to_string(),
+    let mut op: SsaOp<MockTarget> = SsaOp::SystemOp(Box::new(NativeKindedData {
+        kind: SystemOpKind::Timestamp { aux: true },
+        mnemonic: "rdtscp".to_string(),
         metadata: None,
         outputs: vec![SsaVarId::from_index(0), old],
         inputs: vec![old],
-        clobbers: Vec::new(),
-        effects: SsaEffects::new(SsaEffectKind::Opaque, false),
     }));
     assert!(op.replace_def(old, new));
-    let SsaOp::NativeIntrinsic(data) = &op else {
+    let SsaOp::SystemOp(data) = &op else {
         unreachable!()
     };
     assert_eq!(data.outputs, vec![SsaVarId::from_index(0), new]);
@@ -3501,14 +4153,11 @@ fn system_op_defs_uses_effects_and_remap() {
     let a = SsaVarId::from_index(1);
     let b = SsaVarId::from_index(2);
     let op: SsaOp<MockTarget> = SsaOp::SystemOp(Box::new(NativeKindedData {
-        kind: SystemOpKind::ReadSysReg {
-            namespace: SysRegNamespace::X86Msr,
-        },
+        kind: SystemOpKind::ControlRegister(SysRegOp::ReadModelSpecific),
         mnemonic: "rdmsr".to_string(),
         metadata: None,
         outputs: vec![a],
         inputs: vec![b],
-        clobbers: Vec::new(),
     }));
 
     // defs == outputs, uses == inputs.
@@ -3531,9 +4180,7 @@ fn system_op_defs_uses_effects_and_remap() {
     assert_eq!(data.inputs, vec![SsaVarId::from_index(20)]);
     assert_eq!(
         data.kind,
-        SystemOpKind::ReadSysReg {
-            namespace: SysRegNamespace::X86Msr
-        },
+        SystemOpKind::ControlRegister(SysRegOp::ReadModelSpecific),
         "kind must survive remap"
     );
 }
@@ -3551,7 +4198,6 @@ fn compute_op_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a],
         inputs: vec![b],
-        clobbers: Vec::new(),
     }));
     assert_eq!(pdep.defs().collect::<Vec<_>>(), vec![a]);
     assert!(pdep.uses().contains(&b));
@@ -3566,7 +4212,6 @@ fn compute_op_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a],
         inputs: Vec::new(),
-        clobbers: Vec::new(),
     }));
     assert_eq!(rdrand.effects().kind, SsaEffectKind::Read);
 
@@ -3598,7 +4243,6 @@ fn block_string_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a],
         inputs: vec![b],
-        clobbers: Vec::new(),
         reverse: false,
     }));
     assert_eq!(cmps.defs().collect::<Vec<_>>(), vec![a]);
@@ -3613,7 +4257,6 @@ fn block_string_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a],
         inputs: Vec::new(),
-        clobbers: Vec::new(),
         reverse: false,
     }));
     assert_eq!(lods.effects().kind, SsaEffectKind::Read);
@@ -3645,7 +4288,6 @@ fn wide_compare_exchange_defs_uses_effects_and_remap() {
         metadata: None,
         outputs: vec![a],
         inputs: vec![b],
-        clobbers: Vec::new(),
     }));
     assert_eq!(op.defs().collect::<Vec<_>>(), vec![a]);
     assert!(op.uses().contains(&b));
@@ -3721,6 +4363,37 @@ fn call_clobber_defs_uses_effects_and_remap() {
         outputs,
         &vec![SsaVarId::from_index(11), SsaVarId::from_index(12)]
     );
+}
+
+/// An operation with more definitions than [`SsaDefs`] holds in its named
+/// slots reports every one of them, in order.
+///
+/// No operation the crate builds reaches the spill, so nothing else covers it;
+/// a host that lifts a native instruction writing four registers does.
+#[test]
+fn defs_past_the_named_slots_are_all_reported() {
+    let outputs: Vec<SsaVarId> = (40..45).map(SsaVarId::from_index).collect();
+    let op: SsaOp<MockTarget> = SsaOp::CallClobber {
+        outputs: outputs.clone(),
+    };
+    assert_eq!(op.defs().collect::<Vec<_>>(), outputs);
+    assert_eq!(op.defs().count(), outputs.len());
+    assert_eq!(op.defs().len(), outputs.len());
+}
+
+/// An operation that defines nothing renders no assignment prefix.
+///
+/// `CallClobber` with an empty output list is the case that reaches this:
+/// a clobber of no registers is still a well-formed op, and a bare `" = "`
+/// in front of its mnemonic reads as an assignment with a missing left-hand
+/// side. The shared `write_defs` prefix answers it for every op at once.
+#[test]
+fn an_op_defining_nothing_renders_no_assignment_prefix() {
+    let op: SsaOp<MockTarget> = SsaOp::CallClobber {
+        outputs: Vec::new(),
+    };
+    assert_eq!(format!("{op}"), "call.clobber");
+    assert_eq!(op.defs().count(), 0);
 }
 
 #[test]
@@ -3897,7 +4570,6 @@ fn similarity_class_groups_feature_extraction_families() {
             metadata: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
-            clobbers: Vec::new(),
             effects: SsaEffects::new(SsaEffectKind::Opaque, true),
         }))
         .similarity_class(),
@@ -3939,59 +4611,6 @@ fn feature_token_serializes_stable_target_generic_shape() {
 }
 
 #[test]
-fn native_register_aliases_track_subregister_overlap() {
-    let rax = NativeRegister::new("x86_64", "gpr", "rax", "rax", 0, 64).unwrap();
-    let eax = NativeRegister::new("x86_64", "gpr", "rax", "eax", 0, 32).unwrap();
-    let ah = NativeRegister::new("x86_64", "gpr", "rax", "ah", 8, 8).unwrap();
-    let rbx = NativeRegister::new("x86_64", "gpr", "rbx", "rbx", 0, 64).unwrap();
-    let q0 = NativeRegister::new("aarch64", "simd", "v0", "q0", 0, 128).unwrap();
-
-    assert!(rax.aliases(&eax));
-    assert!(eax.aliases(&ah));
-    assert!(!rax.aliases(&rbx));
-    assert!(!rax.aliases(&q0));
-    assert!(NativeRegister::new("x86_64", "gpr", "rax", "al", 0, 0).is_none());
-}
-
-#[test]
-fn native_state_accesses_classify_implicit_machine_state() {
-    let rflags = NativeStateAccess::implicit_read_write(
-        NativeStateLocation::Flags("rflags".to_string()),
-        Some(64),
-    )
-    .unwrap();
-    assert!(rflags.reads());
-    assert!(rflags.writes());
-    assert!(rflags.implicit);
-
-    let vl = NativeStateAccess::implicit_read(NativeStateLocation::VectorLength, None).unwrap();
-    assert!(vl.reads());
-    assert!(!vl.writes());
-    assert!(
-        NativeStateAccess::implicit_write(NativeStateLocation::StackPointer, Some(0)).is_none()
-    );
-}
-
-#[test]
-fn native_clobbers_expose_structured_machine_state_categories() {
-    let rax = NativeRegister::new("x86_64", "gpr", "rax", "rax", 0, 64).unwrap();
-    let reg = NativeClobber::MachineState(
-        NativeStateAccess::implicit_read_write(NativeStateLocation::Register(rax), Some(64))
-            .unwrap(),
-    );
-    let flags = NativeClobber::Flags("eflags".to_string());
-    let memory = NativeClobber::MachineState(
-        NativeStateAccess::implicit_write(NativeStateLocation::Memory("io".to_string()), None)
-            .unwrap(),
-    );
-
-    assert!(reg.touches_registers());
-    assert!(!reg.touches_memory());
-    assert!(flags.touches_flags());
-    assert!(memory.touches_memory());
-}
-
-#[test]
 fn native_opaque_tracks_outputs_inputs_and_effects() {
     let out0 = SsaVarId::from_index(0);
     let out1 = SsaVarId::from_index(1);
@@ -4006,7 +4625,6 @@ fn native_opaque_tracks_outputs_inputs_and_effects() {
         )),
         outputs: vec![out0, out1],
         inputs: vec![in0, in1],
-        clobbers: vec![NativeClobber::Flags("eflags".to_string())],
         effects: SsaEffects::new(SsaEffectKind::ReadWrite, true),
     }));
 
@@ -4034,7 +4652,6 @@ fn native_opaque_rewrites_defs_and_uses_separately() {
         metadata: None,
         outputs: vec![out0, out1],
         inputs: vec![input],
-        clobbers: Vec::new(),
         effects: SsaEffects::pure(),
     }));
 
@@ -4131,4 +4748,107 @@ fn display_renders_every_used_operand() {
             "Display for `{rendered}` omits operand(s) {missing:?} that `for_each_use` reports"
         );
     }
+}
+
+/// Renders one op's whole observable surface as one golden block.
+///
+/// Every reader an operand policy has is recorded together: the opcode name,
+/// the rendered form, the ordered `(role, variable)` visitor trace, `defs()`,
+/// `uses()`, the stack effect, and the result of renaming the first definition
+/// through `replace_def` plus the form that renaming produces. A change in any
+/// one of them is a one-line diff naming the opcode it belongs to.
+fn golden_block(source: &str, index: usize, op: &SsaOp<MockTarget>) -> String {
+    let mut trace: Vec<String> = Vec::new();
+    op.visit_operands(|role, var| trace.push(format!("{role:?}:v{}", var.index())));
+    let defs: Vec<String> = op.defs().map(|v| format!("v{}", v.index())).collect();
+    let uses: Vec<String> = op
+        .uses()
+        .iter()
+        .map(|v| format!("v{}", v.index()))
+        .collect();
+    let (pops, pushes) = op.stack_effect();
+
+    let mut renamed = op.clone();
+    let first_def = op.defs().next();
+    let changed = first_def.is_some_and(|old| renamed.replace_def(old, GOLDEN_RENAME));
+
+    let mut block = String::new();
+    block.push_str(&format!("## {source}[{index}] {}\n", op.opcode_name()));
+    block.push_str(&format!("display  {op}\n"));
+    block.push_str(&format!("visit    {}\n", join_or_dash(&trace)));
+    block.push_str(&format!("defs     {}\n", join_or_dash(&defs)));
+    block.push_str(&format!("uses     {}\n", join_or_dash(&uses)));
+    block.push_str(&format!("stack    pops={pops} pushes={pushes}\n"));
+    block.push_str(&format!("rename   {changed} {renamed}\n"));
+    block
+}
+
+/// Joins golden list fields, spelling the empty list as `-` so a dropped
+/// operand cannot hide as trailing whitespace.
+fn join_or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items.join(" ")
+    }
+}
+
+/// The variable the golden renames every first definition to. Outside both the
+/// definition space (90, 91) and the use space (80, 81) of `all_sample_ops`, so
+/// a rename that lands on the wrong operand is visible in the rendered form.
+const GOLDEN_RENAME: SsaVarId = SsaVarId::from_index(99);
+
+/// Renders the whole behaviour golden.
+fn golden_text() -> String {
+    let mut out = String::from(GOLDEN_HEADER);
+    for (index, op) in all_sample_ops().iter().enumerate() {
+        out.push('\n');
+        out.push_str(&golden_block("sample", index, op));
+    }
+    for (index, (op, _, _)) in visitor_battery().iter().enumerate() {
+        out.push('\n');
+        out.push_str(&golden_block("battery", index, op));
+    }
+    out
+}
+
+/// Leading comment of `testdata/ops_golden.txt`, kept with the generator so the
+/// file explains itself to whoever first sees it in a diff.
+const GOLDEN_HEADER: &str = "\
+# Behaviour golden for every `SsaOp` sample.
+#
+# One block per op: the opcode name, `Display`, the ordered `(role, variable)`
+# `visit_operands` trace, `defs()`, `uses()`, `stack_effect()`, and the outcome
+# of renaming the first definition to v99 with `replace_def` followed by the
+# form that produces. `-` is an empty list.
+#
+# Operands come from disjoint id spaces: definitions are v90/v91 and uses are
+# v80/v81 in the `sample` blocks, so a transposed role is legible here as well
+# as caught by `payload_roles_are_not_transposed`. The `battery` blocks use
+# v0..v7 and exist for the operand shapes `all_sample_ops` does not have.
+#
+# Regenerate with `ANALYSSA_UPDATE_GOLDEN=1 cargo test --lib ops_behaviour_golden`
+# and review the diff; it is the record that a change to the operand matches
+# was behaviour-preserving.
+";
+
+/// Every op's observable behaviour matches the checked-in golden.
+///
+/// The operand policy -- outputs are definitions, inputs are uses, in that
+/// order -- has six readers, and this pins all of them for all 199 variants at
+/// once. A restructuring of the matches those readers are built from is
+/// behaviour-preserving exactly when this file does not move.
+#[test]
+fn ops_behaviour_golden() {
+    let generated = golden_text();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ir/ops/testdata/ops_golden.txt");
+    if env::var_os("ANALYSSA_UPDATE_GOLDEN").is_some() {
+        fs::write(&path, &generated).expect("golden is writable");
+        return;
+    }
+    let expected = include_str!("testdata/ops_golden.txt");
+    assert_eq!(
+        generated, expected,
+        "op behaviour moved; review the diff and regenerate with ANALYSSA_UPDATE_GOLDEN=1"
+    );
 }

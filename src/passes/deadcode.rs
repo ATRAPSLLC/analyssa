@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::{
-    analysis::{cfg::SsaCfg, phis::PhiAnalyzer},
+    analysis::{cfg::SsaCfg, exceptions::FunctionRoots, phis::PhiAnalyzer},
     bitset::BitSet,
     events::{EventKind, EventListener},
     graph::{NodeId, algorithms},
@@ -242,40 +242,42 @@ fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<
         reachable.insert(n.index());
     }
 
-    // A handler region is exception-table *metadata*, not a fact about the
-    // current CFG: a front end can name a block it has not built yet, and a
-    // block-removing edit can leave a region naming one the function no longer
-    // has. The checked accessors treat such an index as "not a block here",
-    // which is the answer; the asserting ones would panic out of DCE and roll
-    // the whole pass back. `verifier::runtime_supplied_vars` already reads these
-    // same two fields that way.
+    // Where else control can enter, from the one place the crate reads the
+    // exception table. `FunctionRoots` treats an index the function does not
+    // have as naming no block, which is the answer -- a front end can name a
+    // block it has not built yet, and a block-removing edit can leave a clause
+    // naming one the function no longer has.
+    //
+    // A stale index is *tolerated here and reported elsewhere*, and the two are
+    // deliberately different questions. Passes read the exception table through
+    // the total accessors (`parts`, `entry_blocks`, `FunctionRoots`), none of
+    // which rejects anything, so an out-of-range clause costs a root rather than
+    // an abort. Whether the IR is valid is the verifier's question, and
+    // `SsaVerifier::check_exception_table` answers it by rejecting that same
+    // clause. Pass robustness and IR validity must not be one condition: a pass
+    // that refused to run on a table the verifier dislikes could not be run to
+    // fix it.
+    let roots = FunctionRoots::of(ssa);
     let mut exception_roots = BitSet::new(ssa.block_count());
-    for handler in ssa.exception_handlers() {
-        if let Some(handler_block) = handler.handler_start_block
-            && !reachable.contains_checked(handler_block)
-        {
-            exception_roots.insert_checked(handler_block);
-        }
-        if let Some(filter_block) = handler.filter_start_block
-            && !reachable.contains_checked(filter_block)
-        {
-            exception_roots.insert_checked(filter_block);
+    for root in roots.flow_roots() {
+        if !reachable.contains_checked(root.block) {
+            exception_roots.insert_checked(root.block);
         }
     }
-
-    // Fallback: handler blocks recognized by their first instruction.
-    for (block_idx, block) in ssa.iter_blocks() {
-        if reachable.contains(block_idx) || exception_roots.contains(block_idx) {
-            continue;
-        }
-        if let Some(first_instr) = block.instructions().first()
-            && matches!(first_instr.op(), SsaOp::EndFinally | SsaOp::Rethrow)
-        {
-            exception_roots.insert(block_idx);
+    // A block reached only by the runtime unwinding into it, recognised by its
+    // leading `EndFinally` or `Rethrow`. These are preservation roots: they must
+    // survive elimination, but they get no edge and no dominance answer.
+    for block in roots.preservation_roots() {
+        if !reachable.contains_checked(block) {
+            exception_roots.insert_checked(block);
         }
     }
 
     for root in exception_roots.iter() {
+        // An earlier root's traversal may already have covered this one.
+        if reachable.contains_checked(root) {
+            continue;
+        }
         for node in algorithms::bfs(cfg, NodeId::new(root)) {
             let node: NodeId = node;
             reachable.insert(node.index());
@@ -908,12 +910,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::{
         events::EventLog,
         ir::{
             block::SsaBlock,
+            exception::{BlockRange, SsaExceptionHandler},
+            function::SsaFunction,
             instruction::SsaInstruction,
+            ops::{
+                FlagAdjustKind, FlagAdjustResult, FlagsMask, KindedVecData, SsaEffectKind, SsaOp,
+                table::OpKindTable,
+            },
             phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
@@ -923,6 +933,61 @@ mod tests {
             run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
         },
     };
+
+    /// Builds a function with an in-function protected region: block 0 is the
+    /// try body, block 1 is where it completes, block 2 is the handler.
+    ///
+    /// No terminator names block 2 — the runtime enters a handler — which is
+    /// exactly why its survival is a question worth asking.
+    fn function_with_an_in_function_handler() -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        for (index, op) in [
+            SsaOp::Jump { target: 1 },
+            SsaOp::Return { value: None },
+            SsaOp::Return { value: None },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut block: SsaBlock<MockTarget> = SsaBlock::new(index);
+            block.add_instruction(SsaInstruction::synthetic(op));
+            ssa.add_block(block);
+        }
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 0,
+            try_offset: 0,
+            try_length: 1,
+            handler_offset: 2,
+            handler_length: 1,
+            class_token_or_filter: 0,
+            protected_range: BlockRange::new(0, 1),
+            handler_range: BlockRange::new(2, 3),
+            filter_range: None,
+        }]);
+        ssa
+    }
+
+    /// A handler block survives elimination even though nothing branches to it.
+    ///
+    /// This is the property the exception table buys, and it is bought *here* —
+    /// by rooting handler entries from the table — not by the CFG view drawing
+    /// a synthetic edge to them. Which matters, because that edge binds for
+    /// only 1 of 29 clauses on the corpus's one exception-carrying fixture: on
+    /// Windows x64 a handler is a funclet, a separate function, so a
+    /// per-function CFG cannot contain the block at all.
+    #[test]
+    fn an_in_function_handler_survives_elimination() {
+        let mut ssa = function_with_an_in_function_handler();
+        let log: EventLog<MockTarget> = EventLog::new();
+        run(&mut ssa, &0, &log, 8);
+
+        assert!(
+            ssa.block(2).is_some(),
+            "the handler block was eliminated: nothing branches to it, so only \
+             the exception table keeps it alive"
+        );
+        assert_mock_valid_full(&ssa, "handler survival");
+    }
 
     #[test]
     fn find_dead_tails_after_terminator() {
@@ -1552,6 +1617,138 @@ mod tests {
                 defining_value,
                 ConstValue::I32(returned_slot as i32),
                 "DCE left the function returning the wrong constant (seed {seed})"
+            );
+        }
+    }
+
+    /// Every kind classifies from its own declared result, so a new variant
+    /// cannot inherit `Pure` by sitting in a shared arm.
+    #[test]
+    fn flag_adjust_effects_follow_its_result() {
+        for kind in FlagAdjustKind::all() {
+            let effects = kind.effects();
+            match kind.result() {
+                FlagAdjustResult::None => {
+                    assert_eq!(
+                        effects.kind,
+                        SsaEffectKind::Opaque,
+                        "{kind:?} writes state the IR cannot name, so it is not pure"
+                    );
+                    assert_eq!(kind.output_arity(), 0);
+                }
+                FlagAdjustResult::Flags | FlagAdjustResult::Register => {
+                    assert_eq!(
+                        effects.kind,
+                        SsaEffectKind::Pure,
+                        "{kind:?} is a function of its operands"
+                    );
+                    assert_eq!(kind.output_arity(), 1);
+                }
+            }
+        }
+    }
+
+    /// A kind that declares a result but carries none has written architectural
+    /// state and handed back nothing to model it. It must not be deletable.
+    #[test]
+    fn a_result_declaring_kind_without_an_output_is_not_pure() {
+        for kind in FlagAdjustKind::all() {
+            if matches!(kind.result(), FlagAdjustResult::None) {
+                continue;
+            }
+            assert_eq!(
+                kind.effects_for_outputs(0).kind,
+                SsaEffectKind::Opaque,
+                "{kind:?} with no output must degrade, not stay pure"
+            );
+            assert_eq!(kind.effects_for_outputs(1).kind, SsaEffectKind::Pure);
+        }
+    }
+
+    /// `setf8`/`setf16` exist to recover a narrow add's overflow; reporting
+    /// only N and Z tells a caller a stale V is still live.
+    #[test]
+    fn flags_written_names_overflow_for_setf() {
+        for kind in [FlagAdjustKind::SetNzFrom8, FlagAdjustKind::SetNzFrom16] {
+            let written = kind.flags_written();
+            assert!(written.contains(FlagsMask::OVERFLOW), "{kind:?} writes V");
+            assert!(written.contains(FlagsMask::SIGN));
+            assert!(written.contains(FlagsMask::ZERO));
+            assert!(
+                !written.contains(FlagsMask::CARRY),
+                "{kind:?} leaves C alone"
+            );
+        }
+    }
+
+    /// The kind is the operation's only identity, so discarding it makes `std`
+    /// indistinguishable from `clc` in both rendering and fingerprinting.
+    #[test]
+    fn flag_adjust_names_its_kind_in_display_and_opcode_name() {
+        let mut rendered = BTreeSet::new();
+        let mut opcodes = BTreeSet::new();
+        for kind in FlagAdjustKind::all() {
+            let op = SsaOp::<MockTarget>::FlagAdjust(Box::new(KindedVecData {
+                kind,
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+            }));
+            assert!(
+                rendered.insert(format!("{op}")),
+                "{kind:?} renders as a duplicate"
+            );
+            assert!(
+                opcodes.insert(op.opcode_name()),
+                "{kind:?} shares a fingerprint"
+            );
+            assert_eq!(op.opcode_name(), kind.kind_str());
+        }
+        assert_eq!(rendered.len(), usize::from(FlagAdjustKind::COUNT));
+    }
+
+    /// A flag adjustment that writes architectural state no SSA value models
+    /// must survive dead-code elimination.
+    ///
+    /// `clac`/`stac` toggle EFLAGS.AC, which is what makes a `mov` from a user
+    /// pointer legal inside the kernel. They have no SSA result, because the
+    /// IR has nothing to represent AC with — so a purity rule that keys on the
+    /// `SsaOp` variant classifies them `Pure`, `removable_when_unused()` says
+    /// yes, and `find_dead_definitions` deletes them through its
+    /// `defs.is_empty()` branch. The SMAP window silently disappears.
+    #[test]
+    fn dce_keeps_a_zero_output_flag_adjust() {
+        for kind in [
+            FlagAdjustKind::SetAlignCheck,
+            FlagAdjustKind::ClearAlignCheck,
+            FlagAdjustKind::SetDirection,
+            FlagAdjustKind::ClearDirection,
+        ] {
+            let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+            let mut block = SsaBlock::new(0);
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::FlagAdjust(Box::new(
+                KindedVecData {
+                    kind,
+                    outputs: Vec::new(),
+                    inputs: Vec::new(),
+                },
+            ))));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+            ssa.add_block(block);
+            ssa.recompute_uses();
+
+            let events = crate::events::EventLog::<MockTarget>::new();
+            super::run(&mut ssa, &0u32, &events, 4);
+
+            let survived = ssa.block(0).is_some_and(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .any(|instr| matches!(instr.op(), SsaOp::FlagAdjust(_)))
+            });
+            assert!(
+                survived,
+                "{kind:?} writes architectural state the IR does not model; \
+                 deleting it changes what the program does"
             );
         }
     }

@@ -71,14 +71,14 @@ pub use editor::{
     SsaEditScope, SsaEditor, SsaRollbackPolicy,
 };
 pub use kind::FunctionKind;
-pub use queries::{MethodPurity, ReturnInfo};
+pub use queries::{MethodPurity, RecordedDefinition, ReturnInfo};
 pub use transforms::{CopyPropagationResult, TrivialPhiOptions};
 
 use crate::{
     analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
     ir::{
         block::SsaBlock,
-        exception::SsaExceptionHandler,
+        exception::{ExceptionBlocks, SsaExceptionHandler},
         instruction::SsaInstruction,
         ops::SsaOp,
         phi::{PhiNode, PhiOperand},
@@ -1062,6 +1062,20 @@ impl<T: Target> SsaFunction<T> {
         &self.exception_handlers
     }
 
+    /// Indexes the block roles this function's exception table assigns.
+    ///
+    /// Prefer this over reading the five `Option<usize>` block fields of each
+    /// [`SsaExceptionHandler`] by hand: it answers "can control enter this
+    /// block without a terminator naming it" and "is this block a protected
+    /// region boundary" once, totally, and for any index.
+    ///
+    /// The result borrows the function, so it cannot outlive an edit to the
+    /// table it was built from.
+    #[must_use]
+    pub fn exception_blocks(&self) -> ExceptionBlocks<'_, T> {
+        ExceptionBlocks::from_handlers(&self.exception_handlers, self.block_count())
+    }
+
     /// Returns whether this function has any exception handlers.
     ///
     /// # Returns
@@ -1251,9 +1265,7 @@ impl<T: Target> SsaFunction<T> {
         }
         Ok(())
     }
-}
 
-impl<T: Target> SsaFunction<T> {
     /// Rebuilds SSA form after CFG modifications (e.g., control flow unflattening).
     ///
     /// This method performs a complete SSA reconstruction using the standard

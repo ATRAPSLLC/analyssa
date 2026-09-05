@@ -23,12 +23,12 @@ use std::collections::BTreeMap;
 use crate::{
     BitSet,
     analysis::{
-        cfg::SsaCfg,
+        exceptions::EhCfg,
         verifier::{SsaVerifier, VerifierError, VerifyLevel},
     },
     error::{Error, Result},
     graph::{
-        NodeId, RootedGraph,
+        NodeId,
         algorithms::{DominatorTree, compute_dominators},
     },
     ir::{
@@ -334,8 +334,8 @@ impl<T: Target> SsaFunction<T> {
             })
             .unwrap_or(false);
         let dominators = if needs_dominance && self.block_count() > 0 {
-            let cfg = SsaCfg::from_ssa(self);
-            Some(compute_dominators(&cfg, cfg.entry()))
+            let eh = EhCfg::from_ssa(self);
+            Some(compute_dominators(&eh, NodeId::new(0)))
         } else {
             None
         };
@@ -506,8 +506,8 @@ impl<T: Target> SsaFunction<T> {
             .variable(new_var)
             .is_some_and(|new| new.def_site().block != block_idx);
         let dominators = if needs_dominance && self.block_count() > 0 {
-            let cfg = SsaCfg::from_ssa(self);
-            Some(compute_dominators(&cfg, cfg.entry()))
+            let eh = EhCfg::from_ssa(self);
+            Some(compute_dominators(&eh, NodeId::new(0)))
         } else {
             None
         };
@@ -685,6 +685,13 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         let Some(block) = self.ssa.block(block_idx) else {
             return Err(Error::new(format!("missing block B{block_idx}")));
         };
+        // The control question, not the positional one. Overwriting a last
+        // instruction that is an ordinary computation would delete a definition
+        // the block still needs, so such a block is reported as having no
+        // terminator rather than silently retargeted.
+        if block.control_terminator().is_none() {
+            return Err(Error::new(format!("block B{block_idx} has no terminator")));
+        }
         let Some(instr_idx) = block.instructions().len().checked_sub(1) else {
             return Err(Error::new(format!("block B{block_idx} has no terminator")));
         };
@@ -854,8 +861,8 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         let Some(mut op) = self
             .ssa
             .block(block_idx)
-            .and_then(|block| block.instructions().last())
-            .map(|instr| instr.op().clone())
+            .and_then(SsaBlock::control_terminator)
+            .cloned()
         else {
             return Err(Error::new(format!("block B{block_idx} has no terminator")));
         };
@@ -889,8 +896,8 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         let Some(mut op) = self
             .ssa
             .block(block_idx)
-            .and_then(|block| block.instructions().last())
-            .map(|instr| instr.op().clone())
+            .and_then(SsaBlock::control_terminator)
+            .cloned()
         else {
             return Err(Error::new(format!("block B{block_idx} has no terminator")));
         };
@@ -1072,7 +1079,7 @@ impl<'a, T: Target> SsaEditor<'a, T> {
             return Err(Error::new(format!("missing block B{predecessor_idx}")));
         };
         if !matches!(
-            predecessor.terminator_op(),
+            predecessor.control_terminator(),
             Some(SsaOp::Jump { target }) if *target == successor_idx
         ) {
             return Err(Error::new(format!(

@@ -8,47 +8,111 @@
 //! renaming, so a divergence corrupts SSA silently rather than failing loudly.
 //! The `visit_operands_mut_agrees_with_visit_operands` test pins that
 //! invariant across every variant.
+//!
+//! [`SsaOp::dest`], [`SsaOp::flags_dest`], [`SsaOp::defs`],
+//! [`SsaOp::for_each_use`], [`SsaOp::uses`], [`SsaOp::replace_def`] and
+//! [`SsaOp::replace_uses`] are all expressed over those two walks, so none of
+//! them can disagree with the others about which operands an operation has or
+//! what role each one plays. For the forty-five boxed-payload variants the
+//! walks themselves delegate to one shared operand policy, so their arms carry
+//! no per-variant statement of that policy either.
 
-use super::*;
-use crate::{ir::variable::SsaVarId, target::Target};
+use crate::{
+    ir::{
+        ops::{def::SsaOp, kinds::OperandRole, operands::KindedOperands},
+        variable::SsaVarId,
+    },
+    target::Target,
+};
 
-/// Iterator over variables defined by an SSA operation.
-pub struct SsaDefs<'a> {
-    primary: Option<SsaVarId>,
-    secondary: Option<SsaVarId>,
-    extra: Option<std::slice::Iter<'a, SsaVarId>>,
+/// Iterator over the variables an SSA operation defines, in the order
+/// [`SsaOp::visit_operands`] reports them.
+///
+/// Owns its contents. [`SsaOp::defs`] collects the `Def` and `FlagsDef`
+/// operands of one walk over the operation, so this iterator cannot disagree
+/// with that walk — or with [`SsaOp::dest`], [`SsaOp::flags_dest`] and
+/// [`SsaOp::replace_def`], which read the same walk — about what the
+/// definitions are, and it does not borrow the operation it came from.
+///
+/// Two definitions live in named slots and any further ones spill to a `Vec`.
+/// No operation in the crate defines more than two variables, so the spill
+/// stays empty — and therefore unallocated — on every `defs()` call the crate
+/// itself makes; a host-built operation with a longer output list allocates
+/// once.
+///
+/// The shape is chosen for the hot path, because `defs()` runs per instruction
+/// in def-use index construction, liveness and the verifier. Two fixed slots
+/// the iterator takes from, rather than an inline buffer addressed by a
+/// running index, are what keep it there: the slots need no cursor field and
+/// their stores fold, and the spill's push is out of line so the allocation it
+/// needs is not code the callers that never spill have to step around.
+#[derive(Debug, Clone, Default)]
+pub struct SsaDefs {
+    /// The first definition.
+    first: Option<SsaVarId>,
+    /// The second definition.
+    second: Option<SsaVarId>,
+    /// Definitions past the second, in reverse so that iteration pops. Empty
+    /// for every operation the crate defines, and an empty `Vec` does not
+    /// allocate.
+    rest: Vec<SsaVarId>,
 }
 
-impl<'a> SsaDefs<'a> {
-    /// Creates a definition iterator from optional primary, optional secondary,
-    /// and any extra definitions.
-    #[must_use]
-    pub fn new(
-        primary: Option<SsaVarId>,
-        secondary: Option<SsaVarId>,
-        extra: Option<&'a [SsaVarId]>,
-    ) -> Self {
-        Self {
-            primary,
-            secondary,
-            extra: extra.map(<[SsaVarId]>::iter),
+impl SsaDefs {
+    /// Appends one definition.
+    #[inline]
+    fn push(&mut self, var: SsaVarId) {
+        if self.first.is_none() {
+            self.first = Some(var);
+        } else if self.second.is_none() {
+            self.second = Some(var);
+        } else {
+            self.push_rest(var);
         }
+    }
+
+    /// Appends a definition past the second.
+    ///
+    /// Kept out of line: no operation in the crate reaches it, and an
+    /// allocation inlined into the hot path is paid for by every caller that
+    /// never spills.
+    #[cold]
+    #[inline(never)]
+    fn push_rest(&mut self, var: SsaVarId) {
+        // Reversed on the way in so that iteration is a `pop`, which needs no
+        // cursor of its own.
+        self.rest.insert(0, var);
+    }
+
+    /// Returns how many definitions the iterator has yet to yield.
+    fn remaining(&self) -> usize {
+        usize::from(self.first.is_some())
+            .saturating_add(usize::from(self.second.is_some()))
+            .saturating_add(self.rest.len())
     }
 }
 
-impl Iterator for SsaDefs<'_> {
+impl Iterator for SsaDefs {
     type Item = SsaVarId;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(primary) = self.primary.take() {
-            return Some(primary);
+        if let Some(var) = self.first.take() {
+            return Some(var);
         }
-        if let Some(secondary) = self.secondary.take() {
-            return Some(secondary);
+        if let Some(var) = self.second.take() {
+            return Some(var);
         }
-        self.extra.as_mut()?.next().copied()
+        self.rest.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
     }
 }
+
+impl ExactSizeIterator for SsaDefs {}
 
 impl<T: Target> SsaOp<T> {
     /// Returns the destination variable if this operation produces one.
@@ -63,641 +127,27 @@ impl<T: Target> SsaOp<T> {
         dest
     }
 
-    /// Returns all variables defined by this operation.
+    /// Returns all variables defined by this operation, in the order
+    /// [`Self::visit_operands`] reports them.
+    ///
+    /// Derived from that walk rather than matched per variant, so it cannot
+    /// disagree with [`Self::dest`], [`Self::flags_dest`] or
+    /// [`Self::replace_def`] about which operands are definitions: all four
+    /// read the same walk. A per-variant match needs an arm for every variant
+    /// that defines more than one variable, and the arm a new variant does not
+    /// get is a definition silently dropped from the def-use index, liveness,
+    /// SCCP, reaching definitions, taint and the verifier's dominance and
+    /// uniqueness checks.
     #[must_use]
-    pub fn defs(&self) -> SsaDefs<'_> {
-        match self {
-            Self::NativeOpaque(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::NativeIntrinsic(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::SystemOp(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::ComputeOp(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::BcdAdjust(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorCrypto(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::TileOp(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPermute(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorMultiplyAdd(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPackNarrow(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorNarrowSaturate(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPredicateWhile(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPredicateBreak(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorComplexAdd(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorCountAdjust(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorExtendInLane(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorElementCount(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSveAddressGen(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::FlagAdjust(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorStructLoadReplicate(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSmeMisc(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPredicateOp(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSveCompute(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorReverseChunks(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorMatrixMulAcc(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSmeOuterProduct(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorPredicateGen(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorFpHelper(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSvePermute(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorTernaryLogic(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorDotProduct(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorMultiSad(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorIntDotProduct(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorStringCompare(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorBitfield(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorIntersect(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorShuffleBits(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorConditionalMove(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorHorizontalMinPos(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorComplexMul(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorClassify(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorHorizontalReduce(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::BlockString(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::WideCompareExchange(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::CallClobber { outputs } => SsaDefs::new(None, None, Some(outputs)),
-            Self::ComputeFlags { dest, .. } => SsaDefs::new(Some(*dest), None, None),
-            Self::FpTranscendental(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::FpuControl(data) => SsaDefs::new(None, None, Some(&data.outputs)),
-            Self::VectorSegmentLoad { dests, .. } => SsaDefs::new(None, None, Some(dests)),
-            Self::VectorFaultingLoad { dest, fault, .. } => SsaDefs::new(Some(*dest), *fault, None),
-            Self::AtomicCmpXchg { old, success, .. } => SsaDefs::new(Some(*old), *success, None),
-            Self::AtomicPairLoad { first, second, .. } => {
-                SsaDefs::new(Some(*first), Some(*second), None)
+    #[inline]
+    pub fn defs(&self) -> SsaDefs {
+        let mut defs = SsaDefs::default();
+        self.visit_operands(|role, var| {
+            if matches!(role, OperandRole::Def | OperandRole::FlagsDef) {
+                defs.push(var);
             }
-            Self::AtomicPairCmpXchg {
-                old_first,
-                old_second,
-                ..
-            } => SsaDefs::new(Some(*old_first), Some(*old_second), None),
-            Self::WideMul { low, high, .. } => SsaDefs::new(Some(*low), Some(*high), None),
-            Self::WideDiv {
-                quotient,
-                remainder,
-                ..
-            } => SsaDefs::new(Some(*quotient), Some(*remainder), None),
-            _ => SsaDefs::new(self.dest(), self.flags_dest(), None),
-        }
-    }
-
-    /// Sets the destination variable for operations that produce a result.
-    ///
-    /// This is used during SSA renaming to update the dest after assigning
-    /// new SSA variable IDs. Returns `true` if the dest was updated.
-    ///
-    /// # Arguments
-    ///
-    /// * `new_dest` - The new destination variable ID
-    pub fn set_dest(&mut self, new_dest: SsaVarId) -> bool {
-        match self {
-            Self::Const { dest, .. }
-            | Self::Add { dest, .. }
-            | Self::AddOvf { dest, .. }
-            | Self::Sub { dest, .. }
-            | Self::SubOvf { dest, .. }
-            | Self::Mul { dest, .. }
-            | Self::MulOvf { dest, .. }
-            | Self::WideMul { low: dest, .. }
-            | Self::Div { dest, .. }
-            | Self::Rem { dest, .. }
-            | Self::WideDiv { quotient: dest, .. }
-            | Self::Neg { dest, .. }
-            | Self::And { dest, .. }
-            | Self::Or { dest, .. }
-            | Self::Xor { dest, .. }
-            | Self::Not { dest, .. }
-            | Self::Shl { dest, .. }
-            | Self::Shr { dest, .. }
-            | Self::Ceq { dest, .. }
-            | Self::Clt { dest, .. }
-            | Self::Cgt { dest, .. }
-            | Self::BoolAnd { dest, .. }
-            | Self::BoolOr { dest, .. }
-            | Self::BoolXor { dest, .. }
-            | Self::BoolNot { dest, .. }
-            | Self::IntConv { dest, .. }
-            | Self::IntToPtr { dest, .. }
-            | Self::PtrToInt { dest, .. }
-            | Self::IntToFloat { dest, .. }
-            | Self::FloatToInt { dest, .. }
-            | Self::FloatConv { dest, .. }
-            | Self::Bitcast { dest, .. }
-            | Self::LoadField { dest, .. }
-            | Self::LoadStaticField { dest, .. }
-            | Self::LoadFieldAddr { dest, .. }
-            | Self::LoadStaticFieldAddr { dest, .. }
-            | Self::LoadElement { dest, .. }
-            | Self::LoadElementAddr { dest, .. }
-            | Self::PtrAdd { dest, .. }
-            | Self::ArrayLength { dest, .. }
-            | Self::LoadIndirect { dest, .. }
-            | Self::NewObj { dest, .. }
-            | Self::NewArr { dest, .. }
-            | Self::CastClass { dest, .. }
-            | Self::IsInst { dest, .. }
-            | Self::Box { dest, .. }
-            | Self::Unbox { dest, .. }
-            | Self::UnboxAny { dest, .. }
-            | Self::SizeOf { dest, .. }
-            | Self::LoadToken { dest, .. }
-            | Self::LoadFunctionPtr { dest, .. }
-            | Self::LoadVirtFunctionPtr { dest, .. }
-            | Self::LoadArg { dest, .. }
-            | Self::LoadLocal { dest, .. }
-            | Self::LoadArgAddr { dest, .. }
-            | Self::LoadLocalAddr { dest, .. }
-            | Self::Copy { dest, .. }
-            | Self::Ckfinite { dest, .. }
-            | Self::FpClassify { dest, .. }
-            | Self::LocalAlloc { dest, .. }
-            | Self::LoadObj { dest, .. }
-            | Self::Phi { dest, .. }
-            | Self::Rol { dest, .. }
-            | Self::Ror { dest, .. }
-            | Self::Rcl { dest, .. }
-            | Self::Rcr { dest, .. }
-            | Self::BSwap { dest, .. }
-            | Self::BRev { dest, .. }
-            | Self::BitScanForward { dest, .. }
-            | Self::BitScanReverse { dest, .. }
-            | Self::Popcount { dest, .. }
-            | Self::Parity { dest, .. }
-            | Self::ComputeFlags { dest, .. }
-            | Self::Select { dest, .. }
-            | Self::CmpXchg { dest, .. }
-            | Self::AtomicRmw { dest, .. }
-            | Self::AtomicLoad { dest, .. }
-            | Self::AtomicExchange { dest, .. }
-            | Self::AtomicLockRmw { dest, .. }
-            | Self::AtomicStoreConditional { status: dest, .. }
-            | Self::AtomicPairLoad { first: dest, .. }
-            | Self::AtomicPairStoreConditional { status: dest, .. }
-            | Self::AtomicPairCmpXchg {
-                old_first: dest, ..
-            }
-            | Self::ReadFlags { dest, .. }
-            | Self::VectorUnary { dest, .. }
-            | Self::VectorBinary { dest, .. }
-            | Self::VectorTernary { dest, .. }
-            | Self::VectorPredicatedUnary { dest, .. }
-            | Self::VectorPredicatedBinary { dest, .. }
-            | Self::VectorPredicatedTernary { dest, .. }
-            | Self::VectorCompare { dest, .. }
-            | Self::VectorLoad { dest, .. }
-            | Self::VectorMaskedLoad { dest, .. }
-            | Self::VectorBroadcastLoad { dest, .. }
-            | Self::VectorGather { dest, .. }
-            | Self::VectorFaultingLoad { dest, .. }
-            | Self::VectorExtract { dest, .. }
-            | Self::VectorInsert { dest, .. }
-            | Self::VectorSplat { dest, .. }
-            | Self::VectorShuffle { dest, .. }
-            | Self::VectorCast { dest, .. }
-            | Self::VectorReinterpret { dest, .. }
-            | Self::VectorPack { dest, .. }
-            | Self::VectorPackLoad { dest, .. }
-            | Self::VectorMaskUnary { dest, .. }
-            | Self::VectorMaskBinary { dest, .. }
-            | Self::VectorReduce { dest, .. }
-            | Self::VectorBitmask { dest, .. } => {
-                *dest = new_dest;
-                true
-            }
-
-            Self::NativeOpaque(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::CallClobber { outputs } => {
-                if let Some(first) = outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::NativeIntrinsic(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::SystemOp(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::ComputeOp(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::BcdAdjust(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorCrypto(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::TileOp(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPermute(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorMultiplyAdd(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPackNarrow(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorNarrowSaturate(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPredicateWhile(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPredicateBreak(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorComplexAdd(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorCountAdjust(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorExtendInLane(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorElementCount(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSveAddressGen(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::FlagAdjust(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorStructLoadReplicate(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSmeMisc(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPredicateOp(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSveCompute(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorReverseChunks(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorMatrixMulAcc(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSmeOuterProduct(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorPredicateGen(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorFpHelper(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSvePermute(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorTernaryLogic(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorDotProduct(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorMultiSad(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorIntDotProduct(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorStringCompare(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorBitfield(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorIntersect(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorShuffleBits(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorConditionalMove(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorHorizontalMinPos(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorComplexMul(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorClassify(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorHorizontalReduce(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::BlockString(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::WideCompareExchange(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::FpTranscendental(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::FpuControl(data) => {
-                if let Some(first) = data.outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::VectorSegmentLoad { dests: outputs, .. } => {
-                if let Some(first) = outputs.first_mut() {
-                    *first = new_dest;
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::AtomicCmpXchg { old, .. } => {
-                *old = new_dest;
-                true
-            }
-
-            Self::Call { dest, .. }
-            | Self::CallVirt { dest, .. }
-            | Self::CallIndirect { dest, .. } => {
-                *dest = Some(new_dest);
-                true
-            }
-
-            // Operations that don't produce a result - cannot set dest
-            Self::StoreField { .. }
-            | Self::StoreStaticField { .. }
-            | Self::StoreElement { .. }
-            | Self::StoreIndirect { .. }
-            | Self::AtomicStore { .. }
-            | Self::FloatCompareFlags { .. }
-            | Self::Jump { .. }
-            | Self::Branch { .. }
-            | Self::BranchCmp { .. }
-            | Self::IndirectBranch { .. }
-            | Self::Switch { .. }
-            | Self::Return { .. }
-            | Self::Pop { .. }
-            | Self::Throw { .. }
-            | Self::Rethrow
-            | Self::EndFinally
-            | Self::EndFilter { .. }
-            | Self::Leave { .. }
-            | Self::InitBlk { .. }
-            | Self::CopyBlk { .. }
-            | Self::InitObj { .. }
-            | Self::CopyObj { .. }
-            | Self::StoreObj { .. }
-            | Self::Nop
-            | Self::Break
-            | Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly
-            | Self::Fence { .. }
-            | Self::InterruptReturn
-            | Self::BranchFlags { .. }
-            | Self::VectorStore { .. }
-            | Self::VectorMaskedStore { .. }
-            | Self::VectorScatter { .. }
-            | Self::VectorSegmentStore { .. }
-            | Self::VectorPackStore { .. }
-            | Self::VectorZeroUpper { .. }
-            | Self::Unreachable => false,
-        }
+        });
+        defs
     }
 
     /// Replaces a definition variable without touching operand uses.
@@ -1509,374 +959,51 @@ impl<T: Target> SsaOp<T> {
                 }
             }
 
-            Self::NativeOpaque(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-
-            Self::NativeIntrinsic(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::SystemOp(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::ComputeOp(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::BcdAdjust(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorCrypto(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::TileOp(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPermute(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorMultiplyAdd(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPackNarrow(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorNarrowSaturate(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPredicateWhile(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPredicateBreak(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorComplexAdd(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorCountAdjust(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorExtendInLane(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorElementCount(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-            }
-            Self::VectorSveAddressGen(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::FlagAdjust(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorStructLoadReplicate(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorSmeMisc(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPredicateOp(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorSveCompute(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorReverseChunks(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorMatrixMulAcc(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorSmeOuterProduct(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorPredicateGen(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorFpHelper(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorSvePermute(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorTernaryLogic(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorDotProduct(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorMultiSad(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorIntDotProduct(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorStringCompare(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorBitfield(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorIntersect(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorShuffleBits(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorConditionalMove(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorHorizontalMinPos(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorComplexMul(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorClassify(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::VectorHorizontalReduce(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::BlockString(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-            Self::WideCompareExchange(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-
-            Self::FpTranscendental(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
-
-            Self::FpuControl(data) => {
-                for item in &data.outputs {
-                    f(OperandRole::Def, *item);
-                }
-                for item in &data.inputs {
-                    f(OperandRole::Use, *item);
-                }
-            }
+            Self::NativeOpaque(data) => data.visit(&mut f),
+            Self::SystemOp(data) => data.visit(&mut f),
+            Self::ComputeOp(data) => data.visit(&mut f),
+            Self::BcdAdjust(data) => data.visit(&mut f),
+            Self::VectorCrypto(data) => data.visit(&mut f),
+            Self::TileOp(data) => data.visit(&mut f),
+            Self::VectorPermute(data) => data.visit(&mut f),
+            Self::VectorMultiplyAdd(data) => data.visit(&mut f),
+            Self::VectorPackNarrow(data) => data.visit(&mut f),
+            Self::VectorNarrowSaturate(data) => data.visit(&mut f),
+            Self::VectorPredicateWhile(data) => data.visit(&mut f),
+            Self::VectorPredicateBreak(data) => data.visit(&mut f),
+            Self::VectorComplexAdd(data) => data.visit(&mut f),
+            Self::VectorCountAdjust(data) => data.visit(&mut f),
+            Self::VectorExtendInLane(data) => data.visit(&mut f),
+            Self::VectorElementCount(data) => data.visit(&mut f),
+            Self::VectorSveAddressGen(data) => data.visit(&mut f),
+            Self::FlagAdjust(data) => data.visit(&mut f),
+            Self::VectorStructLoadReplicate(data) => data.visit(&mut f),
+            Self::VectorSmeMisc(data) => data.visit(&mut f),
+            Self::VectorPredicateOp(data) => data.visit(&mut f),
+            Self::VectorSveCompute(data) => data.visit(&mut f),
+            Self::VectorReverseChunks(data) => data.visit(&mut f),
+            Self::VectorMatrixMulAcc(data) => data.visit(&mut f),
+            Self::VectorSmeOuterProduct(data) => data.visit(&mut f),
+            Self::VectorPredicateGen(data) => data.visit(&mut f),
+            Self::VectorFpHelper(data) => data.visit(&mut f),
+            Self::VectorSvePermute(data) => data.visit(&mut f),
+            Self::VectorTernaryLogic(data)
+            | Self::VectorMultiSad(data)
+            | Self::VectorClassify(data) => data.visit(&mut f),
+            Self::VectorDotProduct(data) => data.visit(&mut f),
+            Self::VectorIntDotProduct(data) => data.visit(&mut f),
+            Self::VectorStringCompare(data) => data.visit(&mut f),
+            Self::VectorBitfield(data) => data.visit(&mut f),
+            Self::VectorIntersect(data) => data.visit(&mut f),
+            Self::VectorShuffleBits(data) => data.visit(&mut f),
+            Self::VectorConditionalMove(data) => data.visit(&mut f),
+            Self::VectorHorizontalMinPos(data) => data.visit(&mut f),
+            Self::VectorComplexMul(data) => data.visit(&mut f),
+            Self::VectorHorizontalReduce(data) => data.visit(&mut f),
+            Self::BlockString(data) => data.visit(&mut f),
+            Self::WideCompareExchange(data) => data.visit(&mut f),
+            Self::FpTranscendental(data) => data.visit(&mut f),
+            Self::FpuControl(data) => data.visit(&mut f),
 
             Self::NewObj { dest, args, .. } => {
                 f(OperandRole::Def, *dest);
@@ -1924,7 +1051,7 @@ impl<T: Target> SsaOp<T> {
             | Self::EndFinally
             | Self::Leave { .. }
             | Self::Nop
-            | Self::Break
+            | Self::Break(_)
             | Self::Constrained { .. }
             | Self::Volatile
             | Self::Unaligned { .. }
@@ -2714,374 +1841,51 @@ impl<T: Target> SsaOp<T> {
                 }
             }
 
-            Self::NativeOpaque(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-
-            Self::NativeIntrinsic(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::SystemOp(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::ComputeOp(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::BcdAdjust(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorCrypto(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::TileOp(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPermute(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorMultiplyAdd(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPackNarrow(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorNarrowSaturate(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPredicateWhile(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPredicateBreak(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorComplexAdd(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorCountAdjust(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorExtendInLane(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorElementCount(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-            }
-            Self::VectorSveAddressGen(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::FlagAdjust(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorStructLoadReplicate(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorSmeMisc(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPredicateOp(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorSveCompute(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorReverseChunks(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorMatrixMulAcc(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorSmeOuterProduct(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorPredicateGen(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorFpHelper(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorSvePermute(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorTernaryLogic(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorDotProduct(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorMultiSad(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorIntDotProduct(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorStringCompare(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorBitfield(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorIntersect(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorShuffleBits(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorConditionalMove(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorHorizontalMinPos(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorComplexMul(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorClassify(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::VectorHorizontalReduce(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::BlockString(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-            Self::WideCompareExchange(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-
-            Self::FpTranscendental(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
-
-            Self::FpuControl(data) => {
-                for item in &mut data.outputs {
-                    f(OperandRole::Def, item);
-                }
-                for item in &mut data.inputs {
-                    f(OperandRole::Use, item);
-                }
-            }
+            Self::NativeOpaque(data) => data.visit_mut(&mut f),
+            Self::SystemOp(data) => data.visit_mut(&mut f),
+            Self::ComputeOp(data) => data.visit_mut(&mut f),
+            Self::BcdAdjust(data) => data.visit_mut(&mut f),
+            Self::VectorCrypto(data) => data.visit_mut(&mut f),
+            Self::TileOp(data) => data.visit_mut(&mut f),
+            Self::VectorPermute(data) => data.visit_mut(&mut f),
+            Self::VectorMultiplyAdd(data) => data.visit_mut(&mut f),
+            Self::VectorPackNarrow(data) => data.visit_mut(&mut f),
+            Self::VectorNarrowSaturate(data) => data.visit_mut(&mut f),
+            Self::VectorPredicateWhile(data) => data.visit_mut(&mut f),
+            Self::VectorPredicateBreak(data) => data.visit_mut(&mut f),
+            Self::VectorComplexAdd(data) => data.visit_mut(&mut f),
+            Self::VectorCountAdjust(data) => data.visit_mut(&mut f),
+            Self::VectorExtendInLane(data) => data.visit_mut(&mut f),
+            Self::VectorElementCount(data) => data.visit_mut(&mut f),
+            Self::VectorSveAddressGen(data) => data.visit_mut(&mut f),
+            Self::FlagAdjust(data) => data.visit_mut(&mut f),
+            Self::VectorStructLoadReplicate(data) => data.visit_mut(&mut f),
+            Self::VectorSmeMisc(data) => data.visit_mut(&mut f),
+            Self::VectorPredicateOp(data) => data.visit_mut(&mut f),
+            Self::VectorSveCompute(data) => data.visit_mut(&mut f),
+            Self::VectorReverseChunks(data) => data.visit_mut(&mut f),
+            Self::VectorMatrixMulAcc(data) => data.visit_mut(&mut f),
+            Self::VectorSmeOuterProduct(data) => data.visit_mut(&mut f),
+            Self::VectorPredicateGen(data) => data.visit_mut(&mut f),
+            Self::VectorFpHelper(data) => data.visit_mut(&mut f),
+            Self::VectorSvePermute(data) => data.visit_mut(&mut f),
+            Self::VectorTernaryLogic(data)
+            | Self::VectorMultiSad(data)
+            | Self::VectorClassify(data) => data.visit_mut(&mut f),
+            Self::VectorDotProduct(data) => data.visit_mut(&mut f),
+            Self::VectorIntDotProduct(data) => data.visit_mut(&mut f),
+            Self::VectorStringCompare(data) => data.visit_mut(&mut f),
+            Self::VectorBitfield(data) => data.visit_mut(&mut f),
+            Self::VectorIntersect(data) => data.visit_mut(&mut f),
+            Self::VectorShuffleBits(data) => data.visit_mut(&mut f),
+            Self::VectorConditionalMove(data) => data.visit_mut(&mut f),
+            Self::VectorHorizontalMinPos(data) => data.visit_mut(&mut f),
+            Self::VectorComplexMul(data) => data.visit_mut(&mut f),
+            Self::VectorHorizontalReduce(data) => data.visit_mut(&mut f),
+            Self::BlockString(data) => data.visit_mut(&mut f),
+            Self::WideCompareExchange(data) => data.visit_mut(&mut f),
+            Self::FpTranscendental(data) => data.visit_mut(&mut f),
+            Self::FpuControl(data) => data.visit_mut(&mut f),
 
             Self::NewObj { dest, args, .. } => {
                 f(OperandRole::Def, dest);
@@ -3129,7 +1933,7 @@ impl<T: Target> SsaOp<T> {
             | Self::EndFinally
             | Self::Leave { .. }
             | Self::Nop
-            | Self::Break
+            | Self::Break(_)
             | Self::Constrained { .. }
             | Self::Volatile
             | Self::Unaligned { .. }
@@ -3160,6 +1964,28 @@ impl<T: Target> SsaOp<T> {
         let mut uses = Vec::new();
         self.for_each_use(|var| uses.push(var));
         uses
+    }
+
+    /// Returns the first variable used by this operation, in operand order.
+    ///
+    /// Equivalent to `self.uses().first().copied()` without the `Vec`: like
+    /// [`use_count`](Self::use_count) and [`uses_var`](Self::uses_var) it walks
+    /// [`for_each_use`](Self::for_each_use) directly, so a caller that wants
+    /// one operand — the type of the value an identity is being checked
+    /// against, say — pays no allocation for it.
+    ///
+    /// # Returns
+    ///
+    /// The operation's first use, or `None` when it reads no variables.
+    #[must_use]
+    pub fn first_use(&self) -> Option<SsaVarId> {
+        let mut first = None;
+        self.for_each_use(|var| {
+            if first.is_none() {
+                first = Some(var);
+            }
+        });
+        first
     }
 
     /// Returns the number of variables used by this operation.

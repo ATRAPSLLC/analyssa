@@ -1,0 +1,1831 @@
+# Behaviour golden for every `SsaOp` sample.
+#
+# One block per op: the opcode name, `Display`, the ordered `(role, variable)`
+# `visit_operands` trace, `defs()`, `uses()`, `stack_effect()`, and the outcome
+# of renaming the first definition to v99 with `replace_def` followed by the
+# form that produces. `-` is an empty list.
+#
+# Operands come from disjoint id spaces: definitions are v90/v91 and uses are
+# v80/v81 in the `sample` blocks, so a transposed role is legible here as well
+# as caught by `payload_roles_are_not_transposed`. The `battery` blocks use
+# v0..v7 and exist for the operand shapes `all_sample_ops` does not have.
+#
+# Regenerate with `ANALYSSA_UPDATE_GOLDEN=1 cargo test --lib ops_behaviour_golden`
+# and review the diff; it is the record that a change to the operand matches
+# was behaviour-preserving.
+
+## sample[0] const
+display  v90 = 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = 0
+
+## sample[1] add
+display  v90 = add v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = add v80, v81 flags=v91
+
+## sample[2] add.ovf
+display  v90 = add.ovf v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = add.ovf v80, v81 flags=v91
+
+## sample[3] sub
+display  v90 = sub v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = sub v80, v81 flags=v91
+
+## sample[4] sub.ovf
+display  v90 = sub.ovf v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = sub.ovf v80, v81 flags=v91
+
+## sample[5] mul
+display  v90 = mul v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = mul v80, v81 flags=v91
+
+## sample[6] mul.ovf
+display  v90 = mul.ovf v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = mul.ovf v80, v81 flags=v91
+
+## sample[7] wide.mul
+display  v90, v91 = widemul v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = widemul v80, v81
+
+## sample[8] div
+display  v90 = div v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = div v80, v81 flags=v91
+
+## sample[9] rem
+display  v90 = rem v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = rem v80, v81 flags=v91
+
+## sample[10] float.compare.flags
+display  v90 = fcmp.flags v80, v81
+visit    FlagsDef:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = fcmp.flags v80, v81
+
+## sample[11] wide.div
+display  v90, v91 = widediv v80:v81, v80
+visit    Def:v90 Def:v91 Use:v80 Use:v81 Use:v80
+defs     v90 v91
+uses     v80 v81 v80
+stack    pops=3 pushes=2
+rename   true v99, v91 = widediv v80:v81, v80
+
+## sample[12] neg
+display  v90 = neg v80 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80
+defs     v90 v91
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = neg v80 flags=v91
+
+## sample[13] and
+display  v90 = and v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = and v80, v81 flags=v91
+
+## sample[14] or
+display  v90 = or v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = or v80, v81 flags=v91
+
+## sample[15] xor
+display  v90 = xor v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = xor v80, v81 flags=v91
+
+## sample[16] not
+display  v90 = not v80 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80
+defs     v90 v91
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = not v80 flags=v91
+
+## sample[17] shl
+display  v90 = shl v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = shl v80, v81 flags=v91
+
+## sample[18] shr
+display  v90 = shr v80, v81 flags=v91
+visit    Def:v90 FlagsDef:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = shr v80, v81 flags=v91
+
+## sample[19] rol
+display  v90 = rol v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = rol v80, v81
+
+## sample[20] ror
+display  v90 = ror v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = ror v80, v81
+
+## sample[21] rcl
+display  v90 = rcl v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = rcl v80, v81
+
+## sample[22] rcr
+display  v90 = rcr v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = rcr v80, v81
+
+## sample[23] bswap
+display  v90 = bswap v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = bswap v80
+
+## sample[24] brev
+display  v90 = brev v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = brev v80
+
+## sample[25] bsf
+display  v90 = bsf v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = bsf v80
+
+## sample[26] bsr
+display  v90 = bsr v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = bsr v80
+
+## sample[27] popcount
+display  v90 = popcnt v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = popcnt v80
+
+## sample[28] parity
+display  v90 = parity v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = parity v80
+
+## sample[29] ceq
+display  v90 = ceq v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = ceq v80, v81
+
+## sample[30] clt
+display  v90 = clt v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = clt v80, v81
+
+## sample[31] cgt
+display  v90 = cgt v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = cgt v80, v81
+
+## sample[32] bool.and
+display  v90 = bool.and v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = bool.and v80, v81
+
+## sample[33] bool.or
+display  v90 = bool.or v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = bool.or v80, v81
+
+## sample[34] bool.xor
+display  v90 = bool.xor v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = bool.xor v80, v81
+
+## sample[35] bool.not
+display  v90 = bool.not v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = bool.not v80
+
+## sample[36] conv
+display  v90 = conv.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = conv.i32 v80
+
+## sample[37] inttoptr
+display  v90 = inttoptr.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = inttoptr.i32 v80
+
+## sample[38] ptrtoint
+display  v90 = ptrtoint.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ptrtoint.i32 v80
+
+## sample[39] inttofloat
+display  v90 = inttofloat.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = inttofloat.i32 v80
+
+## sample[40] floattoint
+display  v90 = floattoint.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = floattoint.i32 v80
+
+## sample[41] fconv
+display  v90 = fconv.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = fconv.i32 v80
+
+## sample[42] bitcast
+display  v90 = bitcast.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = bitcast.i32 v80
+
+## sample[43] select
+display  v90 = select v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = select v80, v81, v80
+
+## sample[44] readflags
+display  v90 = readflags v80, none
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = readflags v80, none
+
+## sample[45] vector.unary
+display  v90 = vunary.Neg v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vunary.Neg v80
+
+## sample[46] vector.binary
+display  v90 = vbinary.Add v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = vbinary.Add v80, v81
+
+## sample[47] vector.ternary
+display  v90 = vternary.Fma v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = vternary.Fma v80, v81, v80
+
+## sample[48] vector.predicated.unary
+display  v90 = vunary.pred.Neg.Merge v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = vunary.pred.Neg.Merge v80, v81, v80
+
+## sample[49] vector.predicated.binary
+display  v90 = vbinary.pred.Add.Merge v80, v81, v80, v81
+visit    Def:v90 Use:v80 Use:v81 Use:v80 Use:v81
+defs     v90
+uses     v80 v81 v80 v81
+stack    pops=4 pushes=1
+rename   true v99 = vbinary.pred.Add.Merge v80, v81, v80, v81
+
+## sample[50] vector.predicated.ternary
+display  v90 = vternary.pred.Fma.Merge v80, v81, v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80 v81 v80
+stack    pops=5 pushes=1
+rename   true v99 = vternary.pred.Fma.Merge v80, v81, v80, v81, v80
+
+## sample[51] vector.compare
+display  v90 = vcmp.Eq v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = vcmp.Eq v80, v81
+
+## sample[52] vector.load
+display  v90 = vload.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vload.i32 v80
+
+## sample[53] vector.store
+display  vstore.i32 v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false vstore.i32 v80, v81
+
+## sample[54] vector.masked.load
+display  v90 = vload.masked.Merge.i32 v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = vload.masked.Merge.i32 v80, v81, v80
+
+## sample[55] vector.masked.store
+display  vstore.masked.i32 v80, v81, v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false vstore.masked.i32 v80, v81, v80
+
+## sample[56] vector.broadcast.load
+display  v90 = vbroadcast.load.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vbroadcast.load.i32 v80
+
+## sample[57] vector.gather
+display  v90 = vgather.Merge.i32 v80, v81, v80, v81
+visit    Def:v90 Use:v80 Use:v81 Use:v80 Use:v81
+defs     v90
+uses     v80 v81 v80 v81
+stack    pops=4 pushes=1
+rename   true v99 = vgather.Merge.i32 v80, v81, v80, v81
+
+## sample[58] vector.faulting.load
+display  v90, v91 = vload.faulting.Normal.Merge.i32 v80, v81, v80
+visit    Def:v90 Def:v91 Use:v80 Use:v81 Use:v80
+defs     v90 v91
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99, v91 = vload.faulting.Normal.Merge.i32 v80, v81, v80
+
+## sample[59] vector.segment.load
+display  v90, v91 = vload.segment.Interleaved.0.i32 v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vload.segment.Interleaved.0.i32 v80, v81
+
+## sample[60] vector.scatter
+display  vscatter.i32 v80, v81, v80, v81
+visit    Use:v80 Use:v81 Use:v80 Use:v81
+defs     -
+uses     v80 v81 v80 v81
+stack    pops=4 pushes=0
+rename   false vscatter.i32 v80, v81, v80, v81
+
+## sample[61] vector.segment.store
+display  vstore.segment.Interleaved.0.i32 v80, [v81], v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false vstore.segment.Interleaved.0.i32 v80, [v81], v80
+
+## sample[62] vector.extract
+display  v90 = vextract v80, 0
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vextract v80, 0
+
+## sample[63] vector.insert
+display  v90 = vinsert v80, 0, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = vinsert v80, 0, v81
+
+## sample[64] vector.splat
+display  v90 = vsplat.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vsplat.i32 v80
+
+## sample[65] vector.shuffle
+display  v90 = vshuffle v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = vshuffle v80, v81
+
+## sample[66] vector.cast
+display  v90 = vcast.Signed.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vcast.Signed.i32 v80
+
+## sample[67] vector.reinterpret
+display  v90 = vreinterpret.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vreinterpret.i32 v80
+
+## sample[68] vector.pack
+display  v90 = vpack.Compress.Merge.e0.i32 v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = vpack.Compress.Merge.e0.i32 v80, v81, v80
+
+## sample[69] vector.pack.load
+display  v90 = vpack.load.Compress.Merge.e0.i32 [v80], v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = vpack.load.Compress.Merge.e0.i32 [v80], v81, v80
+
+## sample[70] vector.pack.store
+display  vpack.store.Compress.e0.i32 [v80], v81, v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false vpack.store.Compress.e0.i32 [v80], v81, v80
+
+## sample[71] vector.zero.upper
+display  vzero.upper
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false vzero.upper
+
+## sample[72] vector.mask.unary
+display  v90 = vmask.unary.Not v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vmask.unary.Not v80
+
+## sample[73] vector.mask.binary
+display  v90 = vmask.binary.And v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = vmask.binary.And v80, v81
+
+## sample[74] vector.reduce
+display  v90 = vreduce.Add v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vreduce.Add v80
+
+## sample[75] vector.bitmask
+display  v90 = vbitmask.LaneMostSignificantBits v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = vbitmask.LaneMostSignificantBits v80
+
+## sample[76] jump
+display  jump B0
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false jump B0
+
+## sample[77] branch
+display  branch v80, B0, B0
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false branch v80, B0, B0
+
+## sample[78] branch.cmp
+display  branchcmp v80 == v81, B0, B0
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false branchcmp v80 == v81, B0, B0
+
+## sample[79] branch.flags
+display  branchflags v80 carry B0, B0
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false branchflags v80 carry B0, B0
+
+## sample[80] switch
+display  switch v80, [B0], B0
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false switch v80, [B0], B0
+
+## sample[81] branch.indirect
+display  branch.indirect v80 [B0]
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false branch.indirect v80 [B0]
+
+## sample[82] return
+display  ret v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false ret v80
+
+## sample[83] load.field
+display  v90 = ldfld 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldfld 0, v80
+
+## sample[84] store.field
+display  stfld 0, v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false stfld 0, v80, v81
+
+## sample[85] load.static.field
+display  v90 = ldsfld 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldsfld 0
+
+## sample[86] store.static.field
+display  stsfld 0, v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false stsfld 0, v80
+
+## sample[87] load.field.addr
+display  v90 = ldflda 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldflda 0, v80
+
+## sample[88] load.static.field.addr
+display  v90 = ldsflda 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldsflda 0
+
+## sample[89] load.element
+display  v90 = ldelem.i32 v80[v81]
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = ldelem.i32 v80[v81]
+
+## sample[90] store.element
+display  stelem.i32 v80[v81], v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false stelem.i32 v80[v81], v80
+
+## sample[91] load.element.addr
+display  v90 = ldelema v80[v81]
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = ldelema v80[v81]
+
+## sample[92] ptradd
+display  v90 = ptradd v80 + v81*4 + 8
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = ptradd v80 + v81*4 + 8
+
+## sample[93] array.length
+display  v90 = ldlen v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldlen v80
+
+## sample[94] load.indirect
+display  v90 = ldind.i32 v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldind.i32 v80
+
+## sample[95] store.indirect
+display  stind.i32 v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false stind.i32 v80, v81
+
+## sample[96] new.obj
+display  v90 = newobj 0(v80)
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = newobj 0(v80)
+
+## sample[97] new.arr
+display  v90 = newarr 0[v80]
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = newarr 0[v80]
+
+## sample[98] cast.class
+display  v90 = castclass 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = castclass 0, v80
+
+## sample[99] is.inst
+display  v90 = isinst 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = isinst 0, v80
+
+## sample[100] box
+display  v90 = box 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = box 0, v80
+
+## sample[101] unbox
+display  v90 = unbox 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = unbox 0, v80
+
+## sample[102] unbox.any
+display  v90 = unbox.any 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = unbox.any 0, v80
+
+## sample[103] sizeof
+display  v90 = sizeof 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = sizeof 0
+
+## sample[104] load.token
+display  v90 = ldtoken 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldtoken 0
+
+## sample[105] call
+display  v90 = call 0(v80)
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = call 0(v80)
+
+## sample[106] call.virt
+display  v90 = callvirt 0(v80)
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = callvirt 0(v80)
+
+## sample[107] call.indirect
+display  v90 = calli v80(v81)
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = calli v80(v81)
+
+## sample[108] load.function.ptr
+display  v90 = ldftn 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldftn 0
+
+## sample[109] load.virt.function.ptr
+display  v90 = ldvirtftn 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldvirtftn 0, v80
+
+## sample[110] load.arg
+display  v90 = ldarg 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldarg 0
+
+## sample[111] load.local
+display  v90 = ldloc 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldloc 0
+
+## sample[112] load.arg.addr
+display  v90 = ldarga 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldarga 0
+
+## sample[113] load.local.addr
+display  v90 = ldloca 0
+visit    Def:v90
+defs     v90
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = ldloca 0
+
+## sample[114] copy
+display  v90 = v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=0 pushes=0
+rename   true v99 = v80
+
+## sample[115] pop
+display  pop v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false pop v80
+
+## sample[116] throw
+display  throw v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false throw v80
+
+## sample[117] rethrow
+display  rethrow
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false rethrow
+
+## sample[118] end.finally
+display  endfinally
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false endfinally
+
+## sample[119] end.filter
+display  endfilter v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false endfilter v80
+
+## sample[120] interrupt.return
+display  iret
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false iret
+
+## sample[121] unreachable
+display  unreachable
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false unreachable
+
+## sample[122] leave
+display  leave B0
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false leave B0
+
+## sample[123] init.blk
+display  initblk v80, v81, v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false initblk v80, v81, v80
+
+## sample[124] copy.blk
+display  cpblk v80, v81, v80
+visit    Use:v80 Use:v81 Use:v80
+defs     -
+uses     v80 v81 v80
+stack    pops=3 pushes=0
+rename   false cpblk v80, v81, v80
+
+## sample[125] fence
+display  fence full
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false fence full
+
+## sample[126] native.opaque
+display  v90, v91 = native.opaque  v80, v81 effects=Opaque
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = native.opaque  v80, v81 effects=Opaque
+
+## sample[127] system.cpuid
+display  v90, v91 = system.cpuid  v80, v81 effects=Read
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = system.cpuid  v80, v81 effects=Read
+
+## sample[128] compute.pdep
+display  v90, v91 = compute.pdep  v80, v81 effects=Pure
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = compute.pdep  v80, v81 effects=Pure
+
+## sample[129] bcd.daa
+display  v90, v91 = bcd.daa  v80, v81 effects=Pure
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = bcd.daa  v80, v81 effects=Pure
+
+## sample[130] crypto.aesenc
+display  v90, v91 = crypto.aesenc v80, v81 effects=Pure
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = crypto.aesenc v80, v81 effects=Pure
+
+## sample[131] tile.zero
+display  v90, v91 = tile.zero v80, v81 effects=Pure
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = tile.zero v80, v81 effects=Pure
+
+## sample[132] vector.permute
+display  v90, v91 = vector.permute v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.permute v80, v81
+
+## sample[133] vector.madd.s16
+display  v90, v91 = vector.madd.s16 v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.madd.s16 v80, v81
+
+## sample[134] vector.pack.narrow.s
+display  v90, v91 = vector.pack.narrow.s v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.pack.narrow.s v80, v81
+
+## sample[135] vector.narrow.saturate.s
+display  v90, v91 = vector.narrow.saturate.s v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.narrow.saturate.s v80, v81
+
+## sample[136] vector.while
+display  v90, v91 = vector.while v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.while v80, v81
+
+## sample[137] vector.break
+display  v90, v91 = vector.break v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.break v80, v81
+
+## sample[138] vector.cadd
+display  v90, v91 = vector.cadd v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.cadd v80, v81
+
+## sample[139] vector.countadj
+display  v90, v91 = vector.countadj v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.countadj v80, v81
+
+## sample[140] vector.xtl
+display  v90, v91 = vector.uxt i0->i0 v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.uxt i0->i0 v80, v81
+
+## sample[141] vector.cnt
+display  v90, v91 = vector.cnt e0 x0
+visit    Def:v90 Def:v91
+defs     v90 v91
+uses     -
+stack    pops=0 pushes=2
+rename   true v99, v91 = vector.cnt e0 x0
+
+## sample[142] vector.adr
+display  v90, v91 = vector.adr uxtw #0 v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.adr uxtw #0 v80, v81
+
+## sample[143] flags.cfinv
+display  v90, v91 = flags.cfinv v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = flags.cfinv v80, v81
+
+## sample[144] vector.ldNr
+display  v90, v91 = vector.ldNr v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.ldNr v80, v81
+
+## sample[145] vector.sme.misc
+display  v90, v91 = vector.sme.misc v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.sme.misc v80, v81
+
+## sample[146] vector.predop
+display  v90, v91 = vector.predop v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.predop v80, v81
+
+## sample[147] vector.sve.compute
+display  v90, v91 = vector.sve.compute v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.sve.compute v80, v81
+
+## sample[148] vector.revchunks
+display  v90, v91 = vector.revchunks v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.revchunks v80, v81
+
+## sample[149] vector.mmla
+display  v90, v91 = vector.mmla v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.mmla v80, v81
+
+## sample[150] vector.sme.mopa
+display  v90, v91 = vector.sme.mopa v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.sme.mopa v80, v81
+
+## sample[151] vector.pgen
+display  v90, v91 = vector.pgen v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.pgen v80, v81
+
+## sample[152] vector.fphelper
+display  v90, v91 = vector.fphelper v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.fphelper v80, v81
+
+## sample[153] vector.sve.perm
+display  v90, v91 = vector.sve.perm v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.sve.perm v80, v81
+
+## sample[154] vector.ternlog
+display  v90, v91 = vector.ternlog v80, v81 imm=0x00
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.ternlog v80, v81 imm=0x00
+
+## sample[155] vector.dotproduct
+display  v90, v91 = vector.dotproduct.0 v80, v81 imm=0x00
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.dotproduct.0 v80, v81 imm=0x00
+
+## sample[156] vector.mpsadbw
+display  v90, v91 = vector.mpsadbw v80, v81 imm=0x00
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.mpsadbw v80, v81 imm=0x00
+
+## sample[157] vector.intdot
+display  v90, v91 = vector.intdot v80, v81 s_a=false s_b=false src=0 dst=0
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.intdot v80, v81 s_a=false s_b=false src=0 dst=0
+
+## sample[158] vector.pcmpstr
+display  v90, v91 = vector.pcmpistrm v80, v81 imm=0x00
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.pcmpistrm v80, v81 imm=0x00
+
+## sample[159] vector.bitfield
+display  v90, v91 = vector.extrq v80, v81 index=0 length=0
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.extrq v80, v81 index=0 length=0
+
+## sample[160] vector.p2intersect
+display  v90, v91 = vector.p2intersect v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.p2intersect v80, v81
+
+## sample[161] vector.shufbitqmb
+display  v90, v91 = vector.shufbitqmb v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.shufbitqmb v80, v81
+
+## sample[162] vector.condmove
+display  v90, v91 = vector.condmove.z v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.condmove.z v80, v81
+
+## sample[163] vector.phminposuw
+display  v90, v91 = vector.phminposuw v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.phminposuw v80, v81
+
+## sample[164] vector.cmul
+display  v90, v91 = vector.cmul v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.cmul v80, v81
+
+## sample[165] vector.fpclass
+display  v90, v91 = vector.fpclass v80, v81 imm=0x00
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.fpclass v80, v81 imm=0x00
+
+## sample[166] vector.hreduce
+display  v90, v91 = vector.hreduce.add 0->0 v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = vector.hreduce.add 0->0 v80, v81
+
+## sample[167] blockstring.cmps
+display  v90, v91 = blockstring.cmps  v80, v81 effects=ReadWrite
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = blockstring.cmps  v80, v81 effects=ReadWrite
+
+## sample[168] atomic.cmpxchg8b
+display  v90, v91 = atomic.cmpxchg8b  v80, v81 effects=Atomic
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = atomic.cmpxchg8b  v80, v81 effects=Atomic
+
+## sample[169] flags.compute
+display  v90 = flags.compute v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = flags.compute v80, v81
+
+## sample[170] call.clobber
+display  v90, v91 = call.clobber
+visit    Def:v90 Def:v91
+defs     v90 v91
+uses     -
+stack    pops=0 pushes=2
+rename   true v99, v91 = call.clobber
+
+## sample[171] cmpxchg
+display  v90 = cmpxchg v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = cmpxchg v80, v81, v80
+
+## sample[172] atomic.rmw
+display  v90 = atomicrmw.xchg v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = atomicrmw.xchg v80, v81
+
+## sample[173] atomic.load
+display  v90 = atomicload.relaxed.i8 i32, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = atomicload.relaxed.i8 i32, v80
+
+## sample[174] atomic.store
+display  atomicstore.relaxed.i8 i32, v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false atomicstore.relaxed.i8 i32, v80, v81
+
+## sample[175] atomic.store.conditional
+display  v90 = atomicstore.conditional.relaxed/relaxed.i8 i32, v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = atomicstore.conditional.relaxed/relaxed.i8 i32, v80, v81
+
+## sample[176] atomic.pair.load
+display  v90, v91 = atomicload.pair.relaxed.i8 i32/i32, v80
+visit    Def:v90 Def:v91 Use:v80
+defs     v90 v91
+uses     v80
+stack    pops=1 pushes=2
+rename   true v99, v91 = atomicload.pair.relaxed.i8 i32/i32, v80
+
+## sample[177] atomic.pair.store.conditional
+display  v90 = atomicstore.conditional.pair.relaxed/relaxed.i8 i32/i32, v80, v81, v80
+visit    Def:v90 Use:v80 Use:v81 Use:v80
+defs     v90
+uses     v80 v81 v80
+stack    pops=3 pushes=1
+rename   true v99 = atomicstore.conditional.pair.relaxed/relaxed.i8 i32/i32, v80, v81, v80
+
+## sample[178] atomic.exchange
+display  v90 = atomicxchg.relaxed.i8 v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = atomicxchg.relaxed.i8 v80, v81
+
+## sample[179] atomic.lock.rmw
+display  v90 = lock.atomicrmw.xchg.relaxed.i8 v80, v81
+visit    Def:v90 Use:v80 Use:v81
+defs     v90
+uses     v80 v81
+stack    pops=2 pushes=1
+rename   true v99 = lock.atomicrmw.xchg.relaxed.i8 v80, v81
+
+## sample[180] atomic.cmpxchg
+display  v90, v91 = cmpxchg.relaxed/relaxed.i8 v80, v81, v80
+visit    Def:v90 Def:v91 Use:v80 Use:v81 Use:v80
+defs     v90 v91
+uses     v80 v81 v80
+stack    pops=3 pushes=2
+rename   true v99, v91 = cmpxchg.relaxed/relaxed.i8 v80, v81, v80
+
+## sample[181] atomic.pair.cmpxchg
+display  v90, v91 = cmpxchg.pair.relaxed/relaxed.i8 v80, v81, v80, v81, v80
+visit    Def:v90 Def:v91 Use:v80 Use:v81 Use:v80 Use:v81 Use:v80
+defs     v90 v91
+uses     v80 v81 v80 v81 v80
+stack    pops=5 pushes=2
+rename   true v99, v91 = cmpxchg.pair.relaxed/relaxed.i8 v80, v81, v80, v81, v80
+
+## sample[182] init.obj
+display  initobj 0, v80
+visit    Use:v80
+defs     -
+uses     v80
+stack    pops=1 pushes=0
+rename   false initobj 0, v80
+
+## sample[183] copy.obj
+display  cpobj 0, v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false cpobj 0, v80, v81
+
+## sample[184] load.obj
+display  v90 = ldobj 0, v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ldobj 0, v80
+
+## sample[185] store.obj
+display  stobj 0, v80, v81
+visit    Use:v80 Use:v81
+defs     -
+uses     v80 v81
+stack    pops=2 pushes=0
+rename   false stobj 0, v80, v81
+
+## sample[186] nop
+display  nop
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false nop
+
+## sample[187] break.undefined
+display  undefined
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false undefined
+
+## sample[188] ckfinite
+display  v90 = ckfinite v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = ckfinite v80
+
+## sample[189] fpclassify
+display  v90 = fpclassify v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = fpclassify v80
+
+## sample[190] fp.transcendental
+display  v90, v91 = fp.transcendental.Sin v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = fp.transcendental.Sin v80, v81
+
+## sample[191] fpu.control
+display  v90, v91 = fpu.control.LoadControlWord v80, v81
+visit    Def:v90 Def:v91 Use:v80 Use:v81
+defs     v90 v91
+uses     v80 v81
+stack    pops=2 pushes=2
+rename   true v99, v91 = fpu.control.LoadControlWord v80, v81
+
+## sample[192] local.alloc
+display  v90 = localloc v80
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=1 pushes=1
+rename   true v99 = localloc v80
+
+## sample[193] constrained
+display  constrained. 0
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false constrained. 0
+
+## sample[194] volatile
+display  volatile.
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false volatile.
+
+## sample[195] unaligned
+display  unaligned. 0
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false unaligned. 0
+
+## sample[196] tail
+display  tail.
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false tail.
+
+## sample[197] readonly
+display  readonly.
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false readonly.
+
+## sample[198] phi
+display  v90 = phi(B0: v80)
+visit    Def:v90 Use:v80
+defs     v90
+uses     v80
+stack    pops=0 pushes=0
+rename   true v99 = phi(B0: v80)
+
+## battery[0] const
+display  v0 = 7
+visit    Def:v0
+defs     v0
+uses     -
+stack    pops=0 pushes=1
+rename   true v99 = 7
+
+## battery[1] add
+display  v0 = add v1, v2 flags=v3
+visit    Def:v0 FlagsDef:v3 Use:v1 Use:v2
+defs     v0 v3
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = add v1, v2 flags=v3
+
+## battery[2] neg
+display  v0 = neg v1
+visit    Def:v0 Use:v1
+defs     v0
+uses     v1
+stack    pops=1 pushes=1
+rename   true v99 = neg v1
+
+## battery[3] shr
+display  v0 = shr.un v1, v2 flags=v3
+visit    Def:v0 FlagsDef:v3 Use:v1 Use:v2
+defs     v0 v3
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = shr.un v1, v2 flags=v3
+
+## battery[4] wide.mul
+display  v0, v1 = widemul v2, v3
+visit    Def:v0 Def:v1 Use:v2 Use:v3
+defs     v0 v1
+uses     v2 v3
+stack    pops=2 pushes=2
+rename   true v99, v1 = widemul v2, v3
+
+## battery[5] wide.div
+display  v0, v1 = widediv v2:v3, v4
+visit    Def:v0 Def:v1 Use:v2 Use:v3 Use:v4
+defs     v0 v1
+uses     v2 v3 v4
+stack    pops=3 pushes=2
+rename   true v99, v1 = widediv v2:v3, v4
+
+## battery[6] float.compare.flags
+display  v0 = fcmp.flags v1, v2
+visit    FlagsDef:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = fcmp.flags v1, v2
+
+## battery[7] select
+display  v0 = select v1, v2, v3
+visit    Def:v0 Use:v1 Use:v2 Use:v3
+defs     v0
+uses     v1 v2 v3
+stack    pops=3 pushes=1
+rename   true v99 = select v1, v2, v3
+
+## battery[8] store.indirect
+display  stind.i32 v0, v1
+visit    Use:v0 Use:v1
+defs     -
+uses     v0 v1
+stack    pops=2 pushes=0
+rename   false stind.i32 v0, v1
+
+## battery[9] atomic.cmpxchg
+display  v0, v1 = cmpxchg.seqcst/relaxed.i64 v2, v3, v4
+visit    Def:v0 Def:v1 Use:v2 Use:v3 Use:v4
+defs     v0 v1
+uses     v2 v3 v4
+stack    pops=3 pushes=2
+rename   true v99, v1 = cmpxchg.seqcst/relaxed.i64 v2, v3, v4
+
+## battery[10] atomic.pair.load
+display  v0, v1 = atomicload.pair.acquire.i128 i64/i64, v2
+visit    Def:v0 Def:v1 Use:v2
+defs     v0 v1
+uses     v2
+stack    pops=1 pushes=2
+rename   true v99, v1 = atomicload.pair.acquire.i128 i64/i64, v2
+
+## battery[11] call
+display  v0 = call 3(v1, v2, v3)
+visit    Def:v0 Use:v1 Use:v2 Use:v3
+defs     v0
+uses     v1 v2 v3
+stack    pops=3 pushes=1
+rename   true v99 = call 3(v1, v2, v3)
+
+## battery[12] call.indirect
+display  calli v0(v1)
+visit    Use:v0 Use:v1
+defs     -
+uses     v0 v1
+stack    pops=2 pushes=0
+rename   false calli v0(v1)
+
+## battery[13] return
+display  ret v0
+visit    Use:v0
+defs     -
+uses     v0
+stack    pops=1 pushes=0
+rename   false ret v0
+
+## battery[14] return
+display  ret
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false ret
+
+## battery[15] phi
+display  v0 = phi(B0: v1, B1: v2)
+visit    Def:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=0 pushes=0
+rename   true v99 = phi(B0: v1, B1: v2)
+
+## battery[16] native.opaque
+display  v0, v1 = native.opaque ud2 v2, v3 effects=Opaque
+visit    Def:v0 Def:v1 Use:v2 Use:v3
+defs     v0 v1
+uses     v2 v3
+stack    pops=2 pushes=2
+rename   true v99, v1 = native.opaque ud2 v2, v3 effects=Opaque
+
+## battery[17] bcd.aam
+display  v0, v1 = bcd.aam aam base=10 v2 effects=Pure
+visit    Def:v0 Def:v1 Use:v2
+defs     v0 v1
+uses     v2
+stack    pops=1 pushes=2
+rename   true v99, v1 = bcd.aam aam base=10 v2 effects=Pure
+
+## battery[18] vector.dotproduct
+display  v0 = vector.dotproduct.32 v1, v2 imm=0xff
+visit    Def:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = vector.dotproduct.32 v1, v2 imm=0xff
+
+## battery[19] vector.mpsadbw
+display  v0 = vector.mpsadbw v1, v2 imm=0x05
+visit    Def:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = vector.mpsadbw v1, v2 imm=0x05
+
+## battery[20] vector.pcmpstr
+display  v0, v1 = vector.pcmpestri v2, v3 imm=0x0c
+visit    Def:v0 Def:v1 Use:v2 Use:v3
+defs     v0 v1
+uses     v2 v3
+stack    pops=2 pushes=2
+rename   true v99, v1 = vector.pcmpestri v2, v3 imm=0x0c
+
+## battery[21] vector.phminposuw
+display  v0 = vector.phminposuw v1
+visit    Def:v0 Use:v1
+defs     v0
+uses     v1
+stack    pops=1 pushes=1
+rename   true v99 = vector.phminposuw v1
+
+## battery[22] vector.condmove
+display  v0 = vector.condmove.lz v1, v2
+visit    Def:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = vector.condmove.lz v1, v2
+
+## battery[23] vector.p2intersect
+display  v0, v1 = vector.p2intersect v2, v3
+visit    Def:v0 Def:v1 Use:v2 Use:v3
+defs     v0 v1
+uses     v2 v3
+stack    pops=2 pushes=2
+rename   true v99, v1 = vector.p2intersect v2, v3
+
+## battery[24] vector.shufbitqmb
+display  v0 = vector.shufbitqmb v1, v2
+visit    Def:v0 Use:v1 Use:v2
+defs     v0
+uses     v1 v2
+stack    pops=2 pushes=1
+rename   true v99 = vector.shufbitqmb v1, v2
+
+## battery[25] vector.bitfield
+display  v0 = vector.extrq v1 index=4 length=8
+visit    Def:v0 Use:v1
+defs     v0
+uses     v1
+stack    pops=1 pushes=1
+rename   true v99 = vector.extrq v1 index=4 length=8
+
+## battery[26] jump
+display  jump B4
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false jump B4
+
+## battery[27] nop
+display  nop
+visit    -
+defs     -
+uses     -
+stack    pops=0 pushes=0
+rename   false nop

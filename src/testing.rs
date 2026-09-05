@@ -13,11 +13,14 @@ use crate::{
     analysis::{SsaVerifier, VerifyLevel},
     error::Result,
     ir::{
+        block::SsaBlock,
+        exception::{BlockRange, HandlerKind, SsaExceptionHandler},
         function::{SsaDefSpec, SsaFunction, SsaFunctionBuilder, VectorFaultingLoadSpec},
+        instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, FenceKind, NativeClobber, SsaEffectKind, SsaEffects,
-            SsaOp, VectorBinaryKind, VectorCompareKind, VectorElement, VectorElementKind,
-            VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
+            AtomicAccessWidth, AtomicOrdering, FenceKind, SsaEffectKind, SsaEffects, SsaOp,
+            VectorBinaryKind, VectorCompareKind, VectorElement, VectorElementKind, VectorFaultMode,
+            VectorMaskMode, VectorSegmentLayout,
         },
         value::ConstValue,
         variable::{DefSite, SsaVarId, VariableOrigin},
@@ -62,6 +65,10 @@ pub struct MockTarget;
 pub enum MockType {
     /// Unknown or intentionally unspecified type.
     Unknown,
+    /// 8-bit integer test type.
+    I8,
+    /// 16-bit integer test type.
+    I16,
     /// 32-bit integer test type.
     I32,
     /// 64-bit integer test type.
@@ -88,6 +95,8 @@ impl fmt::Display for MockType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unknown => write!(f, "unknown"),
+            Self::I8 => write!(f, "i8"),
+            Self::I16 => write!(f, "i16"),
             Self::I32 => write!(f, "i32"),
             Self::I64 => write!(f, "i64"),
             Self::F64 => write!(f, "f64"),
@@ -129,7 +138,10 @@ impl Target for MockTarget {
     }
 
     fn is_integer(t: &Self::Type) -> bool {
-        matches!(t, MockType::I32 | MockType::I64)
+        matches!(
+            t,
+            MockType::I8 | MockType::I16 | MockType::I32 | MockType::I64
+        )
     }
 
     fn is_floating(t: &Self::Type) -> bool {
@@ -137,7 +149,10 @@ impl Target for MockTarget {
     }
 
     fn is_signed(t: &Self::Type) -> bool {
-        matches!(t, MockType::I32 | MockType::I64 | MockType::F64)
+        matches!(
+            t,
+            MockType::I8 | MockType::I16 | MockType::I32 | MockType::I64 | MockType::F64
+        )
     }
 
     fn is_pointer(t: &Self::Type) -> bool {
@@ -154,6 +169,8 @@ impl Target for MockTarget {
 
     fn bit_width(t: &Self::Type) -> Option<u32> {
         match t {
+            MockType::I8 => Some(8),
+            MockType::I16 => Some(16),
             MockType::I32 => Some(32),
             MockType::I64 | MockType::F64 => Some(64),
             MockType::V4I32 | MockType::V2F64 => Some(128),
@@ -273,8 +290,17 @@ impl Target for MockTarget {
         0
     }
 
-    fn is_filter_handler(_flags: &Self::ExceptionKind) -> bool {
-        false
+    fn handler_kind(flags: &Self::ExceptionKind) -> HandlerKind {
+        // The mock `ExceptionKind` is a bare `u32`, so it needs a stated
+        // convention to mean anything: `0 = Catch, 1 = Filter, 2 = Finally,
+        // 3 = Fault`, and anything else is a catch. Fixtures across the crate
+        // spell a plain catch clause `flags: 0`.
+        match flags {
+            1 => HandlerKind::Filter,
+            2 => HandlerKind::Finally,
+            3 => HandlerKind::Fault,
+            _ => HandlerKind::Catch,
+        }
     }
 
     fn field_member_index(field: &Self::FieldRef) -> Option<u32> {
@@ -469,6 +495,64 @@ pub fn diamond_phi_fixture() -> SsaFunction<MockTarget> {
     fixture_result(builder.finish())
 }
 
+/// Builds a function with one protected region and one handler that rejoins
+/// the normal path.
+///
+/// ```text
+///        B0  entry                    clause: try   [1, 2)
+///        |                                    handler B2
+///        B1  protected (try body)
+///       /  \                          B1 -> B3 is the terminator edge;
+///      /    B2  handler entry         nothing names B2, so it is reachable
+///     |    /                          only because the runtime dispatches.
+///      \  /
+///        B3  join, return
+/// ```
+///
+/// The shape is the smallest one that distinguishes the questions this crate
+/// gets wrong when the exception table is ignored: B2 has no terminator
+/// predecessor, B3 is a join with one normal and one exceptional predecessor,
+/// and a value defined in B1 is visible at B3 on the normal path but must not
+/// be assumed to hold in B2.
+#[must_use]
+pub fn try_catch_fixture() -> SsaFunction<MockTarget> {
+    let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
+    builder.ensure_block(3);
+    fixture_result(builder.in_block(0, |block| {
+        block.const_i32(mock_i32(), 1)?;
+        block.jump(1)?;
+        Ok(())
+    }));
+    fixture_result(builder.in_block(1, |block| {
+        block.const_i32(SsaDefSpec::local(0, MockType::I32), 2)?;
+        block.jump(3)?;
+        Ok(())
+    }));
+    fixture_result(builder.in_block(2, |block| {
+        block.const_i32(SsaDefSpec::local(0, MockType::I32), 3)?;
+        block.jump(3)?;
+        Ok(())
+    }));
+    fixture_result(builder.in_block(3, |block| {
+        block.ret(None)?;
+        Ok(())
+    }));
+
+    let mut ssa = fixture_result(builder.finish());
+    ssa.set_exception_handlers(vec![SsaExceptionHandler {
+        flags: 0,
+        try_offset: 0,
+        try_length: 0,
+        handler_offset: 0,
+        handler_length: 0,
+        class_token_or_filter: 0,
+        protected_range: BlockRange::new(1, 2),
+        handler_range: BlockRange::new(2, 3),
+        filter_range: None,
+    }]);
+    ssa
+}
+
 /// Creates a loop fixture with a deferred backedge phi operand.
 ///
 #[must_use]
@@ -615,7 +699,7 @@ pub fn memory_effect_fixture() -> SsaFunction<MockTarget> {
     fixture_result(builder.finish())
 }
 
-/// Creates a native-effect fixture with flags, opaque outputs, clobbers, and wide arithmetic.
+/// Creates a native-effect fixture with flags, opaque outputs, and wide arithmetic.
 #[must_use]
 pub fn native_effect_fixture() -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
@@ -631,7 +715,6 @@ pub fn native_effect_fixture() -> SsaFunction<MockTarget> {
             "fixture.opaque",
             None,
             vec![zero],
-            vec![NativeClobber::Flags("mock-flags".to_string())],
             SsaEffects::new(SsaEffectKind::Opaque, false),
         )?;
         block.branch_flags(flags, crate::ir::FlagCondition::Zero, 1, 1)?;
@@ -836,7 +919,7 @@ pub fn mock_op_at(ssa: &SsaFunction<MockTarget>, block: usize, instr: usize) -> 
 pub fn mock_terminator_at(ssa: &SsaFunction<MockTarget>, block: usize) -> &SsaOp<MockTarget> {
     fixture_option(
         ssa.block(block)
-            .and_then(|ssa_block| ssa_block.terminator_op()),
+            .and_then(|ssa_block| ssa_block.control_terminator()),
         "mock terminator should exist",
     )
 }
@@ -853,6 +936,204 @@ pub fn create_i32_local(
         DefSite::instruction(block, instruction),
         MockType::I32,
     )
+}
+
+/// One link of a [`MockConversionChain`]: an `IntConv` reading the variable the
+/// previous link defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockConvLink {
+    /// The type this conversion targets, which is also the declared type of the
+    /// variable it defines.
+    pub target: MockType,
+    /// Whether the conversion reads its operand as unsigned (zero-extension
+    /// rather than sign-extension).
+    pub unsigned: bool,
+    /// Whether the conversion checks overflow (CIL `conv.ovf.*`). A checked
+    /// conversion has an observable effect and may never be removed.
+    pub overflow_check: bool,
+}
+
+impl MockConvLink {
+    /// Builds an unchecked conversion to `target` with the given signedness.
+    #[must_use]
+    pub const fn new(target: MockType, unsigned: bool) -> Self {
+        Self {
+            target,
+            unsigned,
+            overflow_check: false,
+        }
+    }
+
+    /// Builds an overflow-checked conversion to `target`.
+    #[must_use]
+    pub const fn checked(target: MockType, unsigned: bool) -> Self {
+        Self {
+            target,
+            unsigned,
+            overflow_check: true,
+        }
+    }
+}
+
+/// A straight-line chain of integer conversions, of any depth, for exercising
+/// the conversion-collapse rule.
+///
+/// [`build`](Self::build) lays out one block:
+///
+/// ```text
+/// 0: v0 = const                         // the source, typed `source`
+/// 1: v1 = (links[0].target) v0
+/// 2: v2 = (links[1].target) v1
+/// ...
+/// n: vn = (links[n-1].target) v(n-1)    // the outer conversion
+/// n+1: return vn
+/// ```
+///
+/// # Variable naming
+///
+/// [`var`](Self::var) is indexed by *variable*, not by link: `var(i)` is `vi`,
+/// so `var(0)` is the source (also spelled [`source`](Self::source)) and link
+/// `k` defines `var(k + 1)`. A chain of `n` links therefore has variables
+/// `var(0)..=var(n)`, and a walk that stops "at the first link" has reached
+/// `var(n - 1)`, not `var(n)`. Every depth assertion in the tree is stated in
+/// these terms.
+///
+/// # Panics
+///
+/// Aborts the process — like every other fixture in this module — when `links`
+/// is empty (there would be no outer conversion) or when [`var`](Self::var) is
+/// asked for an index past the chain.
+#[derive(Debug, Clone)]
+pub struct MockConversionChain {
+    /// The built function.
+    ssa: SsaFunction<MockTarget>,
+    /// `v0..=vn`, in chain order, source first.
+    vars: Vec<SsaVarId>,
+    /// The outermost conversion, i.e. the instruction at `outer_index`.
+    outer: SsaOp<MockTarget>,
+    /// Block and instruction index of the outer conversion.
+    outer_index: (usize, usize),
+}
+
+impl MockConversionChain {
+    /// Builds a chain of conversions over a `source`-typed constant.
+    ///
+    /// See the type documentation for the layout and for what `var(i)` names.
+    #[must_use]
+    pub fn build(source: MockType, links: &[MockConvLink]) -> Self {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let mut vars = Vec::with_capacity(links.len().saturating_add(1));
+        let mut types = Vec::with_capacity(links.len().saturating_add(1));
+        types.push(source);
+        types.extend(links.iter().map(|link| link.target));
+        for (index, var_type) in types.iter().enumerate() {
+            vars.push(ssa.create_variable(
+                VariableOrigin::Local(u16::try_from(index).unwrap_or(u16::MAX)),
+                0,
+                DefSite::instruction(0, index),
+                *var_type,
+            ));
+        }
+
+        let source_var = fixture_option(vars.first().copied(), "the chain has a source variable");
+        let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: source_var,
+            value: mock_const_of_width(source),
+        }));
+
+        let mut operand = source_var;
+        let mut outer = None;
+        for (index, link) in links.iter().enumerate() {
+            let dest = fixture_option(
+                vars.get(index.saturating_add(1)).copied(),
+                "every link defines a variable",
+            );
+            let op = SsaOp::IntConv {
+                dest,
+                operand,
+                target: link.target,
+                overflow_check: link.overflow_check,
+                unsigned: link.unsigned,
+            };
+            block.add_instruction(SsaInstruction::synthetic(op.clone()));
+            outer = Some(op);
+            operand = dest;
+        }
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(operand),
+        }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        Self {
+            ssa,
+            vars,
+            outer: fixture_option(
+                outer,
+                "a mock conversion chain needs at least one link to have an outer conversion",
+            ),
+            outer_index: (0, links.len()),
+        }
+    }
+
+    /// Returns the built function.
+    #[must_use]
+    pub const fn function(&self) -> &SsaFunction<MockTarget> {
+        &self.ssa
+    }
+
+    /// Returns the built function for in-place damage — a stale def site, an
+    /// extra instruction — that the layout itself cannot express.
+    pub const fn function_mut(&mut self) -> &mut SsaFunction<MockTarget> {
+        &mut self.ssa
+    }
+
+    /// Consumes the fixture and returns the function, for passes that take it
+    /// by value.
+    #[must_use]
+    pub fn into_function(self) -> SsaFunction<MockTarget> {
+        self.ssa
+    }
+
+    /// Returns the chain's source variable, `var(0)`.
+    #[must_use]
+    pub fn source(&self) -> SsaVarId {
+        self.var(0)
+    }
+
+    /// Returns `v{index}`: `var(0)` is the source and link `k` defines
+    /// `var(k + 1)`.
+    #[must_use]
+    pub fn var(&self, index: usize) -> SsaVarId {
+        fixture_option(
+            self.vars.get(index).copied(),
+            "the chain has no variable at that index",
+        )
+    }
+
+    /// Returns the outermost conversion — the op a pass sees as the candidate.
+    #[must_use]
+    pub fn outer_op(&self) -> SsaOp<MockTarget> {
+        self.outer.clone()
+    }
+
+    /// Returns the block and instruction index of the outermost conversion.
+    #[must_use]
+    pub const fn outer_index(&self) -> (usize, usize) {
+        self.outer_index
+    }
+}
+
+/// Returns a constant of the same width as `ty`, so a chain's source variable
+/// holds a value its declared type can express.
+fn mock_const_of_width(ty: MockType) -> ConstValue<MockTarget> {
+    match MockTarget::bit_width(&ty) {
+        Some(8) => ConstValue::I8(1),
+        Some(16) => ConstValue::I16(1),
+        Some(64) => ConstValue::I64(1),
+        _ => ConstValue::I32(1),
+    }
 }
 
 #[cfg(test)]
@@ -894,7 +1175,10 @@ mod tests {
         let _: () = MockTarget::synthetic_instruction();
         assert_eq!(MockTarget::instruction_mnemonic(&()), "<mock>");
         assert_eq!(MockTarget::instruction_rva(&()), 0);
-        assert!(!MockTarget::is_filter_handler(&0));
+        assert_eq!(MockTarget::handler_kind(&0), HandlerKind::Catch);
+        assert_eq!(MockTarget::handler_kind(&1), HandlerKind::Filter);
+        assert_eq!(MockTarget::handler_kind(&2), HandlerKind::Finally);
+        assert_eq!(MockTarget::handler_kind(&3), HandlerKind::Fault);
     }
 
     #[test]

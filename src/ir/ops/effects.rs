@@ -9,8 +9,17 @@
 //! miscompile rather than a missed optimization. The test battery
 //! cross-checks the predicates against each other for every variant.
 
-use super::*;
-use crate::{ir::variable::SsaVarId, target::Target};
+use crate::{
+    ir::{
+        ops::{
+            def::SsaOp,
+            kinds::AtomicOrdering,
+            vector::{PredicateGenKind, PredicateOpKind},
+        },
+        variable::SsaVarId,
+    },
+    target::Target,
+};
 
 /// Direct single-address memory access extracted from an operation's payload.
 ///
@@ -361,7 +370,7 @@ impl<T: Target> SsaOp<T> {
                 | Self::CallIndirect { .. }
                 | Self::Throw { .. }
                 | Self::Rethrow
-                | Self::Break
+                | Self::Break(_)
                 | Self::Ckfinite { .. }
                 | Self::CmpXchg { .. }
                 | Self::WideCompareExchange { .. }
@@ -389,7 +398,6 @@ impl<T: Target> SsaOp<T> {
                 | Self::VectorSegmentStore { .. }
                 | Self::VectorPackStore { .. }
         ) || matches!(self, Self::NativeOpaque(data) if data.effects.may_throw)
-            || matches!(self, Self::NativeIntrinsic(data) if data.effects.may_throw)
             || matches!(self, Self::SystemOp(data) if data.kind.effects().may_throw)
             || matches!(self, Self::ComputeOp(data) if data.kind.effects().may_throw)
             || matches!(self, Self::BcdAdjust(data) if data.kind.effects().may_throw)
@@ -504,7 +512,6 @@ impl<T: Target> SsaOp<T> {
                 SsaEffects::new(SsaEffectKind::Fence, false).fence_ordering(kind.ordering())
             }
             Self::NativeOpaque(data) => data.effects,
-            Self::NativeIntrinsic(data) => data.effects,
             Self::SystemOp(data) => data.kind.effects(),
             Self::ComputeOp(data) => data.kind.effects(),
             Self::BcdAdjust(data) => data.kind.effects(),
@@ -523,7 +530,6 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorExtendInLane(_)
             | Self::VectorElementCount(_)
             | Self::VectorSveAddressGen(_)
-            | Self::FlagAdjust(_)
             | Self::VectorSmeMisc(_)
             | Self::VectorSveCompute(_)
             | Self::VectorReverseChunks(_)
@@ -574,6 +580,14 @@ impl<T: Target> SsaOp<T> {
                 }
                 _ => SsaEffects::new(SsaEffectKind::Pure, false),
             },
+            // Derived from the kind, never from the variant: an adjustment
+            // confined to the status flags the IR models as SSA values is a
+            // pure function of its operands, while one writing DF or AC is
+            // opaque -- the `FpuControl` treatment two arms above, for the same
+            // reason. A future variant inherits the right class rather than the
+            // convenient one, and a kind that declares a result but carries no
+            // output degrades to opaque instead of becoming deletable.
+            Self::FlagAdjust(data) => data.kind.effects_for_outputs(data.outputs.len()),
             Self::BlockString(data) => data.kind.effects(),
             Self::WideCompareExchange { .. } => {
                 SsaEffects::new(SsaEffectKind::Atomic, self.may_throw())
@@ -628,7 +642,7 @@ impl<T: Target> SsaOp<T> {
             | Self::Unreachable => SsaEffects::new(SsaEffectKind::Opaque, self.may_throw())
                 .with_control(ControlEffect::Terminator),
 
-            Self::Break => SsaEffects::new(SsaEffectKind::Opaque, self.may_throw())
+            Self::Break(_) => SsaEffects::new(SsaEffectKind::Opaque, self.may_throw())
                 .with_trap(TrapClass::IllegalInstruction),
 
             Self::Constrained { .. }

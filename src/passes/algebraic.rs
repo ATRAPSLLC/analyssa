@@ -1,5 +1,6 @@
 //! Algebraic simplification pass — transforms redundant operations using
-//! the identities catalogued in [`crate::analysis::algebraic`].
+//! the identities catalogued in [`crate::analysis::algebraic`] and the
+//! conversion-chain rule in [`crate::analysis::convert`].
 //!
 //! Pure-SSA and target-agnostic. Hosts can call [`run`] directly or use
 //! [`crate::passes::AlgebraicSimplificationPass`] with the scheduler.
@@ -7,24 +8,37 @@
 //! # Algorithm
 //!
 //! 1. Find all constant-valued variables via [`SsaFunction::find_constants`].
-//! 2. For each instruction, call [`simplify_op`] which checks identities:
+//! 2. For each instruction, offer it to [`collapse_conversion_chain`] first. An
+//!    integer conversion reading another integer conversion may be able to read
+//!    straight past it — `(uint16_t)(uint64_t)(uint32_t)x` is one conversion,
+//!    not three — and the rule says how far past. A conversion answered here
+//!    goes no further; it is not an identity `simplify_op` catalogues, and it
+//!    needs neither the constant table nor an operand type.
+//! 3. Otherwise call [`simplify_op`], which checks identities:
 //!    - `x ^ x` → 0, `x - x` → 0, `x & x` → `x`, `x | x` → `x`
 //!    - `x + 0` → `x`, `x * 1` → `x`, `x * 0` → 0
 //!    - `x << 0` → `x`, `x >> 0` → `x`
 //!    - `ceq(x, x)` → 1, `clt(x, x)` → 0, `cgt(x, x)` → 0
 //!    - `div(x, 1)` → `x`, `rem(x, 1)` → 0
-//! 3. Replace matching operations with `Const` or `Copy` ops.
-//! 4. Report one [`EventKind::ConstantFolded`] event per replacement.
+//! 4. Replace matching operations with `Const`, `Copy`, or — for a collapsed
+//!    conversion chain — a *rewritten* operation of the same kind reading a
+//!    different operand.
+//! 5. Report one [`EventKind::ConstantFolded`] event per replacement.
 //!
 //! # Complexity
 //!
-//! O(n) in the number of instructions — a single linear scan plus
-//! constant-table lookups.
+//! O(n + C·d) — one linear scan of the `n` instructions with constant-table
+//! lookups, plus, for each of the `C` integer conversions, a walk of the `d`
+//! links it collapses through. Each walk step is one guarded, scan-free
+//! def-site dereference.
 
 use std::collections::BTreeMap;
 
 use crate::{
-    analysis::algebraic::{SimplifyResult, simplify_op},
+    analysis::{
+        algebraic::{SimplifyResult, simplify_op},
+        convert::collapse_conversion_chain,
+    },
     events::{EventKind, EventListener},
     ir::{
         function::{SsaEditOptions, SsaFunction},
@@ -37,8 +51,9 @@ use crate::{
 
 /// Run algebraic simplification on `ssa`.
 ///
-/// Scans all instructions, applies algebraic identities, and replaces
-/// redundant computations with constants or copy operations.
+/// Scans all instructions, applies the algebraic identities and the
+/// conversion-chain collapse, and replaces each redundant computation with a
+/// constant, a copy, or a conversion reading further up its own chain.
 ///
 /// # Arguments
 ///
@@ -67,6 +82,12 @@ enum Simplification<T: Target> {
     Constant(ConstValue<T>),
     /// Replace the operation's result with a copy of another variable.
     Copy(SsaVarId),
+    /// Replace the operation with a different one computing the same value.
+    ///
+    /// Produced only by the conversion-chain collapse, where the survivor is
+    /// still an `IntConv` — same destination, same target type, same flags —
+    /// reading whichever operand the walk reached.
+    Rewrite(Box<SsaOp<T>>),
 }
 
 /// A single instruction identified as a candidate for algebraic simplification.
@@ -78,7 +99,7 @@ struct SimplificationCandidate<T: Target> {
     instr_idx: usize,
     /// Destination variable of the instruction's result.
     dest: SsaVarId,
-    /// The simplification to apply (constant or copy).
+    /// The simplification to apply: a constant, a copy, or a rewritten operation.
     simplification: Simplification<T>,
     /// Human-readable description of the applied identity.
     description: &'static str,
@@ -109,14 +130,18 @@ fn check_simplification<T: Target>(
         return None;
     }
     let dest = op.dest()?;
+    // Answered first, and answered without reading `constants` or
+    // `operand_type`, so a collapsible conversion pays for neither.
+    if let Some(candidate) = check_convert_chain(ssa, op, block_idx, instr_idx) {
+        return Some(candidate);
+    }
     // The *operand* type decides whether a self-cancelling identity holds
     // (`x - x` is NaN for a NaN float) and at what width its constant should be
     // materialised. A comparison's destination is a boolean, so the destination
     // type would answer neither question.
     let operand_type = op
-        .uses()
-        .first()
-        .and_then(|operand| ssa.variable(*operand))
+        .first_use()
+        .and_then(|operand| ssa.variable(operand))
         .map(|var| var.var_type().clone());
     match simplify_op(op, constants, operand_type.as_ref()) {
         SimplifyResult::Constant(value) => Some(SimplificationCandidate {
@@ -135,6 +160,38 @@ fn check_simplification<T: Target>(
         }),
         SimplifyResult::None => None,
     }
+}
+
+/// Wraps [`collapse_conversion_chain`] as a simplification candidate.
+///
+/// The rule itself — which conversions may be read past, and how far — lives in
+/// [`crate::analysis::convert`]. This only decides how the pass spells the
+/// answer: a conversion to the operand's own type becomes a `Copy`, and a
+/// collapsed chain becomes a `Rewrite` of the conversion in place.
+fn check_convert_chain<T: Target>(
+    ssa: &SsaFunction<T>,
+    op: &SsaOp<T>,
+    block_idx: usize,
+    instr_idx: usize,
+) -> Option<SimplificationCandidate<T>> {
+    let dest = op.dest()?;
+    let (simplification, description) = match collapse_conversion_chain(ssa, op)? {
+        SsaOp::Copy { src, .. } => (
+            Simplification::Copy(src),
+            "conversion to the operand's own type",
+        ),
+        collapsed => (
+            Simplification::Rewrite(Box::new(collapsed)),
+            "convert chain → single convert",
+        ),
+    };
+    Some(SimplificationCandidate {
+        block_idx,
+        instr_idx,
+        dest,
+        simplification,
+        description,
+    })
 }
 
 fn apply_simplifications<T, L>(
@@ -159,6 +216,7 @@ where
                     dest: candidate.dest,
                     src,
                 },
+                Simplification::Rewrite(op) => *op,
             };
             editor.replace_instruction_op(candidate.block_idx, candidate.instr_idx, new_op)?;
             changed = true;
@@ -199,7 +257,10 @@ mod tests {
             instruction::SsaInstruction,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{MockTarget, MockType, mock_op_at, run_mock_pass_boundary},
+        testing::{
+            MockConvLink, MockConversionChain, MockTarget, MockType, mock_op_at,
+            run_mock_pass_boundary,
+        },
     };
 
     fn build_function() -> SsaFunction<MockTarget> {
@@ -365,6 +426,110 @@ mod tests {
             );
         }
         ssa
+    }
+
+    /// Drives a chain collapse through the whole pass, not just through
+    /// `check_simplification`.
+    ///
+    /// A test that inspects the candidate `check_simplification` returns covers
+    /// the *rule* and nothing downstream of it. This one covers the write path:
+    /// `apply_simplifications`' `Simplification::Rewrite` arm, the
+    /// `replace_instruction_op` after it, and the edit scope's repair, which
+    /// renumbers every `SsaVarId`.
+    ///
+    /// That renumbering is why the structure is asserted by *scanning* the
+    /// block rather than by saved `SsaVarId`s: a stale id would make the
+    /// assertion fail for the wrong reason, or pass for one.
+    #[test]
+    fn run_collapses_a_conversion_chain_and_reports_it() {
+        // I32 → I8 → I64 → I16. Only the outer conversion collapses, and it
+        // stops on the I8 link, so exactly one rewrite is expected.
+        let mut ssa = MockConversionChain::build(
+            MockType::I32,
+            &[
+                MockConvLink::new(MockType::I8, true),
+                MockConvLink::new(MockType::I64, true),
+                MockConvLink::new(MockType::I16, true),
+            ],
+        )
+        .into_function();
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0x5Au32;
+
+        let changed = run_mock_pass_boundary(&mut ssa, "conversion chain collapse", |ssa| {
+            run(ssa, &method, &log)
+        });
+
+        assert!(changed, "the chain collapses");
+        assert_eq!(log.count_kind(EventKind::ConstantFolded), 1);
+
+        let narrowing = ssa
+            .all_instructions()
+            .find_map(|instr| match instr.op() {
+                SsaOp::IntConv {
+                    dest,
+                    target: MockType::I8,
+                    ..
+                } => Some(*dest),
+                _ => None,
+            })
+            .expect("the narrowing link survives");
+        let collapsed = ssa
+            .all_instructions()
+            .find_map(|instr| match instr.op() {
+                SsaOp::IntConv {
+                    operand,
+                    target: MockType::I16,
+                    ..
+                } => Some(*operand),
+                _ => None,
+            })
+            .expect("the outer conversion survives");
+
+        assert_eq!(
+            collapsed, narrowing,
+            "the surviving conversion must read the narrowing link's result directly"
+        );
+    }
+
+    /// The mirror of the write path: a pass run over a chain the rule refuses
+    /// must leave the function alone and report nothing, so a `changed` of
+    /// `true` cannot come from having merely *looked* at a conversion.
+    #[test]
+    fn run_leaves_a_checked_conversion_alone() {
+        let mut ssa = MockConversionChain::build(
+            MockType::I32,
+            &[
+                MockConvLink::new(MockType::I8, false),
+                MockConvLink::checked(MockType::I16, false),
+            ],
+        )
+        .into_function();
+        let before = ssa.clone();
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0x5Bu32;
+
+        let changed = run_mock_pass_boundary(&mut ssa, "checked conversion", |ssa| {
+            run(ssa, &method, &log)
+        });
+
+        assert!(!changed, "a checked conversion is not simplifiable");
+        assert!(log.is_empty());
+        assert_eq!(
+            ssa.instruction_count(),
+            before.instruction_count(),
+            "nothing was rewritten"
+        );
+        assert!(
+            ssa.all_instructions().any(|instr| matches!(
+                instr.op(),
+                SsaOp::IntConv {
+                    overflow_check: true,
+                    ..
+                }
+            )),
+            "the overflow check is still there"
+        );
     }
 
     #[test]

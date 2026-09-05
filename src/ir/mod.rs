@@ -52,7 +52,10 @@ pub mod variable;
 pub mod varstore;
 
 pub use block::{ReplaceResult, SsaBlock};
-pub use exception::{NativeExceptionKind, SsaExceptionHandler, native_is_filter_handler};
+pub use exception::{
+    BlockRange, ClauseLayout, ClausePart, ExceptionBlocks, ExceptionTableError, HandlerKind,
+    LaidOutHandler, SsaExceptionHandler,
+};
 pub use function::{
     CheckedReplaceResult, FunctionKind, MethodPurity, ReplacementSkipReason, ReturnInfo,
     SkippedReplacement, SsaBlockBuilder, SsaDefSpec, SsaEditOptions, SsaEditReport, SsaEditScope,

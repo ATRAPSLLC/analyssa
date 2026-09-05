@@ -1879,6 +1879,8 @@ impl fmt::Display for ComputedOp {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+
     use super::*;
     use crate::testing::{MockTarget, MockType};
 
@@ -1942,8 +1944,6 @@ mod tests {
 
     #[test]
     fn const_value_equality_is_structural_and_reflexive_for_floats() {
-        use std::collections::hash_map::DefaultHasher;
-
         fn hash_of(v: &Cv) -> u64 {
             let mut h = DefaultHasher::new();
             v.hash(&mut h);

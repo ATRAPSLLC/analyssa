@@ -56,7 +56,7 @@ use crate::{
 /// use analyssa::{
 ///     analysis::{
 ///         dataflow::{DataFlowSolver, ReachingDefinitions},
-///         SsaCfg,
+///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing,
@@ -64,7 +64,7 @@ use crate::{
 ///
 /// // Diamond CFG: block 0 branches to blocks 1 and 2, which both jump to 3.
 /// let ssa = testing::diamond_phi_fixture();
-/// let graph = SsaCfg::from_ssa(&ssa);
+/// let graph = EhCfg::from_ssa(&ssa);
 ///
 /// let analysis = ReachingDefinitions::new(&ssa);
 /// let solver = DataFlowSolver::new(analysis);

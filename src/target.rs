@@ -22,7 +22,10 @@
 
 use std::{fmt::Debug, hash::Hash};
 
-use crate::{PointerSize, ir::value::ConstValue};
+use crate::{
+    PointerSize,
+    ir::{exception::HandlerKind, value::ConstValue},
+};
 
 /// Element category for a target-independent vector lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -867,10 +870,17 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
         None
     }
 
-    /// `true` if `flags` denotes a filter-style exception handler (i.e. one
-    /// that runs a user-supplied predicate before catching). Hosts without a
-    /// filter notion return `false`.
-    fn is_filter_handler(flags: &Self::ExceptionKind) -> bool;
+    /// Classifies a host's opaque exception-handler flags.
+    ///
+    /// Required and total: every clause a host records is one of the four
+    /// [`HandlerKind`]s, and a host that cannot tell them apart still has to say
+    /// which one it is guessing. A defaulted hook would answer for hosts that
+    /// never considered the question, and structured recovery would report that
+    /// answer as fact.
+    ///
+    /// This is the crate's only handler classifier. Nothing else asks what a
+    /// clause does, so nothing else can contradict it.
+    fn handler_kind(flags: &Self::ExceptionKind) -> HandlerKind;
 
     // ------------------------------------------------------------------------
     // Result-type queries used by `SsaOp::infer_result_type` to lift type

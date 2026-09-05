@@ -54,17 +54,17 @@
 
 use crate::{
     BitSet,
-    analysis::cfg::SsaCfg,
-    graph::{
-        NodeId, RootedGraph,
-        algorithms::{DominatorTree, compute_dominators},
+    analysis::{
+        cfg::SsaCfg,
+        exceptions::{EhCfg, EhDominance, FunctionRoots},
     },
+    graph::NodeId,
     ir::{
+        exception::ExceptionTableError,
         function::SsaFunction,
         ops::{
             AtomicAccessWidth, AtomicOrdering, ControlEffect, MemoryAccessSemantics,
-            MemoryEffectLocation, NativeClobber, NativeStateAccessKind, SsaEffectKind, SsaEffects,
-            SsaOp,
+            MemoryEffectLocation, SsaEffectKind, SsaEffects, SsaOp,
         },
         variable::{DefSite, SsaVarId, SsaVariable, VariableOrigin},
         varstore::VarMap,
@@ -163,12 +163,17 @@ pub enum VerifierError {
         /// Index of the unterminated block.
         block: usize,
     },
-    /// A phi node appears in the entry block (block 0), which has no predecessors
-    /// in a well-formed CFG.
-    PhiInEntryBlock {
-        /// Entry block index that contains the invalid phi.
+    /// A phi node appears in a block no terminator transfers to.
+    ///
+    /// A phi operand names the edge it arrived along, so a block with no
+    /// incoming terminator edges has no edges for its operands to name. The
+    /// entry block is one such block; a handler entry reached only by runtime
+    /// dispatch is another, and `SsaFunction::demote_runtime_entry_phis` is
+    /// what removes a phi from one.
+    PhiWithoutPredecessors {
+        /// Block containing the phi.
         block: usize,
-        /// Index of the phi node in the entry block's phi list.
+        /// Index of the phi node in that block's phi list.
         phi_idx: usize,
     },
     /// A variable is used in a block not dominated by its definition block.
@@ -265,6 +270,13 @@ pub enum VerifierError {
         /// Human-readable description of the native/effect violation.
         reason: String,
     },
+    /// An exception clause cannot be laid out over the function's blocks.
+    MalformedExceptionClause {
+        /// Index of the clause in `SsaFunction::exception_handlers`.
+        clause: usize,
+        /// What is wrong with it.
+        reason: ExceptionTableError,
+    },
 }
 
 impl std::fmt::Display for VerifierError {
@@ -312,8 +324,11 @@ impl std::fmt::Display for VerifierError {
             Self::MissingTerminator { block } => {
                 write!(f, "Block {block}: has successors but no terminator")
             }
-            Self::PhiInEntryBlock { block, phi_idx } => {
-                write!(f, "Block {block}: phi {phi_idx} in entry block")
+            Self::PhiWithoutPredecessors { block, phi_idx } => {
+                write!(
+                    f,
+                    "Block {block}: phi {phi_idx} in a block no terminator transfers to"
+                )
             }
             Self::DominanceViolation {
                 var,
@@ -397,6 +412,9 @@ impl std::fmt::Display for VerifierError {
                 f,
                 "Block {block}: instruction {instr_idx} has invalid native op: {reason}"
             ),
+            Self::MalformedExceptionClause { clause, reason } => {
+                write!(f, "Exception clause {clause}: {reason}")
+            }
         }
     }
 }
@@ -468,6 +486,7 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         self.check_single_definition();
         self.check_block_structure();
         self.check_no_placeholders_or_self_refs();
+        self.check_exception_table();
 
         if level >= VerifyLevel::Standard {
             let cfg = SsaCfg::from_ssa(self.ssa);
@@ -479,10 +498,15 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
             self.check_atomic_operations();
             self.check_wide_arithmetic();
             self.check_native_effects();
+            self.check_flag_masks();
 
             if level >= VerifyLevel::Full {
-                let dom_tree = compute_dominators(&cfg, cfg.entry());
-                self.check_dominance(&cfg, &dom_tree, &definitions);
+                // Exception-aware, so handler and filter code is checked at all:
+                // rooted at the entry block alone, every such block is
+                // unreachable and no dominance violation inside one can be seen.
+                let eh = EhCfg::from_ssa(self.ssa);
+                let dominance = EhDominance::of(&eh);
+                self.check_dominance(&dominance, &definitions);
             }
         }
 
@@ -685,9 +709,12 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
             }
 
             for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-                // Entry block should not have phis (no predecessors)
-                if block_idx == 0 && preds.is_empty() {
-                    self.errors.push(VerifierError::PhiInEntryBlock {
+                // A phi operand names a terminator edge. With no such edge
+                // arriving, there is nothing for an operand to name -- and a
+                // zero-operand phi in such a block, which the operand checks
+                // below cannot see, is reported here too.
+                if preds.is_empty() {
+                    self.errors.push(VerifierError::PhiWithoutPredecessors {
                         block: block_idx,
                         phi_idx,
                     });
@@ -760,8 +787,10 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         }
     }
 
-    /// Variables the runtime supplies rather than any instruction: the exception
-    /// object a catch or filter handler receives on entry.
+    /// Variables the runtime supplies rather than any instruction.
+    ///
+    /// Two shapes qualify, and both are defined by the act of entering a
+    /// handler rather than by an instruction inside one.
     ///
     /// The handler's first instruction is a [`SsaOp::Pop`] consuming an object
     /// the runtime pushed, so there is no definition to find and none should be
@@ -773,22 +802,40 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     ///
     /// The `Pop` at a handler entry is what *identifies* the variable; once
     /// identified, it is exempt as a definition would be, since that is exactly
-    /// what the runtime provides. Reading it outside the handler is a dominance
-    /// violation, which [`Self::check_dominance`] reports on its own. Every
-    /// other undefined read — including one in the same block that no
-    /// handler-entry `Pop` consumes — stays reportable.
+    /// what the runtime provides. Every other undefined read — including one in
+    /// the same block that no handler-entry `Pop` consumes — stays reportable.
+    ///
+    /// The second shape is a **merge value at an exception root**: a variable
+    /// registered with a phi-shaped definition site at a non-entry flow root,
+    /// carrying no phi node with that result. The runtime enters a handler from
+    /// part-way through the protected region, so a group the region redefines
+    /// has no single reaching value there and is given a fresh version instead.
+    /// That version is not undefined — entering the handler is what defines it —
+    /// but no instruction and no phi produces it, so both the registration check
+    /// and the defined-before-use check would otherwise report every read of it.
+    ///
+    /// The exemption is derived from IR shape, deliberately, rather than from a
+    /// marker on the variable: the variable's origin is what phi grouping and
+    /// type propagation key on, so spending it here would cost both.
     fn runtime_supplied_vars(&self) -> BitSet {
         let mut vars = BitSet::lazy(self.var_capacity);
         let block_count = self.ssa.blocks().len();
         let mut entry_blocks = BitSet::new(block_count.max(1));
         for handler in self.ssa.exception_handlers() {
-            for block in [handler.handler_start_block, handler.filter_start_block]
-                .into_iter()
-                .flatten()
-            {
+            for block in handler.entry_blocks() {
                 entry_blocks.insert_checked(block);
             }
         }
+        // Merge values at exception roots, from the one place the crate reads
+        // the exception table's entry points.
+        let roots = FunctionRoots::of(self.ssa);
+        if roots.has_flow_roots() {
+            let merge_values = roots.exception_entry_values(self.ssa);
+            for value in merge_values.iter() {
+                vars.insert_checked(value);
+            }
+        }
+
         if entry_blocks.count() == 0 {
             return vars;
         }
@@ -984,6 +1031,29 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
             // an entry value, and `Argument` would assert a signature position
             // the lifter has not recovered.
             VariableOrigin::EntryLiveIn => true,
+        }
+    }
+
+    /// Checks that every exception clause can be laid out over the function's
+    /// blocks.
+    ///
+    /// Runs at [`VerifyLevel::Quick`]: the check is one pass over the table,
+    /// which is a handful of rows, and a clause that names blocks the function
+    /// does not have is the kind of corruption every later check then reasons
+    /// from.
+    ///
+    /// This is a question about the IR, not about pass robustness. Passes read
+    /// the table through the total accessors and tolerate a stale index by
+    /// losing a root or a barrier; the verifier is where "tolerated" stops
+    /// meaning "valid". A clause whose blocks lie outside this function
+    /// altogether — the funclet handler — is legal and reported by nothing.
+    fn check_exception_table(&mut self) {
+        let block_count = self.ssa.blocks().len();
+        for (clause, handler) in self.ssa.exception_handlers().iter().enumerate() {
+            if let Err(reason) = handler.layout(block_count) {
+                self.errors
+                    .push(VerifierError::MalformedExceptionClause { clause, reason });
+            }
         }
     }
 
@@ -1667,7 +1737,13 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         }
     }
 
-    /// Checks native opaque clobber and effect-summary consistency.
+    /// Checks effect-summary consistency and terminator agreement.
+    ///
+    /// An operation's effect summary is the only channel a pass consults, so
+    /// the invariants it has to satisfy — a fence declaring fence semantics, a
+    /// block-ending control effect belonging to a terminator and only to one —
+    /// are checked against the operation itself rather than against a parallel
+    /// restatement of them.
     fn check_native_effects(&mut self) {
         for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
@@ -1693,34 +1769,51 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                         "op with a block-ending control effect must be a terminator",
                     );
                 }
+            }
+        }
+    }
 
-                if let SsaOp::NativeOpaque(data) = instr.op() {
-                    let clobbers = &data.clobbers;
-                    let effects = &data.effects;
-                    for clobber in clobbers {
-                        self.check_native_clobber(block_idx, instr_idx, clobber);
-                    }
-                    if effects.is_pure()
-                        && clobbers.iter().any(|clobber| {
-                            matches!(
-                                clobber,
-                                NativeClobber::Register(_)
-                                    | NativeClobber::RegisterClass(_)
-                                    | NativeClobber::Flags(_)
-                                    | NativeClobber::Memory(_)
-                                    | NativeClobber::Other(_)
-                            ) || matches!(
-                                clobber,
-                                NativeClobber::MachineState(access) if access.writes()
-                            )
-                        })
-                    {
+    /// Checks that flag-selecting operations name flags the IR defines.
+    ///
+    /// Two shapes, both of which make an operation claim something about flags
+    /// that nothing else in the crate can interpret.
+    ///
+    /// A [`SsaOp::ReadFlags`] mask with bits outside [`FlagsMask::NAMED`]
+    /// selects a flag this crate has no name for. [`FlagsMask::from_bits`] is
+    /// unmasked on purpose — a persisted mask must round-trip so the bits can be
+    /// *reported* rather than silently dropped — which makes reporting them
+    /// this check's job. The empty mask stays legal: selecting no flags is a
+    /// legal thing to ask for.
+    ///
+    /// A [`SsaOp::FlagAdjust`] whose output count differs from
+    /// [`FlagAdjustKind::output_arity`] has written architectural state and
+    /// handed back the wrong number of values to model it. An adjustment
+    /// declaring a result and carrying none is the dangerous direction: the
+    /// write is unobservable, and an effect summary derived from the kind alone
+    /// would call it pure and let dead-code elimination take it.
+    ///
+    /// [`FlagsMask::NAMED`]: crate::ir::ops::FlagsMask::NAMED
+    /// [`FlagsMask::from_bits`]: crate::ir::ops::FlagsMask::from_bits
+    /// [`FlagAdjustKind::output_arity`]: crate::ir::ops::FlagAdjustKind::output_arity
+    fn check_flag_masks(&mut self) {
+        for (block_idx, block) in self.ssa.blocks().iter().enumerate() {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                match instr.op() {
+                    SsaOp::ReadFlags { mask, .. } if !mask.is_valid() => {
                         self.invalid_native(
                             block_idx,
                             instr_idx,
-                            "pure native opaque operation cannot declare clobbers",
+                            "flag mask selects bits that name no defined flag",
                         );
                     }
+                    SsaOp::FlagAdjust(data) if data.outputs.len() != data.kind.output_arity() => {
+                        self.invalid_native(
+                            block_idx,
+                            instr_idx,
+                            "flag adjustment output count does not match its kind",
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1789,33 +1882,6 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
 
         if effects.volatile && effects.memory_semantics == MemoryAccessSemantics::None {
             self.invalid_native(block, instr_idx, "volatile effect must access memory");
-        }
-    }
-
-    /// Checks native clobber descriptors for structural validity.
-    fn check_native_clobber(&mut self, block: usize, instr_idx: usize, clobber: &NativeClobber) {
-        match clobber {
-            NativeClobber::MachineState(access) => {
-                if !access.is_valid() {
-                    self.invalid_native(block, instr_idx, "invalid machine-state access");
-                }
-                if matches!(access.kind, NativeStateAccessKind::Clobber) && !access.writes() {
-                    self.invalid_native(block, instr_idx, "clobber access must write state");
-                }
-            }
-            NativeClobber::Register(register) => {
-                if !register.is_valid() {
-                    self.invalid_native(block, instr_idx, "invalid native register clobber");
-                }
-            }
-            NativeClobber::RegisterClass(name)
-            | NativeClobber::Flags(name)
-            | NativeClobber::Memory(name)
-            | NativeClobber::Other(name) => {
-                if name.is_empty() {
-                    self.invalid_native(block, instr_idx, "native clobber name cannot be empty");
-                }
-            }
         }
     }
 
@@ -2048,23 +2114,15 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
     ///
     /// For phi operands, the use is considered to be at the end of the predecessor
     /// block (not at the phi's block), following standard SSA semantics.
-    fn check_dominance(
-        &mut self,
-        cfg: &SsaCfg<'_, T>,
-        dom_tree: &DominatorTree,
-        definitions: &VarMap<(usize, DefSite)>,
-    ) {
-        // Compute reachable blocks
+    fn check_dominance(&mut self, dominance: &EhDominance, definitions: &VarMap<(usize, DefSite)>) {
         let block_count = self.ssa.block_count().max(1);
+        let tree = dominance.tree();
         let mut reachable = BitSet::new(block_count);
-        let mut worklist = vec![0usize];
-        while let Some(block_idx) = worklist.pop() {
-            if block_idx < block_count && reachable.insert(block_idx) {
-                for &succ in cfg.block_successors(block_idx) {
-                    if succ < block_count {
-                        worklist.push(succ);
-                    }
-                }
+        for block_idx in 0..block_count {
+            // Reachability the tree already knows, over the exception-aware
+            // view -- so a handler is checked rather than skipped.
+            if tree.is_reachable(NodeId::new(block_idx)) {
+                reachable.insert_checked(block_idx);
             }
         }
 
@@ -2093,11 +2151,9 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                             continue;
                         }
                         // Definition must dominate use block
-                        let def_node = NodeId::new(def_block);
-                        let use_node = NodeId::new(block_idx);
-                        if def_node.index() < dom_tree.node_count()
-                            && use_node.index() < dom_tree.node_count()
-                            && !dom_tree.dominates(def_node, use_node)
+                        if def_block < block_count
+                            && block_idx < block_count
+                            && !dominance.definition_is_well_formed(def_block, block_idx)
                         {
                             self.errors.push(VerifierError::DominanceViolation {
                                 var: used_var,
@@ -2125,11 +2181,9 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                             continue;
                         }
                         // Definition must dominate the predecessor block
-                        let def_node = NodeId::new(def_block);
-                        let pred_node = NodeId::new(pred_block);
-                        if def_node.index() < dom_tree.node_count()
-                            && pred_node.index() < dom_tree.node_count()
-                            && !dom_tree.dominates(def_node, pred_node)
+                        if def_block < block_count
+                            && pred_block < block_count
+                            && !dominance.definition_is_well_formed(def_block, pred_block)
                         {
                             self.errors.push(VerifierError::DominanceViolation {
                                 var: used_var,
@@ -2141,5 +2195,101 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ir::{
+            block::SsaBlock,
+            exception::{BlockRange, SsaExceptionHandler},
+            instruction::SsaInstruction,
+            ops::SsaOp,
+            variable::{DefSite, VariableOrigin},
+        },
+        testing::{MockTarget, MockType},
+    };
+
+    /// A merge value at an exception root is defined by entering the handler,
+    /// so neither the registration check nor the defined-before-use check may
+    /// demand an instruction for it.
+    ///
+    /// The same shape at the **entry** block stays reportable: the entry is not
+    /// an exception root, nothing dispatches to it, and a phi-shaped site there
+    /// with no phi really is an undefined read.
+    #[test]
+    fn a_merge_value_at_an_exception_root_is_not_an_undefined_use() {
+        /// `root` is where the merge value is registered as defined.
+        fn function_with_merge_value_at(root: usize) -> SsaFunction<MockTarget> {
+            let mut ssa = SsaFunction::<MockTarget>::new(0, 1);
+            // Registered as defined at the top of `root`, with no phi node.
+            // Version 1, not 0: version 0 at the entry block is how an argument
+            // or an initialized local is spelled, and is entry-defined by
+            // design, so it would not discriminate.
+            let merged = ssa.create_variable(
+                VariableOrigin::Local(0),
+                1,
+                DefSite::phi(root),
+                MockType::I32,
+            );
+
+            let mut entry = SsaBlock::new(0);
+            entry.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+            ssa.add_block(entry);
+
+            let mut guard = SsaBlock::new(1);
+            guard.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+            ssa.add_block(guard);
+
+            // The handler reads the merge value.
+            let mut handler = SsaBlock::new(2);
+            handler.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+                value: Some(merged),
+            }));
+            ssa.add_block(handler);
+
+            let mut join = SsaBlock::new(3);
+            join.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+            ssa.add_block(join);
+
+            ssa.set_exception_handlers(vec![SsaExceptionHandler {
+                flags: 0,
+                try_offset: 0,
+                try_length: 0,
+                handler_offset: 0,
+                handler_length: 0,
+                class_token_or_filter: 0,
+                protected_range: BlockRange::new(1, 2),
+                handler_range: BlockRange::new(2, 3),
+                filter_range: None,
+            }]);
+            ssa.recompute_uses();
+            ssa
+        }
+
+        let at_root = function_with_merge_value_at(2);
+        for level in [VerifyLevel::Standard, VerifyLevel::Full] {
+            let errors = SsaVerifier::new(&at_root).verify(level);
+            assert!(
+                !errors.iter().any(|error| matches!(
+                    error,
+                    VerifierError::UndefinedUse { .. } | VerifierError::UnregisteredVariable { .. }
+                )),
+                "a merge value at an exception root must verify clean at {level:?}: {errors:?}"
+            );
+        }
+
+        // The same shape where no runtime dispatch can define it.
+        let at_entry = function_with_merge_value_at(0);
+        let errors = SsaVerifier::new(&at_entry).verify(VerifyLevel::Standard);
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                VerifierError::UndefinedUse { .. } | VerifierError::UnregisteredVariable { .. }
+            )),
+            "the entry block is not an exception root, so this is still undefined: {errors:?}"
+        );
     }
 }

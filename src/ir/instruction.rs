@@ -244,7 +244,7 @@ impl<T: Target> SsaInstruction<T> {
     }
 
     /// Returns all SSA variables defined by this instruction.
-    pub fn defs(&self) -> impl Iterator<Item = SsaVarId> + '_ {
+    pub fn defs(&self) -> impl Iterator<Item = SsaVarId> {
         self.op.defs()
     }
 

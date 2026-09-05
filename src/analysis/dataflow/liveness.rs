@@ -61,7 +61,7 @@ use crate::{
 /// use analyssa::{
 ///     analysis::{
 ///         dataflow::{DataFlowSolver, LiveVariables},
-///         SsaCfg,
+///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing,
@@ -69,7 +69,7 @@ use crate::{
 ///
 /// // Block 1 defines the loop counter phi; block 2 returns it.
 /// let ssa = testing::loop_counter_fixture();
-/// let graph = SsaCfg::from_ssa(&ssa);
+/// let graph = EhCfg::from_ssa(&ssa);
 ///
 /// let analysis = LiveVariables::new(&ssa);
 /// let solver = DataFlowSolver::new(analysis);
@@ -355,6 +355,16 @@ impl MeetSemiLattice for LivenessResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        ir::{
+            SsaBlock, SsaInstruction,
+            ops::SsaOp,
+            phi::{PhiNode, PhiOperand},
+            value::ConstValue,
+            variable::{DefSite, VariableOrigin},
+        },
+        testing::{MockTarget, MockType},
+    };
 
     /// A value consumed *only* by a successor's phi is live across the edge, but
     /// never appears in the solver's `out_state`: phi-operand uses are relocated
@@ -363,17 +373,6 @@ mod tests {
     /// allocator reading it would reuse a register that is still live.
     #[test]
     fn live_out_includes_values_a_successor_phi_consumes() {
-        use crate::{
-            ir::{
-                SsaBlock, SsaInstruction,
-                ops::SsaOp,
-                phi::{PhiNode, PhiOperand},
-                value::ConstValue,
-                variable::{DefSite, VariableOrigin},
-            },
-            testing::{MockTarget, MockType},
-        };
-
         // B0 defines `v` and jumps to B1, whose phi is `v`'s only consumer.
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
         let value = ssa.create_variable(

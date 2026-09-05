@@ -94,8 +94,7 @@ fn memory_fixture_feeds_memory_ssa_and_effect_queries() {
     let ssa = memory_effect_fixture();
     assert_valid(&ssa, VerifyLevel::Full);
 
-    let cfg = SsaCfg::from_ssa(&ssa);
-    let memory = MemorySsa::build(&ssa, &cfg, PointerSize::Bit64);
+    let memory = MemorySsa::build(&ssa, PointerSize::Bit64);
     let stats = memory.stats();
     assert!(
         stats.store_count >= 2,

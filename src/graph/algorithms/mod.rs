@@ -25,12 +25,23 @@
 //! ## Dominator Analysis
 //!
 //! - [`compute_dominators`] - Compute the dominator tree using Lengauer-Tarjan
+//! - [`compute_dominators_rooted`] - The same, rooted at the graph's own entry
 //! - [`compute_dominance_frontiers`] - Compute dominance frontiers for SSA
 //! - [`DominatorTree`] - Result of dominator computation
+//!
+//! ## Post-Dominance and Control Dependence
+//!
+//! - [`compute_post_dominators`] - Post-dominance, over the graph reversed and
+//!   rooted at a virtual exit
+//! - [`control_dependences`] - Which branch decides whether each node runs
+//! - [`PostDominatorTree`] / [`ControlDependences`] - Results indexed by the
+//!   original nodes, with the virtual exit kept out of every answer
+//! - [`ReverseGraph`] - The reversed, exit-rooted view both are computed on
 //!
 //! ## Strongly Connected Components
 //!
 //! - [`strongly_connected_components`] - Tarjan's SCC algorithm
+//! - [`condensation`] - The DAG of those components
 //!
 //! # Algorithm Selection
 //!
@@ -40,6 +51,7 @@
 //! | Topological Sort | O(V + E) | Dependency ordering |
 //! | Dominators | O(V α(V)) | SSA construction, loop analysis |
 //! | SCC | O(V + E) | Recursion detection, call graph analysis |
+//! | Post-dominance | O(V + E) then O(V α(V)) | Control dependence, structuring |
 //!
 //! # Examples
 //!
@@ -85,6 +97,7 @@
 
 mod cycles;
 mod dominators;
+mod postdom;
 mod scc;
 mod topological;
 mod traversal;
@@ -94,6 +107,10 @@ pub use cycles::{find_cycle, has_cycle};
 #[allow(unused_imports)]
 pub use dominators::{
     DominatorTree, compute_dominance_frontiers, compute_dominators, compute_dominators_rooted,
+};
+pub use postdom::{
+    ControlDependences, PostDominatorTree, ReverseGraph, compute_post_dominators,
+    control_dependences,
 };
 pub use scc::{condensation, strongly_connected_components};
 pub use topological::topological_sort;

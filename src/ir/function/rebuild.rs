@@ -51,13 +51,14 @@ use crate::{
     BitSet, Error, Result,
     analysis::{
         cfg::SsaCfg,
+        exceptions::{EhCfg, FunctionRoots},
         liveness,
         phis::{PhiPlacementConfig, place_pruned_phis},
         verifier::{SsaVerifier, VerifierError, VerifyLevel},
     },
     graph::{
-        NodeId, RootedGraph,
-        algorithms::{DominatorTree, compute_dominance_frontiers, compute_dominators},
+        NodeId,
+        algorithms::{compute_dominance_frontiers, compute_dominators},
     },
     ir::{
         block::SsaBlock,
@@ -104,6 +105,15 @@ struct RenameContext<'a, T: Target> {
     /// Built from [`place_pruned_phis`] output so rename can associate each phi
     /// with its group — needed when multiple groups share `Phi` origin.
     phi_groups: &'a BTreeMap<usize, Vec<u32>>,
+
+    /// Groups that must be given a fresh version on entry to an exception
+    /// root, keyed by that root's block. See
+    /// [`SsaRebuilder::compute_root_kills`].
+    root_kills: &'a BTreeMap<usize, BTreeSet<u32>>,
+
+    /// Origin of each rename group, for minting a merge value at an exception
+    /// root.
+    group_origins: &'a BTreeMap<u32, VariableOrigin>,
 
     /// Number of method arguments (including `this` for instance methods).
     /// Used for computing default group IDs from `VariableOrigin::Argument`.
@@ -211,10 +221,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
         // Include exception handler entries as roots
         for handler in &ssa.exception_handlers {
-            for block in [handler.handler_start_block, handler.filter_start_block]
-                .into_iter()
-                .flatten()
-            {
+            for block in handler.entry_blocks() {
                 if block < block_count && !reachable.contains(block) {
                     worklist.push(block);
                     while let Some(b) = worklist.pop() {
@@ -272,6 +279,11 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         self.rename(); // Phase 12
 
         // Stage 5: Cleanup & compaction
+        // A phi operand names a terminator edge; a block the runtime dispatches
+        // to has none, so a phi placed there is unrepresentable. Removing it
+        // before trivial-phi elimination also stops that pass folding such a
+        // phi onto whichever operand happens to be reachable.
+        self.ssa.demote_runtime_entry_phis(); // Phase 12b
         self.eliminate_trivial_phis(); // Phase 13
         self.ssa.strip_nops(); // Phase 14
         self.ssa.compact_variables(); // Phase 15
@@ -279,6 +291,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         self.ssa.reindex_variables(); // Phase 17
         self.repair_same_block_future_uses(); // Phase 17b
         // reindex can cause stale phi operand refs to collide with new IDs
+        self.ssa.demote_runtime_entry_phis(); // Phase 17c
         self.eliminate_trivial_phis(); // Phase 18
         // Phi elimination leaves the eliminated results as orphaned rows in
         // `variables` (it cannot drop them itself without breaking the
@@ -308,7 +321,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                     | VerifierError::MissingPhiOperand { block, .. }
                     | VerifierError::ExtraPhiOperand { block, .. }
                     | VerifierError::MissingTerminator { block }
-                    | VerifierError::PhiInEntryBlock { block, .. }
+                    | VerifierError::PhiWithoutPredecessors { block, .. }
                     | VerifierError::TerminatorNotLast { block, .. }
                     | VerifierError::IntraBlockCycle { block, .. }
                     | VerifierError::PlaceholderVariable { block, .. }
@@ -329,6 +342,13 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                     // A variable that *is* read but has no definition is reported
                     // as `UndefinedUse` instead, and is not filtered here.
                     VerifierError::OrphanVariable { .. } => return false,
+                    // A malformed exception clause is not an SSA defect and is
+                    // not something reconstruction touches: the rebuild rewrites
+                    // definitions and phis, never a clause's block ranges. It is
+                    // reported where it can be acted on -- by the verifier a
+                    // caller runs -- rather than here, where it would fail a
+                    // rebuild that had no way to fix it.
+                    VerifierError::MalformedExceptionClause { .. } => return false,
                 };
                 // Keep errors for reachable blocks (or block-independent errors)
                 block.is_none_or(|b| self.reachable.contains(b))
@@ -1205,22 +1225,29 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             }
         }
 
-        // Second pass: rebuild CFG from cleaned-up SSA (no phantom edges).
-        // The cfg borrow of self.ssa must end before merge_handler_dom_trees
-        // borrows &mut self, so we scope it in a block.
-        let (dom_tree, entry_node) = {
-            let cfg = SsaCfg::from_ssa(self.ssa);
-            let dom_tree = compute_dominators(&cfg, cfg.entry());
-            self.dominance_frontiers = compute_dominance_frontiers(&cfg, &dom_tree);
+        // Second pass: rebuild the flow view from the cleaned-up SSA.
+        //
+        // Rooted at `EhCfg`, not the terminator relation: a handler or filter
+        // entry is reachable there by construction, so one dominator tree and
+        // one frontier pass cover the whole function. Rooting at the entry
+        // block alone leaves every handler unreachable, which is why this used
+        // to need a second, per-handler dominator computation merged in after
+        // the fact -- N root-local trees that give contradictory `dominates`
+        // answers for any block reachable from two of them.
+        {
+            let eh = EhCfg::from_ssa(self.ssa);
+            let dom_tree = compute_dominators(&eh, NodeId::new(0));
+            self.dominance_frontiers = compute_dominance_frontiers(&eh, &dom_tree);
 
-            // Extract successor map (only for reachable blocks)
+            // Successors include the synthesized exceptional edges. Phi
+            // placement prunes on liveness, and terminator-only liveness would
+            // prune a phi the exception-aware frontier legitimately demands.
+            let successor_lists = eh.successor_lists();
             for i in self.reachable.iter() {
                 self.successor_map
-                    .insert(i, cfg.block_successors(i).to_vec());
+                    .insert(i, successor_lists.get(i).cloned().unwrap_or_default());
             }
 
-            // Extract dominator tree children (only for reachable blocks)
-            let entry_node = cfg.entry();
             for i in self.reachable.iter() {
                 self.dom_children.insert(
                     i,
@@ -1233,96 +1260,6 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
                         .map(|n| n.index())
                         .collect(),
                 );
-            }
-
-            (dom_tree, entry_node)
-        };
-
-        self.merge_handler_dom_trees(&dom_tree, entry_node);
-    }
-
-    /// Merges local dominator trees for exception handler roots into the main structures.
-    ///
-    /// Handler/filter entries not dominated by the entry block are reachable via
-    /// exception flow but not via the normal dominator tree. This computes local
-    /// dom trees for each handler root and merges their `dom_children` and
-    /// `dominance_frontiers` into the main structures so that rename covers all blocks.
-    fn merge_handler_dom_trees(&mut self, dom_tree: &DominatorTree, entry: NodeId) {
-        let cfg = SsaCfg::from_ssa(self.ssa);
-        // IMPORTANT: The handler BFS must NOT cross into blocks already in the
-        // main dom tree. If it did, the handler's local dom tree could create
-        // parent→child relationships that conflict with the main tree, introducing
-        // cycles in dom_children and causing rename_block_recursive to loop forever.
-        let block_count = self.ssa.blocks.len();
-        let mut main_dom_blocks = BitSet::new(block_count);
-        for b in self.reachable.iter() {
-            if dom_tree.dominates(entry, NodeId::new(b)) {
-                main_dom_blocks.insert(b);
-            }
-        }
-
-        let mut handler_roots: Vec<usize> = Vec::new();
-        for handler in &self.ssa.exception_handlers {
-            for block in [handler.handler_start_block, handler.filter_start_block]
-                .into_iter()
-                .flatten()
-            {
-                if block < block_count
-                    && self.reachable.contains(block)
-                    && !main_dom_blocks.contains(block)
-                {
-                    handler_roots.push(block);
-                }
-            }
-        }
-
-        for &root in &handler_roots {
-            let local_dom = compute_dominators(&cfg, NodeId::new(root));
-            let local_df = compute_dominance_frontiers(&cfg, &local_dom);
-
-            // Collect handler-reachable blocks via BFS from root, stopping at
-            // blocks already in the main dom tree to prevent cycle creation.
-            let mut handler_reachable = BitSet::new(block_count);
-            let mut wl = vec![root];
-            while let Some(b) = wl.pop() {
-                if handler_reachable.insert(b) {
-                    for &succ in cfg.block_successors(b) {
-                        if succ < block_count
-                            && self.reachable.contains(succ)
-                            && !main_dom_blocks.contains(succ)
-                        {
-                            wl.push(succ);
-                        }
-                    }
-                }
-            }
-
-            // Merge dom_children (only for handler-reachable blocks)
-            for b in handler_reachable.iter() {
-                let children: Vec<usize> = local_dom
-                    .children(NodeId::new(b))
-                    .iter()
-                    .filter(|n| n.index() < block_count && handler_reachable.contains(n.index()))
-                    .map(|n| n.index())
-                    .collect();
-                if !children.is_empty() {
-                    self.dom_children.entry(b).or_default().extend(children);
-                }
-            }
-
-            // Merge dominance frontiers
-            for b in handler_reachable.iter() {
-                let Some(local_b) = local_df.get(b) else {
-                    continue;
-                };
-                if b >= self.dominance_frontiers.len() {
-                    let new_len = b.checked_add(1).unwrap_or(self.dominance_frontiers.len());
-                    self.dominance_frontiers
-                        .resize(new_len, BitSet::new(block_count));
-                }
-                if let Some(slot) = self.dominance_frontiers.get_mut(b) {
-                    slot.union_with(local_b);
-                }
             }
         }
     }
@@ -1534,13 +1471,64 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         }
     }
 
+    /// Groups whose reaching value is unknown on entry to each exception root.
+    ///
+    /// Block dominance says a guard ran wholly before the handler it protects.
+    /// The runtime leaves it part-way: the throw happened at some instruction
+    /// inside the protected region, so anything the region assigns may or may
+    /// not have taken effect. A group the region redefines therefore has no
+    /// single reaching value at the root, and renaming must not push the
+    /// guard's version into the handler.
+    ///
+    /// Only groups **live-in** at the root are considered, so a handler that
+    /// never reads a group costs nothing. A group whose definitions all lie
+    /// outside the region is left alone: those assignments completed before the
+    /// region began, and discarding them would lose a value that provably
+    /// reached the handler. When the region's extent is unknown, every live-in
+    /// group is killed, which is the conservative direction.
+    fn compute_root_kills(&self) -> BTreeMap<usize, BTreeSet<u32>> {
+        let roots = FunctionRoots::of(self.ssa);
+        let mut kills: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+        if !roots.has_flow_roots() {
+            return kills;
+        }
+
+        for root in roots.flow_roots() {
+            let region = roots.region_of(root.block);
+            let mut groups: BTreeSet<u32> = BTreeSet::new();
+
+            for (group, def_blocks) in &self.defs {
+                let live_here = self
+                    .live_in
+                    .get(group)
+                    .is_some_and(|blocks| blocks.contains_checked(root.block));
+                if !live_here {
+                    continue;
+                }
+                let unknown = match region.as_ref() {
+                    None => true,
+                    Some(range) => def_blocks.iter().any(|block| range.contains(block)),
+                };
+                if unknown {
+                    groups.insert(*group);
+                }
+            }
+
+            if !groups.is_empty() {
+                kills.insert(root.block, groups);
+            }
+        }
+
+        kills
+    }
+
     /// Places PHI nodes for all groups using iterated dominance frontiers.
     fn place_phis(&mut self) {
         // Leave target resolver for exception handler phi placement
         let leave_target_fn = |block_idx: usize, blocks: &[SsaBlock<T>]| -> Option<usize> {
             blocks
                 .get(block_idx)
-                .and_then(|block| match block.terminator_op() {
+                .and_then(|block| match block.control_terminator() {
                     Some(SsaOp::Leave { target }) => Some(*target),
                     _ => None,
                 })
@@ -1595,6 +1583,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
 
     /// Renames variables after PHI placement during SSA rebuild.
     fn rename(&mut self) {
+        let root_kills = self.compute_root_kills();
         let ctx = RenameContext {
             var_origins: &self.var_origins,
             group_types: &self.group_types,
@@ -1602,6 +1591,8 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             successor_map: &self.successor_map,
             dom_children: &self.dom_children,
             phi_groups: &self.phi_groups,
+            root_kills: &root_kills,
+            group_origins: &self.group_origins,
             num_args: self.ssa.num_args,
         };
 
@@ -1683,10 +1674,7 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         }
 
         for handler in self.ssa.exception_handlers.clone() {
-            for block in [handler.handler_start_block, handler.filter_start_block]
-                .into_iter()
-                .flatten()
-            {
+            for block in handler.entry_blocks() {
                 if self.reachable.contains(block) && !dom_tree_reachable.contains(block) {
                     Self::rename_block_recursive(
                         self.ssa,
@@ -1846,15 +1834,10 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
         let block_count = self.ssa.blocks.len();
         let mut handler_entry_blocks = BitSet::new(block_count);
         for h in &self.ssa.exception_handlers {
-            if let Some(b) = h.handler_start_block
-                && b < block_count
-            {
-                handler_entry_blocks.insert(b);
-            }
-            if let Some(b) = h.filter_start_block
-                && b < block_count
-            {
-                handler_entry_blocks.insert(b);
+            for block in h.entry_blocks() {
+                if block < block_count {
+                    handler_entry_blocks.insert(block);
+                }
             }
         }
 
@@ -2077,6 +2060,14 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
     ) -> BTreeMap<u32, usize> {
         let mut pushed_counts: BTreeMap<u32, usize> = BTreeMap::new();
 
+        Self::mint_root_merge_values(
+            ssa,
+            block_idx,
+            ctx,
+            version_stacks,
+            next_version,
+            &mut pushed_counts,
+        );
         Self::rename_phis(
             ssa,
             block_idx,
@@ -2171,6 +2162,53 @@ impl<'a, T: Target> SsaRebuilder<'a, T> {
             if *old_result != new_var_id {
                 rename_map.insert(*old_result, new_var_id);
             }
+        }
+    }
+
+    /// Gives each group [`SsaRebuilder::compute_root_kills`] named at this block
+    /// a fresh version, standing for "the runtime entered here, so the reaching
+    /// value is unknown".
+    ///
+    /// The variable is registered with a phi-shaped definition site and **no
+    /// phi node**. That is deliberate, and it is what the verifier recognises
+    /// as a value the runtime supplies: a real phi would assert a *known* merge
+    /// over the operands it lists, and at a root whose only other predecessor
+    /// is a terminator edge, trivial-phi elimination would fold it straight
+    /// back to the guard's version -- the value this rule exists to refuse.
+    fn mint_root_merge_values(
+        ssa: &mut SsaFunction<T>,
+        block_idx: usize,
+        ctx: &RenameContext<'_, T>,
+        version_stacks: &mut BTreeMap<u32, Vec<SsaVarId>>,
+        next_version: &mut BTreeMap<u32, u32>,
+        pushed_counts: &mut BTreeMap<u32, usize>,
+    ) {
+        let Some(groups) = ctx.root_kills.get(&block_idx) else {
+            return;
+        };
+
+        for group in groups {
+            let version = *next_version.get(group).unwrap_or(&0);
+            let entry = next_version.entry(*group).or_insert(0);
+            *entry = entry.saturating_add(1);
+
+            let origin = ctx
+                .group_origins
+                .get(group)
+                .copied()
+                .unwrap_or(VariableOrigin::EntryLiveIn);
+            let var_type = ctx
+                .group_types
+                .get(group)
+                .cloned()
+                .unwrap_or_else(T::unknown_type);
+
+            let merged = ssa.create_variable(origin, version, DefSite::phi(block_idx), var_type);
+            ssa.set_rename_group(merged, *group);
+
+            version_stacks.entry(*group).or_default().push(merged);
+            let count = pushed_counts.entry(*group).or_insert(0);
+            *count = count.saturating_add(1);
         }
     }
 

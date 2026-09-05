@@ -54,10 +54,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    analysis::{
-        cfg::SsaCfg,
-        memory::{MemoryDefSite, MemoryLocation, MemoryOp, MemorySsa, MemoryVersion},
-    },
+    analysis::memory::{MemoryDefSite, MemoryLocation, MemoryOp, MemorySsa, MemoryVersion},
     events::{Event, EventKind, EventListener},
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
@@ -118,8 +115,7 @@ where
     L: EventListener<T> + ?Sized,
 {
     let rewrites = {
-        let cfg = SsaCfg::from_ssa(ssa);
-        let mem_ssa = MemorySsa::build(ssa, &cfg, ptr_size);
+        let mem_ssa = MemorySsa::build(ssa, ptr_size);
         plan_rewrites(ssa, &mem_ssa)
     };
     if rewrites.is_empty() {

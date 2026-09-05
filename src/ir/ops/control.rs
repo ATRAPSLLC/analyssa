@@ -4,10 +4,34 @@
 //! CFG-shaping passes (block merging, jump threading, control-flow
 //! simplification) use when they splice blocks.
 
-use super::*;
-use crate::target::Target;
+use crate::{
+    ir::{ops::def::SsaOp, variable::SsaVarId},
+    target::Target,
+};
 
 impl<T: Target> SsaOp<T> {
+    /// Builds an integer conversion that cannot overflow.
+    ///
+    /// A representation change — truncating a register to a subregister,
+    /// widening one, relabelling a sign — never traps, so the only
+    /// [`SsaOp::IntConv`] a lifter builds for one carries no overflow check.
+    /// Naming that construction here keeps every caller from restating the same
+    /// five fields, and keeps the question "which conversions does the lift
+    /// emit?" answerable in one place.
+    ///
+    /// `unsigned` selects zero- over sign-extension; it describes the
+    /// *conversion*, not the operand.
+    #[must_use]
+    pub fn int_conv(dest: SsaVarId, operand: SsaVarId, target: T::Type, unsigned: bool) -> Self {
+        Self::IntConv {
+            dest,
+            operand,
+            target,
+            overflow_check: false,
+            unsigned,
+        }
+    }
+
     /// Returns `true` if this operation is a terminator (ends a basic block).
     #[must_use]
     pub const fn is_terminator(&self) -> bool {

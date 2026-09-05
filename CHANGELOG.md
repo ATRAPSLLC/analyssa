@@ -4,6 +4,596 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [Unreleased]
+
+## [0.6.0] - 2026-09-04
+
+Structured control-flow recovery arrives: any control-flow graph becomes a tree
+of statements, total by construction, with the exception model rebuilt
+underneath it — a clause is now three typed block ranges instead of five loose
+indices, and one exception-aware flow view replaces five hand-written copies of
+the same loop. An address becomes a value the IR can carry, so a function,
+global or import stays distinguishable from the integer it lowers to. And the
+native taxonomy gains an identity per instruction where it had one per class,
+with an operation table that keeps those identities injective.
+
+The defects fixed alongside share a shape with the 0.5.0 set, one step further
+out: a fact about the function *asserted from metadata* rather than established
+against the IR as it stands. A leader assumed to be available everywhere it was
+found. A phi identified by an origin that does not identify it. A block index
+taken from a def site, a phi operand, or an exception table and used to index a
+set sized for the current CFG.
+
+### Added
+
+- **`analysis::structure`** — structured control-flow recovery: loops classified
+  by where they test, multi-way branches, protected regions with their handlers,
+  and conditions spanning several blocks (`Predicate`), which is what turns two
+  nested branches back into `a && b`. Total by construction, with `Region::Goto`
+  as the fallback for edges no structured form expresses, so quality is a count
+  (`StructureMetrics::resized_inputs` and `depth_limited`) rather than a
+  precondition.
+
+- **`analysis::structure::BlockSet` and `StructureOptions::max_depth`** — the two
+  types that make the recovery total. `BlockSet` carries the index domain it was
+  built for, so `contains` is total over every `NodeId`; `max_depth` (with
+  `DEFAULT_MAX_DEPTH`) bounds the recovery's stack *and* every later traversal of
+  the result, the derived `Drop` and `Clone` included, and caps how many blocks
+  one condition may fold. Reaching either costs quality, never correctness.
+
+- **`ProtectedHandlerKind` and `HandlerFilter`** — the input side of a handler,
+  split from `HandlerKind`, which now describes only a recovered one. A filter
+  expression rides `ProtectedHandlerKind::Filter`, so a filter without an
+  expression and an expression on a `finally` are unrepresentable.
+
+- **`analysis::recovery`** — the bridge from an `SsaFunction` to that recovery.
+  `structure_ssa` reads the exception table into `ProtectedRegions`, derives
+  condition-only blocks from instructions, and returns `Recovered`: the tree
+  *and* the clauses it could not convert (`RejectedClause`, `ClauseRejection`).
+  Clauses sharing a try range become one region with several handlers, so
+  `try/catch(A)/catch(B)` does not lose a catch.
+
+- **`compute_post_dominators`, `control_dependences` and `ReverseGraph`** in
+  `graph::algorithms`, with `PostDominatorTree` and `ControlDependences` — the
+  results are indexed by the original nodes, over a reversed graph rooted at a
+  virtual exit so a function with several returns, or none, still has one.
+  `immediate_post_dominator` is the single bounds guard, and `strict_controllers`
+  is the answer a doc sentence could not give: under Ferrante-Ottenstein-Warren a
+  loop header lies in its own post-dominance frontier, so walking `controllers`
+  as a parent chain does not terminate. `DominatorTree::is_reachable` exposes
+  reachability the tree already knew, instead of a second BFS.
+
+- **`analysis::exceptions`** — one exception-aware flow view, replacing five
+  hand-written copies of one loop over the exception table: `FunctionRoots`
+  (where control can enter), `EhCfg` (the graph in which those are reachable) and
+  `EhDominance`. The last keeps apart three questions that were one answer used
+  for all of them — `definition_reaches`, which knows a throw can interrupt a
+  guard part-way, `dominates_block`, and the verifier's floor
+  `definition_is_well_formed`.
+
+- **`ExceptionBlocks` and `SsaFunction::exception_blocks`** — the block roles an
+  exception table assigns (`is_runtime_entry`, `is_region_start`,
+  `is_region_end`), indexed once instead of re-derived from five loose
+  `Option<usize>` fields at eleven reader sites. It borrows the function, because
+  an owned snapshot threaded through a mutating fixpoint goes stale unnoticed.
+
+- **`ir::exception::BlockRange`, and one exception clause as three of them.** A
+  clause part is a non-empty half-open block range, and the pairing is the type:
+  a start without its end is not a value `BlockRange` can hold.
+  `SsaExceptionHandler` carries `protected_range`, `handler_range` and
+  `filter_range`, each an `Option`, which is the whole of a clause's legitimate
+  partiality. `parts` and `entry_blocks` are the total views the barriers use;
+  `layout` is the checked one, yielding a `ClauseLayout` and `LaidOutHandler` or
+  an `ExceptionTableError`. `ClausePart` names which part a range belongs to,
+  and `BlockRange::to_bitset` is the crate's only interval-to-set expansion.
+
+- **`ir::exception::HandlerKind` and `Target::handler_kind`** — one handler
+  taxonomy and one classifier, re-exported from `analysis::structure` so the enum
+  the recovery reports and the enum the IR classifies are the same enum.
+
+- **`ExceptionTableError` and `SsaVerifier::check_exception_table`, at
+  `VerifyLevel::Quick`** — reports `VerifierError::MalformedExceptionClause` for
+  a clause whose parts run past the last block, claim each other's blocks, or
+  disagree about being a filter. `EmptyBlockRange` is the deserialization-side
+  refusal of a pair covering no block, the one path no constructor guards.
+
+- **`ConstValue::Symbol(T::SymbolRef)`, with `Target::SymbolRef` and
+  `Target::symbol_address`** — a located or named entity used as a value. It
+  folds exactly as the other reference constants do, which is to say not at all:
+  address arithmetic stays the address model's job. `SymbolRef` is distinct from
+  `MethodRef`, which names a *callable*, and `symbol_address` defaults to `None`,
+  so hosts whose symbols are metadata tokens need write nothing.
+
+- **`passes::algebraic` collapses redundant integer conversion chains.** A lift
+  emits one conversion per width change, so a value narrowed, widened and
+  narrowed again arrives as `(uint16_t)(uint64_t)(uint32_t)x` — 40.8% of `x86_64`
+  conversions took another conversion as their operand. An intermediate is
+  unobservable when the result is no wider than it *and* no wider than the
+  source; where the result is wider, the two are interchangeable exactly when
+  they agree on sign or zero. A conversion that checks overflow is never removed.
+  Over the committed fixtures, `x86_64` integer conversions fell 26.7% and
+  `arm_64` 15.8%; three-deep casts in rendered source fell 64%.
+
+- **`analysis::convert::collapse_conversion_chain`** — that rule as a documented,
+  testable analysis instead of a fast path buried in a pass, with an oracle
+  matrix over all 2048 three-link shapes the mock target can express.
+  `testing::MockConvLink` and `MockConversionChain` build a chain of any depth
+  over any mock integer width, laid out so a test can damage one def site
+  deliberately.
+
+- **`SsaFunction::recorded_definition` and `RecordedDefinition`** — the crate's
+  one guarded, scan-free def-site dereference. A def site is variable *metadata*:
+  an edit that does not restate it leaves it naming whatever instruction now sits
+  at that index, so dereferencing it unchecked answers with a foreign operation
+  rather than failing. `get_definition`, `get_definition_instruction` and
+  `try_constant_value` are built on it.
+
+- **`analysis::cache::FunctionAnalyses`, `scheduling::AnalysisCache` and
+  `CacheStats`** — the derived analyses of one function, each computed at most
+  once and only if asked for, and a per-method cache of those that outlives the
+  visit which built it. The handle borrows the function and hands that borrow
+  back through `ir()`, so pairing two functions' results by mistake fails to
+  compile; the map lock is released before a caller touches an entry, so an
+  analysis never runs under it.
+
+- **Smaller additions.** `SsaOp::first_use` (the first operand without the `Vec`
+  that `uses()` allocates); `PointsTo::empty`, a `const` empty relation a
+  consumer can borrow; `SsaEditor::replace_phi_predecessor_group_for_result`, the
+  origin-keyed rewrite keyed by the phi's result instead;
+  `SsaFunction::demote_runtime_entry_phis`, which removes phis from blocks no
+  terminator transfers to; `SsaCfg::predecessor_blocks` and
+  `to_predecessor_sets`; `SsaBlock::control_terminator`, the crate's single
+  definition of "the terminator"; and `MemorySsa::classify_memory_operation`,
+  now public, since "does this touch memory, and where" is a question a consumer
+  can have without wanting the versioning built on top of it.
+
+- **A payload on every many-to-one system kind** — `CacheMaintenanceOp` (13
+  instructions), `TlbMaintenanceOp` (13), `BarrierOp` (3), `HypervisorOp` (32),
+  `HardwareEngineOp` (12), `InterruptReturnOp` (13), `BreakpointOp` (17),
+  `TrapOp` (16) and `SysRegOp` (72), carried by the matching `SystemOpKind`
+  variants, by the new `SystemOpKind::ControlRegister`, and by `SsaOp::Break`.
+  Five of these classes had been rendering a *representative* member's mnemonic
+  for the whole class, so `clflush` read as `invd` and `xend` as `serialize` —
+  worse than a generic label, because it looks correct. `SsaOp::Break` and
+  `SystemOpKind::Trap` now distinguish `ud2` from a breakpoint trap and
+  `int 0x80` from `int 0x2d`, and `SsaBlockBuilder::break_` takes the
+  `BreakpointOp` as a required argument.
+
+- **`MachineStateOp` and `SystemOpKind::MachineState`**, replacing
+  `SystemOpKind::Privileged` — one variant per operation across 138 instructions,
+  from descriptor tables and port I/O through the CET shadow stack and key locker
+  to the ARM, AArch64 and MIPS machine-state operations. `mnemonic`, `kind_str`,
+  `effects` and `writes_destination_operand` are all per-operation, and there is
+  no catch-all arm to fall into.
+
+- **Eleven `FlagAdjustKind` variants for the x86 flag writers** — the clear/set
+  pairs for carry, direction, alignment check and interrupt, plus
+  `LoadStatusFromReg` (`sahf`), `StoreStatusToReg` (`lahf`) and
+  `SetRegFromCarry` (`salc`) — with `FlagAdjustResult` and
+  `FlagAdjustKind::{result, output_arity, effects, effects_for_outputs,
+  kind_str, mnemonic}`. `flags_written` names the bits each writes and
+  `defines_register` marks the two whose result is a register, so a caller can
+  tell whether a pending comparison survives without knowing the architecture.
+  `SsaBlockBuilder::flag_adjust` and `flag_adjust_state` are the first way to
+  construct one inside this crate, which is why every defect in it was latent.
+
+- **`FlagsMask::DIRECTION`, `INTERRUPT` and `ALIGN_CHECK`, with `NAMED`, `ALL`,
+  `is_valid`, `undefined_bits`, `from_bits_checked`, `intersects` and the
+  matching `NativeFlagBit` variants.** The control flags sit deliberately outside
+  `FlagsMask::x86_status`: no comparison produces them and no condition code
+  reads them. `NAMED` is the one table in bit order, `ALL` a `const` fold of it,
+  `is_valid` its complement, and `Display` a loop over it, so a bit added to the
+  table becomes valid, printable and checkable in one edit.
+
+- **`SsaVerifier::check_flag_masks`, at `VerifyLevel::Standard`** — reports
+  `InvalidNativeOperation` for an `SsaOp::ReadFlags` naming a bit no flag
+  defines, and for an `SsaOp::FlagAdjust` whose output count differs from
+  `FlagAdjustKind::output_arity`. `SsaBlockBuilder::read_flags` refuses the same
+  mask at construction; the verifier's copy is for persisted blobs.
+
+- **Identity for the remaining native kinds** — eight `SysRegOp` variants with
+  `effects` (model-specific, extended-control, control and debug registers, read
+  and written); `SystemOpKind::Hint(HintOp)`, the carrier that makes `endbr64`
+  distinguishable from padding, whose effects keep a lifted `nop` non-removable
+  without making it a memory barrier; `SystemTransactionKind::ResumeLoadTracking`
+  and `SuspendLoadTracking` with `{mnemonic, kind_str, effects}`;
+  `PacKind::kind_str` and `mnemonic`, keeping the sign/authenticate pair apart;
+  and eight `FpuControlKind` variants for the SSE control word and the `xsave`
+  family.
+
+- **`ir::ops::table`, `OpKindTable` and `OpKindIter`** — the contract every
+  operation-kind enum shares: a pinned `COUNT`, an index-to-variant `from_index`,
+  an injective `kind_str`, an optional `mnemonic`, and an `all` iterator. Sixteen
+  enums implement it, and one registry drives the count, spelling and cross-table
+  injectivity checks for all of them at once. `SystemOpKind::identities` and
+  `ComputeKind::identities` extend that to the two payload-carrying taxonomies,
+  built family by family from an exhaustive `family()` match because Rust cannot
+  count the variants of an enum with payloads.
+
+### Changed
+
+- **Breaking.** **`Target` gains a required `SymbolRef` associated type and
+  `ConstValue` gains a `Symbol` variant**, so implementors and exhaustive matches
+  both need updating; a host with no notion of a symbol can point `SymbolRef` at
+  any `Clone + Eq + Hash + Debug` type. `const_value_i64` reads a symbol's
+  address, so it does not vanish from address normalisation, `AliasKey` and the
+  range analyses, and Display and `serde` bounds across the IR data model follow
+  the new variant.
+
+- **Breaking.** **`SsaOp::defs` returns an owning `SsaDefs`, which loses its
+  lifetime parameter**; `SsaDefs::new` goes with the change. The iterator is the
+  `Def`- and `FlagsDef`-role operands of `SsaOp::visit_operands`, so it cannot
+  disagree with `SsaOp::dest`, `SsaOp::flags_dest` or `SsaOp::replace_def`, and
+  it holds two definitions without allocating.
+
+- **The operand policy of the forty-five boxed-payload operations is written
+  once** — `outputs` are definitions, `inputs` are uses, definitions come first,
+  and the stack effect is `(inputs.len(), outputs.len())`, in one blanket
+  implementation no payload type can override. A payload struct that grows a
+  field no longer compiles until someone decides whether it is an operand.
+
+- **Breaking.** **`Display` for seventeen operations separates operands with `, `
+  instead of a space** — the vector operations with boxed payloads plus
+  `FpTranscendental` and `FpuControl`. Two spellings of one list were maintained
+  across forty-five render arms; the rendering is now one helper.
+  `VectorSegmentLoad` renders its destinations the way every other operation
+  does rather than `Debug`-formatting a `Vec`.
+
+- **Breaking.** **`analysis::structure`'s caller-supplied block sets are
+  `BlockSet` rather than `BitSet`, and `StructureOptions` gained a required
+  `max_depth`** — every struct literal must be rewritten. `StructureOptions` also
+  gains `Debug`, `Clone`, `PartialEq` and `Eq`.
+
+- **Two shapes recover one level flatter.** `Structured::labels` is now exactly
+  the set of `Region::Goto` targets, since a block placed at top level because no
+  region owned it is reached by falling into it rather than by jumping to it. And
+  a conditional whose first arm cannot fall through returns the other arm as the
+  resume point instead of nesting it as an `else`, so `if (c) return; ..` stays
+  one level deep however often it repeats — which keeps the early-return spine,
+  ordinary in decompiled input, off the depth bound.
+
+- **The conversion-chain collapse moved out of `passes::algebraic` into
+  `analysis::convert`**, whose contract permits the def-use walk that
+  `analysis::algebraic`'s O(1)-per-operation contract does not. The pass now
+  decides only how to spell the answer, its module header states the bound as
+  O(n + C·d), and it no longer allocates per instruction: the operand-type
+  binding it used to build and discard is gone, the remaining lookup going
+  through `SsaOp::first_use`.
+
+- **Breaking.** **`MockType` gains `MockType::I8` and `MockType::I16`**, which
+  make the conversion rule's (width, signedness) space a space rather than a
+  pair, and give `analysis::algebraic`'s 8- and 16-bit constant widths their
+  first test coverage. Exhaustive matches on this fixture enum need two arms.
+
+- **Breaking.** **`VerifierError::PhiInEntryBlock` becomes
+  `PhiWithoutPredecessors`.** A phi operand names the terminator edge it arrived
+  along, so the rule is about having no incoming edges rather than about being
+  block 0 — a handler entry the runtime dispatches to has none either, and a
+  zero-operand phi there, previously reported nowhere, is now an error. The
+  rebuild runs `demote_runtime_entry_phis` before each trivial-phi elimination,
+  so the crate cannot emit IR its own verifier rejects.
+
+  `SsaRebuilder` also roots dominance at the exception-aware view, replacing the
+  per-handler dominator computation merged in afterwards: N root-local trees give
+  contradictory `dominates` answers for a block reachable from two of them, and
+  each cost a whole-CFG pass. Entering a handler now kills the groups the
+  protected region may have reassigned, since the runtime dispatches from
+  part-way through the region and those groups have no single reaching value.
+
+- **Breaking.** **`SsaFunction::block_predecessors`, `block_successors`,
+  `compute_predecessors` and `block_has_successor` are removed**;
+  `analysis::SsaCfg` is the only place the crate derives a CFG relation. Two
+  relations answered "which blocks flow into this one" under near-identical names
+  on two types, and disagreed in three ways: the removed ones spliced in an
+  exception edge, deduplicated inconsistently, and dropped self-loops.
+  `SsaCfg::block_predecessors` is the exact inverse of `block_successors`,
+  multiplicity included. `LoopInfo::preheader` therefore counts distinct
+  predecessor blocks rather than edges, so a header entered twice from one block
+  by `Branch c, header, header` still has a preheader, and `passes::blockmerge`
+  refuses to inline an entry trampoline across an exception-region boundary
+  explicitly, where that refusal was an accident of the spliced edge.
+
+- **Breaking.** **`SsaBlock::terminator` and `terminator_op` are renamed to
+  `last_instruction` and `last_op`.** Both were the block's last instruction
+  unconditionally, while all 35 call sites were asking a control-flow question,
+  which `SsaCfg::from_ssa` answered a third way. `control_terminator` is now that
+  question, and every successor, target and editor path routes through it. Two
+  behaviours follow, both on IR the verifier already reports as
+  `TerminatorNotLast`: a block whose last instruction is not a terminator
+  contributes no CFG edges, and `set_target` **appends** a `Jump` rather than
+  writing over the last instruction, which previously deleted a computation the
+  block still needed.
+
+- **Breaking.** **`analysis::SsaCfg` no longer draws an edge from a protected
+  region to its handler**, so a block's successor count is its terminator's
+  arity. The synthetic edge was the wrong *edge* — control reaches a handler from
+  wherever it threw, not from the region's first block — it fired for 1 of 29
+  clauses on the corpus's one exception-carrying fixture, and it broke arity for
+  every other consumer. A consumer needing handler reachability reads
+  `SsaFunction::exception_handlers`.
+
+- **Breaking.** **An exception clause is three `Option<BlockRange>` parts, not
+  five loose block indices.** Every struct literal and field read of
+  `SsaExceptionHandler` changes, and its `Debug`, `Clone` and serde forms change
+  shape, so a host persisting the serde form must migrate. `filter_offset` is
+  gated on `SsaExceptionHandler::kind`, so `class_token_or_filter` is read as an
+  IL offset only where it is one, and `remap_block_indices` maps each part by its
+  members — exact for the order-preserving remap compaction performs, and a
+  superset otherwise, which is the conservative direction.
+
+- **Breaking.** **`Target::handler_kind` replaces `Target::is_filter_handler`.**
+  Every host `impl Target` fails to compile until it supplies the new one; in
+  this crate only `MockTarget`, which reads its `u32` flags as 0 = catch,
+  1 = filter, 2 = finally, 3 = fault. `filter_offset` therefore answers `Some`
+  for flags 1, where it previously answered `None` for everything.
+
+- **Everything that reads a clause now reads it through the same accessors.**
+  `passes::blockmerge` fences every part of every clause via
+  `SsaExceptionHandler::parts`, so a merge at a filter's exclusive end no longer
+  happens, and `ExceptionBlocks` and `FunctionRoots` go through `BlockRange` too.
+  `SsaVerifier::verify` can consequently report errors for functions it
+  previously accepted, at every level including `VerifyLevel::Quick`; passes are
+  unaffected, and `rebuild_ssa` filters the new error out, since reconstruction
+  never rewrites a clause's ranges.
+
+- **The edit-scope boundary now leaves both the def sites and the use index
+  exact, for every scope.** `repair_ssa` and `rebuild_ssa` rewrite instructions
+  and variables without restoring the index, so an edit above `UsesOnly` finished
+  with an index that no longer described the function — and that index is the
+  candidate list `replace_uses_checked_indexed` iterates, so the next pass's
+  rewrites were being chosen from it.
+
+- **Breaking.** **Post-dominance seeds one virtual-exit edge per exit-less
+  region, not per stranded node**, and `compute_post_dominators` /
+  `control_dependences` return the two new result types. The old seeding
+  established a *forward* property — "this node reaches no sink" — with a walk
+  that only moved backwards. On `0 -> 1 -> 2 -> 1` the virtual exit gained edges
+  to both 0 and 1, so node 1 stopped post-dominating node 0 although it is node
+  0's only successor, and node 1 was reported control dependent on a block with
+  one unconditional successor.
+
+  Seeding is now one edge per terminal strongly connected component, which
+  unifies the two cases: a terminal singleton with no successors is exactly a
+  real sink. Graphs where every node reaches a sink are bit-identical, seed order
+  included, and the O(V²) rescan becomes O(V + E). `control_dependences` returns
+  `node_count` rows rather than `node_count + 1`; the extra row was provably
+  always empty.
+
+- **Breaking.** **`MemorySsa::build` drops its `cfg` parameter, and Memory SSA is
+  rooted at handler and filter entries.** Handler blocks were unreachable in the
+  terminator-only CFG, so phi placement and renaming skipped them: a store inside
+  a handler reached the rejoin block with no merge point, and `passes::memory`
+  forwarded the try-path store into a load there — the wrong value on every path
+  that actually threw. A depth-1 handler still got its phi by accident, because
+  `compute_dominance_frontiers` inserts before it notices the unreachable-node
+  sentinel, which is why the suite was green.
+
+  `MemoryDefSite::ExceptionEntry` is the other half of the rule: the runtime
+  dispatches into a handler from part-way through the protected region, so a
+  store that region makes is not known to have run. Its locations get a version
+  standing for "unknown", which `passes::memory` declines by construction. A
+  store that completed *before* the region is unaffected.
+
+- **Breaking.** **`SsaOp::FlagAdjust` effects and identity are derived from
+  `FlagAdjustKind`.** The operation sat in a shared "pure value-producing
+  compute" arm that never inspected the kind — right while the enum held only
+  NZCV producers, but `cld`, `std`, `clac` and `stac` write control flags no SSA
+  operand models, so `removable_when_unused()` said yes and dead-code elimination
+  silently removed the SMAP window around a user-pointer access. Purity now
+  follows `FlagAdjustKind::result`, and `opcode_name` and `Display` read the kind
+  instead of emitting a constant `"flags.adjust"`; the spellings come from the
+  private table `coarse_token` already used, so coarse tokens are byte-identical.
+
+- **`FlagAdjustKind::flags_written` reports OVERFLOW for `setf8`/`setf16`.**
+  AArch64 `setf8`/`setf16` write N, Z **and** V and leave C alone; V is the point
+  of the instruction. Reporting only N and Z told a caller a stale V was still
+  live, which folds a `b.vs` against a flag `setf8` had overwritten.
+
+- **Breaking.** **The system and compute taxonomies have one representation per
+  instruction, so several `kind_str` fingerprints move** — `rdmsr` is
+  `"system.sysreg.msr.read"`, `rdtscp` is `"system.timestamp.aux"`, every
+  `PacKind` reads `"compute.pac.*"`, and `HintOp` is spelled `"system.hint.*"`.
+  These keys are checked injective over the union of every table plus both
+  composites' `identities()`. `SsaFeatureToken` and `similarity_class`
+  fingerprints move with them, so a host caching them should invalidate;
+  `coarse_token` is unaffected.
+
+- **Breaking.** **Two effect and mnemonic corrections in the native tables.**
+  RISC-V `csrrw`, `csrrs` and `csrrc` are `ReadWrite`, each reading a CSR and
+  writing it back in one instruction, while ARM `ldc` is `Read`; and
+  `MachineStateOp::mnemonic` for `InterruptDisable` and `InterruptEnable` is
+  `"di"` and `"ei"`, the MIPS spellings those variants name.
+
+- **`FlagsMask::Display` renders undefined bits as `?0x…`.** `from_bits` stays
+  unmasked so a persisted mask round-trips exactly; what makes that safe is that
+  a bit outside `FlagsMask::NAMED` is now visible everywhere, rather than
+  printing `none` or a truncated but plausible-looking list.
+
+- **`SsaOp::coarse_token` no longer normalizes its `kind_str` inputs.** Five arms
+  lowercased and trimmed a crate literal into a fresh `String`, which cannot
+  change the answer: every registered table's keys are pinned equal to their own
+  normalized form. The host-supplied mnemonic arm still normalizes, because that
+  string comes from a decoder.
+
+### Removed
+
+- **`SsaOp::set_dest`.** Nothing called it — not this crate, its tests, its
+  benches or its fuzz targets — and SSA renaming rewrites definitions through
+  `SsaOp::replace_def`, which handles secondary outputs too. It also disagreed
+  with the operand walk about `Call`, `CallVirt` and `CallIndirect`, where it
+  *created* a destination the walk reports nothing for.
+
+- **`ProtectedHandler::filter_entry` and `ProtectedHandler::filter_blocks`.** Two
+  fields independent of each other and of the handler's kind, so a filter handler
+  with no expression recovered silently as one without a filter and a `finally`
+  could carry one. `ProtectedHandlerKind::Filter` carries a `HandlerFilter`
+  instead.
+
+- **`SsaOp::NativeIntrinsic`, `NativeIntrinsicData`, `NativeIntrinsicId` and
+  `SsaOpClass::NativeIntrinsic`.** Nothing constructed the operation, in this
+  crate or any front-end; `SystemOp` and `ComputeOp` are its documented
+  structured replacement and had already taken every case it covered.
+
+- **`SysRegNamespace`, `SystemOpKind::ReadSysReg` and
+  `SystemOpKind::WriteSysReg`.** A namespace names the register *file* an operand
+  reaches while the variant beside it names the instruction, so `rdmsr` was
+  representable twice and both spellings answered `"system.sysreg.read"`.
+  `SystemOpKind::ControlRegister` is the single home, and the architecture a
+  variant came from rides `NativeKindedData::metadata`.
+
+- **`BarrierOp::TransactionEnd`, `TransactionTest`, `TransactionAbort`,
+  `ResumeLoadTracking` and `SuspendLoadTracking`.** `xend`, `xtest`, `xabort` and
+  the load-tracking pair were representable as barriers *and* as
+  `SystemTransactionKind`, and the two homes disagreed about whether a commit
+  fences, so whether a store could move across `xend` depended on which spelling
+  a front-end picked. `BarrierOp` now names `serialize`, `mcommit` and `pcommit`.
+
+- **`NativeClobber`, `NativeStateAccess`, `NativeStateAccessKind`,
+  `NativeStateLocation`, `NativeRegister`, and the `clobbers` field on every
+  operation payload that carried one.** A clobber is a claim that an operation
+  changed state it cannot name, and nothing acted on one: memory SSA, the passes,
+  type propagation and the block helpers all read `SsaEffects`, leaving a
+  parallel, unconsulted restatement where a wrong claim could sit unchallenged.
+  Registers written are `outputs`, flags defined are the flags value, the
+  register file a system operation touches is named by its `SystemOpKind`, and
+  genuinely unknown semantics declare `SsaEffectKind::Opaque`.
+  `SsaBlockBuilder::native_opaque` loses its `clobbers` parameter.
+
+- **`NativeExceptionKind`, `native_is_filter_handler` and
+  `Target::is_filter_handler`.** A second copy of the handler taxonomy, variant
+  for variant, plus a boolean where the question has four answers — so a catch, a
+  finally and a fault could not be told apart and structured recovery could not
+  name what a handler does. `HandlerKind` is the one home and
+  `Target::handler_kind` the one classifier, required and total.
+
+- **The five loose block-index fields of an exception clause**
+  (`try_start_block`, `try_end_block`, `handler_start_block`,
+  `handler_end_block`, `filter_start_block`). Five options that only meant
+  anything in pairs, with nothing typing the pairing: a start could exist without
+  its end, an exclusive end could swallow a neighbouring part, and the filter had
+  no end at all.
+
+### Fixed
+
+- **The conversion-chain collapse dereferenced def sites without the guard.** It
+  carried its own copy of `get_definition`'s fast path, minus the check that the
+  instruction found actually defines the variable asked for, so a def site stale
+  by one index handed the walk an unrelated conversion whose widths then decided
+  whether to rewrite — silent wrong code, where a refusal would have cost only
+  the optimization. Every link now resolves through `recorded_definition`.
+
+  Five other sites had made the same unguarded copy. `try_constant_value` yields
+  `None` rather than an unrelated `Const`'s value, so an induction stride becomes
+  unknown instead of wrong, and `SsaEvaluator`'s three scan-free lookups answer
+  `false`/`None` instead of deriving from a foreign instruction. LICM's back-edge
+  taint set and `analysis::loops`' induction update take the *recovering* lookup
+  instead, since losing a link there only costs an optimization.
+
+- **A cyclic def-use chain made the collapse walk spin forever.** Malformed IR
+  can present exact def sites that lead in a circle, and the walk had no bound
+  and no visited set. It now refuses once it has taken more steps than
+  `SsaFunction::var_id_bound` — exact by pigeonhole, with no allocation and no
+  arbitrary constant.
+
+- **GVN forwarded a redundant computation to a leader that did not reach it.**
+  Blocks are visited in index order, which says nothing about dominance: two
+  sibling branches both computing `x + 1` made the lower-numbered one the leader
+  and rewrote the other's uses to a definition that does not dominate them. A
+  leader is now only a leader where it is available, and availability is
+  dominance. On the MIPS fixture this was `DominanceViolation { def_block: 1,
+  use_block: 7 }` — the last remaining reason a debug and a release build lifted
+  the same bytes differently.
+
+- **Loop canonicalization rewrote every header phi to one value.**
+  `insert_preheader` and `unify_latches` keyed their phi maps on
+  `VariableOrigin`, but `VariableOrigin::Phi` is a unit variant, so every phi
+  merging earlier phis — the ordinary shape in lifted native code — shares it.
+  One inserted phi stood for all of them, a dominance violation for all but one.
+  Both now key on the header phi's result.
+
+- **`LoopInfo::contains` panicked on a block index the loop's set cannot
+  represent.** Callers reach it with indices from def sites, phi operands and CFG
+  metadata, all of which describe the function as it was. A `BitSet` bounds
+  assert is a panic: over 21,600 binaries it fired 8 times from LICM alone, each
+  unwinding into `guard_pass`, which rolled the pass back and left the function
+  unoptimised with nothing upstream the wiser. Such an index now answers "not in
+  this loop". Dead-code elimination had the same defect from the other metadata
+  source — `handler_start_block` and `filter_start_block` can name a block the
+  current function does not have — and now reads them with the checked accessors
+  the verifier already used.
+
+- **A load could resolve to a different value on consecutive runs.** More than
+  one stored location can must-alias a query and they can hold different values;
+  returning whichever the map yielded first made the answer a function of the
+  hasher's per-instance seed, so the same bytes lifted to different SSA. The most
+  recently stored version now wins, with the lower variable id breaking a tie.
+
+- **`analysis::structure` read caller-supplied block sets with the panicking
+  `BitSet::contains`.** `structure_with` is documented "Always succeeds", yet a
+  set narrower than the graph aborted on the first two-armed branch and a
+  protected region sized to itself aborted in `pick_follow`. Sets are now
+  renormalised once at the boundary and counted in
+  `StructureMetrics::resized_inputs`; an `entry` outside the graph recovers as
+  `Region::Empty`, and an out-of-range successor id contributes no edge.
+
+- **Structuring recursed once per chained conditional, on an unbounded stack.**
+  The depth was Θ(conditionals), not Θ(source nesting), and the tree was as deep
+  as the walk, so the caller's derived `Drop`, `Clone` and `PartialEq` recursed
+  just as far. `StructureOptions::max_depth` now bounds both.
+
+- **Protected regions were lost or printed unprotected.** Two regions sharing a
+  try start kept only one, because the entry-to-region map held a single index
+  per block — so the ordinary `try { try {} catch {} } finally {}` encoding
+  dropped a clause; the map now holds every region starting at a block, outermost
+  last. And a region whose entry is unreachable — nothing says a `try` is
+  reached, since the runtime takes the edge into the handler — left its handler
+  blocks to the orphan pass, which emitted them outside any `Region::Try`; such
+  regions are now drained and opened at top level.
+
+- **Three defects in how a conditional's blocks are placed.** A join folded into
+  the predicate stayed the conditional's resume point, becoming a `Region::Goto`
+  to a block with no statement position — on exactly the shape merging exists to
+  remove. A handler's joins were bounded by a loop the handler is not inside,
+  since the runtime enters a handler where the enclosing loop's back edge does
+  not, so a handler-internal diamond degraded to an over-wide arm plus a goto;
+  entering a handler or filter now raises a loop-frame barrier, while `break` and
+  `continue` still name the enclosing loop. And a construction site that dropped
+  a conditional dropped the blocks its condition spans, which nothing else
+  places; both such sites now emit them through one shared helper.
+
+- **An exception clause could be mapped half-way, by specification.**
+  `remap_block_indices` was documented to advance a removed exclusive end to the
+  next surviving block anywhere in the function, and to clear a start without
+  touching its end — so a region that began somewhere and ended nowhere, and a
+  handler whose end had crossed into the filter block, were states the IR could
+  hold and no check could refuse. The range type deletes both.
+
+- **Nothing converted an exception table into `ProtectedRegion`s.** The recovery
+  advertised protected regions with their handlers while a host holding an
+  `SsaFunction` had no in-crate path to one: the IR carried block ranges where
+  the recovery wanted sets, the filter had no stored extent, and `Target` could
+  not tell a finally from a catch. `analysis::recovery::structure_ssa` is that
+  path, and it reports the clauses it could not convert instead of dropping them.
+
+- **`structure` and `structure_protected` declared every block condition-only
+  without saying so.** Both are generic over the graph traits `SsaCfg`
+  implements, so the obvious call on the crate's own CFG type asserted that every
+  SSA block — stores, calls, everything — computes nothing but its own branch
+  condition. The claim is now in both `///` blocks, and `condition_only_blocks`
+  answers it from block contents. A tree recovered through `structure_ssa`
+  therefore has fewer merged conditions and more gotos, which is the sound
+  direction.
+
+### Security
+
+- **`arrayref` 0.3.10 and later are banned in `deny.toml`.** The release was
+  published as part of an ongoing attack on crates.io. This crate's tree does not
+  contain it; the ban is prophylactic, so a future dependency cannot pull it in
+  silently. The range is open-ended because the publishing account itself is
+  compromised, which makes every later version equally untrusted until ownership
+  is confirmed recovered.
+
 ## [0.5.0] - 2026-08-04
 
 Correctness of the SSA rebuild and the phi transforms. On a 125 MB x86-64

@@ -5,9 +5,35 @@
 //! [`super::classify`], control-flow queries in [`super::control`], and
 //! rendering in [`super::display`].
 
-use super::*;
 use crate::{
-    ir::{value::ConstValue, variable::SsaVarId},
+    ir::{
+        ops::{
+            kinds::{
+                AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BcdAdjustData, BreakpointOp,
+                CmpKind, ComputeKind, FenceKind, FpuControlKind, KindedVecData, NativeKindedData,
+                NativeOpaqueData, SystemOpKind, TranscendentalKind, VecImm8Data,
+            },
+            native::{BlockStringOpData, FlagCondition, FlagsMask, WideCmpXchgData},
+            vector::{
+                ComplexMulKind, FlagAdjustKind, FpHelperKind, PredicateGenKind, SvePermuteKind,
+                TileOpKind, VectorBinaryKind, VectorBitfieldData, VectorBitmaskKind,
+                VectorCastKind, VectorCompareKind, VectorComplexAddData, VectorConditionalMoveData,
+                VectorCountAdjustData, VectorCryptoKind, VectorDotProductData, VectorElement,
+                VectorElementCountData, VectorExtendInLaneData, VectorFaultMode,
+                VectorHorizontalMinPosData, VectorHorizontalReduceData, VectorIntDotProductData,
+                VectorIntersectData, VectorMaddKind, VectorMaskBinaryKind, VectorMaskMode,
+                VectorMaskUnaryKind, VectorMatrixMulAccData, VectorNarrowSaturateData,
+                VectorPackKind, VectorPackNarrowData, VectorPermuteData, VectorPredicateBreakData,
+                VectorPredicateOpData, VectorPredicateWhileData, VectorReduceKind,
+                VectorReverseChunksData, VectorSegmentLayout, VectorShuffleBitsData,
+                VectorSmeMiscData, VectorSmeOuterProductData, VectorStringCompareData,
+                VectorStructLoadReplicateData, VectorSveAddressGenData, VectorSveComputeData,
+                VectorTernaryKind, VectorUnaryKind,
+            },
+        },
+        value::ConstValue,
+        variable::SsaVarId,
+    },
     target::{Target, VectorShuffleMask},
 };
 
@@ -1460,30 +1486,25 @@ pub enum SsaOp<T: Target> {
         kind: FenceKind,
     },
 
-    /// Target-specific native instruction with explicit operands, outputs, and effects.
-    /// Opaque native instruction with explicit inputs/outputs, clobbers, and a
+    /// Target-specific native instruction with explicit operands, outputs, and
+    /// effects.
+    ///
+    /// Opaque native instruction with explicit inputs/outputs and a
     /// conservative effect summary. The payload is boxed (see
     /// [`NativeOpaqueData`]) to keep `SsaOp` small.
     NativeOpaque(Box<NativeOpaqueData>),
 
-    /// Recognized native intrinsic with explicit inputs/outputs, clobbers, and a
-    /// conservative effect summary, plus a structured [`NativeIntrinsicId`]. Used
-    /// for hardware ops with no primitive closed form but faithful dataflow
-    /// (`cpuid`/`rdtsc`/`pdep`/`pext`/`crc32`/`rdrand`/PAC/…). The payload is
-    /// boxed (see [`NativeIntrinsicData`]) to keep `SsaOp` small.
-    NativeIntrinsic(Box<NativeIntrinsicData>),
-
     /// Typed native **system / privileged** operation (`cpuid`, time-stamp reads,
     /// system/control-register access, syscalls, traps, cache/TLB maintenance,
     /// privileged state ops). The first-class typed replacement for the system
-    /// cases of `NativeIntrinsic` / `NativeOpaque`: a structured
+    /// cases of `NativeOpaque`: a structured
     /// [`SystemOpKind`] identity drives a precise effect summary and a distinct
     /// similarity class. The payload is boxed (see [`NativeKindedData`]).
     SystemOp(Box<NativeKindedData<SystemOpKind>>),
 
     /// Typed native **compute** intrinsic (`pdep`/`pext`, `crc32`,
     /// `rdrand`/`rdseed`, pointer authentication). The first-class typed
-    /// replacement for the compute cases of `NativeIntrinsic`: a structured
+    /// replacement for the hardware compute intrinsics: a structured
     /// [`ComputeKind`] identity drives a precise effect summary (pure, except
     /// nondeterministic random sources) and a distinct similarity class. The
     /// payload is boxed (see [`NativeKindedData`]).
@@ -1494,6 +1515,8 @@ pub enum SsaOp<T: Target> {
     /// drives a pure effect summary and an arithmetic similarity class; the
     /// accumulator and flags flow through as typed SSA values. The payload is
     /// boxed (see [`BcdAdjustData`]).
+    ///
+    /// [`BcdAdjustKind`]: crate::ir::ops::kinds::BcdAdjustKind
     BcdAdjust(Box<BcdAdjustData>),
 
     /// Typed hardware **vector cryptographic** operation (AES / SHA / SM3 /
@@ -1642,6 +1665,8 @@ pub enum SsaOp<T: Target> {
     /// read / read-write) and a distinct similarity class. The payload is boxed
     /// (see [`BlockStringOpData`]). (`rep movs`/`rep stos` use `CopyBlk`/
     /// `InitBlk`, not this op.)
+    ///
+    /// [`BlockStringKind`]: crate::ir::ops::native::BlockStringKind
     BlockString(Box<BlockStringOpData>),
 
     /// Typed native **wide compare-and-swap** (`cmpxchg8b` / `cmpxchg16b`). The
@@ -1921,8 +1946,12 @@ pub enum SsaOp<T: Target> {
     /// No operation (for nop instructions)
     Nop,
 
-    /// Breakpoint trap
-    Break,
+    /// Breakpoint or undefined-instruction trap, named by its [`BreakpointOp`].
+    ///
+    /// The payload is what lets a renderer tell `ud2` from `int3` from `brk`:
+    /// they lower alike, but they are not the same instruction and the cleaned
+    /// IR carries no mnemonic string to fall back on.
+    Break(BreakpointOp),
 
     /// Check for finite floating point: throws if not finite
     Ckfinite {

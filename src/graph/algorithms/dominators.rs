@@ -169,6 +169,25 @@ impl DominatorTree {
         a_in <= b_in && b_out <= a_out
     }
 
+    /// Whether the dominator-tree DFS reached `node` from the entry.
+    ///
+    /// This is the reachability the tree already knows: `compute_dominators`
+    /// walks the graph from the entry, and a node it never reached is marked
+    /// `UNVISITED`. Callers that need "is this block reachable" alongside a
+    /// dominator tree should ask here rather than running a second BFS over the
+    /// same graph — and, in particular, rather than inferring it from
+    /// `dominates(entry, node)`, which is also `false` for the entry's own
+    /// out-of-range neighbours.
+    ///
+    /// A node outside the tree's node count is not reachable.
+    #[inline]
+    #[must_use]
+    pub fn is_reachable(&self, node: NodeId) -> bool {
+        self.tin
+            .get(node.index())
+            .is_some_and(|&entered| entered != Self::UNVISITED)
+    }
+
     /// Checks if node `a` strictly dominates node `b`.
     ///
     /// Strict dominance excludes self-dominance: a strictly dominates b iff
@@ -836,10 +855,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::graph::{
-        DirectedGraph, NodeId,
-        algorithms::dominators::{DominatorTree, compute_dominance_frontiers, compute_dominators},
+    use crate::{
+        analysis::cfg::SsaCfg,
+        graph::{
+            DirectedGraph, NodeId,
+            algorithms::dominators::{
+                DominatorTree, compute_dominance_frontiers, compute_dominators,
+            },
+        },
+        ir::{SsaFunction, SsaVarId, block::SsaBlock, instruction::SsaInstruction, ops::SsaOp},
+        testing::MockTarget,
     };
+
+    /// A single-instruction block, for edge-shape fixtures.
+    fn block(id: usize, op: SsaOp<MockTarget>) -> SsaBlock<MockTarget> {
+        let mut block = SsaBlock::new(id);
+        block.add_instruction(SsaInstruction::synthetic(op));
+        block
+    }
 
     /// The dominance test exactly as it was implemented before DFS intervals:
     /// walk the immediate-dominator chain from `b` up to the entry.
@@ -1445,5 +1478,53 @@ mod tests {
 
         // g's immediate dominator is e (only one path to g)
         assert_eq!(dom_tree.immediate_dominator(g), Some(e));
+    }
+
+    /// This module's predecessor derivation agrees with `SsaCfg`'s stored one.
+    ///
+    /// `precompute_predecessors` is deliberately a second derivation: it is
+    /// generic over any [`Successors`] graph, including ones that store no
+    /// predecessors of their own. It cannot disagree with a stored relation
+    /// built by inverting the same [`Successors`] impl in the same node order —
+    /// but "cannot disagree" is worth asserting rather than assuming, because
+    /// phi *placement* reads the frontier built from this one while phi
+    /// *validation* reads `SsaCfg`'s, and a divergence would desynchronise them.
+    #[test]
+    fn precompute_predecessors_agrees_with_the_stored_cfg_relation() {
+        // A doubled arm and a self-loop: the two shapes where a relation that
+        // deduplicated, or dropped self-edges, would part company with this one.
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+        ssa.add_block(block(
+            0,
+            SsaOp::Branch {
+                condition: SsaVarId::from_index(0),
+                true_target: 1,
+                false_target: 1,
+            },
+        ));
+        ssa.add_block(block(
+            1,
+            SsaOp::Branch {
+                condition: SsaVarId::from_index(0),
+                true_target: 1,
+                false_target: 2,
+            },
+        ));
+        ssa.add_block(block(2, SsaOp::Return { value: None }));
+
+        let cfg = SsaCfg::from_ssa(&ssa);
+        let ours = super::precompute_predecessors(&cfg);
+
+        for block_idx in 0..cfg.block_count() {
+            let mine: Vec<usize> = ours
+                .get(block_idx)
+                .map(|row| row.iter().map(|node| node.index()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                mine,
+                cfg.block_predecessors(block_idx).to_vec(),
+                "the two derivations disagree at B{block_idx}"
+            );
+        }
     }
 }

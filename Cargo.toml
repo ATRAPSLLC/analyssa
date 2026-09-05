@@ -1,6 +1,6 @@
 [package]
 name = "analyssa"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -36,7 +36,7 @@ indexing_slicing = "deny"
 # don't serialize the IR are unaffected: the impl simply does not apply to them,
 # and nothing is forced onto `Target`.
 #
-# Not covered, deliberately: borrowed views (`SsaDefs<'a>`, `MemoryEffect<'a, T>`),
+# Not covered, deliberately: derived views (`SsaDefs`, `MemoryEffect<'a, T>`),
 # transient pass machinery (builders, editors, edit reports), and
 # `SsaFeatureToken` -- its `&'static str` opcode can serialize but cannot
 # deserialize, so a derive there would be a one-way trap.
@@ -49,7 +49,7 @@ thiserror = "2.0.20"
 boxcar = "0.2.14"
 dashmap = "6.2.1"
 rayon = "1.12.0"
-log = "0.4.33"
+log = "0.4.34"
 num_enum = "0.7.6"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 
