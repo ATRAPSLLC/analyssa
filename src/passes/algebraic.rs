@@ -6407,6 +6407,80 @@ mod tests {
         }
     }
 
+    /// **A wide value never joins truncated into a truth value.** A join of a
+    /// widened `bool` and a wide argument, read only at the `bool`'s width,
+    /// would narrow to the `bool`'s type and truncate the argument into it,
+    /// but a truth value holds 0 or 1 however many bits store it, which a
+    /// truncated integer need not be. The phi stays wide. The control is
+    /// `a_wide_value_read_at_the_narrow_bits_joins_truncated`'s narrowing
+    /// case, the same join of an integer's extension.
+    #[test]
+    fn a_wide_value_never_joins_truncated_into_a_truth_value() {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(3, 0);
+        builder
+            .in_block(0, |block| {
+                let flag = block.load_arg(mock_i32(), 1)?;
+                block.branch(flag, 1, 2)
+            })
+            .expect("entry");
+        let mut widened = None;
+        builder
+            .in_block(1, |block| {
+                let truth = block.load_arg(SsaDefSpec::tmp(MockType::Bool), 0)?;
+                widened = Some(block.conv(mock_i32(), truth, MockType::I32, false, true)?);
+                block.jump(3)
+            })
+            .expect("truth arm");
+        let mut whole = None;
+        builder
+            .in_block(2, |block| {
+                whole = Some(block.load_arg(mock_i32(), 2)?);
+                block.jump(3)
+            })
+            .expect("wide arm");
+        builder
+            .in_block(3, |block| {
+                let joined = block.phi(
+                    mock_i32(),
+                    [(1, widened.expect("widened")), (2, whole.expect("wide"))],
+                )?;
+                let low = block.conv(
+                    SsaDefSpec::tmp(MockType::I1),
+                    joined,
+                    MockType::I1,
+                    false,
+                    true,
+                )?;
+                block.ret(Some(low))
+            })
+            .expect("join");
+        let mut ssa = builder.finish().expect("finish");
+        run_mock_pass_boundary(&mut ssa, "truth value truncation", |ssa| {
+            AlgebraicSimplificationPass.run(
+                ssa,
+                &PassEnv::new(&0u32, &NullListener, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
+        });
+        let truth_typed = ssa.blocks().iter().any(|block| {
+            block.instructions().iter().any(|instr| {
+                matches!(
+                    instr.op(),
+                    SsaOp::IntConv {
+                        target: MockType::Bool,
+                        ..
+                    }
+                )
+            }) || block.phi_nodes().iter().any(|phi| {
+                ssa.variable(phi.result())
+                    .is_some_and(|v| *v.var_type() == MockType::Bool)
+            })
+        });
+        assert!(
+            !truth_typed,
+            "nothing is truncated into a truth value: {ssa}"
+        );
+    }
+
     /// **A phi's value never joins truncated.** The phis a value flows
     /// through are one web, which the lowering gives one variable; truncating
     /// the inner phi's value where it enters the outer one would split the web,
