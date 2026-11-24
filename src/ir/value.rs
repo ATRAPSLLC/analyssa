@@ -1165,9 +1165,20 @@ impl<T: Target> ConstValue<T> {
     ///
     /// # Returns
     ///
-    /// The constant, or `None` for a type that is not such an integer.
+    /// The constant, or `None` for a type that is not such an integer. A
+    /// truth value ([`Target::is_boolean`]) is [`Self::True`] or
+    /// [`Self::False`] for low bits of 1 or 0, and `None` for any other bits:
+    /// a boolean type holds no other value, however many bits it is stored in.
     #[must_use]
     pub fn from_bits_of_type(bits: u64, ty: &T::Type) -> Option<Self> {
+        if T::is_boolean(ty) {
+            let low = T::bit_width(ty).map_or(bits, |width| BitWidth::new(width).low_bits(bits));
+            return match low {
+                0 => Some(Self::False),
+                1 => Some(Self::True),
+                _ => None,
+            };
+        }
         if !T::is_integer(ty) {
             return None;
         }
@@ -2367,6 +2378,16 @@ mod tests {
         );
         assert_eq!(Cv::Null.ceq(&Cv::Null), Some(Cv::True));
         assert_eq!(Cv::True.ceq(&Cv::False), Some(Cv::False));
+    }
+
+    /// **A boolean type's constant from bits is a truth value.** Its low bits
+    /// name `True` or `False`, never an integer of the boolean's width, which a
+    /// narrowing would otherwise give a joined or compared constant.
+    #[test]
+    fn a_truth_values_constant_from_bits_is_true_or_false() {
+        assert_eq!(Cv::from_bits_of_type(0, &MockType::Bool), Some(Cv::False));
+        assert_eq!(Cv::from_bits_of_type(1, &MockType::Bool), Some(Cv::True));
+        assert_eq!(Cv::from_bits_of_type(0b11, &MockType::Bool), Some(Cv::True));
     }
 
     /// Standard integer layouts share conversion semantics without host arithmetic hooks.

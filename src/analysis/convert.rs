@@ -1372,6 +1372,12 @@ fn narrowed_web<T: Target>(
         total(|joining| joining.dying),
         total(|joining| joining.extensions),
     );
+    // A truth value holds 0 or 1 however many bits store it: a wide value
+    // truncated to its width is no truth value, and the narrow phis could not
+    // be typed as one.
+    if truncated > 0 && T::is_boolean(&source_type) {
+        return Vec::new();
+    }
     // A comparison of a phi with a constant its extension gives back, with
     // another value extended the same way, or with a phi of the set, reads it
     // at the narrow width: narrowed, it is a comparison of extensions, which
