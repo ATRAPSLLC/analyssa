@@ -1,4 +1,4 @@
-//! Copy propagation pass — eliminates redundant copy operations and trivial
+//! Copy propagation pass - eliminates redundant copy operations and trivial
 //! phi nodes.
 //!
 //! # Algorithm
@@ -22,16 +22,16 @@
 //!    and recompute use lists so the pass does not leave orphan variables.
 //! 7. **Validate**: if the repaired function is not verifier-clean, restore
 //!    the pre-iteration function and report no progress for that iteration.
-//! 8. **Repeat** until no more changes (converges in 1–3 iterations).
+//! 8. **Repeat** until no more changes (converges in 1-3 iterations).
 //!
 //! # Host hook
 //!
 //! Some hosts need to perform extra work between resolving the copy chains
 //! and applying the propagation, such as recovering local-variable type
-//! information. [`run_with_hook`] takes a closure
-//! invoked once per iteration after `protect_sole_local_defs` and
-//! `resolve_chains`, before `propagate_copies` rewrites uses. Hosts that
-//! don't need a hook call [`run`] (no-op closure).
+//! information. [`CopyPropagationPass::propagate`] takes a closure invoked
+//! once per iteration after
+//! `protect_sole_local_defs` and `resolve_chains`, before `propagate_copies`
+//! rewrites uses; a host with nothing to do passes one that does nothing.
 //!
 //! # Complexity
 //!
@@ -41,179 +41,19 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    analysis::phis::PhiAnalyzer,
+    Result,
+    analysis::{budget::Budget, phis::PhiAnalyzer},
     bitset::BitSet,
-    events::{EventKind, EventListener},
+    events::EventKind,
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
-        ops::SsaOp,
         variable::SsaVarId,
         varstore::VarSet,
     },
     passes::utils::resolve_chain,
+    scheduling::{FunctionPass, ModificationScope, PassEnv},
     target::Target,
 };
-
-/// Run copy propagation on `ssa`.
-///
-/// Equivalent to `run_with_hook(ssa, method, events, max_iterations, |_, _| {})`.
-///
-/// # Arguments
-///
-/// * `ssa` — The SSA function to transform in place.
-/// * `method` — Opaque method reference recorded in emitted events.
-/// * `events` — Event sink for [`EventKind::CopyPropagated`] events.
-/// * `max_iterations` — Cap on the outer fixpoint loop.
-///
-/// # Returns
-///
-/// `true` if any copy was propagated.
-pub fn run<T, L>(
-    ssa: &mut SsaFunction<T>,
-    method: &T::MethodRef,
-    events: &L,
-    max_iterations: usize,
-) -> bool
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    run_with_hook(ssa, method, events, max_iterations, |_, _| {})
-}
-
-/// Run copy propagation with a host-specified hook.
-///
-/// Invokes `on_resolved` once per iteration after the resolved-copies map
-/// is built and before `propagate_copies` rewrites uses. The host can use
-/// the hook to perform extra per-iteration work, such as recovering type
-/// information.
-///
-/// # Arguments
-///
-/// * `ssa` — The SSA function to transform in place.
-/// * `method` — Opaque method reference recorded in emitted events.
-/// * `events` — Event sink for [`EventKind::CopyPropagated`] events.
-/// * `max_iterations` — Cap on the outer fixpoint loop.
-/// * `on_resolved` — Closure invoked with the resolved copy map before
-///   propagation. Receives `(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>)`.
-///
-/// # Returns
-///
-/// `true` if any copy was propagated.
-pub fn run_with_hook<T, L, F>(
-    ssa: &mut SsaFunction<T>,
-    method: &T::MethodRef,
-    events: &L,
-    max_iterations: usize,
-    mut on_resolved: F,
-) -> bool
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-    F: FnMut(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>),
-{
-    let mut changed = false;
-    for _ in 0..max_iterations {
-        let replaced = run_iteration(ssa, method, events, &mut on_resolved);
-        if replaced == 0 {
-            break;
-        }
-        changed = true;
-    }
-    changed
-}
-
-/// Run a single iteration of copy propagation.
-///
-/// Exposed for hosts that want to drive their own fixpoint loop.
-///
-/// # Arguments
-///
-/// * `ssa` — The SSA function to transform in place.
-/// * `method` — Opaque method reference recorded in emitted events.
-/// * `events` — Event sink for [`EventKind::CopyPropagated`] events.
-/// * `on_resolved` — Closure invoked with the resolved copy map before
-///   propagation.
-///
-/// # Returns
-///
-/// The number of uses replaced this iteration.
-pub fn run_iteration<T, L, F>(
-    ssa: &mut SsaFunction<T>,
-    method: &T::MethodRef,
-    events: &L,
-    mut on_resolved: F,
-) -> usize
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-    F: FnMut(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>),
-{
-    let mut copies = PhiAnalyzer::new(ssa).collect_all_copies();
-    if copies.is_empty() {
-        return 0;
-    }
-
-    protect_sole_local_defs(ssa, &mut copies);
-    // `source_defs` depends only on `ssa`, so build it once and reuse it for
-    // both ordering-protection passes below instead of rebuilding per call.
-    let source_defs = build_source_defs(ssa);
-    let first_uses = build_first_uses(ssa);
-    protect_same_block_ordering_with(&first_uses, &source_defs, &mut copies);
-
-    let resolved: BTreeMap<SsaVarId, SsaVarId> = copies
-        .iter()
-        .map(|(&dest, &src)| (dest, resolve_chain(&copies, src)))
-        .collect();
-    let mut resolved = resolved;
-    protect_same_block_ordering_with(&first_uses, &source_defs, &mut resolved);
-
-    on_resolved(ssa, &resolved);
-
-    let mut result = None;
-    let edit_result = ssa.edit(
-        SsaEditOptions::new()
-            .with_verify(true)
-            .with_rollback(SsaRollbackPolicy::OnFailure),
-        |editor| {
-            let propagation = editor.propagate_copies(&resolved);
-            for dest_idx in propagation.fully_propagated.iter() {
-                editor.nop_copy_defining(SsaVarId::from_index(dest_idx));
-            }
-            result = Some(propagation);
-            Ok(())
-        },
-    );
-    if edit_result.is_err() {
-        return 0;
-    }
-    let Some(result) = result else {
-        return 0;
-    };
-
-    let event_pairs: Vec<(SsaVarId, SsaVarId)> = result
-        .fully_propagated
-        .iter()
-        .chain(result.partially_propagated.iter())
-        .filter_map(|dest_idx| {
-            let dest = SsaVarId::from_index(dest_idx);
-            resolved.get(&dest).copied().map(|src| (dest, src))
-        })
-        .collect();
-
-    for (dest, src) in event_pairs {
-        let event = crate::events::Event {
-            kind: EventKind::CopyPropagated,
-            method: Some(method.clone()),
-            location: None,
-            message: format!("{dest} → {src}"),
-            pass: None,
-        };
-        events.push(event);
-    }
-
-    result.total_replaced
-}
 
 /// Remove copies from the candidate set when they would lose information.
 ///
@@ -229,9 +69,9 @@ where
 ///
 /// # Arguments
 ///
-/// * `ssa` — The SSA function providing variable and rename group info.
-/// * `copies` — Mutable map of `dest → src` copies to filter in place.
-pub fn protect_sole_local_defs<T: Target>(
+/// * `ssa` - The SSA function providing variable and rename group info.
+/// * `copies` - Mutable map of `dest → src` copies to filter in place.
+fn protect_sole_local_defs<T: Target>(
     ssa: &SsaFunction<T>,
     copies: &mut BTreeMap<SsaVarId, SsaVarId>,
 ) {
@@ -245,7 +85,9 @@ pub fn protect_sole_local_defs<T: Target>(
     // groups referenced by phi nodes, and address-taken groups.
     let mut group_def_count: BTreeMap<u32, usize> = BTreeMap::new();
     let mut groups_in_phis = BitSet::new(group_bound);
-    let mut address_taken_groups = BitSet::new(group_bound);
+    // One authority for which slots are memory, so arguments whose address is
+    // taken are covered alongside locals.
+    let address_taken = ssa.address_taken_slots();
     for block in ssa.blocks() {
         for instr in block.instructions() {
             let op = instr.op();
@@ -254,12 +96,6 @@ pub fn protect_sole_local_defs<T: Target>(
                 if group < real_local_limit {
                     let counter = group_def_count.entry(group).or_insert(0);
                     *counter = counter.saturating_add(1);
-                }
-            }
-            if let SsaOp::LoadLocalAddr { local_index, .. } = op {
-                let group = (ssa.num_args() as u32).saturating_add(*local_index as u32);
-                if group < real_local_limit {
-                    address_taken_groups.insert(group as usize);
                 }
             }
         }
@@ -287,7 +123,7 @@ pub fn protect_sole_local_defs<T: Target>(
             continue;
         }
         let def_count = group_def_count.get(&dest_group).copied().unwrap_or(0);
-        if address_taken_groups.contains(dest_group as usize)
+        if address_taken.group(dest_group, ssa.num_args())
             || (def_count <= 1 && groups_in_phis.contains(dest_group as usize))
         {
             protected.insert(dest);
@@ -299,31 +135,11 @@ pub fn protect_sole_local_defs<T: Target>(
     }
 }
 
-/// Removes copies that could create same-block use-before-def ordering.
-///
-/// A replacement `dest -> src` is unsafe when `src` is defined by an
-/// instruction in block `B` and `dest` is used by an earlier instruction in
-/// the same block. Rewriting that use would place `src` before its
-/// definition, violating SSA instruction order.
-///
-/// # Arguments
-///
-/// * `ssa` - The SSA function providing definitions and uses.
-/// * `copies` - Mutable map of copy replacements to filter in place.
-pub fn protect_same_block_ordering<T: Target>(
-    ssa: &SsaFunction<T>,
-    copies: &mut BTreeMap<SsaVarId, SsaVarId>,
-) {
-    let source_defs = build_source_defs(ssa);
-    let first_uses = build_first_uses(ssa);
-    protect_same_block_ordering_with(&first_uses, &source_defs, copies);
-}
-
 /// Builds a `def-variable -> (block, instruction)` index in a single pass.
 ///
 /// The result depends only on `ssa`, so callers that filter multiple copy
 /// maps for the same function can build it once and reuse it across
-/// [`protect_same_block_ordering_with`] calls.
+/// [`protect_same_block_ordering`] calls.
 fn build_source_defs<T: Target>(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, (usize, usize)> {
     let mut source_defs: BTreeMap<SsaVarId, (usize, usize)> = BTreeMap::new();
     for (block_idx, block) in ssa.blocks().iter().enumerate() {
@@ -353,10 +169,19 @@ fn build_first_uses<T: Target>(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, (usiz
     first_uses
 }
 
-/// Like [`protect_same_block_ordering`] but reuses prebuilt `source_defs` and
-/// `first_uses` indexes (see [`build_source_defs`], [`build_first_uses`])
-/// instead of recomputing them.
-fn protect_same_block_ordering_with(
+/// Removes copies that could create same-block use-before-def ordering.
+///
+/// A replacement `dest -> src` is unsafe when `src` is defined by an
+/// instruction in block `B` and `dest` is used by an earlier instruction in
+/// the same block. Rewriting that use would place `src` before its
+/// definition, violating SSA instruction order.
+///
+/// # Arguments
+///
+/// * `first_uses` - Each variable's first use ([`build_first_uses`]).
+/// * `source_defs` - Each variable's definition ([`build_source_defs`]).
+/// * `copies` - Mutable map of copy replacements to filter in place.
+fn protect_same_block_ordering(
     first_uses: &BTreeMap<SsaVarId, (usize, usize)>,
     source_defs: &BTreeMap<SsaVarId, (usize, usize)>,
     copies: &mut BTreeMap<SsaVarId, SsaVarId>,
@@ -376,27 +201,222 @@ fn protect_same_block_ordering_with(
     });
 }
 
+/// Pass that eliminates redundant copy operations and trivial phi nodes.
+///
+/// [`FunctionPass::run`] is [`Self::propagate`] with no per-iteration hook.
+/// Hosts that need a post-step (e.g. CIL local-type propagation) implement
+/// their own pass that calls [`Self::propagate`] with one.
+///
+/// # Modification scope
+///
+/// [`ModificationScope::InstructionsOnly`] - replaces instructions,
+/// never changes the CFG.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyPropagationPass;
+
+impl CopyPropagationPass {
+    /// Runs copy propagation on `ssa`, with a host hook: [`FunctionPass::run`]
+    /// with `on_resolved` called each round, until a round changes nothing or the
+    /// context's [`Budget::CopyRounds`] runs out.
+    ///
+    /// Invokes `on_resolved` once per iteration after the resolved-copies map
+    /// is built and before `propagate_copies` rewrites uses. The host can use
+    /// the hook to perform extra per-iteration work, such as recovering type
+    /// information; `|_, _| {}` does none.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function to transform in place.
+    /// * `env` - The pass environment: where events are recorded, naming the method.
+    /// * `on_resolved` - Closure invoked with the resolved copy map before
+    ///   propagation. Receives `(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>)`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any copy was propagated.
+    pub fn propagate<T, F>(
+        &self,
+        ssa: &mut SsaFunction<T>,
+        env: &PassEnv<'_, T>,
+        mut on_resolved: F,
+    ) -> bool
+    where
+        T: Target,
+        F: FnMut(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>),
+    {
+        let mut changed = false;
+        let mut rounds = env.context().budget().rounds(Budget::CopyRounds);
+        while rounds.next_round() {
+            if self.run_iteration(ssa, env, &mut on_resolved) == 0 {
+                rounds.settle();
+            } else {
+                changed = true;
+            }
+        }
+        if let Some(exhaustion) = rounds.exhausted() {
+            env.exhausted(exhaustion);
+        }
+        changed
+    }
+
+    /// Run a single iteration of copy propagation.
+    ///
+    /// Exposed for hosts that want to drive their own fixpoint loop.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function to transform in place.
+    /// * `env` - The pass environment: where events are recorded, naming the method.
+    /// * `on_resolved` - Closure invoked with the resolved copy map before
+    ///   propagation.
+    ///
+    /// # Returns
+    ///
+    /// The number of uses replaced this iteration.
+    pub fn run_iteration<T, F>(
+        &self,
+        ssa: &mut SsaFunction<T>,
+        env: &PassEnv<'_, T>,
+        mut on_resolved: F,
+    ) -> usize
+    where
+        T: Target,
+        F: FnMut(&mut SsaFunction<T>, &BTreeMap<SsaVarId, SsaVarId>),
+    {
+        let mut copies = PhiAnalyzer::new(ssa).collect_all_copies();
+        if copies.is_empty() {
+            return 0;
+        }
+
+        protect_sole_local_defs(ssa, &mut copies);
+        // `source_defs` depends only on `ssa`, so build it once and reuse it for
+        // both ordering-protection passes below instead of rebuilding per call.
+        let source_defs = build_source_defs(ssa);
+        let first_uses = build_first_uses(ssa);
+        protect_same_block_ordering(&first_uses, &source_defs, &mut copies);
+
+        let resolved: BTreeMap<SsaVarId, SsaVarId> = copies
+            .iter()
+            .map(|(&dest, &src)| (dest, resolve_chain(&copies, src)))
+            .collect();
+        let mut resolved = resolved;
+        protect_same_block_ordering(&first_uses, &source_defs, &mut resolved);
+
+        on_resolved(ssa, &resolved);
+
+        // A copy into a version of a slot the function reads as storage is a write
+        // to the slot, whatever its SSA readers: propagated, it stays.
+        let slots = ssa.storage_slots();
+        let mut result = None;
+        let edit_result = ssa.edit(
+            SsaEditOptions::new()
+                .with_verify(true)
+                .with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                let propagation = editor.propagate_copies(&resolved);
+                for dest in propagation.fully_propagated.iter() {
+                    let writes_slot = editor
+                        .function()
+                        .variable(dest)
+                        .is_some_and(|variable| slots.contains(variable.origin()));
+                    if !writes_slot {
+                        editor.nop_copy_defining(dest);
+                    }
+                }
+                result = Some(propagation);
+                Ok(())
+            },
+        );
+        if edit_result.is_err() {
+            return 0;
+        }
+        let Some(result) = result else {
+            return 0;
+        };
+
+        let event_pairs: Vec<(SsaVarId, SsaVarId)> = result
+            .fully_propagated
+            .iter()
+            .chain(result.partially_propagated.iter())
+            .filter_map(|dest| resolved.get(&dest).copied().map(|src| (dest, src)))
+            .collect();
+
+        for (dest, src) in event_pairs {
+            env.record(EventKind::CopyPropagated)
+                .message(format!("{dest} → {src}"));
+        }
+
+        result.total_replaced
+    }
+}
+
+impl<T> FunctionPass<T> for CopyPropagationPass
+where
+    T: Target,
+    T::MethodRef: Send + Sync,
+{
+    /// Returns this pass's unique short name for logging.
+    fn name(&self) -> &'static str {
+        "copy-propagation"
+    }
+
+    /// Returns this pass's human-readable description.
+    fn description(&self) -> &'static str {
+        "Eliminate redundant copy operations and trivial phi nodes"
+    }
+
+    /// Returns the IR scope this pass may modify.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::InstructionsOnly
+    }
+
+    /// Reports whether this pass leaves the SSA form intact for the next pass.
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
+    /// Runs copy propagation on one method: [`Self::propagate`] with no
+    /// per-iteration hook.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function to simplify in place.
+    /// * `env` - The pass environment: where events are recorded, naming the
+    ///   method, and the budget its rounds count against.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any copy or trivial phi was eliminated.
+    fn run(&self, ssa: &mut SsaFunction<T>, env: &PassEnv<'_, T>) -> Result<bool> {
+        Ok(self.propagate(ssa, env, |_, _| {}))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        analysis::{budget::WorkBudget, context::AnalysisContext},
         events::EventLog,
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            ops::SsaOp,
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         testing::{
-            MockTarget, MockType, assert_mock_valid_full, mock_terminator_at,
+            MACHINE, MockTarget, MockType, assert_mock_valid_full, mock_terminator_at,
             run_mock_pass_boundary,
         },
     };
 
+    /// Wrap an op in a synthetic instruction.
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
         SsaInstruction::synthetic(op)
     }
 
+    /// Create an `I32` local variable defined at the given block/instruction site.
     fn local_at(
         ssa: &mut SsaFunction<MockTarget>,
         idx: u16,
@@ -411,6 +431,7 @@ mod tests {
         )
     }
 
+    /// A single `Copy` of a constant is propagated away and reported.
     #[test]
     fn simple_copy_eliminated() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -422,19 +443,24 @@ mod tests {
             value: ConstValue::I32(42),
         }));
         block.add_instruction(instr(SsaOp::Copy { dest: dst, src }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(dst) }));
+        block.add_instruction(instr(SsaOp::returns(Some(dst))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "simple copy propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(changed, "simple copy should be eliminated");
         assert!(log.has(EventKind::CopyPropagated));
     }
 
+    /// A three-link copy chain collapses back to its original source.
     #[test]
     fn three_element_chain_collapsed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
@@ -448,18 +474,23 @@ mod tests {
         }));
         block.add_instruction(instr(SsaOp::Copy { dest: b, src: a }));
         block.add_instruction(instr(SsaOp::Copy { dest: c, src: b }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(c) }));
+        block.add_instruction(instr(SsaOp::returns(Some(c))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "copy chain propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(changed, "three-element chain should be collapsed");
     }
 
+    /// A function with no copies reports no change.
     #[test]
     fn no_copies_nothing_changed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
@@ -469,29 +500,39 @@ mod tests {
             dest: v0,
             value: ConstValue::I32(7),
         }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(v0) }));
+        block.add_instruction(instr(SsaOp::returns(Some(v0))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "no-copy propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(!changed, "no copies should mean no changes");
     }
 
+    /// An empty function reports no change.
     #[test]
     fn empty_function_no_changes() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "empty copy propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(!changed);
     }
 
+    /// A zero-iteration cap makes no change even when a propagatable copy exists.
     #[test]
     fn copy_with_zero_iterations_no_change() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -503,18 +544,24 @@ mod tests {
             value: ConstValue::I32(99),
         }));
         block.add_instruction(instr(SsaOp::Copy { dest: dst, src }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(dst) }));
+        block.add_instruction(instr(SsaOp::returns(Some(dst))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "zero-iteration copy propagation", |ssa| {
-            run(ssa, &method, &log, 0)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE))
+                    .with_budget(WorkBudget::DEFAULT.with_limit(Budget::CopyRounds, 0)),
+                |_, _| {},
+            )
         });
         assert!(!changed, "zero iterations should make no changes");
     }
 
+    /// Two copies of the same source both resolve to that source.
     #[test]
     fn copy_propagation_uses_existing_value() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
@@ -528,21 +575,26 @@ mod tests {
         }));
         b0.add_instruction(instr(SsaOp::Copy { dest: b, src: a }));
         b0.add_instruction(instr(SsaOp::Copy { dest: c, src: a }));
-        b0.add_instruction(instr(SsaOp::Return { value: Some(c) }));
+        b0.add_instruction(instr(SsaOp::returns(Some(c))));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "existing-value copy propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(changed, "copy propagation should rewrite existing values");
-        // The return should reference v0 (a) or v2 (c) — propagation happens
+        // The return should reference v0 (a) or v2 (c) - propagation happens
         let ret = mock_terminator_at(&ssa, 0);
         assert!(matches!(ret, SsaOp::Return { .. }));
     }
 
+    /// A single iteration reports the number of uses it replaced.
     #[test]
     fn run_iteration_returns_count() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -554,17 +606,22 @@ mod tests {
             value: ConstValue::I32(5),
         }));
         block.add_instruction(instr(SsaOp::Copy { dest: dst, src }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(dst) }));
+        block.add_instruction(instr(SsaOp::returns(Some(dst))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         assert_mock_valid_full(&ssa, "copy propagation iteration before");
-        let count = run_iteration(&mut ssa, &0u32, &log, |_, _| {});
+        let count = CopyPropagationPass.run_iteration(
+            &mut ssa,
+            &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE)),
+            |_, _| {},
+        );
         assert_mock_valid_full(&ssa, "copy propagation iteration after");
         assert!(count > 0, "should have replaced at least one use");
     }
 
+    /// A copy chain spanning three blocks is fully collapsed.
     #[test]
     fn multiple_copies_in_different_blocks() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
@@ -586,18 +643,23 @@ mod tests {
         ssa.add_block(b1);
         let mut b2 = SsaBlock::new(2);
         b2.add_instruction(instr(SsaOp::Copy { dest: d, src: c }));
-        b2.add_instruction(instr(SsaOp::Return { value: Some(d) }));
+        b2.add_instruction(instr(SsaOp::returns(Some(d))));
         ssa.add_block(b2);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "multi-block copy propagation", |ssa| {
-            run(ssa, &method, &log, 10)
+            CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {},
+            )
         });
         assert!(changed, "chain across blocks should be collapsed");
     }
 
+    /// A replacement whose source is defined after an existing use of the destination is rejected.
     #[test]
     fn protect_same_block_ordering_removes_late_source_replacement() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
@@ -625,19 +687,22 @@ mod tests {
             dest: one,
             value: ConstValue::I32(1),
         }));
-        block.add_instruction(instr(SsaOp::Return {
-            value: Some(use_before_src),
-        }));
+        block.add_instruction(instr(SsaOp::returns(Some(use_before_src))));
         ssa.add_block(block);
         ssa.recompute_uses();
         assert_mock_valid_full(&ssa, "same-block ordering protection fixture");
 
         let mut copies = BTreeMap::from([(dest, src)]);
-        protect_same_block_ordering(&ssa, &mut copies);
+        protect_same_block_ordering(
+            &build_first_uses(&ssa),
+            &build_source_defs(&ssa),
+            &mut copies,
+        );
 
         assert!(copies.is_empty());
     }
 
+    /// After a full chain is propagated, no `Copy` instructions or orphan variables remain.
     #[test]
     fn propagated_copies_do_not_leave_orphan_variables() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
@@ -653,7 +718,7 @@ mod tests {
         block.add_instruction(instr(SsaOp::Copy { dest: b, src: a }));
         block.add_instruction(instr(SsaOp::Copy { dest: c, src: b }));
         block.add_instruction(instr(SsaOp::Copy { dest: out, src: c }));
-        block.add_instruction(instr(SsaOp::Return { value: Some(out) }));
+        block.add_instruction(instr(SsaOp::returns(Some(out))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
@@ -662,7 +727,11 @@ mod tests {
         assert!(run_mock_pass_boundary(
             &mut ssa,
             "orphan-free copy propagation",
-            |ssa| run(ssa, &method, &log, 10)
+            |ssa| CopyPropagationPass.propagate(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                |_, _| {}
+            )
         ));
         assert!(
             !ssa.iter_instructions()

@@ -1,4 +1,4 @@
-//! [`PassScheduler`] — the core engine that orchestrates [`SsaPass`]
+//! [`PassScheduler`] - the core engine that orchestrates [`SsaPass`]
 //! execution across methods.
 //!
 //! The scheduler organizes registered passes into execution layers
@@ -30,75 +30,91 @@
 //! tracking entirely.
 
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    marker::PhantomData,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use dashmap::DashSet;
-use log::debug;
+use log::{Level, debug, log_enabled};
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    analysis::verifier::{SsaVerifier, VerifyLevel},
+    analysis::{
+        budget::{Budget, Rounds},
+        verifier::VerifyLevel,
+    },
     error::{Error, Result},
-    events::EventKind,
+    events::{Event, EventKind},
     graph::IndexedGraph,
     ir::function::SsaFunction,
+    parallel::MapCarried,
     passes::{
-        AlgebraicSimplificationPass, BlockMergingPass, ControlFlowSimplificationPass,
-        CopyPropagationPass, DeadCodeEliminationPass, DeadMethodEliminationPass,
-        GlobalValueNumberingPass, JumpThreadingPass, LicmPass, LoopCanonicalizationPass,
-        MemoryOptimizationPass, OpaquePredicatePass, ReassociationPass, StrengthReductionPass,
-        ValueRangePropagationPass,
+        AlgebraicSimplificationPass, ArmMergingPass, BlockMergingPass,
+        ControlFlowSimplificationPass, CopyPropagationPass, DeadCodeEliminationPass,
+        DeadMethodEliminationPass, DuplicateMergingPass, GlobalValueNumberingPass,
+        JumpThreadingPass, LicmPass, LoopCanonicalizationPass, LoopRejoiningPass,
+        MemoryOptimizationPass, MootTestPass, OpaquePredicatePass, ReassociationPass,
+        StrengthReductionPass, ValueRangePropagationPass,
     },
-    scheduling::pass::{ModificationScope, SsaPass, SsaPassHost},
+    scheduling::{
+        AsGlobalPass, AsSsaPass, Declared, DeobfuscationCapability,
+        pass::{SsaPass, SsaPassHost},
+        transaction::{Guarded, PassTransaction, Verify},
+    },
     target::Target,
 };
 
 /// A registered pass paired with its assigned fallback layer number.
 type LayeredPass<T, H> = (Box<dyn SsaPass<T, H>>, usize);
 
+/// What the scheduler does when a pass fails on one method.
+///
+/// Either way the method is first restored to its state before the pass, so
+/// the store never holds a half-edited body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailurePolicy {
+    /// The run stops with the failure as its error.
+    #[default]
+    Abort,
+    /// The method keeps its restored body, the failure is recorded as an
+    /// [`EventKind::PassFailed`] event, and the run goes on: one method a
+    /// pass cannot handle does not cost every other method its optimization.
+    RollbackAndContinue,
+}
+
+/// What the scheduler checks after each pass, and what a failure costs.
+#[derive(Debug, Clone, Copy)]
+struct RunChecks {
+    /// Verify each method after every pass.
+    verify_hard: bool,
+    /// What a pass failing on one method does to the run.
+    on_failure: FailurePolicy,
+}
+
 /// Built-in pass-pipeline configuration.
+///
+/// What the pipeline runs and checks. How many rounds it and its passes may
+/// take is the work budget of the host's context ([`SsaPassHost::context`]):
+/// [`Budget::PipelineRounds`], [`Budget::StableRounds`] and
+/// [`Budget::PhaseRounds`] for the scheduler, each pass's own rounds for its
+/// fixpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineConfig {
-    /// Maximum iterations for the whole scheduler pipeline.
-    pub max_iterations: usize,
-    /// Number of stable outer iterations required before stopping.
-    pub stable_iterations: usize,
-    /// Maximum fixpoint iterations for one scheduler layer.
-    pub max_phase_iterations: usize,
-    /// Maximum fixpoint iterations for block merging.
-    pub block_merge_iterations: usize,
-    /// Maximum fixpoint iterations for control-flow simplification.
-    pub control_flow_iterations: usize,
-    /// Maximum fixpoint iterations for copy propagation.
-    pub copy_iterations: usize,
-    /// Maximum fixpoint iterations for dead-code elimination.
-    pub dead_code_iterations: usize,
-    /// Maximum fixpoint iterations for value-range propagation.
-    pub range_iterations: usize,
     /// Include interprocedural dead-method elimination in scheduler presets.
     pub include_dead_method_elimination: bool,
     /// Verify each method after every pass and fail fast on invalid SSA.
     pub verify_hard: bool,
+    /// What a pass failing on one method does to the run.
+    pub on_method_failure: FailurePolicy,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 10,
-            stable_iterations: 1,
-            max_phase_iterations: 10,
-            block_merge_iterations: 10,
-            control_flow_iterations: 10,
-            copy_iterations: 10,
-            dead_code_iterations: 50,
-            range_iterations: 20,
             include_dead_method_elimination: true,
             verify_hard: false,
+            on_method_failure: FailurePolicy::Abort,
         }
     }
 }
@@ -108,12 +124,12 @@ impl Default for PipelineConfig {
 /// Passes are organized into execution layers computed from their declared
 /// capabilities. Each layer runs all its passes to fixpoint with
 /// normalization between iterations. The entire pipeline repeats until
-/// global fixpoint or `max_iterations`.
+/// global fixpoint or the host's [`Budget::PipelineRounds`].
 ///
 /// # Type parameters
 ///
-/// * `T` — The host's target type.
-/// * `H` — The host adapter (must implement [`SsaPassHost<T>`]).
+/// * `T` - The host's target type.
+/// * `H` - The host adapter (must implement [`SsaPassHost<T>`]).
 ///   Typically a single host type implements [`crate::world::World`],
 ///   [`crate::host::SsaStore`], [`crate::host::DirtySet`], and
 ///   [`SsaPassHost<T>`] together.
@@ -123,14 +139,10 @@ where
     T::MethodRef: Send + Sync,
     H: SsaPassHost<T>,
 {
-    /// Maximum iterations for the entire pipeline before stopping.
-    max_iterations: usize,
-    /// Stop early if no changes for this many consecutive iterations.
-    stable_iterations: usize,
-    /// Maximum fixpoint iterations for a single layer before moving on.
-    max_phase_iterations: usize,
     /// Verify each method after every pass and return an error on invalid SSA.
     verify_hard: bool,
+    /// What a pass failing on one method does to the run.
+    on_failure: FailurePolicy,
     /// All non-normalize passes paired with their fallback layer number.
     passes: Vec<LayeredPass<T, H>>,
     /// Normalization passes. Run between every layer's fixpoint iterations.
@@ -138,13 +150,14 @@ where
     /// Phantom marker; the host type appears only in trait bounds at the
     /// `run_pipeline` entry point, but we record it here to keep the
     /// scheduler instance keyed to a specific host.
-    _host: std::marker::PhantomData<fn(&H)>,
+    _host: PhantomData<fn(&H)>,
 }
 
 impl<T, H> PassScheduler<T, H>
 where
     T: Target,
     T::MethodRef: Send + Sync,
+    SsaFunction<T>: Send,
     H: SsaPassHost<T>,
 {
     /// Creates a scheduler that registers no built-in passes.
@@ -152,20 +165,26 @@ where
     /// Only the iteration limits and `verify_hard` flag from `config` are
     /// applied; the pass-tuning fields (e.g. `copy_iterations`,
     /// `include_dead_method_elimination`) are ignored because no built-in
-    /// passes are added. Hosts that organize their own pipeline — adding
+    /// passes are added. Hosts that organize their own pipeline - adding
     /// every pass explicitly via [`Self::add`], [`Self::add_at_layer`], or
-    /// [`Self::add_normalize`] — should start here instead of [`Self::new`]
+    /// [`Self::add_normalize`] - should start here instead of [`Self::new`]
     /// to avoid running the default pipeline alongside their own passes.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Supplies the `verify_hard` flag and the failure policy.
+    ///
+    /// # Returns
+    ///
+    /// A scheduler with empty layered and normalize pass lists.
     #[must_use]
     pub fn empty(config: PipelineConfig) -> Self {
         Self {
-            max_iterations: config.max_iterations,
-            stable_iterations: config.stable_iterations,
-            max_phase_iterations: config.max_phase_iterations,
             verify_hard: config.verify_hard,
+            on_failure: config.on_method_failure,
             passes: Vec::new(),
             normalize: Vec::new(),
-            _host: std::marker::PhantomData,
+            _host: PhantomData,
         }
     }
 
@@ -184,6 +203,16 @@ where
     /// and [`crate::world::World`]; they do not need to hand-roll the pass
     /// order. Hosts that supply their own complete pipeline should use
     /// [`Self::empty`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Which passes it registers and how it checks them; the
+    ///   rounds it and they take are the host's budget at
+    ///   [`Self::run_pipeline`].
+    ///
+    /// # Returns
+    ///
+    /// A scheduler pre-loaded with the default normalize and layered passes.
     #[must_use]
     pub fn new(config: PipelineConfig) -> Self
     where
@@ -191,46 +220,57 @@ where
     {
         let mut scheduler = Self::empty(config);
 
-        scheduler.add_normalize(Box::new(GlobalValueNumberingPass::new()));
-        scheduler.add_normalize(Box::new(CopyPropagationPass::new(config.copy_iterations)));
-        scheduler.add_normalize(Box::new(DeadCodeEliminationPass::new(
-            config.dead_code_iterations,
-        )));
+        scheduler.add_normalize(Box::new(AsSsaPass(GlobalValueNumberingPass::new())));
+        scheduler.add_normalize(Box::new(AsSsaPass(CopyPropagationPass)));
+        scheduler.add_normalize(Box::new(AsSsaPass(DeadCodeEliminationPass)));
 
         if config.include_dead_method_elimination {
-            scheduler.add(Box::new(DeadMethodEliminationPass));
+            scheduler.add(Box::new(AsGlobalPass(DeadMethodEliminationPass)));
         }
 
-        scheduler.add(Box::new(ControlFlowSimplificationPass::new(
-            config.control_flow_iterations,
-        )));
-        scheduler.add(Box::new(JumpThreadingPass::new()));
-        scheduler.add(Box::new(LoopCanonicalizationPass::new()));
-        scheduler.add(Box::new(BlockMergingPass::new(
-            config.block_merge_iterations,
-        )));
-        scheduler.add(Box::new(AlgebraicSimplificationPass::new()));
-        scheduler.add(Box::new(ReassociationPass::new()));
-        scheduler.add(Box::new(StrengthReductionPass));
-        scheduler.add(Box::new(ValueRangePropagationPass::new(
-            config.range_iterations,
-        )));
-        scheduler.add(Box::new(OpaquePredicatePass::<T>::new()));
-        scheduler.add(Box::new(LicmPass::new()));
+        scheduler.add(Box::new(AsSsaPass(ControlFlowSimplificationPass)));
+        scheduler.add(Box::new(AsSsaPass(JumpThreadingPass::new())));
+        scheduler.add(Box::new(AsSsaPass(LoopCanonicalizationPass::new())));
+        scheduler.add(Box::new(AsSsaPass(BlockMergingPass)));
+        scheduler.add(Box::new(AsSsaPass(DuplicateMergingPass::new())));
+        scheduler.add(Box::new(AsSsaPass(LoopRejoiningPass::new())));
+        scheduler.add(Box::new(AsSsaPass(ArmMergingPass::new())));
+        scheduler.add(Box::new(AsSsaPass(MootTestPass::new())));
+        scheduler.add(Box::new(AsSsaPass(AlgebraicSimplificationPass::new())));
+        scheduler.add(Box::new(AsSsaPass(ReassociationPass::new())));
+        scheduler.add(Box::new(AsSsaPass(StrengthReductionPass::new())));
+        scheduler.add(Box::new(AsSsaPass(ValueRangePropagationPass::new())));
+        // The one analyssa pass whose effect the shared vocabulary names, said
+        // here rather than left to each host to remember. A host whose
+        // capability enum does not carry the milestone declares nothing, which
+        // is what the pass provides there.
+        scheduler.add(Box::new(
+            Declared::new(AsSsaPass(OpaquePredicatePass::<T>::new()))
+                .providing([DeobfuscationCapability::SimplifiedPredicates]),
+        ));
+        scheduler.add(Box::new(AsSsaPass(LicmPass::new())));
         // Runs after the value passes: forwarding a store to a load exposes the
         // stored value to constant folding and GVN on the next iteration.
-        scheduler.add(Box::new(MemoryOptimizationPass));
+        scheduler.add(Box::new(AsSsaPass(MemoryOptimizationPass)));
 
         scheduler
     }
 
     /// Returns the number of non-normalize (layered) passes registered.
+    ///
+    /// # Returns
+    ///
+    /// The count of passes subject to capability-based layer assignment.
     #[must_use]
     pub fn pass_count(&self) -> usize {
         self.passes.len()
     }
 
     /// Returns the number of normalization passes registered.
+    ///
+    /// # Returns
+    ///
+    /// The count of passes run between layer fixpoint iterations.
     #[must_use]
     pub fn normalize_count(&self) -> usize {
         self.normalize.len()
@@ -238,6 +278,14 @@ where
 
     /// Register a layered pass using its own `fallback_layer()` return
     /// value.
+    ///
+    /// The pass's [`fallback_layer`](SsaPass::fallback_layer) is read once at
+    /// registration and stored alongside it; capability relaxation may later
+    /// push it to a higher layer, but never below this seed.
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The layered pass to register.
     pub fn add(&mut self, pass: Box<dyn SsaPass<T, H>>) {
         let layer = pass.fallback_layer();
         self.passes.push((pass, layer));
@@ -249,6 +297,12 @@ where
     /// Useful for hosts that organize passes via a phase enum (e.g.,
     /// CIL: Structure=0, Value=1, Simplify=2, Inline=3) rather than
     /// per-pass-type defaults.
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The layered pass to register.
+    /// * `layer` - Seed fallback layer, used in place of the pass's own
+    ///   [`fallback_layer`](SsaPass::fallback_layer).
     pub fn add_at_layer(&mut self, pass: Box<dyn SsaPass<T, H>>, layer: usize) {
         self.passes.push((pass, layer));
     }
@@ -257,6 +311,10 @@ where
     ///
     /// Normalize passes run between every layer's fixpoint iterations
     /// and are excluded from the capability dependency graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The normalization pass to register.
     pub fn add_normalize(&mut self, pass: Box<dyn SsaPass<T, H>>) {
         self.normalize.push(pass);
     }
@@ -283,7 +341,7 @@ where
         }
 
         // Build a map from capability to provider indices.
-        let mut providers: HashMap<T::Capability, Vec<usize>> = HashMap::new();
+        let mut providers: FxHashMap<T::Capability, Vec<usize>> = FxHashMap::default();
         for (i, (pass, _)) in self.passes.iter().enumerate() {
             for cap in pass.provides() {
                 providers.entry(*cap).or_default().push(i);
@@ -378,11 +436,13 @@ where
     /// Run the complete pipeline across all layers.
     ///
     /// Seeds the dirty set with all methods, then iterates layers until
-    /// convergence or `max_iterations`.
+    /// convergence or the host's [`Budget::PipelineRounds`], stopping once
+    /// [`Budget::StableRounds`] rounds change nothing and giving each layer
+    /// [`Budget::PhaseRounds`].
     ///
     /// # Arguments
     ///
-    /// * `host` — The host adapter providing method storage, dirty
+    /// * `host` - The host adapter providing method storage, dirty
     ///   tracking, and event recording.
     ///
     /// # Returns
@@ -397,7 +457,7 @@ where
         // Seed the dirty set with all methods that have SSA. On the
         // first iteration every method qualifies. Hosts that pre-seed
         // their own dirty set (typically by marking newly-built methods
-        // as dirty when SSA is constructed) are unaffected — `mark_dirty`
+        // as dirty when SSA is constructed) are unaffected - `mark_dirty`
         // is idempotent.
         for method in host.iter_methods() {
             host.mark_dirty(&method);
@@ -420,28 +480,35 @@ where
 
         let mut stable_count: usize = 0;
         let mut iterations: usize = 0;
-        let max_phase = self.max_phase_iterations;
-        let max_iterations = self.max_iterations;
-        let stable_iterations = self.stable_iterations;
-        let verify_hard = self.verify_hard;
+        let budget = *host.context().budget();
+        let max_phase = budget.limit(Budget::PhaseRounds);
+        let max_iterations = budget.limit(Budget::PipelineRounds);
+        let stable_iterations = budget.limit(Budget::StableRounds);
+        let checks = RunChecks {
+            verify_hard: self.verify_hard,
+            on_failure: self.on_failure,
+        };
 
-        for iteration in 0..max_iterations {
+        // Whether the last round taken changed something: a run whose rounds
+        // all ran out with it set stopped short of the fixpoint.
+        let mut last_changed = false;
+        let mut rounds = Rounds::new(Budget::PipelineRounds, max_iterations);
+        while rounds.next_round() {
+            let iteration = iterations;
             iterations = iteration.saturating_add(1);
             debug!("Pipeline iteration {iterations}/{max_iterations}");
 
             let iteration_modified: DashSet<T::MethodRef> = DashSet::new();
+            let run = PipelineRun {
+                host,
+                iteration_modified: &iteration_modified,
+                checks,
+                max_phase_iterations: max_phase,
+            };
             let mut iteration_changed = false;
 
             for layer in &layer_indices {
-                if Self::layer_to_fixpoint(
-                    host,
-                    &mut self.passes,
-                    layer,
-                    &mut self.normalize,
-                    max_phase,
-                    &iteration_modified,
-                    verify_hard,
-                )? {
+                if run.layer_to_fixpoint(&mut self.passes, layer, &mut self.normalize)? {
                     iteration_changed = true;
                 }
             }
@@ -449,13 +516,7 @@ where
             // Ensure normalize runs at least once on iteration 0 even if no
             // layer pass made changes.
             if iteration == 0 && !iteration_changed && !self.normalize.is_empty() {
-                iteration_changed = Self::normalize_to_fixpoint(
-                    host,
-                    &mut self.normalize,
-                    max_phase,
-                    &iteration_modified,
-                    verify_hard,
-                )?;
+                iteration_changed = run.normalize_to_fixpoint(&mut self.normalize)?;
             }
 
             // Update dirty/stable tracking at iteration boundary.
@@ -476,49 +537,244 @@ where
                 }
             }
 
+            last_changed = iteration_changed;
             if iteration_changed {
                 stable_count = 0;
             } else {
                 stable_count = stable_count.saturating_add(1);
                 if stable_count >= stable_iterations {
                     debug!("Pipeline stable after {iterations} iterations");
-                    break;
+                    rounds.settle();
                 }
             }
+        }
+        if let Some(exhaustion) = rounds.exhausted().filter(|_| last_changed) {
+            host.events().push(Event::exhausted(None, exhaustion));
         }
 
         Ok(iterations)
     }
 
-    /// Run normalize passes to fixpoint.
-    fn normalize_to_fixpoint(
+    /// Runs `pass` on one function exactly as a scheduled run does, and
+    /// reports a rejection as an error.
+    ///
+    /// The pass runs inside a transaction ([`PassTransaction::run_guarded`])
+    /// with the scheduler's repair after it: a failed edit the pass left
+    /// applied is an error, and a change is repaired as the pass's
+    /// [`modification_scope`](SsaPass::modification_scope) asks. `verify`
+    /// says which results are checked and how hard;
+    /// `Verify::Always(VerifyLevel::Standard)` is what a run under
+    /// `verify_hard` does. Whatever the pass does wrong - it returns an error,
+    /// panics, leaves a rebuild that fails or SSA the verifier rejects -
+    /// `ssa` is restored to the function it was before the pass.
+    ///
+    /// This is the scheduler's per-function step and nothing around it: it
+    /// does not ask [`SsaPass::should_run`], which decides whether a scheduled
+    /// run hands the pass a method at all, and it touches no host store, so
+    /// it marks nothing processed and invalidates no analyses. It is the way
+    /// to test a pass on a function of its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The pass to run.
+    /// * `ssa` - The function, transformed in place.
+    /// * `method` - The method the function is, handed to the pass.
+    /// * `host` - Host adapter handed to the pass.
+    /// * `verify` - Which results to verify, and at what level.
+    ///
+    /// # Returns
+    ///
+    /// Whether the pass changed the function and the change was kept.
+    ///
+    /// # Errors
+    ///
+    /// The pass failed, panicked, needed a rebuild that failed, or left SSA
+    /// the verifier rejected (its errors listed), naming the pass and the
+    /// method; `ssa` is then as it was before the pass.
+    pub fn run_once(
+        pass: &dyn SsaPass<T, H>,
+        ssa: &mut SsaFunction<T>,
+        method: &T::MethodRef,
         host: &H,
-        passes: &mut [Box<dyn SsaPass<T, H>>],
-        max_phase_iterations: usize,
-        iteration_modified: &DashSet<T::MethodRef>,
-        verify_hard: bool,
+        verify: Verify,
     ) -> Result<bool> {
+        let outcome = PassTransaction::new().run_guarded(ssa, verify, |ssa| {
+            Self::run_and_repair(pass, ssa, method, host)
+        });
+        Self::settled(pass, method, outcome).map_err(Error::new)
+    }
+
+    /// How a run of `pass` on `method` ended: whether it changed the function
+    /// and kept the change, or why it was rejected, naming the pass and the
+    /// method, with the verifier's errors for SSA it rejected.
+    fn settled(
+        pass: &dyn SsaPass<T, H>,
+        method: &T::MethodRef,
+        outcome: Guarded<Error>,
+    ) -> Result<bool, String> {
+        match outcome {
+            Guarded::Unchanged => Ok(false),
+            Guarded::Applied => Ok(true),
+            Guarded::Failed(error) => Err(format!(
+                "pass '{}' failed for method {method:?}: {error}",
+                pass.name()
+            )),
+            Guarded::Panicked(detail) => Err(format!(
+                "pass '{}' panicked for method {method:?}: {detail}",
+                pass.name()
+            )),
+            Guarded::Invalid(verifier_errors) => Err(format!(
+                "pass '{}' produced invalid SSA for method {method:?}: {}",
+                pass.name(),
+                verifier_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )),
+        }
+    }
+
+    /// Runs `pass` on one method and applies the SSA repair its change needs
+    /// ([`crate::scheduling::ModificationScope::settle`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The pass to run.
+    /// * `ssa` - The method's function, transformed in place.
+    /// * `method` - The method being processed.
+    ///
+    /// # Returns
+    ///
+    /// Whether the function changed.
+    ///
+    /// # Errors
+    ///
+    /// The pass's error when it fails, and an error when it left an edit
+    /// half applied or a graph change it did not repair.
+    fn run_and_repair(
+        pass: &dyn SsaPass<T, H>,
+        ssa: &mut SsaFunction<T>,
+        method: &T::MethodRef,
+        host: &H,
+    ) -> Result<bool> {
+        let reported = pass.run_on_method(ssa, method, host)?;
+        pass.modification_scope()
+            .settle(ssa, pass.repairs_ssa(), reported)
+    }
+}
+
+/// Format an event-kind delta map into a compact summary string.
+///
+/// Keeps only transformation kinds (skipping bookkeeping events), renders each
+/// as `"<count> <description>"`, and sorts the parts so the summary is
+/// deterministic across runs - it feeds a debug log line, where a stable
+/// ordering makes runs comparable. Example: `"93 strings decrypted, 115
+/// constants folded"`.
+///
+/// # Arguments
+///
+/// * `delta` - Per-kind event counts recorded during one pass, as produced by
+///   [`EventListener::count_by_kind_since`](crate::events::EventListener::count_by_kind_since).
+///
+/// # Returns
+///
+/// A comma-separated summary, or the empty string if no transformation events
+/// are present.
+fn format_event_delta(delta: &FxHashMap<EventKind, usize>) -> String {
+    let mut parts: Vec<String> = delta
+        .iter()
+        .filter(|(kind, _)| kind.is_transformation())
+        .map(|(kind, count)| format!("{} {}", count, kind.description()))
+        .collect();
+    parts.sort();
+    parts.join(", ")
+}
+
+/// One iteration of a pipeline run: the host it runs on, the methods it has
+/// changed so far, what it checks after each pass, and the rounds each phase
+/// may take.
+struct PipelineRun<'a, T: Target, H> {
+    /// The host the passes run on.
+    host: &'a H,
+    /// The methods any pass changed this iteration.
+    iteration_modified: &'a DashSet<T::MethodRef>,
+    /// What is checked after each pass, and what a failure costs.
+    checks: RunChecks,
+    /// The rounds one phase may run to its fixpoint.
+    max_phase_iterations: usize,
+}
+
+impl<T, H> PipelineRun<'_, T, H>
+where
+    T: Target,
+    T::MethodRef: Send + Sync,
+    SsaFunction<T>: Send,
+    H: SsaPassHost<T>,
+{
+    /// Run normalize passes to fixpoint.
+    ///
+    /// Repeats a full sweep of `passes` until one sweep reports no change or
+    /// `max_phase_iterations` is reached. This is the convergence loop
+    /// [`layer_to_fixpoint`](Self::layer_to_fixpoint) invokes after each round
+    /// of structural changes, letting cleanup (DCE, GVN, copy propagation)
+    /// cascade before the next layer sweep.
+    ///
+    /// # Arguments
+    ///
+    /// * `passes` - The normalize passes to drive to fixpoint.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any sweep changed a method.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any pass failure surfaced by
+    /// [`run_passes_once`](Self::run_passes_once).
+    fn normalize_to_fixpoint(&self, passes: &mut [Box<dyn SsaPass<T, H>>]) -> Result<bool> {
         let mut any_changed = false;
-        for _ in 0..max_phase_iterations {
-            let changed = Self::run_passes_once(host, passes, iteration_modified, verify_hard)?;
-            if !changed {
-                break;
+        let mut rounds = Rounds::new(Budget::PhaseRounds, self.max_phase_iterations);
+        while rounds.next_round() {
+            if self.run_passes_once(passes)? {
+                any_changed = true;
+            } else {
+                rounds.settle();
             }
-            any_changed = true;
+        }
+        if let Some(exhaustion) = rounds.exhausted() {
+            self.host.events().push(Event::exhausted(None, exhaustion));
         }
         Ok(any_changed)
     }
-
     /// Run all passes in a single layer to fixpoint, running normalize
     /// passes between iterations.
+    ///
+    /// Each round runs the layer's passes once; after every round that changed
+    /// something - and once more when the layer finally settles - the normalize
+    /// passes are driven to their own fixpoint, so structural edits are cleaned
+    /// up and expose new opportunities before the next round. An empty layer
+    /// returns immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `all_passes` - The full layered-pass vector; `layer_indices` selects
+    ///   into it.
+    /// * `layer_indices` - Indices of the passes belonging to this layer.
+    /// * `normalize_passes` - Normalize passes interleaved between rounds.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any layer pass fired during the phase.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any pass or normalize failure.
     fn layer_to_fixpoint(
-        host: &H,
+        &self,
         all_passes: &mut [LayeredPass<T, H>],
         layer_indices: &[usize],
         normalize_passes: &mut [Box<dyn SsaPass<T, H>>],
-        max_phase_iterations: usize,
-        iteration_modified: &DashSet<T::MethodRef>,
-        verify_hard: bool,
     ) -> Result<bool> {
         if layer_indices.is_empty() {
             return Ok(false);
@@ -526,60 +782,61 @@ where
 
         let mut phase_changed = false;
 
-        for _ in 0..max_phase_iterations {
-            let pass_changed = Self::run_layer_passes_once(
-                host,
-                all_passes,
-                layer_indices,
-                iteration_modified,
-                verify_hard,
-            )?;
+        let mut rounds = Rounds::new(Budget::PhaseRounds, self.max_phase_iterations);
+        while rounds.next_round() {
+            let pass_changed = self.run_layer_passes_once(all_passes, layer_indices)?;
 
             if !pass_changed {
                 if phase_changed && !normalize_passes.is_empty() {
-                    Self::normalize_to_fixpoint(
-                        host,
-                        normalize_passes,
-                        max_phase_iterations,
-                        iteration_modified,
-                        verify_hard,
-                    )?;
+                    self.normalize_to_fixpoint(normalize_passes)?;
                 }
-                break;
+                rounds.settle();
+                continue;
             }
 
             phase_changed = true;
 
             if !normalize_passes.is_empty() {
-                Self::normalize_to_fixpoint(
-                    host,
-                    normalize_passes,
-                    max_phase_iterations,
-                    iteration_modified,
-                    verify_hard,
-                )?;
+                self.normalize_to_fixpoint(normalize_passes)?;
             }
+        }
+        if let Some(exhaustion) = rounds.exhausted() {
+            self.host.events().push(Event::exhausted(None, exhaustion));
         }
 
         Ok(phase_changed)
     }
-
     /// Run all normalize passes once across all eligible methods.
-    fn run_passes_once(
-        host: &H,
-        passes: &mut [Box<dyn SsaPass<T, H>>],
-        iteration_modified: &DashSet<T::MethodRef>,
-        verify_hard: bool,
-    ) -> Result<bool> {
+    ///
+    /// One full sweep: [`initialize`](SsaPass::initialize) every pass, run the
+    /// global passes, then dispatch each per-method pass over either all
+    /// methods or just the dirty set depending on
+    /// [`requires_full_scan`](SsaPass::requires_full_scan), and finally
+    /// [`finalize`](SsaPass::finalize) every pass. The two-phase split (globals
+    /// before per-method) keeps whole-program passes ordered ahead of the
+    /// parallel per-method work within the sweep.
+    ///
+    /// # Arguments
+    ///
+    /// * `passes` - The normalize passes to run one sweep of.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any pass changed a method during the sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first pass failure from initialize, run, repair, or finalize.
+    fn run_passes_once(&self, passes: &mut [Box<dyn SsaPass<T, H>>]) -> Result<bool> {
         for pass in passes.iter_mut() {
-            pass.initialize(host)?;
+            pass.initialize(self.host)?;
         }
 
-        let (all_methods, dirty_methods) = Self::method_orders(host);
+        let (all_methods, dirty_methods) = self.method_orders();
         let any_changed = AtomicBool::new(false);
 
         for pass in passes.iter() {
-            if pass.is_global() && pass.run_global(host)? {
+            if pass.is_global() && pass.run_global(self.host)? {
                 any_changed.store(true, Ordering::Relaxed);
             }
         }
@@ -593,39 +850,48 @@ where
             } else {
                 &dirty_methods
             };
-            Self::run_single_pass(
-                pass.as_ref(),
-                host,
-                methods,
-                &any_changed,
-                iteration_modified,
-                verify_hard,
-            )?;
+            self.run_single_pass(pass.as_ref(), methods, &any_changed)?;
         }
 
         for pass in passes.iter_mut() {
-            pass.finalize(host)?;
+            pass.finalize(self.host)?;
         }
 
         Ok(any_changed.load(Ordering::Relaxed))
     }
-
     /// Run all passes in a specific layer once across eligible methods.
+    ///
+    /// The layered analogue of [`run_passes_once`](Self::run_passes_once):
+    /// initialize, run globals, dispatch per-method work, then finalize - but
+    /// the passes are reached by index into the shared `all_passes` vector
+    /// rather than owned directly, so each lookup is bounds-checked and an
+    /// out-of-range index becomes a scheduler error instead of a panic.
+    ///
+    /// # Arguments
+    ///
+    /// * `all_passes` - The full layered-pass vector.
+    /// * `indices` - Indices of the passes to run this round.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any pass changed a method during the round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on an out-of-bounds index or any pass failure.
     fn run_layer_passes_once(
-        host: &H,
+        &self,
         all_passes: &mut [LayeredPass<T, H>],
         indices: &[usize],
-        iteration_modified: &DashSet<T::MethodRef>,
-        verify_hard: bool,
     ) -> Result<bool> {
         for &idx in indices {
             let pass_entry = all_passes
                 .get_mut(idx)
                 .ok_or_else(|| Error::new(format!("scheduler: pass index {idx} out of bounds")))?;
-            pass_entry.0.initialize(host)?;
+            pass_entry.0.initialize(self.host)?;
         }
 
-        let (all_methods, dirty_methods) = Self::method_orders(host);
+        let (all_methods, dirty_methods) = self.method_orders();
         let any_changed = AtomicBool::new(false);
 
         for &idx in indices {
@@ -633,7 +899,7 @@ where
                 .get(idx)
                 .ok_or_else(|| Error::new(format!("scheduler: pass index {idx} out of bounds")))?;
             let pass = &pass_entry.0;
-            if pass.is_global() && pass.run_global(host)? {
+            if pass.is_global() && pass.run_global(self.host)? {
                 any_changed.store(true, Ordering::Relaxed);
             }
         }
@@ -651,229 +917,149 @@ where
             } else {
                 &dirty_methods
             };
-            Self::run_single_pass(
-                pass.as_ref(),
-                host,
-                methods,
-                &any_changed,
-                iteration_modified,
-                verify_hard,
-            )?;
+            self.run_single_pass(pass.as_ref(), methods, &any_changed)?;
         }
 
         for &idx in indices {
             let pass_entry = all_passes
                 .get_mut(idx)
                 .ok_or_else(|| Error::new(format!("scheduler: pass index {idx} out of bounds")))?;
-            pass_entry.0.finalize(host)?;
+            pass_entry.0.finalize(self.host)?;
         }
 
         Ok(any_changed.load(Ordering::Relaxed))
     }
-
-    /// Determine the two method processing orders in one pass.
-    ///
-    /// Returns `(all_methods, dirty_methods)`. Both derive from the same
-    /// traversal order, so the call graph behind
-    /// [`World::methods_reverse_topological`] is built **once** per pass
-    /// batch rather than once per list — and the batch itself sits inside the
-    /// scheduler's fixpoint, so a per-list rebuild is paid on every iteration.
-    ///
-    /// Ordering follows reverse topological order if the host supplies one, or
-    /// falls back to `host.iter_methods()`.
-    ///
-    /// [`World::methods_reverse_topological`]: crate::world::World::methods_reverse_topological
-    fn method_orders(host: &H) -> (Vec<T::MethodRef>, Vec<T::MethodRef>) {
-        // Components arrive callee-first and grouped by mutual recursion.
-        // Flattening discards the grouping, which is correct here: this order
-        // only decides *membership and sequence* for a per-method pass, and
-        // `run_single_pass` dispatches those in parallel anyway. An analysis
-        // that genuinely needs callee-before-caller must be a global pass and
-        // drive `interproc::solve`, which consumes the components ungrouped.
-        let topo: Vec<T::MethodRef> = host
-            .methods_reverse_topological()
-            .into_iter()
-            .flatten()
-            .collect();
-        let order: Vec<_> = if topo.is_empty() {
-            host.iter_methods()
-        } else {
-            topo
-        };
-
-        let all: Vec<T::MethodRef> = order.into_iter().filter(|m| host.contains(m)).collect();
-
-        // Build the dirty set as a HashSet so membership is O(1); a `Vec`
-        // made the per-method filter below O(methods * dirty).
-        let dirty_set: HashSet<T::MethodRef> = host.dirty_snapshot().into_iter().collect();
-        let dirty: Vec<T::MethodRef> = all
-            .iter()
-            .filter(|m| dirty_set.contains(*m))
-            .cloned()
-            .collect();
-
-        (all, dirty)
-    }
-
     /// Execute a single pass across all eligible methods in parallel.
     ///
-    /// For each method: takes (or clones) the SSA from the store, runs
-    /// the pass, applies SSA repair based on the pass's modification
-    /// scope, reinserts the SSA, and records modification.
+    /// For each method (via rayon): takes - or, for a peer-reading pass,
+    /// clones - the SSA from the store and runs the pass inside a
+    /// [`PassTransaction`], one reusable snapshot buffer per worker. Inside the
+    /// transaction the pass runs, and when it changed the function (by its own
+    /// report, or by the function's edit flag when it claims otherwise) the
+    /// scheduler applies the SSA repair its
+    /// [`modification_scope`](SsaPass::modification_scope) calls for, unless
+    /// the pass [repairs its own SSA](SsaPass::repairs_ssa) and says it
+    /// changed. Under `verify_hard` the result is then verified, whether or not
+    /// the pass reported a change.
+    ///
+    /// A pass error, a caught panic, a failed rebuild, or a verifier rejection
+    /// restores the function to its state before the pass, and the restored
+    /// function is what goes back into the store - the store never holds a
+    /// half-edited body, whether the SSA was taken or cloned. A kept change
+    /// marks the method processed, records it as modified this iteration, and
+    /// asks the host to [invalidate its analyses](SsaPassHost::invalidate_analyses).
+    /// Per-method failures are collected and the first is surfaced after the
+    /// parallel region joins.
+    ///
+    /// # Arguments
+    ///
+    /// * `pass` - The pass to execute against each method.
+    /// * `methods` - The methods to dispatch across, already filtered for
+    ///   eligibility by the caller.
+    /// * `any_changed` - Set to `true` if any method was changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first collected per-method failure - a pass error, a caught
+    /// panic, a failed SSA rebuild, or (under `verify_hard`) a verifier
+    /// rejection.
     fn run_single_pass(
+        &self,
         pass: &dyn SsaPass<T, H>,
-        host: &H,
         methods: &[T::MethodRef],
         any_changed: &AtomicBool,
-        iteration_modified: &DashSet<T::MethodRef>,
-        verify_hard: bool,
     ) -> Result<()> {
-        let event_snapshot = host.events().recorded_count();
+        let event_snapshot = self.host.events().recorded_count();
         let pass_change_count = AtomicUsize::new(0);
-        let errors = Mutex::new(Vec::<String>::new());
+        let verify = if self.checks.verify_hard {
+            Verify::Always(VerifyLevel::Standard)
+        } else {
+            Verify::Never
+        };
 
         // Passes that read other methods' SSA need peer SSAs to remain
         // visible during parallel execution. Clone the SSA before
         // processing so the original stays readable.
         let clone_for_visibility = pass.reads_peer_ssa();
 
-        methods.par_iter().for_each(|method| {
-            if !pass.should_run(method, host) {
-                return;
-            }
+        // Nothing goes back into the store until every method has run. A peer
+        // reader then sees each peer as it was when the pass began, whatever
+        // order the workers happen to finish in; writing results back as they
+        // came in let a method inline a callee before or after that callee's
+        // own rewrite depending on thread timing, so the same input produced
+        // different output under different machine load. The bookkeeping that
+        // other methods' passes consult (processed marks, analysis
+        // invalidation) waits for the same reason, and the results are
+        // committed in method order.
+        let outcomes: Vec<_> = methods
+            .par_iter()
+            .map_init_carried(PassTransaction::new, |transaction, method| {
+                if !pass.should_run(method, self.host) {
+                    return None;
+                }
 
-            let mut ssa: SsaFunction<T> = if clone_for_visibility {
-                let Some(cloned) = host.clone_ssa(method) else {
-                    return;
+                let taken = if clone_for_visibility {
+                    self.host.clone_ssa(method)
+                } else {
+                    self.host.take_ssa(method)
                 };
-                cloned
-            } else {
-                let Some(ssa) = host.take_ssa(method) else {
-                    return;
-                };
-                ssa
-            };
+                let mut ssa = taken?;
 
-            let original = if verify_hard { Some(ssa.clone()) } else { None };
-            // The SSA was *taken* from the store, so an unwind through this call
-            // skips every `insert_ssa` below and the method loses its body
-            // permanently — a panicking pass would silently delete code rather
-            // than fail. Catching it turns that into a reported error with the
-            // function restored, matching how a returned `Err` is handled.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pass.run_on_method(&mut ssa, method, host)
-            }));
-            let result = match outcome {
-                Ok(result) => result,
-                Err(payload) => {
-                    let detail = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    if let Some(snapshot) = original {
-                        ssa = snapshot;
-                    }
-                    host.insert_ssa(method.clone(), ssa);
-                    if let Ok(mut guard) = errors.lock() {
-                        guard.push(format!(
-                            "pass '{}' panicked for method {:?}: {detail}",
-                            pass.name(),
-                            method,
-                        ));
-                    }
-                    return;
-                }
-            };
-            let changed = match result {
-                Ok(changed) => changed,
-                Err(error) => {
-                    if let Some(snapshot) = original {
-                        ssa = snapshot;
-                    }
-                    host.insert_ssa(method.clone(), ssa);
-                    if let Ok(mut guard) = errors.lock() {
-                        guard.push(format!(
-                            "pass '{}' failed for method {:?}: {}",
-                            pass.name(),
-                            method,
-                            error
-                        ));
-                    }
-                    return;
-                }
-            };
+                let outcome = transaction.run_guarded(&mut ssa, verify, |ssa| {
+                    PassScheduler::<T, H>::run_and_repair(pass, ssa, method, self.host)
+                });
+                Some((method, ssa, outcome))
+            })
+            .collect();
 
-            if changed && !pass.repairs_ssa() {
-                match pass.modification_scope() {
-                    ModificationScope::UsesOnly | ModificationScope::InstructionsOnly => {
-                        ssa.repair_ssa();
-                    }
-                    ModificationScope::CfgModifying => {
-                        if let Err(e) = ssa.rebuild_ssa() {
-                            if let Some(snapshot) = original {
-                                ssa = snapshot;
-                            }
-                            host.insert_ssa(method.clone(), ssa);
-                            if let Ok(mut guard) = errors.lock() {
-                                guard.push(format!(
-                                    "pass '{}' failed SSA rebuild for method {:?}: {}",
-                                    pass.name(),
-                                    method,
-                                    e
-                                ));
-                            }
-                            return;
-                        }
-                    }
+        let mut failures = Vec::new();
+        for (method, ssa, outcome) in outcomes.into_iter().flatten() {
+            // Restored or rewritten, the function goes back: the SSA was
+            // taken out of the store (or, for a peer reader, the store copy
+            // is overwritten with an identical restore).
+            self.host.insert_ssa(method.clone(), ssa);
+
+            match PassScheduler::<T, H>::settled(pass, method, outcome) {
+                Ok(false) => {}
+                Ok(true) => {
+                    any_changed.store(true, Ordering::Relaxed);
+                    pass_change_count.fetch_add(1, Ordering::Relaxed);
+                    self.host.mark_processed(method);
+                    self.host.invalidate_analyses(method);
+                    self.iteration_modified.insert(method.clone());
+                }
+                Err(failure) => {
+                    // Rolled back, but the pass may have computed facts about
+                    // the function while it was mid-edit.
+                    self.host.invalidate_analyses(method);
+                    failures.push((method, failure));
                 }
             }
-
-            if verify_hard {
-                let verifier_errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-                if !verifier_errors.is_empty() {
-                    if let Some(snapshot) = original {
-                        ssa = snapshot;
-                    }
-                    host.insert_ssa(method.clone(), ssa);
-                    let details = verifier_errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    if let Ok(mut guard) = errors.lock() {
-                        guard.push(format!(
-                            "pass '{}' produced invalid SSA for method {:?}: {}",
-                            pass.name(),
-                            method,
-                            details
-                        ));
-                    }
-                    return;
-                }
-            }
-
-            host.insert_ssa(method.clone(), ssa);
-
-            if changed {
-                any_changed.store(true, Ordering::Relaxed);
-                pass_change_count.fetch_add(1, Ordering::Relaxed);
-                host.mark_processed(method);
-                iteration_modified.insert(method.clone());
-            }
-        });
-
-        let failures = errors
-            .into_inner()
-            .map_err(|_| Error::new("scheduler: failed to read pass errors"))?;
-        if let Some(first) = failures.first() {
-            return Err(Error::new(first.clone()));
         }
 
-        if log::log_enabled!(log::Level::Debug) {
+        match self.checks.on_failure {
+            FailurePolicy::Abort => {
+                if let Some((_, first)) = failures.first() {
+                    return Err(Error::new(first.clone()));
+                }
+            }
+            FailurePolicy::RollbackAndContinue => {
+                for (method, failure) in failures {
+                    self.host.events().push(Event {
+                        kind: EventKind::PassFailed,
+                        method: Some(method.clone()),
+                        location: None,
+                        message: failure,
+                        pass: Some(pass.name().to_string()),
+                    });
+                }
+            }
+        }
+
+        if log_enabled!(Level::Debug) {
             let count = pass_change_count.load(Ordering::Relaxed);
             if count > 0 {
-                let event_delta = host.events().count_by_kind_since(event_snapshot);
+                let event_delta = self.host.events().count_by_kind_since(event_snapshot);
                 if event_delta.is_empty() {
                     debug!("  pass '{}' changed {} methods", pass.name(), count);
                 } else {
@@ -894,17 +1080,62 @@ where
 
         Ok(())
     }
-}
 
-/// Format an event-kind delta map into a compact summary string.
-///
-/// Example: "93 strings decrypted, 115 constants folded".
-fn format_event_delta(delta: &HashMap<EventKind, usize>) -> String {
-    let mut parts: Vec<String> = delta
-        .iter()
-        .filter(|(kind, _)| kind.is_transformation())
-        .map(|(kind, count)| format!("{} {}", count, kind.description()))
-        .collect();
-    parts.sort();
-    parts.join(", ")
+    /// Determine the two method processing orders in one pass.
+    ///
+    /// Returns `(all_methods, dirty_methods)`. Both derive from the same
+    /// traversal order, so the call graph behind
+    /// [`World::methods_reverse_topological`] is built **once** per pass
+    /// batch rather than once per list - and the batch itself sits inside the
+    /// scheduler's fixpoint, so a per-list rebuild is paid on every iteration.
+    ///
+    /// Ordering follows reverse topological order if the host supplies one, or
+    /// falls back to `host.iter_methods()`. Both lists are filtered to methods
+    /// the host still holds SSA for, and the dirty list is derived by
+    /// intersecting against a `HashSet` so the filter stays O(methods).
+    ///
+    /// # Arguments
+    ///
+    ///
+    /// # Returns
+    ///
+    /// `(all_methods, dirty_methods)`: every method with SSA, and the subset of
+    /// those currently marked dirty, both in the same order.
+    ///
+    /// [`World::methods_reverse_topological`]: crate::world::World::methods_reverse_topological
+    fn method_orders(&self) -> (Vec<T::MethodRef>, Vec<T::MethodRef>) {
+        // Components arrive callee-first and grouped by mutual recursion.
+        // Flattening discards the grouping, which is correct here: this order
+        // only decides *membership and sequence* for a per-method pass, and
+        // `run_single_pass` dispatches those in parallel anyway. An analysis
+        // that genuinely needs callee-before-caller must be a global pass and
+        // drive `interproc::solve`, which consumes the components ungrouped.
+        let topo: Vec<T::MethodRef> = self
+            .host
+            .methods_reverse_topological()
+            .into_iter()
+            .flatten()
+            .collect();
+        let order: Vec<_> = if topo.is_empty() {
+            self.host.iter_methods()
+        } else {
+            topo
+        };
+
+        let all: Vec<T::MethodRef> = order
+            .into_iter()
+            .filter(|m| self.host.contains(m))
+            .collect();
+
+        // Build the dirty set as a HashSet so membership is O(1); a `Vec`
+        // made the per-method filter below O(methods * dirty).
+        let dirty_set: FxHashSet<T::MethodRef> = self.host.dirty_snapshot().into_iter().collect();
+        let dirty: Vec<T::MethodRef> = all
+            .iter()
+            .filter(|m| dirty_set.contains(*m))
+            .cloned()
+            .collect();
+
+        (all, dirty)
+    }
 }

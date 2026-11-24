@@ -1,32 +1,32 @@
-//! Dead code elimination passes — both per-method and interprocedural.
+//! Dead code elimination passes - both per-method and interprocedural.
 //!
-//! # Per-method DCE ([`run`] / [`run_iteration`])
+//! # Per-method DCE ([`DeadCodeEliminationPass`])
 //!
-//! Performs the following steps each iteration until convergence:
+//! Performs the following steps each iteration
+//! ([`DeadCodeEliminationPass::run_iteration`]) until convergence:
 //!
-//! 1. **Reachable blocks** — BFS from the entry block (plus exception
+//! 1. **Reachable blocks** - BFS from the entry block (plus exception
 //!    handler roots) to determine which blocks are live.
-//! 2. **Clear unreachable blocks** — instructions and phis in blocks not
+//! 2. **Clear unreachable blocks** - instructions and phis in blocks not
 //!    reachable from entry or any handler are removed.
-//! 3. **Remove op-less instructions** — `Nop` instructions and other
-//!    stack-simulation artefacts are stripped.
-//! 4. **Remove Nops** — simplifies the CFG for subsequent block merging.
-//! 5. **Prune phi operands** — remove phi operands from unreachable
+//! 3. **Remove Nops** - `Nop` stack-simulation artefacts are stripped, which
+//!    simplifies the CFG for subsequent block merging.
+//! 4. **Prune phi operands** - remove phi operands from unreachable
 //!    predecessors.
-//! 6. **Simplify trivial phis** — phis where all operands are the same
+//! 5. **Simplify trivial phis** - phis where all operands are the same
 //!    variable (or self-referential) are replaced with a `Copy` or removed.
-//! 7. **Recompute reachability** after phi changes.
-//! 8. **Liveness via reverse dataflow** — compute which variables are
+//! 6. **Recompute reachability** after phi changes.
+//! 7. **Liveness via reverse dataflow** - compute which variables are
 //!    live at each point using an RPO traversal and a worklist.
-//! 9. **Remove dead phis** — phis whose results are not live.
-//! 10. **Remove dead pure definitions** — instructions with no side effects
-//!     whose results are not live.
-//! 11. **Clean up Nops** created by dead-def removal.
+//! 8. **Remove dead phis** - phis whose results are not live.
+//! 9. **Remove dead pure definitions** - instructions with no side effects
+//!    whose results are not live.
+//! 10. **Clean up Nops** created by dead-def removal.
 //!
 //! Each mutating step runs through the checked SSA editor and performs
 //! boundary repair before the next analysis step.
 //!
-//! # Global DCE ([`run_global`])
+//! # Global DCE ([`DeadMethodEliminationPass`])
 //!
 //! Interprocedural dead-method detection. Traverses the call graph from
 //! [`World::entry_points`] and marks every method that is not transitively
@@ -35,15 +35,21 @@
 //!
 //! # Shared utilities
 //!
-//! - [`find_dead_tails`] — identifies unreachable code after a terminator
+//! - [`find_dead_tails`] - identifies unreachable code after a terminator
 //!   (shared with the control flow pass).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+};
+
+use rustc_hash::FxHashSet;
 
 use crate::{
-    analysis::{cfg::SsaCfg, exceptions::FunctionRoots, phis::PhiAnalyzer},
+    Result,
+    analysis::{budget::Budget, cfg::SsaCfg, exceptions::FunctionRoots, phis::PhiAnalyzer},
     bitset::BitSet,
-    events::{EventKind, EventListener},
+    events::{EventBuilder, EventKind, EventListener},
     graph::{NodeId, algorithms},
     ir::{
         function::{SsaEditOptions, SsaFunction},
@@ -52,6 +58,7 @@ use crate::{
         variable::{SsaVarId, VariableOrigin},
         varstore::{VarMap, VarSet},
     },
+    scheduling::{FunctionPass, ModificationScope, ModulePass, PassEnv},
     target::Target,
     world::World,
 };
@@ -64,7 +71,7 @@ use crate::{
 ///
 /// # Arguments
 ///
-/// * `ssa` — The SSA function to scan.
+/// * `ssa` - The SSA function to scan.
 ///
 /// # Returns
 ///
@@ -85,208 +92,49 @@ pub fn find_dead_tails<T: Target>(ssa: &SsaFunction<T>) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Run per-method dead code elimination on `ssa`.
+/// The values something the function does reads, as dead code elimination
+/// decides them: an operand of an operation with an effect, a value returned
+/// or thrown, and every value a live one is computed from.
 ///
-/// Iterates the multi-step DCE algorithm (reachability, liveness, dead
-/// removal) until convergence. Each checked edit boundary performs the
-/// required SSA repair before the next analysis step.
-///
-/// # Arguments
-///
-/// * `ssa` — The SSA function to clean up in place.
-/// * `method` — Opaque method reference recorded in emitted events.
-/// * `events` — Event sink for [`EventKind::InstructionRemoved`],
-///   [`EventKind::BlockRemoved`], and [`EventKind::PhiSimplified`] events.
-/// * `max_iterations` — Cap on the outer fixpoint loop.
-///
-/// # Returns
-///
-/// `true` if any instruction, phi node, or block was removed.
-pub fn run<T, L>(
-    ssa: &mut SsaFunction<T>,
-    method: &T::MethodRef,
-    events: &L,
-    max_iterations: usize,
-) -> bool
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    let mut changed = false;
-    for _ in 0..max_iterations {
-        if run_iteration(ssa, method, events) == 0 {
-            break;
-        }
-        changed = true;
-    }
-    changed
-}
-
-/// Single iteration of per-method DCE.
-///
-/// Performs reachability analysis, removes unreachable blocks, strips
-/// op-less instructions and nops, prunes phi operands, simplifies trivial
-/// phis, computes liveness, and removes dead phis and definitions.
+/// A load is an effect of its own (it may fault), so its address is live, but
+/// its result is live only where a live value reads it: a load whose result
+/// is not live is a read the function makes and discards.
 ///
 /// # Arguments
 ///
-/// * `ssa` — The SSA function to clean up in place.
-/// * `method` — Opaque method reference recorded in emitted events.
-/// * `events` — Event sink for transformation events.
+/// * `ssa` - The SSA function to scan.
 ///
 /// # Returns
 ///
-/// The total number of changes made this iteration. Zero means the
-/// algorithm has converged.
-pub fn run_iteration<T, L>(ssa: &mut SsaFunction<T>, method: &T::MethodRef, events: &L) -> usize
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    let mut total_changes: usize = 0;
-
-    // Step 1: reachable blocks (entry + exception handlers + fallback).
-    let reachable = find_reachable_blocks(ssa);
-
-    // Step 2: clear unreachable blocks.
-    total_changes =
-        total_changes.saturating_add(clear_unreachable_blocks(ssa, &reachable, method, events));
-
-    // Step 3: remove op-less instructions (stack-simulation artifacts).
-    let opless = find_opless_instructions(ssa, &reachable);
-    total_changes =
-        total_changes.saturating_add(remove_opless_instructions(ssa, &opless, method, events));
-
-    // Step 4: remove Nop instructions (simplifies CFG for block merging).
-    total_changes =
-        total_changes.saturating_add(remove_nop_instructions(ssa, &reachable, method, events));
-
-    // Step 5: prune phi operands from unreachable predecessors.
-    let mut pruned = 0usize;
-    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
-        pruned = editor.prune_phi_operands(&reachable);
-        Ok(())
-    });
-    total_changes = total_changes.saturating_add(pruned);
-    let reachable_set: BTreeSet<usize> = reachable.iter().collect();
-
-    // Step 6: simplify trivial phis (purely structural).
-    let trivial_phis = PhiAnalyzer::new(ssa).find_all_trivial(&reachable_set);
-    total_changes =
-        total_changes.saturating_add(simplify_trivial_phis(ssa, &trivial_phis, method, events));
-
-    // Step 7+8: recompute reachability after phi simplification, then compute
-    // liveness. One CFG built here serves both the reachability sweep and the
-    // RPO traversal.
-    //
-    // This CFG must be rebuilt rather than reusing step 1's: step 2 clears
-    // unreachable blocks, and `SsaBlock::clear` removes their instructions —
-    // terminators included — so their outgoing edges disappear. Forward
-    // traversals from entry happen not to observe the difference, since the
-    // cleared blocks were already unreachable, but the CFG object itself is
-    // genuinely stale and reusing it would rest on that coincidence rather than
-    // on an invariant.
+/// A [`VarSet`] of every live variable.
+#[must_use]
+pub fn live_values<T: Target>(ssa: &SsaFunction<T>) -> VarSet {
     let cfg = SsaCfg::from_ssa(ssa);
-    let reachable = find_reachable_blocks_with_cfg(ssa, &cfg);
+    let reachable = FunctionRoots::of(ssa).live_blocks(&cfg);
     let rpo = compute_reverse_postorder(ssa, &reachable, &cfg);
-    let live = compute_live_variables(ssa, &reachable, &rpo);
-
-    // Steps 9+10: dead phis and dead pure definitions.
-    //
-    // Both sets are derived from `live`, which — like `dead_phi_results` — is a
-    // `BitSet` indexed by `SsaVarId`. Closing an edit session runs the boundary
-    // repair (`repair_ssa` -> `compact_variables`), which **renumbers every
-    // `SsaVarId`**, so no var-id-keyed analysis result survives a session
-    // boundary. Both removals therefore share ONE session, applied only after
-    // every such result has been consumed: removing the phis in their own session
-    // and *then* consulting `live` for dead definitions would index the old
-    // numbering with new ids and delete definitions that are still live.
-    let dead_phis = find_dead_phis(ssa, &reachable, &live);
-    let mut dead_phi_results = VarSet::new(ssa.var_id_bound());
-    for &(block_idx, phi_idx) in &dead_phis {
-        if let Some(result) = ssa
-            .block(block_idx)
-            .and_then(|b| b.phi_nodes().get(phi_idx))
-            .map(PhiNode::result)
-        {
-            dead_phi_results.insert(result);
-        }
-    }
-    let dead_defs = find_dead_definitions(ssa, &reachable, &live, &dead_phi_results);
-    total_changes = total_changes
-        .saturating_add(dead_phis.len())
-        .saturating_add(dead_defs.len());
-    remove_dead_phis_and_definitions(ssa, &dead_phis, &dead_defs, method, events);
-
-    total_changes
+    compute_live_variables(ssa, &reachable, &rpo)
 }
 
-fn find_reachable_blocks<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
-    if ssa.block_count() == 0 {
-        return BitSet::new(0);
-    }
-    let cfg = SsaCfg::from_ssa(ssa);
-    find_reachable_blocks_with_cfg(ssa, &cfg)
-}
-
-/// Reachability using a prebuilt CFG, so callers that already have one (and
-/// that have not changed any terminator) avoid rebuilding it.
-fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<T>) -> BitSet {
-    if ssa.block_count() == 0 {
-        return BitSet::new(0);
-    }
-
-    let mut reachable = BitSet::new(ssa.block_count());
-    for n in algorithms::bfs(cfg, NodeId::new(0)) {
-        let n: NodeId = n;
-        reachable.insert(n.index());
-    }
-
-    // Where else control can enter, from the one place the crate reads the
-    // exception table. `FunctionRoots` treats an index the function does not
-    // have as naming no block, which is the answer -- a front end can name a
-    // block it has not built yet, and a block-removing edit can leave a clause
-    // naming one the function no longer has.
-    //
-    // A stale index is *tolerated here and reported elsewhere*, and the two are
-    // deliberately different questions. Passes read the exception table through
-    // the total accessors (`parts`, `entry_blocks`, `FunctionRoots`), none of
-    // which rejects anything, so an out-of-range clause costs a root rather than
-    // an abort. Whether the IR is valid is the verifier's question, and
-    // `SsaVerifier::check_exception_table` answers it by rejecting that same
-    // clause. Pass robustness and IR validity must not be one condition: a pass
-    // that refused to run on a table the verifier dislikes could not be run to
-    // fix it.
-    let roots = FunctionRoots::of(ssa);
-    let mut exception_roots = BitSet::new(ssa.block_count());
-    for root in roots.flow_roots() {
-        if !reachable.contains_checked(root.block) {
-            exception_roots.insert_checked(root.block);
-        }
-    }
-    // A block reached only by the runtime unwinding into it, recognised by its
-    // leading `EndFinally` or `Rethrow`. These are preservation roots: they must
-    // survive elimination, but they get no edge and no dominance answer.
-    for block in roots.preservation_roots() {
-        if !reachable.contains_checked(block) {
-            exception_roots.insert_checked(block);
-        }
-    }
-
-    for root in exception_roots.iter() {
-        // An earlier root's traversal may already have covered this one.
-        if reachable.contains_checked(root) {
-            continue;
-        }
-        for node in algorithms::bfs(cfg, NodeId::new(root)) {
-            let node: NodeId = node;
-            reachable.insert(node.index());
-        }
-    }
-
-    reachable
-}
-
+/// Order the reachable blocks in reverse postorder for the liveness sweep.
+///
+/// Liveness is a backward dataflow, so it converges fastest when blocks are
+/// visited in reverse postorder. RPO from the entry block covers the blocks
+/// reachable through normal control flow; exception roots (handlers reached
+/// only by the runtime) are not on any edge from entry, so each uncovered
+/// reachable block seeds its own RPO traversal, appended in block-index order
+/// for determinism. Membership is tracked in an incremental [`BitSet`] rather
+/// than a linear scan of the growing list, keeping the handler sweep linear
+/// instead of quadratic in the block count.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function being analyzed.
+/// * `reachable` - The set of reachable blocks to include.
+/// * `cfg` - A CFG already built from `ssa`.
+///
+/// # Returns
+///
+/// The reachable block indices in reverse postorder.
 fn compute_reverse_postorder<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
@@ -327,6 +175,32 @@ fn compute_reverse_postorder<T: Target>(
     rpo
 }
 
+/// Compute the set of live variables by reverse dataflow.
+///
+/// Runs in three phases. Phase 1 seeds a worklist with the roots of liveness:
+/// operands of side-effectful (non-pure) ops, and the values carried by
+/// `Return` and `Throw` - anything observable outside the function. Phase 2
+/// builds a def→uses map (from both phi operands and instruction uses) and
+/// propagates liveness backward until the worklist drains, so a value is live
+/// whenever a live value uses it. Phase 3 bridges local/argument slots: a live
+/// `LoadLocal`/`LoadLocalAddr`/`LoadArg`/`LoadArgAddr` keeps alive every
+/// definition sharing
+/// its [`VariableOrigin`], and because that can make further loads live it
+/// loops to a fixpoint. The def→uses map is a dense [`VarMap`] rather than a
+/// tree map because variable ids are dense and it is probed once per worklist
+/// pop; instruction operands are gathered once per instruction, not once per
+/// definition, so a multi-output op does not re-walk them.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function being analyzed.
+/// * `reachable` - The set of reachable blocks; unreachable blocks contribute
+///   no liveness.
+/// * `rpo` - Reachable blocks in reverse postorder.
+///
+/// # Returns
+///
+/// A [`VarSet`] of every live variable.
 fn compute_live_variables<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
@@ -335,7 +209,7 @@ fn compute_live_variables<T: Target>(
     let mut live = VarSet::new(ssa.var_id_bound());
     let mut worklist = VecDeque::new();
 
-    // Phase 1: roots — operands of side-effectful ops, return values, throws.
+    // Phase 1: roots - operands of side-effectful ops, return values, throws.
     for &block_idx in rpo {
         if !reachable.contains(block_idx) {
             continue;
@@ -350,7 +224,7 @@ fn compute_live_variables<T: Target>(
                         }
                     });
                 }
-                if let SsaOp::Return { value: Some(v) } = op
+                if let SsaOp::Return { value: Some(v), .. } = op
                     && live.insert(*v)
                 {
                     worklist.push_back(*v);
@@ -367,7 +241,7 @@ fn compute_live_variables<T: Target>(
     // Phase 2: backward propagation.
     // Dense, indexed by variable id: this is rebuilt on every DCE iteration and
     // probed once per worklist pop, so a `BTreeMap` paid an O(log n) comparison
-    // chain on every access for no benefit — variable ids are dense by
+    // chain on every access for no benefit - variable ids are dense by
     // construction.
     let mut def_uses: VarMap<Vec<SsaVarId>> = VarMap::new(ssa.var_id_bound());
 
@@ -428,7 +302,7 @@ fn compute_live_variables<T: Target>(
                     SsaOp::LoadLocalAddr { dest, local_index } => {
                         load_local_info.push((*dest, VariableOrigin::Local(*local_index)));
                     }
-                    SsaOp::LoadArg { dest, arg_index } => {
+                    SsaOp::LoadArg { dest, arg_index } | SsaOp::LoadArgAddr { dest, arg_index } => {
                         load_local_info.push((*dest, VariableOrigin::Argument(*arg_index)));
                     }
                     _ => {}
@@ -482,6 +356,30 @@ fn compute_live_variables<T: Target>(
     live
 }
 
+/// Locate pure instructions whose results are all dead.
+///
+/// Scans reachable blocks for instructions whose effects report
+/// `removable_when_unused`, i.e. may be deleted when their results are dead. An
+/// instruction with no defs is dead
+/// outright; one with defs is dead only if *every* def is absent from `live`.
+/// `Pop` is handled separately: a `Pop` is dead not when its own result is
+/// unused but when the value it pops is being removed this iteration - either
+/// an instruction def collected into `dead_vars` during the first scan, or a
+/// dead phi result passed in via `dead_phi_results` - so a second scan catches
+/// those. Keeping a stack-balancing `Pop` whose source vanished would leave the
+/// operand stack unbalanced.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function being analyzed.
+/// * `reachable` - The set of reachable blocks to scan.
+/// * `live` - The live-variable set from [`compute_live_variables`].
+/// * `dead_phi_results` - Results of phis being removed this iteration, so a
+///   `Pop` of one is recognised as dead.
+///
+/// # Returns
+///
+/// `(block_idx, instr_idx)` pairs identifying the dead instructions.
 fn find_dead_definitions<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
@@ -532,6 +430,23 @@ fn find_dead_definitions<T: Target>(
     dead
 }
 
+/// Locate phi nodes whose results are dead.
+///
+/// A phi is dead when its result variable is not in `live`. Only reachable
+/// blocks are scanned, since a phi in an unreachable block is removed by
+/// [`clear_unreachable_blocks`] instead. The results feed both
+/// [`remove_dead_phis_and_definitions`] and the `dead_phi_results` set that
+/// [`find_dead_definitions`] uses to spot now-dead `Pop`s.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function being analyzed.
+/// * `reachable` - The set of reachable blocks to scan.
+/// * `live` - The live-variable set from [`compute_live_variables`].
+///
+/// # Returns
+///
+/// `(block_idx, phi_idx)` pairs identifying the dead phi nodes.
 fn find_dead_phis<T: Target>(
     ssa: &SsaFunction<T>,
     reachable: &BitSet,
@@ -557,20 +472,25 @@ fn find_dead_phis<T: Target>(
 /// every [`SsaVarId`] (`repair_ssa` -> `compact_variables`), so splitting the two
 /// removals across two sessions would leave the caller's var-id-keyed liveness
 /// bitset describing the pre-renumber function while the ids it is queried with
-/// come from the post-renumber one — silently deleting live definitions.
+/// come from the post-renumber one - silently deleting live definitions.
 ///
 /// Phi indices and instruction indices live in separate per-block vectors, so the
 /// two removals cannot disturb each other's indices; each is applied
 /// highest-index-first so earlier removals do not shift later ones.
-fn remove_dead_phis_and_definitions<T, L>(
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function to mutate in place.
+/// * `dead_phis` - `(block_idx, phi_idx)` pairs from [`find_dead_phis`].
+/// * `dead_defs` - `(block_idx, instr_idx)` pairs from [`find_dead_definitions`].
+/// * `env` - The pass environment: where events are recorded, naming the method.
+fn remove_dead_phis_and_definitions<T>(
     ssa: &mut SsaFunction<T>,
     dead_phis: &[(usize, usize)],
     dead_defs: &[(usize, usize)],
-    method: &T::MethodRef,
-    events: &L,
+    env: &PassEnv<'_, T>,
 ) where
     T: Target,
-    L: EventListener<T> + ?Sized,
 {
     let mut instructions_by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for &(block_idx, instr_idx) in dead_defs {
@@ -605,26 +525,18 @@ fn remove_dead_phis_and_definitions<T, L>(
 
                 editor.nop_instruction(block_idx, instr_idx)?;
                 let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
-                push_event(
-                    events,
-                    EventKind::InstructionRemoved,
-                    method,
-                    Some(location),
-                    message,
-                );
+                env.record(EventKind::InstructionRemoved)
+                    .location(location)
+                    .message(message);
             }
         }
         for (block_idx, mut indices) in phis_by_block {
             indices.sort_by(|a, b| b.cmp(a));
             for phi_idx in indices {
                 if editor.remove_phi(block_idx, phi_idx).is_ok() {
-                    push_event(
-                        events,
-                        EventKind::PhiSimplified,
-                        method,
-                        Some(block_idx),
-                        "removed dead phi node".to_string(),
-                    );
+                    env.record(EventKind::PhiSimplified)
+                        .location(block_idx)
+                        .message("removed dead phi node".to_string());
                 }
             }
         }
@@ -632,20 +544,155 @@ fn remove_dead_phis_and_definitions<T, L>(
     });
 }
 
-fn simplify_trivial_phis<T, L>(
+/// Gives each phi operand whose value is undefined ([`SsaOp::defines_undefined`])
+/// the value of a sibling operand available at the end of its edge.
+///
+/// The path that brings an undefined value into a phi relies on nothing it
+/// holds, so the operand may be any value the edge can carry: one whose
+/// definition dominates the end of the edge's predecessor, or that the
+/// function is entered with. Of several such siblings the lowest value id
+/// is taken, whatever order the phi lists them in. A phi whose defined
+/// operands then agree is trivial, and the copies its edges would carry
+/// agree too. Only the phi operand changes: every other read of the value
+/// keeps it.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function to mutate in place.
+/// * `env` - The pass environment: where events are recorded, naming the method.
+///
+/// # Returns
+///
+/// The number of operands given a sibling's value.
+fn fill_undefined_phi_operands<T>(ssa: &mut SsaFunction<T>, env: &PassEnv<'_, T>) -> usize
+where
+    T: Target,
+{
+    let undefined: BTreeSet<SsaVarId> = ssa
+        .blocks()
+        .iter()
+        .flat_map(|block| block.instructions())
+        .filter(|instruction| instruction.op().defines_undefined())
+        .flat_map(|instruction| instruction.op().defs())
+        .collect();
+    if undefined.is_empty() || ssa.block_count() == 0 {
+        return 0;
+    }
+    let dominators = algorithms::compute_dominators(&SsaCfg::from_ssa(ssa), NodeId::new(0));
+    let available = |value: SsaVarId, at: usize| {
+        ssa.variable(value).is_some_and(|variable| {
+            dominators.dominates(NodeId::new(variable.def_site().block()), NodeId::new(at))
+        })
+    };
+    // (block, phi, edge, value) for every operand to fill.
+    let mut fills: Vec<(usize, usize, usize, SsaVarId)> = Vec::new();
+    for block in ssa.blocks() {
+        for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
+            let defined: Vec<SsaVarId> = phi
+                .normal_operands()
+                .map(|operand| operand.value())
+                .filter(|value| !undefined.contains(value) && *value != phi.result())
+                .collect();
+            for operand in phi.normal_operands() {
+                if !undefined.contains(&operand.value()) {
+                    continue;
+                }
+                let edge = operand.predecessor();
+                if let Some(value) = defined
+                    .iter()
+                    .copied()
+                    .filter(|value| available(*value, edge))
+                    .min()
+                {
+                    fills.push((block.id(), phi_idx, edge, value));
+                }
+            }
+        }
+    }
+    if fills.is_empty() {
+        return 0;
+    }
+    let mut filled = 0usize;
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for &(block_idx, phi_idx, edge, value) in &fills {
+            editor.set_phi_operand(block_idx, phi_idx, edge, value)?;
+            filled = filled.saturating_add(1);
+        }
+        Ok(())
+    });
+    if result.is_err() {
+        return 0;
+    }
+    for &(block_idx, _, edge, value) in &fills {
+        env.record(EventKind::PhiSimplified)
+            .location(block_idx)
+            .message(format!("undefined operand from B{edge} given {value}"));
+    }
+    filled
+}
+
+/// Replace or remove trivial phi nodes.
+///
+/// A phi identified as trivial by the [`PhiAnalyzer`]
+/// carries an optional replacement variable: `Some(v)` means every distinct
+/// operand resolves to `v`, so the phi becomes a `Copy` from `v`; `None` means
+/// the phi is purely self-referential and is deleted outright. Removals within
+/// a block are applied highest-index-first so earlier edits do not shift the
+/// indices of later ones, and the whole batch runs in one checked edit session.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function to mutate in place.
+/// * `trivial_phis` - `(block_idx, phi_idx, replacement)` triples, where a
+///   `None` replacement marks a self-referential phi to delete.
+/// * `env` - The pass environment: where events are recorded, naming the method.
+///
+/// # Returns
+///
+/// The number of phis simplified or removed.
+fn simplify_trivial_phis<T>(
     ssa: &mut SsaFunction<T>,
     trivial_phis: &[(usize, usize, Option<SsaVarId>)],
-    method: &T::MethodRef,
-    events: &L,
+    env: &PassEnv<'_, T>,
 ) -> usize
 where
     T: Target,
-    L: EventListener<T> + ?Sized,
 {
     let mut simplified: usize = 0;
 
+    // A replacement can be the result of another phi this batch removes: a
+    // phi trivial to a phi that is trivial in turn. Each is followed through
+    // the batch to the value the chain ends at, so no use is rewritten to a
+    // result the batch then removes. A chain that ends at a phi that names
+    // only itself ends at no value, and its phi waits for the next round.
+    let removed: BTreeMap<SsaVarId, Option<SsaVarId>> = trivial_phis
+        .iter()
+        .filter_map(|&(block_idx, phi_idx, replacement)| {
+            let result = ssa.block(block_idx)?.phi_nodes().get(phi_idx)?.result();
+            Some((result, replacement))
+        })
+        .collect();
+    let resolve = |start: SsaVarId| -> Option<SsaVarId> {
+        let mut value = start;
+        let mut seen = BTreeSet::new();
+        while let Some(&next) = removed.get(&value) {
+            if !seen.insert(value) {
+                return None;
+            }
+            value = next?;
+        }
+        Some(value)
+    };
+
     let mut by_block: BTreeMap<usize, Vec<(usize, Option<SsaVarId>)>> = BTreeMap::new();
     for &(block_idx, phi_idx, replacement) in trivial_phis {
+        let replacement = match replacement {
+            Some(value) => match resolve(value) {
+                Some(resolved) => Some(resolved),
+                None => continue,
+            },
+            None => None,
+        };
         by_block
             .entry(block_idx)
             .or_default()
@@ -654,30 +701,22 @@ where
 
     let _ = ssa.edit(SsaEditOptions::new(), |editor| {
         for (block_idx, mut phis) in by_block {
-            phis.sort_by_key(|p| std::cmp::Reverse(p.0));
+            phis.sort_by_key(|p| Reverse(p.0));
             for (phi_idx, replacement) in phis {
                 if let Some(replacement_var) = replacement {
                     if editor
                         .simplify_phi_to_copy(block_idx, phi_idx, replacement_var)
                         .is_ok()
                     {
-                        push_event(
-                            events,
-                            EventKind::PhiSimplified,
-                            method,
-                            Some(block_idx),
-                            format!("replaced with {replacement_var}"),
-                        );
+                        env.record(EventKind::PhiSimplified)
+                            .location(block_idx)
+                            .message(format!("replaced with {replacement_var}"));
                         simplified = simplified.saturating_add(1);
                     }
                 } else if editor.remove_phi(block_idx, phi_idx).is_ok() {
-                    push_event(
-                        events,
-                        EventKind::PhiSimplified,
-                        method,
-                        Some(block_idx),
-                        "removed self-referential phi".to_string(),
-                    );
+                    env.record(EventKind::PhiSimplified)
+                        .location(block_idx)
+                        .message("removed self-referential phi".to_string());
                     simplified = simplified.saturating_add(1);
                 }
             }
@@ -688,110 +727,71 @@ where
     simplified
 }
 
-fn clear_unreachable_blocks<T, L>(
+/// Clear the contents of every block not in the reachable set.
+///
+/// Walks all block indices and, for each one absent from `reachable`, empties
+/// its instructions and phis via `clear_block`. The block slot itself is kept
+/// (block indices remain stable for the rest of the iteration); only its
+/// contents go, which severs its outgoing edges and lets subsequent
+/// reachability sweeps see the reduced CFG.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function to mutate in place.
+/// * `reachable` - The set of reachable blocks; every other block is cleared.
+/// * `env` - The pass environment: where events are recorded, naming the method.
+///
+/// # Returns
+///
+/// The number of blocks cleared.
+fn clear_unreachable_blocks<T>(
     ssa: &mut SsaFunction<T>,
     reachable: &BitSet,
-    method: &T::MethodRef,
-    events: &L,
+    env: &PassEnv<'_, T>,
 ) -> usize
 where
     T: Target,
-    L: EventListener<T> + ?Sized,
 {
-    let mut cleared: usize = 0;
-    let total_blocks = ssa.block_count();
+    let mut cleared: Vec<usize> = Vec::new();
+    // A failure is recorded on the function for the pass's runner (see
+    // `SsaFunction::take_edit_failure`).
     let _ = ssa.edit(SsaEditOptions::new(), |editor| {
-        for block_idx in 0..total_blocks {
-            if !reachable.contains(block_idx) && editor.clear_block(block_idx).unwrap_or(false) {
-                push_event(
-                    events,
-                    EventKind::BlockRemoved,
-                    method,
-                    Some(block_idx),
-                    format!("removed unreachable block {block_idx}"),
-                );
-                cleared = cleared.saturating_add(1);
-            }
-        }
+        cleared = editor.clear_unreached_blocks(reachable);
         Ok(())
     });
-    cleared
-}
-
-fn find_opless_instructions<T: Target>(
-    ssa: &SsaFunction<T>,
-    reachable: &BitSet,
-) -> Vec<(usize, usize)> {
-    let mut opless = Vec::new();
-    for block_idx in reachable.iter() {
-        if let Some(block) = ssa.block(block_idx) {
-            let instr_count = block.instructions().len();
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let is_last = instr_idx == instr_count.saturating_sub(1);
-                if matches!(instr.op(), SsaOp::Nop) && (!is_last || instr_count > 1) {
-                    opless.push((block_idx, instr_idx));
-                }
-            }
-        }
+    for &block_idx in &cleared {
+        env.record(EventKind::BlockRemoved)
+            .location(block_idx)
+            .message(format!("removed unreachable block {block_idx}"));
     }
-    opless
+    cleared.len()
 }
 
-fn remove_opless_instructions<T, L>(
+/// Remove every `Nop` in the reachable blocks.
+///
+/// Front ends emit `Nop`s as stack-simulation artefacts, and removing them
+/// flattens the CFG for the subsequent block-merge pass. Every `Nop` goes,
+/// including one that is the sole instruction of its block: the session's
+/// boundary repair strips all `Nop`s regardless. All removals share one edit
+/// session, and events are coalesced into one per block reporting the count,
+/// rather than one per `Nop`.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function to mutate in place.
+/// * `reachable` - The set of reachable blocks to scan.
+/// * `env` - The pass environment: where events are recorded, naming the method.
+///
+/// # Returns
+///
+/// The number of `Nop` instructions removed.
+fn remove_nop_instructions<T>(
     ssa: &mut SsaFunction<T>,
-    opless: &[(usize, usize)],
-    method: &T::MethodRef,
-    events: &L,
+    reachable: &BitSet,
+    env: &PassEnv<'_, T>,
 ) -> usize
 where
     T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    if opless.is_empty() {
-        return 0;
-    }
-    let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for &(block_idx, instr_idx) in opless {
-        by_block.entry(block_idx).or_default().push(instr_idx);
-    }
-    let mut removed: usize = 0;
-    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
-        for (block_idx, mut indices) in by_block {
-            indices.sort_by(|a, b| b.cmp(a));
-            for instr_idx in indices {
-                if let Some(instr) = editor
-                    .function()
-                    .block(block_idx)
-                    .and_then(|block| block.instructions().get(instr_idx))
-                {
-                    let mnemonic_owned = instr.mnemonic().to_string();
-                    editor.nop_instruction(block_idx, instr_idx)?;
-                    let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
-                    push_event(
-                        events,
-                        EventKind::InstructionRemoved,
-                        method,
-                        Some(location),
-                        format!("removed op-less instruction: {mnemonic_owned}"),
-                    );
-                    removed = removed.saturating_add(1);
-                }
-            }
-        }
-        Ok(())
-    });
-    removed
-}
-
-fn remove_nop_instructions<T, L>(
-    ssa: &mut SsaFunction<T>,
-    reachable: &BitSet,
-    method: &T::MethodRef,
-    events: &L,
-) -> usize
-where
-    T: Target,
-    L: EventListener<T> + ?Sized,
 {
     let mut nops = Vec::new();
     for block_idx in reachable.iter() {
@@ -825,111 +825,279 @@ where
             *entry = entry.saturating_add(1);
         }
         for (block_idx, count) in per_block {
-            push_event(
-                events,
-                EventKind::InstructionRemoved,
-                method,
-                Some(block_idx),
-                format!("removed {count} Nop instructions"),
-            );
+            env.record(EventKind::InstructionRemoved)
+                .location(block_idx)
+                .message(format!("removed {count} Nop instructions"));
         }
     }
 
     removed
 }
 
-fn push_event<T, L>(
-    events: &L,
-    kind: EventKind,
-    method: &T::MethodRef,
-    location: Option<usize>,
-    message: String,
-) where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    let event = crate::events::Event {
-        kind,
-        method: Some(method.clone()),
-        location,
-        message,
-        pass: None,
-    };
-    events.push(event);
-}
+/// Pass that removes unreachable blocks, unused definitions, and dead phi
+/// nodes within a single method.
+///
+/// Complements [`DeadMethodEliminationPass`], which handles interprocedural
+/// DCE.
+///
+/// # Modification scope
+///
+/// [`ModificationScope::CfgModifying`] - removes instructions and phis, and
+/// clears unreachable blocks, which removes their outgoing edges. Every edit
+/// runs in a checked session that repairs the function at its boundary, so
+/// the pass [repairs its own SSA](FunctionPass::repairs_ssa).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeadCodeEliminationPass;
 
-/// Run interprocedural dead-method elimination.
-///
-/// Traverses the call graph from [`World::entry_points`], marking every
-/// method that is not transitively reachable as dead via
-/// [`World::mark_dead`].
-///
-/// # Arguments
-///
-/// * `world` — The host's [`World<T>`] providing entry points, call edges,
-///   and the full method list.
-/// * `events` — Event sink for [`EventKind::MethodMarkedDead`] events.
-///
-/// # Returns
-///
-/// `true` if any method was newly marked dead.
-pub fn run_global<T, L, W>(world: &W, events: &L) -> bool
+impl<T> FunctionPass<T> for DeadCodeEliminationPass
 where
     T: Target,
-    L: EventListener<T> + ?Sized,
-    W: World<T> + ?Sized,
+    T::MethodRef: Send + Sync,
 {
-    let entries = world.entry_points();
-    let mut live: HashSet<T::MethodRef> = entries.iter().cloned().collect();
-    let mut worklist: VecDeque<T::MethodRef> = entries.into_iter().collect();
+    /// Returns this pass's unique short name for logging.
+    fn name(&self) -> &'static str {
+        "dead-code-elimination"
+    }
 
-    while let Some(method) = worklist.pop_front() {
-        for callee in world.callees(&method) {
-            if live.insert(callee.clone()) {
-                worklist.push_back(callee);
+    /// Returns this pass's human-readable description.
+    fn description(&self) -> &'static str {
+        "Remove unreachable blocks, unused definitions, and op-less instructions"
+    }
+
+    /// Returns the IR scope this pass may modify.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::CfgModifying
+    }
+
+    /// Reports whether this pass leaves the SSA form intact for the next pass.
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
+    /// Runs intraprocedural dead-code elimination on one method: removes
+    /// unreachable blocks, unused definitions, and dead phi nodes, one
+    /// [`Self::run_iteration`] at a time until a round changes nothing or the
+    /// context's [`Budget::DeadCodeRounds`] runs out.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function to clean up in place.
+    /// * `env` - The pass environment: where events are recorded, naming the method.
+    ///
+    /// # Returns
+    ///
+    /// `true` if anything was removed.
+    fn run(&self, ssa: &mut SsaFunction<T>, env: &PassEnv<'_, T>) -> Result<bool> {
+        let mut changed = false;
+        let mut rounds = env.context().budget().rounds(Budget::DeadCodeRounds);
+        while rounds.next_round() {
+            if self.run_iteration(ssa, env) == 0 {
+                rounds.settle();
+            } else {
+                changed = true;
             }
         }
+        if let Some(exhaustion) = rounds.exhausted() {
+            env.exhausted(exhaustion);
+        }
+        Ok(changed)
+    }
+}
+
+impl DeadCodeEliminationPass {
+    /// Single iteration of per-method DCE.
+    ///
+    /// Performs reachability analysis, removes unreachable blocks, strips
+    /// nops, prunes phi operands, simplifies trivial
+    /// phis, computes liveness, and removes dead phis and definitions.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function to clean up in place.
+    /// * `env` - The pass environment: where events are recorded, naming the method.
+    ///
+    /// # Returns
+    ///
+    /// The total number of changes made this iteration. Zero means the
+    /// algorithm has converged.
+    pub fn run_iteration<T: Target>(
+        &self,
+        ssa: &mut SsaFunction<T>,
+        env: &PassEnv<'_, T>,
+    ) -> usize {
+        let mut total_changes: usize = 0;
+
+        // Step 1: reachable blocks - the entry's reach, then every handler, filter
+        // and preservation root's.
+        //
+        // A stale index is *tolerated here and reported elsewhere*, and the two are
+        // deliberately different questions. Passes read the exception table through
+        // the total accessors (`parts`, `entry_blocks`, `FunctionRoots`), none of
+        // which rejects anything, so an out-of-range clause costs a root rather than
+        // an abort. Whether the IR is valid is the verifier's question, and
+        // `SsaVerifier::check_exception_table` answers it by rejecting that same
+        // clause. Pass robustness and IR validity must not be one condition: a pass
+        // that refused to run on a table the verifier dislikes could not be run to
+        // fix it.
+        let reachable = FunctionRoots::of(ssa).live_blocks(&SsaCfg::from_ssa(ssa));
+
+        // Step 2: clear unreachable blocks.
+        total_changes =
+            total_changes.saturating_add(clear_unreachable_blocks(ssa, &reachable, env));
+
+        // Step 3: remove Nop instructions (stack-simulation artifacts; removing
+        // them simplifies the CFG for block merging).
+        total_changes = total_changes.saturating_add(remove_nop_instructions(ssa, &reachable, env));
+
+        // Step 4: prune phi operands from unreachable predecessors.
+        let mut pruned = 0usize;
+        let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+            pruned = editor.prune_phi_operands(&reachable);
+            Ok(())
+        });
+        total_changes = total_changes.saturating_add(pruned);
+        let reachable_set: BTreeSet<usize> = reachable.iter().collect();
+
+        // Step 4b: an undefined phi operand takes a sibling's value, which can
+        // leave the phi trivial for step 5.
+        total_changes = total_changes.saturating_add(fill_undefined_phi_operands(ssa, env));
+
+        // Step 5: simplify trivial phis (purely structural).
+        let trivial_phis = PhiAnalyzer::new(ssa).find_all_trivial(&reachable_set);
+        total_changes =
+            total_changes.saturating_add(simplify_trivial_phis(ssa, &trivial_phis, env));
+
+        // Steps 6+7: recompute reachability after phi simplification, then compute
+        // liveness. One CFG built here serves both the reachability sweep and the
+        // RPO traversal.
+        //
+        // This CFG must be rebuilt rather than reusing step 1's: step 2 clears
+        // unreachable blocks, and `SsaBlock::clear` removes their instructions -
+        // terminators included - so their outgoing edges disappear. Forward
+        // traversals from entry happen not to observe the difference, since the
+        // cleared blocks were already unreachable, but the CFG object itself is
+        // genuinely stale and reusing it would rest on that coincidence rather than
+        // on an invariant.
+        let cfg = SsaCfg::from_ssa(ssa);
+        let reachable = FunctionRoots::of(ssa).live_blocks(&cfg);
+        let rpo = compute_reverse_postorder(ssa, &reachable, &cfg);
+        let live = compute_live_variables(ssa, &reachable, &rpo);
+
+        // Steps 8+9: dead phis and dead pure definitions.
+        //
+        // Both sets are derived from `live`, which - like `dead_phi_results` - is a
+        // `BitSet` indexed by `SsaVarId`. Closing an edit session runs the boundary
+        // repair (`repair_ssa` -> `compact_variables`), which **renumbers every
+        // `SsaVarId`**, so no var-id-keyed analysis result survives a session
+        // boundary. Both removals therefore share ONE session, applied only after
+        // every such result has been consumed: removing the phis in their own session
+        // and *then* consulting `live` for dead definitions would index the old
+        // numbering with new ids and delete definitions that are still live.
+        let dead_phis = find_dead_phis(ssa, &reachable, &live);
+        let mut dead_phi_results = VarSet::new(ssa.var_id_bound());
+        for &(block_idx, phi_idx) in &dead_phis {
+            if let Some(result) = ssa
+                .block(block_idx)
+                .and_then(|b| b.phi_nodes().get(phi_idx))
+                .map(PhiNode::result)
+            {
+                dead_phi_results.insert(result);
+            }
+        }
+        let dead_defs = find_dead_definitions(ssa, &reachable, &live, &dead_phi_results);
+        total_changes = total_changes
+            .saturating_add(dead_phis.len())
+            .saturating_add(dead_defs.len());
+        remove_dead_phis_and_definitions(ssa, &dead_phis, &dead_defs, env);
+
+        total_changes
+    }
+}
+
+/// Global interprocedural dead-method elimination pass.
+///
+/// Operates over the whole program via [`World<T>`](World), not per-method.
+///
+/// This pass is declared as `is_global()` and never invoked per-method.
+/// It marks all methods not transitively reachable from entry points as
+/// dead using [`World::mark_dead`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeadMethodEliminationPass;
+
+impl<T> ModulePass<T> for DeadMethodEliminationPass
+where
+    T: Target,
+    T::MethodRef: Send + Sync,
+{
+    /// Returns this pass's unique short name for logging.
+    fn name(&self) -> &'static str {
+        "dead-method-elimination"
     }
 
-    let mut changed = false;
-    for method in world.all_methods() {
-        if !live.contains(&method) && !world.is_dead(&method) {
-            world.mark_dead(&method);
-            push_event(
-                events,
-                EventKind::MethodMarkedDead,
-                &method,
-                None,
-                "method has no live callers".to_string(),
-            );
-            changed = true;
-        }
+    /// Returns this pass's human-readable description.
+    fn description(&self) -> &'static str {
+        "Mark methods that have no live callers and aren't entry points"
     }
-    changed
+
+    /// Runs interprocedural dead-method elimination over the whole program.
+    ///
+    /// Walks the [`World`] from its entry points along its call edges and
+    /// marks every method not transitively reachable as dead
+    /// ([`World::mark_dead`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `world` - The program's methods, entry points and call edges.
+    /// * `env` - The pass environment: where events are recorded, naming the method.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any method was newly marked dead.
+    fn run(&self, world: &dyn World<T>, events: &dyn EventListener<T>) -> Result<bool> {
+        let entries = world.entry_points();
+        let mut live: FxHashSet<T::MethodRef> = entries.iter().cloned().collect();
+        let mut worklist: VecDeque<T::MethodRef> = entries.into_iter().collect();
+
+        while let Some(method) = worklist.pop_front() {
+            for callee in world.callees(&method) {
+                if live.insert(callee.clone()) {
+                    worklist.push_back(callee);
+                }
+            }
+        }
+
+        let mut changed = false;
+        for method in world.all_methods() {
+            if !live.contains(&method) && !world.is_dead(&method) {
+                world.mark_dead(&method);
+                EventBuilder::new(events, EventKind::MethodMarkedDead)
+                    .method(method.clone())
+                    .message("method has no live callers");
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
     use crate::{
+        analysis::context::AnalysisContext,
         events::EventLog,
         ir::{
             block::SsaBlock,
             exception::{BlockRange, SsaExceptionHandler},
             function::SsaFunction,
             instruction::SsaInstruction,
-            ops::{
-                FlagAdjustKind, FlagAdjustResult, FlagsMask, KindedVecData, SsaEffectKind, SsaOp,
-                table::OpKindTable,
-            },
+            ops::SsaOp,
             phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
         testing::{
-            MockTarget, MockType, MockWorld, assert_mock_valid_full,
+            MACHINE, MockTarget, MockType, MockWorld, assert_mock_valid_full,
             run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
         },
     };
@@ -937,14 +1105,14 @@ mod tests {
     /// Builds a function with an in-function protected region: block 0 is the
     /// try body, block 1 is where it completes, block 2 is the handler.
     ///
-    /// No terminator names block 2 — the runtime enters a handler — which is
+    /// No terminator names block 2 - the runtime enters a handler - which is
     /// exactly why its survival is a question worth asking.
     fn function_with_an_in_function_handler() -> SsaFunction<MockTarget> {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         for (index, op) in [
             SsaOp::Jump { target: 1 },
-            SsaOp::Return { value: None },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
+            SsaOp::returns(None),
         ]
         .into_iter()
         .enumerate()
@@ -963,23 +1131,31 @@ mod tests {
             protected_range: BlockRange::new(0, 1),
             handler_range: BlockRange::new(2, 3),
             filter_range: None,
+            selector: None,
         }]);
         ssa
     }
 
     /// A handler block survives elimination even though nothing branches to it.
     ///
-    /// This is the property the exception table buys, and it is bought *here* —
-    /// by rooting handler entries from the table — not by the CFG view drawing
+    /// This is the property the exception table buys, and it is bought *here* -
+    /// by rooting handler entries from the table - not by the CFG view drawing
     /// a synthetic edge to them. Which matters, because that edge binds for
-    /// only 1 of 29 clauses on the corpus's one exception-carrying fixture: on
-    /// Windows x64 a handler is a funclet, a separate function, so a
-    /// per-function CFG cannot contain the block at all.
+    /// few clauses in lifted native code: on Windows x64 a handler is a
+    /// funclet, a separate function, so a per-function CFG cannot contain the
+    /// block at all.
     #[test]
     fn an_in_function_handler_survives_elimination() {
         let mut ssa = function_with_an_in_function_handler();
         let log: EventLog<MockTarget> = EventLog::new();
-        run(&mut ssa, &0, &log, 8);
+        assert!(
+            DeadCodeEliminationPass
+                .run(
+                    &mut ssa,
+                    &PassEnv::new(&0, &log, AnalysisContext::new(MACHINE))
+                )
+                .is_ok()
+        );
 
         assert!(
             ssa.block(2).is_some(),
@@ -989,11 +1165,101 @@ mod tests {
         assert_mock_valid_full(&ssa, "handler survival");
     }
 
+    /// **An unread value the implementation chooses is dead.** `v0 =
+    /// runtime(unspecified)` that nothing reads is removed.
+    #[test]
+    fn an_unread_unspecified_value_is_removed() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::RuntimeValue {
+            dest: SsaVarId::from_index(0),
+            kind: crate::ir::ops::RuntimeValueKind::Unspecified,
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
+        ssa.add_block(block);
+        let log: EventLog<MockTarget> = EventLog::new();
+        assert!(
+            DeadCodeEliminationPass
+                .run(
+                    &mut ssa,
+                    &PassEnv::new(&0, &log, AnalysisContext::new(MACHINE))
+                )
+                .is_ok()
+        );
+        let kept = ssa.blocks().iter().any(|block| {
+            block
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.op(), SsaOp::RuntimeValue { .. }))
+        });
+        assert!(!kept, "the unread value survived");
+    }
+
+    /// **The state a return leaves its caller is live.** An accrual of
+    /// status flags nothing in the function reads, `v2 = v0 | v1`, stays
+    /// while the return names it as state its caller observes; the control,
+    /// the same function returning without it, loses the accrual.
+    #[test]
+    fn the_state_a_return_leaves_its_caller_is_live() {
+        let accrued = |state: bool| {
+            let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+            for index in 0..3 {
+                ssa.create_variable(
+                    VariableOrigin::Local(index),
+                    0,
+                    DefSite::instruction(0, usize::from(index)),
+                    MockType::I32,
+                );
+            }
+            let var = SsaVarId::from_index;
+            let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
+            for (dest, value) in [(0, 1), (1, 0x10)] {
+                block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+                    dest: var(dest),
+                    value: ConstValue::I32(value),
+                }));
+            }
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Or {
+                dest: var(2),
+                left: var(0),
+                right: var(1),
+                flags: None,
+            }));
+            let state = if state { vec![var(2)] } else { Vec::new() };
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns_with(None, state)));
+            ssa.add_block(block);
+            let log: EventLog<MockTarget> = EventLog::new();
+            assert!(
+                DeadCodeEliminationPass
+                    .run(
+                        &mut ssa,
+                        &PassEnv::new(&0, &log, AnalysisContext::new(MACHINE))
+                    )
+                    .is_ok()
+            );
+            ssa.blocks().iter().any(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .any(|instruction| matches!(instruction.op(), SsaOp::Or { .. }))
+            })
+        };
+        assert!(accrued(true), "the accrual the return names went");
+        assert!(!accrued(false), "an accrual nothing reads stayed");
+    }
+
+    /// A `Nop` following a `Return` is reported as a dead tail at index 1.
     #[test]
     fn find_dead_tails_after_terminator() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         block.add_instruction(SsaInstruction::synthetic(SsaOp::Nop));
         ssa.add_block(block);
 
@@ -1001,13 +1267,14 @@ mod tests {
         assert_eq!(dead, vec![(0, 1)]);
     }
 
+    /// Global DCE marks a method unreachable from any entry point as dead.
     #[test]
     fn global_dce_marks_unreachable_methods() {
         // Methods 1, 2, 3, 4. Entry: 1. Edges: 1→2, 2→3. Method 4 is
         // unreachable.
         let world = MockWorld::new([1u32, 2, 3, 4], [1u32], [(1u32, 2), (2u32, 3)]);
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run_global(&world, &log);
+        let changed = DeadMethodEliminationPass.run(&world, &log) == Ok(true);
         assert!(changed);
         assert!(world.is_dead(&4));
         assert!(!world.is_dead(&1));
@@ -1016,11 +1283,12 @@ mod tests {
         assert_eq!(log.count_kind(EventKind::MethodMarkedDead), 1);
     }
 
+    /// Global DCE reports no change when every method is reachable.
     #[test]
     fn global_dce_no_op_when_all_reachable() {
         let world = MockWorld::new([1u32, 2], [1u32], [(1u32, 2)]);
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run_global(&world, &log);
+        let changed = DeadMethodEliminationPass.run(&world, &log) == Ok(true);
         assert!(!changed);
     }
 
@@ -1031,7 +1299,7 @@ mod tests {
     fn find_dead_tails_with_dead_code() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(1, 0);
         let mut block0: SsaBlock<MockTarget> = SsaBlock::new(0);
-        block0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         block0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
             dest: SsaVarId::from_index(0),
             value: ConstValue::I32(42),
@@ -1049,7 +1317,7 @@ mod tests {
     fn find_dead_tails_multiple_dead_instructions() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(1, 0);
         let mut block0: SsaBlock<MockTarget> = SsaBlock::new(0);
-        block0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         for (i, v) in [1, 2, 3].iter().enumerate() {
             block0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
                 dest: SsaVarId::from_index(i),
@@ -1086,7 +1354,7 @@ mod tests {
         };
         assert_eq!(op.successors(), vec![1, 2, 3, 4]);
 
-        let op: SsaOp<MockTarget> = SsaOp::Return { value: None };
+        let op: SsaOp<MockTarget> = SsaOp::returns(None);
         assert!(op.successors().is_empty());
 
         let op: SsaOp<MockTarget> = SsaOp::Leave { target: 3 };
@@ -1099,8 +1367,12 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed =
-            run_mock_pass_boundary(&mut ssa, "empty DCE", |ssa| run(ssa, &method, &log, 20));
+        let changed = run_mock_pass_boundary(&mut ssa, "empty DCE", |ssa| {
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
+        });
         assert!(!changed);
     }
 
@@ -1115,14 +1387,17 @@ mod tests {
         let mut phi = PhiNode::new(phi_var, VariableOrigin::Phi);
         phi.add_operand(PhiOperand::new(phi_var, 0)); // self-ref
         block.add_phi(phi);
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block);
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed =
             run_mock_malformed_cleanup_boundary(&mut ssa, "self-referential phi DCE", |ssa| {
-                run(ssa, &method, &log, 20)
+                DeadCodeEliminationPass.run(
+                    ssa,
+                    &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+                ) == Ok(true)
             });
         assert!(changed, "self-referential phi should be removed");
         // The trivial phi should have been removed.
@@ -1134,6 +1409,7 @@ mod tests {
         );
     }
 
+    /// A block with no predecessors is removed and a `BlockRemoved` event fires.
     #[test]
     fn removes_unreachable_block() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
@@ -1157,7 +1433,7 @@ mod tests {
             dest: v0,
             value: ConstValue::I32(5),
         }));
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
         ssa.add_block(b0);
 
         let mut b1 = SsaBlock::new(1);
@@ -1165,19 +1441,23 @@ mod tests {
             dest: v1,
             value: ConstValue::I32(99),
         }));
-        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v1) }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v1))));
         ssa.add_block(b1);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "unreachable-block DCE", |ssa| {
-            run(ssa, &method, &log, 20)
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
         });
         assert!(changed, "unreachable block should be removed");
         assert!(log.has(EventKind::BlockRemoved));
     }
 
+    /// A pure instruction whose result is never used is removed.
     #[test]
     fn unused_pure_instruction_removed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
@@ -1207,19 +1487,23 @@ mod tests {
             operand: v0,
             flags: None,
         }));
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "unused pure instruction DCE", |ssa| {
-            run(ssa, &method, &log, 20)
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
         });
         assert!(changed, "unused pure instruction should be removed");
         assert!(log.has(EventKind::InstructionRemoved));
     }
 
+    /// A phi whose result is never used is removed.
     #[test]
     fn dead_phi_removed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -1260,33 +1544,42 @@ mod tests {
         let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(2));
         phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
-        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
         ssa.add_block(b2);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed =
-            run_mock_pass_boundary(&mut ssa, "dead phi DCE", |ssa| run(ssa, &method, &log, 20));
+        let changed = run_mock_pass_boundary(&mut ssa, "dead phi DCE", |ssa| {
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
+        });
         // phi_var is never used after the phi, so the phi should be removed
         assert!(changed);
         assert!(log.has(EventKind::PhiSimplified));
     }
 
+    /// `Nop` instructions are stripped, leaving only the terminator.
     #[test]
     fn nop_instructions_removed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let mut b0 = SsaBlock::new(0);
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::Nop));
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::Nop));
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed =
-            run_mock_pass_boundary(&mut ssa, "nop DCE", |ssa| run(ssa, &method, &log, 20));
+        let changed = run_mock_pass_boundary(&mut ssa, "nop DCE", |ssa| {
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
+        });
         assert!(changed, "Nop instructions should be removed");
         assert!(log.has(EventKind::InstructionRemoved));
         // Only the Return should remain
@@ -1299,6 +1592,31 @@ mod tests {
         );
     }
 
+    /// A `Nop` that is the only instruction of its block is stripped in the
+    /// same iteration as any other `Nop`; nothing is left for a later pass.
+    #[test]
+    fn a_lone_nop_is_stripped() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Nop));
+        ssa.add_block(b0);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        assert!(
+            DeadCodeEliminationPass.run_iteration(
+                &mut ssa,
+                &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE))
+            ) > 0
+        );
+        assert!(
+            ssa.block(0)
+                .is_some_and(|block| block.instructions().is_empty()),
+            "the lone Nop is removed"
+        );
+    }
+
+    /// An unused but side-effecting (overflow-checked) instruction is kept.
     #[test]
     fn side_effect_instruction_not_removed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -1333,7 +1651,7 @@ mod tests {
             dest: v1,
             value: ConstValue::I32(20),
         }));
-        // Use an overflow-checked arithmetic op (impure — may throw)
+        // Use an overflow-checked arithmetic op (impure - may throw)
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::AddOvf {
             dest: v2,
             left: v0,
@@ -1341,7 +1659,7 @@ mod tests {
             unsigned: false,
             flags: None,
         }));
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
@@ -1349,11 +1667,15 @@ mod tests {
         let method = 0u32;
         // We don't expect specific changes; just verify the function stays valid
         let changed = run_mock_pass_boundary(&mut ssa, "side-effect DCE", |ssa| {
-            run(ssa, &method, &log, 20)
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
         });
         assert!(!changed, "side-effecting unused instruction must remain");
     }
 
+    /// A CFG whose blocks are all reachable and live is left untouched.
     #[test]
     fn all_blocks_reachable_nothing_removed() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -1385,7 +1707,7 @@ mod tests {
         ssa.add_block(b0);
 
         let mut b1 = SsaBlock::new(1);
-        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
         ssa.add_block(b1);
 
         let mut b2 = SsaBlock::new(2);
@@ -1393,34 +1715,42 @@ mod tests {
             dest: v1,
             value: ConstValue::I32(2),
         }));
-        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v1) }));
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v1))));
         ssa.add_block(b2);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "reachable-block DCE", |ssa| {
-            run(ssa, &method, &log, 20)
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
         });
-        // v1 is used, both blocks reachable — no dead code
+        // v1 is used, both blocks reachable - no dead code
         assert!(!changed, "reachable live blocks should not be removed");
     }
 
+    /// A single iteration reports zero changes on an already-clean function.
     #[test]
     fn run_iteration_returns_zero_on_no_work() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let mut b0 = SsaBlock::new(0);
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         assert_mock_valid_full(&ssa, "DCE iteration no-work before");
-        let count = run_iteration(&mut ssa, &0u32, &log);
+        let count = DeadCodeEliminationPass.run_iteration(
+            &mut ssa,
+            &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE)),
+        );
         assert_mock_valid_full(&ssa, "DCE iteration no-work after");
         assert_eq!(count, 0);
     }
 
+    /// Removing a dead definition compacts the variable numbering.
     #[test]
     fn compact_variables_after_dce() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
@@ -1448,22 +1778,25 @@ mod tests {
             dest: v1,
             value: ConstValue::I32(99),
         }));
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
         ssa.add_block(b0);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         let changed = run_mock_pass_boundary(&mut ssa, "variable compaction DCE", |ssa| {
-            run(ssa, &method, &log, 20)
+            DeadCodeEliminationPass.run(
+                ssa,
+                &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE)),
+            ) == Ok(true)
         });
         assert!(changed);
         // v1 should be gone after compaction
         assert!(log.has(EventKind::InstructionRemoved));
     }
 
-    /// Regression: DCE must never delete a live definition, however the variables
-    /// happen to be numbered.
+    /// DCE must never delete a live definition, however the variables happen to
+    /// be numbered.
     ///
     /// Liveness is a `BitSet` keyed by `SsaVarId`, and closing an edit session
     /// renumbers every `SsaVarId` (`repair_ssa` -> `compact_variables`). Applying
@@ -1473,9 +1806,9 @@ mod tests {
     /// mismatch depends entirely on how its ids permute under compaction, so this
     /// sweeps the id space rather than asserting one hand-built collision.
     ///
-    /// `VerifyLevel::Quick` has no defined-before-use check, so in a release build
-    /// the resulting corruption was silently *accepted* rather than rolled back —
-    /// hence the check here is `Full`.
+    /// The check here is `Full` rather than the `Quick` a release pass group
+    /// uses: `Quick` rejects a dangling read, but this sweep is about every
+    /// definition DCE could delete, so it checks everything the verifier can.
     #[test]
     fn dce_never_deletes_a_live_definition() {
         // Deterministic xorshift; no `rand` dependency, and a failure is
@@ -1492,8 +1825,8 @@ mod tests {
         for seed in 1..2_000u64 {
             let mut rng = seed;
             // `slots` constants, all defined in the entry block so each dominates
-            // the join, plus the phi result. Ids are permuted across ALL of them —
-            // including the phi's — because the corruption needs the dead phi to
+            // the join, plus the phi result. Ids are permuted across ALL of them -
+            // including the phi's - because the corruption needs the dead phi to
             // hold a *low* id: compaction only shifts the ids above the one it
             // drops, so a phi pinned to the highest id renumbers nothing.
             let slots = 4 + (next(&mut rng) % 4) as usize; // 4..=7
@@ -1573,15 +1906,22 @@ mod tests {
             // Return one of the entry constants: that one is unambiguously LIVE,
             // and every other constant is dead.
             let returned_slot = (next(&mut rng) % slots as u64) as usize;
-            b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-                value: Some(var(returned_slot)),
-            }));
+            b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(var(
+                returned_slot,
+            )))));
             ssa.add_block(b3);
             ssa.recompute_uses();
 
             let log: EventLog<MockTarget> = EventLog::new();
             let method = 0u32;
-            let _ = run(&mut ssa, &method, &log, 20);
+            assert!(
+                DeadCodeEliminationPass
+                    .run(
+                        &mut ssa,
+                        &PassEnv::new(&method, &log, AnalysisContext::new(MACHINE))
+                    )
+                    .is_ok()
+            );
 
             assert_mock_valid_full(&ssa, &format!("DCE corrupted SSA (seed {seed})"));
 
@@ -1598,7 +1938,7 @@ mod tests {
                 .iter()
                 .flat_map(SsaBlock::instructions)
                 .find_map(|instr| match instr.op() {
-                    SsaOp::Return { value } => *value,
+                    SsaOp::Return { value, .. } => *value,
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("function still returns a value (seed {seed})"));
@@ -1621,135 +1961,178 @@ mod tests {
         }
     }
 
-    /// Every kind classifies from its own declared result, so a new variant
-    /// cannot inherit `Pure` by sitting in a shared arm.
-    #[test]
-    fn flag_adjust_effects_follow_its_result() {
-        for kind in FlagAdjustKind::all() {
-            let effects = kind.effects();
-            match kind.result() {
-                FlagAdjustResult::None => {
-                    assert_eq!(
-                        effects.kind,
-                        SsaEffectKind::Opaque,
-                        "{kind:?} writes state the IR cannot name, so it is not pure"
-                    );
-                    assert_eq!(kind.output_arity(), 0);
-                }
-                FlagAdjustResult::Flags | FlagAdjustResult::Register => {
-                    assert_eq!(
-                        effects.kind,
-                        SsaEffectKind::Pure,
-                        "{kind:?} is a function of its operands"
-                    );
-                    assert_eq!(kind.output_arity(), 1);
-                }
-            }
+    /// A join `B2` of a branch at `B0`: `B1` brings in a register a call left
+    /// undefined, and the other edge `kept`, a value defined in `B0` where
+    /// `dominating`, in `B3`, which `B0` branches to instead of straight to
+    /// `B2`, otherwise. Returns the function and the kept value.
+    fn clobbered_join(dominating: bool) -> (SsaFunction<MockTarget>, SsaVarId) {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let kept_block = if dominating { 0 } else { 3 };
+        let condition = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let kept = ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(kept_block, 0),
+            MockType::I32,
+        );
+        let clobbered = ssa.create_variable(
+            VariableOrigin::Local(1),
+            1,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+        let merged =
+            ssa.create_variable(VariableOrigin::Local(1), 2, DefSite::phi(2), MockType::I32);
+        let constant = |dest, value| {
+            SsaInstruction::synthetic(SsaOp::Const {
+                dest,
+                value: ConstValue::I32(value),
+            })
+        };
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(constant(condition, 1));
+        if dominating {
+            b0.add_instruction(constant(kept, 7));
         }
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition,
+            true_target: 1,
+            false_target: if dominating { 2 } else { 3 },
+        }));
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::CallClobber {
+            outputs: vec![clobbered],
+            machine: None,
+        }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+        let mut b2 = SsaBlock::new(2);
+        let mut phi = PhiNode::new(merged, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(kept, kept_block));
+        phi.add_operand(PhiOperand::new(clobbered, 1));
+        b2.add_phi(phi);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(merged))));
+        ssa.add_block(b0);
+        ssa.add_block(b1);
+        ssa.add_block(b2);
+        if !dominating {
+            let mut b3 = SsaBlock::new(3);
+            b3.add_instruction(constant(kept, 7));
+            b3.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+            ssa.add_block(b3);
+        }
+        ssa.recompute_uses();
+        (ssa, kept)
     }
 
-    /// A kind that declares a result but carries none has written architectural
-    /// state and handed back nothing to model it. It must not be deletable.
+    /// **An undefined phi operand takes a sibling's value available on its
+    /// edge.** The register a call left undefined that `B1` brings into the
+    /// join is `B0`'s value, which dominates `B1`, so the join is that value
+    /// on both edges. A value defined on another path, in `B3`, is not
+    /// available at the end of `B1`, and the operand keeps the clobber.
     #[test]
-    fn a_result_declaring_kind_without_an_output_is_not_pure() {
-        for kind in FlagAdjustKind::all() {
-            if matches!(kind.result(), FlagAdjustResult::None) {
-                continue;
-            }
-            assert_eq!(
-                kind.effects_for_outputs(0).kind,
-                SsaEffectKind::Opaque,
-                "{kind:?} with no output must degrade, not stay pure"
-            );
-            assert_eq!(kind.effects_for_outputs(1).kind, SsaEffectKind::Pure);
-        }
+    fn an_undefined_phi_operand_takes_a_siblings_value_available_on_its_edge() {
+        let log: EventLog<MockTarget> = EventLog::new();
+        let (mut ssa, kept) = clobbered_join(true);
+        assert_eq!(
+            fill_undefined_phi_operands(
+                &mut ssa,
+                &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE))
+            ),
+            1
+        );
+        let operands: Vec<SsaVarId> = ssa
+            .block(2)
+            .and_then(|block| block.phi_nodes().first())
+            .map(|phi| phi.operands().iter().map(PhiOperand::value).collect())
+            .unwrap_or_default();
+        assert_eq!(operands, vec![kept, kept]);
+
+        let (mut ssa, _) = clobbered_join(false);
+        assert_eq!(
+            fill_undefined_phi_operands(
+                &mut ssa,
+                &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE))
+            ),
+            0
+        );
     }
 
-    /// `setf8`/`setf16` exist to recover a narrow add's overflow; reporting
-    /// only N and Z tells a caller a stale V is still live.
+    /// **A phi trivial to a phi that is trivial in turn takes the value the
+    /// chain ends at.** `B2` merges `v` from both its edges, and `B4` merges
+    /// `B2`'s result from both of its: both are trivial in one round, `B4`'s
+    /// to `B2`'s result. Rewritten to that result after `B2`'s phi was gone,
+    /// the return read a value nothing defines.
     #[test]
-    fn flags_written_names_overflow_for_setf() {
-        for kind in [FlagAdjustKind::SetNzFrom8, FlagAdjustKind::SetNzFrom16] {
-            let written = kind.flags_written();
-            assert!(written.contains(FlagsMask::OVERFLOW), "{kind:?} writes V");
-            assert!(written.contains(FlagsMask::SIGN));
-            assert!(written.contains(FlagsMask::ZERO));
-            assert!(
-                !written.contains(FlagsMask::CARRY),
-                "{kind:?} leaves C alone"
-            );
-        }
-    }
-
-    /// The kind is the operation's only identity, so discarding it makes `std`
-    /// indistinguishable from `clc` in both rendering and fingerprinting.
-    #[test]
-    fn flag_adjust_names_its_kind_in_display_and_opcode_name() {
-        let mut rendered = BTreeSet::new();
-        let mut opcodes = BTreeSet::new();
-        for kind in FlagAdjustKind::all() {
-            let op = SsaOp::<MockTarget>::FlagAdjust(Box::new(KindedVecData {
-                kind,
-                outputs: Vec::new(),
-                inputs: Vec::new(),
-            }));
-            assert!(
-                rendered.insert(format!("{op}")),
-                "{kind:?} renders as a duplicate"
-            );
-            assert!(
-                opcodes.insert(op.opcode_name()),
-                "{kind:?} shares a fingerprint"
-            );
-            assert_eq!(op.opcode_name(), kind.kind_str());
-        }
-        assert_eq!(rendered.len(), usize::from(FlagAdjustKind::COUNT));
-    }
-
-    /// A flag adjustment that writes architectural state no SSA value models
-    /// must survive dead-code elimination.
-    ///
-    /// `clac`/`stac` toggle EFLAGS.AC, which is what makes a `mov` from a user
-    /// pointer legal inside the kernel. They have no SSA result, because the
-    /// IR has nothing to represent AC with — so a purity rule that keys on the
-    /// `SsaOp` variant classifies them `Pure`, `removable_when_unused()` says
-    /// yes, and `find_dead_definitions` deletes them through its
-    /// `defs.is_empty()` branch. The SMAP window silently disappears.
-    #[test]
-    fn dce_keeps_a_zero_output_flag_adjust() {
-        for kind in [
-            FlagAdjustKind::SetAlignCheck,
-            FlagAdjustKind::ClearAlignCheck,
-            FlagAdjustKind::SetDirection,
-            FlagAdjustKind::ClearDirection,
-        ] {
-            let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
-            let mut block = SsaBlock::new(0);
-            block.add_instruction(SsaInstruction::synthetic(SsaOp::FlagAdjust(Box::new(
-                KindedVecData {
-                    kind,
-                    outputs: Vec::new(),
-                    inputs: Vec::new(),
-                },
-            ))));
-            block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    fn a_phi_trivial_to_a_trivial_phi_takes_the_value_the_chain_ends_at() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let condition = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let value = ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(0, 1),
+            MockType::I32,
+        );
+        let first =
+            ssa.create_variable(VariableOrigin::Local(1), 1, DefSite::phi(2), MockType::I32);
+        let second =
+            ssa.create_variable(VariableOrigin::Local(1), 2, DefSite::phi(4), MockType::I32);
+        let constant = |dest, value| {
+            SsaInstruction::synthetic(SsaOp::Const {
+                dest,
+                value: ConstValue::I32(value),
+            })
+        };
+        let branch = |to, past| {
+            SsaInstruction::synthetic(SsaOp::Branch {
+                condition,
+                true_target: to,
+                false_target: past,
+            })
+        };
+        let jump = |target| SsaInstruction::synthetic(SsaOp::Jump { target });
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(constant(condition, 1));
+        b0.add_instruction(constant(value, 7));
+        b0.add_instruction(branch(1, 2));
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(jump(2));
+        let mut b2 = SsaBlock::new(2);
+        let mut phi = PhiNode::new(first, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(value, 0));
+        phi.add_operand(PhiOperand::new(value, 1));
+        b2.add_phi(phi);
+        b2.add_instruction(branch(3, 4));
+        let mut b3 = SsaBlock::new(3);
+        b3.add_instruction(jump(4));
+        let mut b4 = SsaBlock::new(4);
+        let mut phi = PhiNode::new(second, VariableOrigin::Local(1));
+        phi.add_operand(PhiOperand::new(first, 2));
+        phi.add_operand(PhiOperand::new(first, 3));
+        b4.add_phi(phi);
+        b4.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(second))));
+        for block in [b0, b1, b2, b3, b4] {
             ssa.add_block(block);
-            ssa.recompute_uses();
-
-            let events = crate::events::EventLog::<MockTarget>::new();
-            super::run(&mut ssa, &0u32, &events, 4);
-
-            let survived = ssa.block(0).is_some_and(|block| {
-                block
-                    .instructions()
-                    .iter()
-                    .any(|instr| matches!(instr.op(), SsaOp::FlagAdjust(_)))
-            });
-            assert!(
-                survived,
-                "{kind:?} writes architectural state the IR does not model; \
-                 deleting it changes what the program does"
-            );
         }
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let trivial = PhiAnalyzer::new(&ssa).find_all_trivial(&(0..5).collect::<BTreeSet<usize>>());
+        assert_eq!(trivial.len(), 2, "{trivial:?}");
+        simplify_trivial_phis(
+            &mut ssa,
+            &trivial,
+            &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE)),
+        );
+        assert_mock_valid_full(&ssa, "chained trivial phis");
     }
 }
