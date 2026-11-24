@@ -7,6 +7,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-24
+
+Fixes to analyses that read an operand at a width or signedness other than its
+own. A host whose operations mix widths (a bytecode evaluation stack holding
+narrow values as 32-bit integers) had comparisons decided, remainders reduced
+and offsets folded wrongly.
+
+### Fixed
+
+- **Comparisons are decided in the comparison's window.** Predicate analysis
+  decided constant comparisons, range orderings and sign facts from each
+  operand's own value, so the unsigned 32-bit maximum tested for equality with
+  a signed -1 was decided unequal. Every such decision now goes through
+  `decide_operands`, which views both operands as the comparison reads them.
+- **Strength reduction reads a signed remainder's dividend signed.** A
+  dividend whose range is non-negative only as an unsigned value no longer
+  turns a signed remainder by a power of two into a mask.
+- **Address arithmetic wraps an integer at its own width.** Displacements and
+  constant bases of integer values wrapped at the pointer width, so a 64-bit
+  sum on a 32-bit target, or a 32-bit sum on a 64-bit one, folded to the wrong
+  offset and could be dropped as a round trip.
+- **Reassociation keeps a folded constant's type.** The sum of two shift counts
+  of different widths, an `int32` 44 and an `int64` 7, was written as an
+  `int64` into the `int32` variable that held the first.
+- **Nothing is narrowed into a truth value.** A Boolean holds 0 or 1 however
+  many bits store it. `ConstValue::from_bits_of_type` of a Boolean type now
+  gives `True` or `False`, or `None` for other bits, instead of an integer of
+  the Boolean's width; and phi narrowing no longer truncates a wide value into
+  a Boolean's type. A comparison with a widened Boolean, or a join of one with
+  a byte, had been narrowed to a Boolean holding 255.
+
+### Changed
+
+- **`Target::operand_width` states the contract the analyses keep.** Every
+  analysis reads an operand at its type's own width; a host whose operations
+  widen narrow operands states each widening as an `IntConv`, and a wider
+  answer from the hook only makes the verifier accept mixed widths.
+
 ## [0.7.0] - 2026-11-23
 
 A static execution engine, an operation set that states every ISA's semantics
