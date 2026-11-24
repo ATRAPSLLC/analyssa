@@ -711,6 +711,25 @@ where
                 Chain::Same | Chain::ProductShifted => candidate.const1_var,
                 Chain::ShiftMultiplied => candidate.const2_var,
             };
+            // The folded value is that variable's, of its type: a shift's two
+            // counts may be of two widths, `int32` 44 and `int64` 7, and their
+            // sum is still a count of the first. A value the type does not hold
+            // is no rewrite.
+            let Some(combined) = editor
+                .function()
+                .variable(folded)
+                .map(|variable| variable.var_type().clone())
+                .and_then(|ty| {
+                    let (bits, _) = combined.integer_pattern(ptr_size)?;
+                    ConstValue::from_bits_of_type(bits, &ty)
+                })
+                .filter(|retyped| {
+                    retyped.as_i64().is_some() && retyped.as_i64() == combined.as_i64()
+                        || retyped.integer_pattern(ptr_size) == combined.integer_pattern(ptr_size)
+                })
+            else {
+                continue;
+            };
             let Some((const_block, const_instr_idx)) = editor
                 .function()
                 .blocks()
@@ -1376,6 +1395,60 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let changed = run_reassociate(&mut ssa, "in-width shift chain", &log);
         assert!(changed, "2 + 3 = 5 < 32, so the shifts should combine");
+    }
+
+    /// **A folded constant keeps its variable's type.** A shift's two counts
+    /// may be of two widths: `(x << 44) << 7L`, as strength reduction states
+    /// a product by 128 over an `int64`, sums the counts into the `int32` that
+    /// held 44, and that variable holds an `int32` 51, not an `int64` one a
+    /// host would load as the wider value.
+    #[test]
+    fn a_folded_constant_keeps_its_variables_type() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let typed = |ssa: &mut SsaFunction<MockTarget>, at: usize, ty: MockType| {
+            ssa.create_variable(
+                VariableOrigin::Local(u16::try_from(at).expect("few")),
+                0,
+                DefSite::instruction(0, at),
+                ty,
+            )
+        };
+        let x = typed(&mut ssa, 0, MockType::I64);
+        let c1 = typed(&mut ssa, 1, MockType::I32);
+        let c2 = typed(&mut ssa, 2, MockType::I64);
+        let inner = typed(&mut ssa, 3, MockType::I64);
+        let outer = typed(&mut ssa, 4, MockType::I64);
+        let mut block = SsaBlock::new(0);
+        for (dest, value) in [
+            (x, ConstValue::I64(1)),
+            (c1, ConstValue::I32(44)),
+            (c2, ConstValue::I64(7)),
+        ] {
+            block.add_instruction(instr(SsaOp::Const { dest, value }));
+        }
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: inner,
+            value: x,
+            amount: c1,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Shl {
+            dest: outer,
+            value: inner,
+            amount: c2,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::returns(Some(outer))));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        assert!(run_reassociate(&mut ssa, "mixed count widths", &log));
+        assert_eq!(
+            ssa.find_constants().get(&c1).cloned(),
+            Some(ConstValue::I32(51)),
+            "{ssa}"
+        );
     }
 
     /// A negative count is out of range, so `(x << -1) << 2` is not `x << 1`
