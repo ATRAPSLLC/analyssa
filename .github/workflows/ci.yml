@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # The MSRV is a supported configuration, so it must lint clean too — a
+        # The MSRV is a supported configuration, so it must lint clean too - a
         # stable-only clippy job lets a 1.88 break land silently.
         rust: [stable, "1.88"]
     steps:
@@ -91,9 +91,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/check.sh doctest
 
-  # Fuzzing is deliberately not a CI job. Coverage-guided fuzzing only pays off
+  conventions:
+    name: Source conventions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check.sh conventions
+
+  fuzz:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/check.sh fuzz
+
+  # Running the fuzzers is deliberately not a CI job (the build above is). Coverage-guided fuzzing only pays off
   # with an accumulated corpus, and a runner starts from an empty one every
-  # time — a cold 60s campaign is little more than random input, at the cost of
+  # time - a cold 60s campaign is little more than random input, at the cost of
   # a full ASan build per push. Fuzz locally instead:
   #
   #   cargo +nightly fuzz run --target x86_64-unknown-linux-gnu <validate|pipeline>
