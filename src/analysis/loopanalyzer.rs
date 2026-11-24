@@ -25,7 +25,7 @@
 
 use crate::{
     analysis::{
-        exceptions::EhCfg,
+        cfg::SsaCfg,
         loops::{LoopForest, detect_loops},
     },
     graph::{NodeId, algorithms},
@@ -54,7 +54,7 @@ pub struct LoopAnalyzer<'a, T: Target> {
     /// inside a handler are unreachable, so such a loop is invisible: no
     /// `LoopInfo` is created and every loop pass silently declines to act on
     /// it. Rooting here makes handler loops ordinary loops.
-    eh: EhCfg<'a, T>,
+    eh: SsaCfg<'a, T>,
 }
 
 impl<'a, T: Target> LoopAnalyzer<'a, T> {
@@ -62,7 +62,7 @@ impl<'a, T: Target> LoopAnalyzer<'a, T> {
     #[must_use]
     pub fn new(ssa: &'a SsaFunction<T>) -> Self {
         Self {
-            eh: EhCfg::from_ssa(ssa),
+            eh: SsaCfg::from_ssa(ssa),
         }
     }
 

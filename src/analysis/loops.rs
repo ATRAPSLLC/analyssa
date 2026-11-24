@@ -96,14 +96,14 @@
 //!
 //! ```rust
 //! use analyssa::{
-//!     analysis::{detect_loops, exceptions::EhCfg},
+//!     analysis::{SsaCfg, detect_loops},
 //!     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
 //!     testing,
 //! };
 //!
 //! // Works with any graph implementing the traits
 //! let ssa = testing::loop_counter_fixture();
-//! let graph = EhCfg::from_ssa(&ssa);
+//! let graph = SsaCfg::from_ssa(&ssa);
 //!
 //! let dominators = compute_dominators(&graph, graph.entry());
 //! let forest = detect_loops(&graph, &dominators);
@@ -118,12 +118,17 @@
 //! assert!(!forest.is_in_loop(NodeId::new(0)));
 //! ```
 
-use std::collections::HashMap;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, btree_map::Entry},
+};
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     bitset::BitSet,
     graph::{GraphBase, NodeId, Predecessors, Successors, algorithms::DominatorTree},
-    ir::{function::SsaFunction, ops::SsaOp, variable::SsaVarId},
+    ir::{block::SsaBlock, function::SsaFunction, ops::SsaOp, variable::SsaVarId},
     target::Target,
 };
 
@@ -356,8 +361,13 @@ impl LoopInfo {
     ///
     /// For control-flow flattened code (e.g., ConfuserEx), the actual loop
     /// condition is often inside a case block rather than at the dispatcher
-    /// header. This method searches for blocks with `Branch` instructions
-    /// within the loop body.
+    /// header. This method searches the loop body for a block ending in a
+    /// two-way conditional terminator - `Branch`, `BranchCmp` or `BranchFlags`
+    /// (see [`SsaOp::two_way_targets`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose block terminators are inspected.
     ///
     /// # Returns
     ///
@@ -365,28 +375,30 @@ impl LoopInfo {
     /// - `None` - No conditional branch found in the loop body
     #[must_use]
     pub fn find_condition_in_body<T: Target>(&self, ssa: &SsaFunction<T>) -> Option<NodeId> {
-        for block_idx in self.body.iter() {
-            if let Some(block) = ssa.block(block_idx)
-                && matches!(block.control_terminator(), Some(SsaOp::Branch { .. }))
-            {
-                return Some(NodeId::new(block_idx));
-            }
-        }
-        None
+        self.body
+            .iter()
+            .find(|&block_idx| ends_in_condition(ssa, block_idx))
+            .map(NodeId::new)
     }
 
     /// Finds all conditional blocks within the loop body.
     ///
     /// Unlike `find_condition_in_body`, this returns all blocks with
     /// conditional branches, useful for complex loops with multiple exit points.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose block terminators are inspected.
+    ///
+    /// # Returns
+    ///
+    /// Every body block terminated by a two-way conditional terminator
+    /// (`Branch`, `BranchCmp` or `BranchFlags`), in body-iteration order.
     #[must_use]
     pub fn find_all_conditions_in_body<T: Target>(&self, ssa: &SsaFunction<T>) -> Vec<NodeId> {
         self.body
             .iter()
-            .filter(|&block_idx| {
-                ssa.block(block_idx)
-                    .is_some_and(|b| matches!(b.control_terminator(), Some(SsaOp::Branch { .. })))
-            })
+            .filter(|&block_idx| ends_in_condition(ssa, block_idx))
             .map(NodeId::new)
             .collect()
     }
@@ -400,6 +412,11 @@ impl LoopInfo {
     ///
     /// The method attempts to classify the update kind (add, sub, etc.) by
     /// analyzing the instruction that produces the update value.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function providing the header's phi nodes and the
+    ///   defining instructions of their operands.
     ///
     /// # Returns
     ///
@@ -435,7 +452,7 @@ impl LoopInfo {
 
                 // Try to determine update kind by analyzing the defining instruction
                 let (update_kind, stride) =
-                    Self::analyze_update_instruction(ssa, update_op.value(), phi.result());
+                    analyze_update_instruction(ssa, update_op.value(), phi.result());
 
                 induction_vars.push(InductionVar {
                     phi_result: phi.result(),
@@ -450,51 +467,6 @@ impl LoopInfo {
         }
 
         induction_vars
-    }
-
-    /// Analyzes an instruction to determine if it's an induction update.
-    ///
-    /// Looks for patterns like `v = phi_result + const` or `v = phi_result - const`.
-    fn analyze_update_instruction<T: Target>(
-        ssa: &SsaFunction<T>,
-        update_var: SsaVarId,
-        phi_result: SsaVarId,
-    ) -> (InductionUpdateKind, Option<i64>) {
-        // Find the instruction that defines update_var.
-        //
-        // Recovering lookup: this runs once per induction candidate, so the
-        // fallback scan is bounded by the number of candidates, and what a
-        // stale def site would otherwise cost is a *stride* — the loop's trip
-        // count and every consumer of it. The failure policy is
-        // `InductionUpdateKind::Unknown`, which is what this already answers
-        // for an update it cannot read, so recovery only adds answers; it never
-        // turns an unknown stride into a wrong one.
-        let Some(instr) = ssa.get_definition_instruction(update_var) else {
-            return (InductionUpdateKind::Unknown, None);
-        };
-
-        // Check for Add/Sub patterns
-        match instr.op() {
-            // Check if one operand is the phi result
-            SsaOp::Add { left, right, .. } if *left == phi_result || *right == phi_result => {
-                let other = if *left == phi_result { *right } else { *left };
-                let stride = ssa.try_constant_value(other).and_then(|v| v.as_i64());
-                return (InductionUpdateKind::Add, stride);
-            }
-            // For subtraction, left should be phi_result
-            SsaOp::Sub { left, right, .. } if *left == phi_result => {
-                let stride = ssa.try_constant_value(*right).and_then(|v| v.as_i64());
-                return (InductionUpdateKind::Sub, stride);
-            }
-            SsaOp::Mul { left, right, .. } if *left == phi_result || *right == phi_result => {
-                let other = if *left == phi_result { *right } else { *left };
-                let stride = ssa.try_constant_value(other).and_then(|v| v.as_i64());
-                return (InductionUpdateKind::Mul, stride);
-            }
-            _ => {}
-        }
-
-        (InductionUpdateKind::Unknown, None)
     }
 }
 
@@ -519,30 +491,31 @@ impl LoopForest {
         }
     }
 
-    /// Adds a loop to the forest.
+    /// Adds a loop to the forest, updating the block-to-loop map.
+    ///
+    /// Every block in the loop body is pointed at this loop, but only when this
+    /// loop is more deeply nested than whatever already claims the block. That
+    /// keeps `block_to_loop` resolving to the *innermost* loop for each block,
+    /// which is the invariant [`innermost_loop`](Self::innermost_loop) and the
+    /// depth queries depend on. Correctness therefore relies on outer loops being
+    /// added before inner ones, or at least on the depth comparison ordering them.
+    ///
+    /// # Arguments
+    ///
+    /// * `loop_info` - The loop to append; its body drives the map update.
     pub fn add_loop(&mut self, loop_info: LoopInfo) {
-        let loop_idx = self.loops.len();
-
-        // Update block-to-loop mapping for all blocks in this loop
-        for block_idx in loop_info.body.iter() {
-            let Some(slot) = self.block_to_loop.get_mut(block_idx) else {
-                continue;
-            };
-            // Only update if this is a more deeply nested loop
-            match *slot {
-                Some(existing_idx) => {
-                    if self
-                        .loops
-                        .get(existing_idx)
-                        .is_some_and(|l| l.depth < loop_info.depth)
-                    {
-                        *slot = Some(loop_idx);
-                    }
-                }
-                None => *slot = Some(loop_idx),
+        let loop_index = self.loops.len();
+        for block in loop_info.body.iter() {
+            if let Some(slot) = self.block_to_loop.get_mut(block)
+                && slot.is_none_or(|existing| {
+                    self.loops
+                        .get(existing)
+                        .is_some_and(|info| info.depth < loop_info.depth)
+                })
+            {
+                *slot = Some(loop_index);
             }
         }
-
         self.loops.push(loop_info);
     }
 
@@ -579,6 +552,20 @@ impl LoopForest {
     }
 
     /// Returns the loop depth for a block (0 if not in any loop).
+    ///
+    /// This is a one-based nesting count, not the zero-based `depth` field stored
+    /// on [`LoopInfo`]: it looks up the innermost containing loop and adds one, so
+    /// an outermost loop's blocks report `1` while a block in no loop reports `0`.
+    /// The offset lets a single return value distinguish "not in a loop" from
+    /// "in the outermost loop".
+    ///
+    /// # Arguments
+    ///
+    /// * `block` - The block whose nesting depth is queried.
+    ///
+    /// # Returns
+    ///
+    /// The one-based nesting depth, or `0` when the block is in no loop.
     #[must_use]
     pub fn loop_depth(&self, block: NodeId) -> usize {
         self.innermost_loop(block)
@@ -608,7 +595,7 @@ impl LoopForest {
     #[must_use]
     pub fn by_depth_descending(&self) -> Vec<&LoopInfo> {
         let mut sorted: Vec<_> = self.loops.iter().collect();
-        sorted.sort_by_key(|l| std::cmp::Reverse(l.depth));
+        sorted.sort_by_key(|l| Reverse(l.depth));
         sorted
     }
 }
@@ -640,13 +627,13 @@ impl LoopForest {
 ///
 /// ```rust
 /// use analyssa::{
-///     analysis::{detect_loops, exceptions::EhCfg},
+///     analysis::{SsaCfg, detect_loops},
 ///     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
 ///     testing,
 /// };
 ///
 /// let ssa = testing::loop_counter_fixture();
-/// let graph = EhCfg::from_ssa(&ssa);
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// let forest = detect_loops(&graph, &dominators);
@@ -667,47 +654,34 @@ where
 {
     let block_count = graph.node_count();
     let mut forest = LoopForest::new(block_count);
-
-    // Collect loops by header
-    let mut loops_by_header: HashMap<NodeId, LoopInfo> = HashMap::new();
-
-    // Find all back edges: edge (n -> h) where h dominates n
+    // Header ordering determines stable loop indices.
+    let mut loops_by_header: BTreeMap<NodeId, LoopInfo> = BTreeMap::new();
     for node in graph.node_ids() {
         for succ in graph.successors(node) {
-            // Check if successor dominates current node (back edge)
             if dominators.dominates(succ, node) {
-                // Found back edge: node -> succ (succ is loop header)
-                let header = succ;
-
-                let loop_info = loops_by_header
-                    .entry(header)
-                    .or_insert_with(|| LoopInfo::new(header, block_count));
-
+                let loop_info = match loops_by_header.entry(succ) {
+                    Entry::Vacant(entry) => entry.insert(LoopInfo::new(succ, block_count)),
+                    Entry::Occupied(entry) => entry.into_mut(),
+                };
                 loop_info.latches.push(node);
-                expand_loop_body(graph, loop_info, node);
+                expand_loop_body(graph, dominators, loop_info, node);
             }
         }
     }
-
-    // Compute additional loop information for each loop
-    for loop_info in loops_by_header.values_mut() {
-        compute_preheader(graph, loop_info);
-        compute_exits(graph, loop_info);
-        loop_info.loop_type = classify_loop(loop_info);
+    for info in loops_by_header.values_mut() {
+        compute_preheader(graph, info);
+        compute_exits(graph, info);
+        info.loop_type = classify_loop(info);
     }
 
-    // Convert to Vec and compute nesting relationships
-    let mut loops: Vec<LoopInfo> = loops_by_header.into_values().collect();
+    let mut loops = Vec::with_capacity(loops_by_header.len());
+    for info in loops_by_header.into_values() {
+        loops.push(info);
+    }
     compute_nesting(&mut loops);
-
-    // Sort by header for deterministic ordering
-    loops.sort_by_key(|l| l.header.index());
-
-    // Add all loops to forest
-    for loop_info in loops {
-        forest.add_loop(loop_info);
+    for info in loops {
+        forest.add_loop(info);
     }
-
     forest
 }
 
@@ -730,20 +704,20 @@ where
 ///
 /// ```rust
 /// use analyssa::{
-///     analysis::{exceptions::EhCfg, loops::has_back_edges},
+///     analysis::{SsaCfg, loops::has_back_edges},
 ///     graph::{algorithms::compute_dominators, RootedGraph},
 ///     testing,
 /// };
 ///
 /// // A loop fixture has a back edge...
 /// let looping = testing::loop_counter_fixture();
-/// let graph = EhCfg::from_ssa(&looping);
+/// let graph = SsaCfg::from_ssa(&looping);
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// assert!(has_back_edges(&graph, &dominators));
 ///
 /// // ...while an acyclic diamond CFG does not.
 /// let diamond = testing::diamond_phi_fixture();
-/// let graph = EhCfg::from_ssa(&diamond);
+/// let graph = SsaCfg::from_ssa(&diamond);
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// assert!(!has_back_edges(&graph, &dominators));
 /// ```
@@ -766,21 +740,29 @@ where
 ///
 /// Uses a worklist algorithm: starting from the latch, we add
 /// predecessors that aren't the header until we've found all loop body nodes.
-fn expand_loop_body<G>(graph: &G, loop_info: &mut LoopInfo, latch: NodeId)
-where
-    G: Predecessors,
-{
+/// Only a predecessor the header dominates belongs to the loop. Every block
+/// the entry reaches that reaches the latch without passing the header is one,
+/// so this keeps out exactly the blocks no path from the entry reaches: one
+/// that branches into the body would otherwise join it, and its other
+/// successors would read as exits the loop never takes.
+fn expand_loop_body<G: Predecessors>(
+    graph: &G,
+    dominators: &DominatorTree,
+    loop_info: &mut LoopInfo,
+    latch: NodeId,
+) {
     if loop_info.contains(latch) {
         return;
     }
-
-    let mut worklist = vec![latch];
-
+    let mut worklist = Vec::new();
+    worklist.push(latch);
     while let Some(node) = worklist.pop() {
         if loop_info.body.insert(node.index()) {
-            // Node wasn't in body yet, add its predecessors
             for pred in graph.predecessors(node) {
-                if pred != loop_info.header && !loop_info.body.contains_checked(pred.index()) {
+                if pred != loop_info.header
+                    && !loop_info.body.contains_checked(pred.index())
+                    && dominators.dominates(loop_info.header, pred)
+                {
                     worklist.push(pred);
                 }
             }
@@ -788,178 +770,285 @@ where
     }
 }
 
-/// Identifies the preheader for a loop.
-///
-/// A preheader is a single predecessor of the header that is outside the loop.
-/// If the header has multiple non-loop predecessors, there is no preheader.
-fn compute_preheader<G>(graph: &G, loop_info: &mut LoopInfo)
-where
-    G: Predecessors,
-{
-    let mut non_loop_preds: Vec<NodeId> = Vec::new();
-
-    for pred in graph.predecessors(loop_info.header) {
-        if !loop_info.body.contains_checked(pred.index()) && !non_loop_preds.contains(&pred) {
-            non_loop_preds.push(pred);
+/// Finds the unique external predecessor, stopping once two distinct blocks disprove it.
+fn compute_preheader<G: Predecessors>(graph: &G, info: &mut LoopInfo) {
+    let mut first = None;
+    for pred in graph.predecessors(info.header) {
+        if !info.body.contains_checked(pred.index()) {
+            match first {
+                None => first = Some(pred),
+                Some(known) if pred != known => {
+                    info.preheader = None;
+                    return;
+                }
+                Some(_) => {}
+            }
         }
     }
-
-    // A preheader is a *block* that reaches the header and nothing else does,
-    // so the question is how many distinct blocks enter from outside — not how
-    // many edges. A block entering twice, as `Branch c, header, header` does,
-    // is still one preheader: there is one place to put loop-invariant code and
-    // one terminator to redirect.
-    loop_info.preheader = if non_loop_preds.len() == 1 {
-        non_loop_preds.first().copied()
-    } else {
-        None
-    };
+    info.preheader = first;
 }
 
-/// Computes exit edges for a loop.
-///
-/// An exit edge goes from a block inside the loop to a block outside the loop.
-fn compute_exits<G>(graph: &G, loop_info: &mut LoopInfo)
-where
-    G: Successors,
-{
-    loop_info.exits.clear();
-
-    for body_block_idx in loop_info.body.iter() {
-        let body_block = NodeId::new(body_block_idx);
-        for succ in graph.successors(body_block) {
-            if !loop_info.body.contains_checked(succ.index()) {
-                loop_info.exits.push(LoopExit {
-                    exiting_block: body_block,
-                    exit_block: succ,
+/// Collects every exit edge from the loop's blocks, preserving graph iteration order.
+fn compute_exits<G: Successors>(graph: &G, info: &mut LoopInfo) {
+    info.exits.clear();
+    for index in info.body.iter() {
+        let block = NodeId::new(index);
+        for successor in graph.successors(block) {
+            if !info.body.contains_checked(successor.index()) {
+                info.exits.push(LoopExit {
+                    exiting_block: block,
+                    exit_block: successor,
                 });
             }
         }
     }
 }
 
-/// Classifies the loop type based on structure.
-fn classify_loop(loop_info: &LoopInfo) -> LoopType {
-    // Check for infinite loop (no exits)
-    if loop_info.exits.is_empty() {
+/// Classifies the loop from its exit locations.
+fn classify_loop(info: &LoopInfo) -> LoopType {
+    if info.exits.is_empty() {
         return LoopType::Infinite;
     }
-
-    // Check for multiple latches (complex)
-    if loop_info.latches.len() > 1 {
+    if info.latches.len() > 1 {
         return LoopType::Complex;
     }
-
-    // Get the single latch
-    let latch = loop_info.single_latch();
-
-    // Check if all exits are from the latch (post-tested / do-while loop)
-    if let Some(latch) = latch {
-        let latch_exits = loop_info
-            .exits
-            .iter()
-            .filter(|e| e.exiting_block == latch)
-            .count();
-
-        if latch_exits == loop_info.exits.len() && latch_exits > 0 {
-            return LoopType::PostTested;
+    let latch = info.single_latch();
+    let mut latch_exits = 0usize;
+    let mut header_exits = 0usize;
+    for exit in &info.exits {
+        if Some(exit.exiting_block) == latch {
+            latch_exits = latch_exits.saturating_add(1);
+        }
+        if exit.exiting_block == info.header {
+            header_exits = header_exits.saturating_add(1);
         }
     }
-
-    // Check if header is the only exiting block (pre-tested / while loop)
-    let header_exits = loop_info
-        .exits
-        .iter()
-        .filter(|e| e.exiting_block == loop_info.header)
-        .count();
-
-    if header_exits == loop_info.exits.len() && header_exits > 0 {
-        return LoopType::PreTested;
+    if latch.is_some() && latch_exits == info.exits.len() {
+        LoopType::PostTested
+    } else if header_exits == info.exits.len() {
+        LoopType::PreTested
+    } else {
+        LoopType::Complex
     }
-
-    // Mixed or irregular exit structure
-    LoopType::Complex
 }
 
-/// Computes loop nesting relationships and depths.
+/// Computes deterministic parent, child and depth relations.
 fn compute_nesting(loops: &mut [LoopInfo]) {
     let n = loops.len();
 
-    // Build header-to-index mapping
-    let header_to_idx: HashMap<NodeId, usize> = loops
-        .iter()
-        .enumerate()
-        .map(|(i, l)| (l.header, i))
-        .collect();
+    let mut header_to_idx = FxHashMap::with_capacity_and_hasher(n, Default::default());
 
-    // `LoopInfo::size` is a `BitSet` popcount over the whole loop body, and the
-    // sort below called it once per comparison — O(L log L) popcounts per loop,
-    // O(L² log L) overall. Computed once here instead: L popcounts total.
-    let sizes: Vec<usize> = loops.iter().map(LoopInfo::size).collect();
-
-    // For each loop, find its parent (smallest enclosing loop)
+    let mut sizes = Vec::with_capacity(n);
+    for (index, info) in loops.iter().enumerate() {
+        header_to_idx.insert(info.header, index);
+        sizes.push(info.body.count());
+    }
     for i in 0..n {
-        let Some(header) = loops.get(i).map(|l| l.header) else {
+        let Some(header) = loops.get(i).map(|info| info.header) else {
             continue;
         };
-
-        // The parent is the *minimum* containing loop, so a full sort was never
-        // needed — one linear scan finds it. The `j` tiebreak preserves the
-        // previous behaviour for equally-sized candidates, which matters because
-        // the downstream similarity pipeline requires a deterministic result.
-        let parent_idx = (0..n)
-            .filter(|&j| j != i && loops.get(j).is_some_and(|l| l.contains(header)))
-            .min_by_key(|&j| (sizes.get(j).copied().unwrap_or(usize::MAX), j));
-
-        if let Some(parent_idx) = parent_idx {
-            let parent_header = match loops.get(parent_idx).map(|l| l.header) {
-                Some(h) => h,
-                None => continue,
-            };
-            if let Some(loop_i) = loops.get_mut(i) {
-                loop_i.parent = Some(parent_header);
+        let mut parent = None;
+        for j in 0..n {
+            if j != i && loops.get(j).is_some_and(|info| info.contains(header)) {
+                let key = (sizes.get(j).copied().unwrap_or(usize::MAX), j);
+                if parent.is_none_or(|known| key < known) {
+                    parent = Some(key);
+                }
+            }
+        }
+        if let Some((_, index)) = parent {
+            let header = loops.get(index).map(|info| info.header);
+            if let Some(info) = loops.get_mut(i) {
+                info.parent = header;
             }
         }
     }
-
-    // Compute children from parent relationships
     for i in 0..n {
-        let parent_opt = loops.get(i).and_then(|l| l.parent);
-        let Some(parent_header) = parent_opt else {
+        let Some((parent, header)) = loops
+            .get(i)
+            .and_then(|info| Some((info.parent?, info.header)))
+        else {
             continue;
         };
-        let header_i = match loops.get(i).map(|l| l.header) {
-            Some(h) => h,
-            None => continue,
-        };
-        if let Some(&parent_idx) = header_to_idx.get(&parent_header)
-            && let Some(parent) = loops.get_mut(parent_idx)
+        if let Some(index) = header_to_idx.get(&parent)
+            && let Some(info) = loops.get_mut(*index)
         {
-            parent.children.push(header_i);
+            info.children.push(header);
         }
+    }
+    for i in 0..n {
+        let mut depth = 0usize;
+        let mut current = loops.get(i).and_then(|info| info.parent);
+        while let Some(parent) = current {
+            depth = depth.saturating_add(1);
+            current = header_to_idx
+                .get(&parent)
+                .and_then(|index| loops.get(*index))
+                .and_then(|info| info.parent);
+        }
+        if let Some(info) = loops.get_mut(i) {
+            info.depth = depth;
+        }
+    }
+}
+
+/// Whether `block_idx` ends in a two-way conditional terminator.
+fn ends_in_condition<T: Target>(ssa: &SsaFunction<T>, block_idx: usize) -> bool {
+    ssa.block(block_idx)
+        .and_then(SsaBlock::control_terminator)
+        .and_then(SsaOp::two_way_targets)
+        .is_some()
+}
+
+/// Analyzes an instruction to determine if it's an induction update.
+///
+/// Looks for patterns like `v = phi_result + const` or `v = phi_result - const`,
+/// recovering the stride from the other operand when it is a constant. `Add`
+/// and `Mul` accept the phi result on either side (both are commutative),
+/// but `Sub` only recognizes `phi_result - const`, since a subtraction with
+/// the phi on the right is not a simple stride. Anything else, including a
+/// non-constant stride, yields `Unknown` with no stride.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function used to look up the defining instruction and
+///   resolve constant operands.
+/// * `update_var` - The variable holding the per-iteration updated value.
+/// * `phi_result` - The header phi result the update is expected to build on.
+///
+/// # Returns
+///
+/// The classified update kind paired with the stride, if it could be determined.
+fn analyze_update_instruction<T: Target>(
+    ssa: &SsaFunction<T>,
+    update_var: SsaVarId,
+    phi_result: SsaVarId,
+) -> (InductionUpdateKind, Option<i64>) {
+    // Find the instruction that defines update_var.
+    //
+    // Recovering lookup: this runs once per induction candidate, so the
+    // fallback scan is bounded by the number of candidates, and what a
+    // stale def site would otherwise cost is a *stride* - the loop's trip
+    // count and every consumer of it. The failure policy is
+    // `InductionUpdateKind::Unknown`, which is what this already answers
+    // for an update it cannot read, so recovery only adds answers; it never
+    // turns an unknown stride into a wrong one.
+    let Some(instr) = ssa.get_definition_instruction(update_var) else {
+        return (InductionUpdateKind::Unknown, None);
+    };
+
+    // Check for Add/Sub patterns
+    match instr.op() {
+        // Check if one operand is the phi result
+        SsaOp::Add { left, right, .. } if *left == phi_result || *right == phi_result => {
+            let other = if *left == phi_result { *right } else { *left };
+            let stride = ssa.try_constant_value(other).and_then(|v| v.as_i64());
+            return (InductionUpdateKind::Add, stride);
+        }
+        // For subtraction, left should be phi_result
+        SsaOp::Sub { left, right, .. } if *left == phi_result => {
+            let stride = ssa.try_constant_value(*right).and_then(|v| v.as_i64());
+            return (InductionUpdateKind::Sub, stride);
+        }
+        SsaOp::Mul { left, right, .. } if *left == phi_result || *right == phi_result => {
+            let other = if *left == phi_result { *right } else { *left };
+            let stride = ssa.try_constant_value(other).and_then(|v| v.as_i64());
+            return (InductionUpdateKind::Mul, stride);
+        }
+        _ => {}
     }
 
-    // Compute depths from parent chain
-    for i in 0..n {
-        let mut depth: usize = 0;
-        let mut current = loops.get(i).and_then(|l| l.parent);
-        while let Some(parent_header) = current {
-            depth = depth.saturating_add(1);
-            if let Some(&parent_idx) = header_to_idx.get(&parent_header) {
-                current = loops.get(parent_idx).and_then(|l| l.parent);
-            } else {
-                break;
-            }
-        }
-        if let Some(l) = loops.get_mut(i) {
-            l.depth = depth;
-        }
-    }
+    (InductionUpdateKind::Unknown, None)
 }
 
 #[cfg(test)]
 mod tests {
-    /// A block index the set cannot represent is not in the loop — the answer,
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::{
+        analysis::cfg::SsaCfg,
+        graph::{DirectedGraph, algorithms::compute_dominators},
+        ir::{
+            SsaFunction, SsaVarId,
+            instruction::SsaInstruction,
+            ops::{CmpKind, SsaOp, native::FlagCondition},
+        },
+        testing::MockTarget,
+    };
+
+    /// **A block no path from the entry reaches is in no loop.** The loop
+    /// `0 -> 1 -> 2 -> 0` never leaves, and `3`, which nothing reaches,
+    /// branches into it at `1` and out of it to `4`. Walking back from the
+    /// latch reached `3` and took it into the body, so `4` read as an exit and
+    /// the structurer resumed the loop that never ends at a block that never
+    /// runs.
+    #[test]
+    fn an_unreachable_block_is_in_no_loop() {
+        let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
+        for _ in 0..5 {
+            graph.add_node(());
+        }
+        for (from, to) in [(0, 1), (1, 2), (2, 0), (3, 1), (3, 4)] {
+            graph
+                .add_edge(NodeId::new(from), NodeId::new(to), ())
+                .expect("edge endpoints exist");
+        }
+        let dominators = compute_dominators(&graph, NodeId::new(0));
+        let forest = detect_loops(&graph, &dominators);
+        let [looped] = forest.loops() else {
+            panic!("one loop: {:?}", forest.loops());
+        };
+        assert!(!looped.contains(NodeId::new(3)));
+        assert_eq!(looped.exit_count(), 0);
+    }
+
+    /// **A loop lists its children in header order.** Nesting numbers the
+    /// loops by position, so a position that follows the detection map's hash
+    /// order lists the siblings of one parent in that order, and the forest
+    /// differs between two builds of the same graph.
+    #[test]
+    fn a_loops_children_ascend_by_header() {
+        // 0 -> 1, the outer loop's header, which holds self-loops at 2 to 6
+        // in a chain and returns from 7; 8 is its exit.
+        let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
+        for _ in 0..9 {
+            graph.add_node(());
+        }
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (2, 2),
+            (2, 3),
+            (3, 3),
+            (3, 4),
+            (4, 4),
+            (4, 5),
+            (5, 5),
+            (5, 6),
+            (6, 6),
+            (6, 7),
+            (7, 1),
+            (1, 8),
+        ];
+        for (from, to) in edges {
+            graph
+                .add_edge(NodeId::new(from), NodeId::new(to), ())
+                .expect("edge endpoints exist");
+        }
+        let dominators = compute_dominators(&graph, NodeId::new(0));
+        let forest = detect_loops(&graph, &dominators);
+
+        let outer = forest
+            .loops()
+            .iter()
+            .find(|looped| looped.header == NodeId::new(1))
+            .expect("the outer loop is detected");
+        let children: Vec<usize> = outer.children.iter().map(|child| child.index()).collect();
+        assert_eq!(children, vec![2, 3, 4, 5, 6]);
+    }
+
+    /// A block index the set cannot represent is not in the loop - the answer,
     /// not a programming error. Callers reach this with indices from variable
     /// def sites and CFG metadata, which describe the function as it was and can
     /// name a block it no longer has; asking the `BitSet` directly asserts, and
@@ -978,13 +1067,6 @@ mod tests {
         assert!(!info.contains(NodeId::new(4)), "one past the end");
         assert!(!info.contains(NodeId::new(9_999)), "far past the end");
     }
-
-    use super::*;
-    use crate::{
-        analysis::cfg::SsaCfg,
-        ir::{SsaFunction, SsaVarId, block::SsaBlock, instruction::SsaInstruction, ops::SsaOp},
-        testing::MockTarget,
-    };
 
     /// A single-instruction block, for edge-shape fixtures.
     fn block(id: usize, op: SsaOp<MockTarget>) -> SsaBlock<MockTarget> {
@@ -1018,7 +1100,7 @@ mod tests {
                 false_target: 2,
             },
         ));
-        ssa.add_block(block(2, SsaOp::Return { value: None }));
+        ssa.add_block(block(2, SsaOp::returns(None)));
 
         // The terminator relation, deliberately: the question is how many edges
         // a branch takes into the header. `compute_dominators` takes its entry
@@ -1030,7 +1112,7 @@ mod tests {
             "two edges from B0 and the latch"
         );
 
-        let dominators = crate::graph::algorithms::compute_dominators(&cfg, NodeId::new(0));
+        let dominators = compute_dominators(&cfg, NodeId::new(0));
         let forest = detect_loops(&cfg, &dominators);
         let loop_info = forest
             .loops()
@@ -1044,6 +1126,45 @@ mod tests {
         );
     }
 
+    /// A loop whose condition is a compare-and-branch or a flag test reports
+    /// that block as its condition, as it does a plain `Branch`.
+    #[test]
+    fn every_two_way_terminator_is_a_loop_condition() {
+        let var = SsaVarId::from_index(0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+        ssa.add_block(block(0, SsaOp::Jump { target: 1 }));
+        ssa.add_block(block(
+            1,
+            SsaOp::BranchCmp {
+                left: var,
+                right: var,
+                cmp: CmpKind::Lt,
+                unsigned: false,
+                true_target: 2,
+                false_target: 3,
+            },
+        ));
+        ssa.add_block(block(
+            2,
+            SsaOp::BranchFlags {
+                flags: var,
+                condition: FlagCondition::Zero,
+                true_target: 1,
+                false_target: 3,
+            },
+        ));
+        ssa.add_block(block(3, SsaOp::returns(None)));
+
+        let mut info = LoopInfo::new(NodeId::new(1), 4);
+        info.body.insert(2);
+        assert_eq!(info.find_condition_in_body(&ssa), Some(NodeId::new(1)));
+        assert_eq!(
+            info.find_all_conditions_in_body(&ssa),
+            [NodeId::new(1), NodeId::new(2)]
+        );
+    }
+
+    /// A freshly created `LoopInfo` contains only its header and is not yet canonical.
     #[test]
     fn test_loop_info_creation() {
         let header = NodeId::new(0);
@@ -1057,6 +1178,7 @@ mod tests {
         assert!(!loop_info.is_canonical());
     }
 
+    /// A loop with one preheader and one latch reports as canonical.
     #[test]
     fn test_loop_info_canonical() {
         let header = NodeId::new(1);
@@ -1070,6 +1192,7 @@ mod tests {
         assert!(loop_info.is_canonical());
     }
 
+    /// The forest reports each block's depth from the innermost loop containing it.
     #[test]
     fn test_loop_forest() {
         let mut forest = LoopForest::new(10);
@@ -1096,5 +1219,122 @@ mod tests {
 
         // Block 0 should not be in any loop
         assert_eq!(forest.loop_depth(NodeId::new(0)), 0);
+    }
+    /// Builds a nested loop with two inner exits and one outer exit.
+    fn admission_fixture() -> DirectedGraph<'static, (), ()> {
+        let mut graph = DirectedGraph::new();
+        for _ in 0..8 {
+            graph.add_node(());
+        }
+        for (from, to) in [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 2),
+            (3, 4),
+            (4, 1),
+            (1, 7),
+            (3, 6),
+            (6, 4),
+        ] {
+            graph
+                .add_edge(NodeId::new(from), NodeId::new(to), ())
+                .unwrap();
+        }
+        graph
+    }
+
+    /// Natural loop membership, ordering and depth match the explicit graph structure.
+    #[test]
+    fn loop_detection_preserves_the_nested_loop_structure() {
+        let graph = admission_fixture();
+        let dominators = compute_dominators(&graph, NodeId::new(0));
+        let forest = detect_loops(&graph, &dominators);
+        let outer = forest.loop_for_header(NodeId::new(1)).unwrap();
+        let inner = forest.loop_for_header(NodeId::new(2)).unwrap();
+        assert_eq!(outer.body.iter().collect::<Vec<_>>(), [1, 2, 3, 4, 6]);
+        assert_eq!(inner.body.iter().collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(outer.children, [NodeId::new(2)]);
+        assert_eq!(outer.depth, 0);
+        assert_eq!(inner.depth, 1);
+        assert_eq!(inner.parent, Some(NodeId::new(1)));
+        assert_eq!(
+            forest
+                .innermost_loop(NodeId::new(3))
+                .map(|info| info.header),
+            Some(NodeId::new(2))
+        );
+        assert_eq!(outer.loop_type, LoopType::PreTested);
+        assert_eq!(inner.loop_type, LoopType::PostTested);
+    }
+
+    /// Counts predecessor edges the loop expander actually consumes.
+    struct CountedLoop {
+        nodes: usize,
+        inspected: Cell<usize>,
+    }
+    impl GraphBase for CountedLoop {
+        fn node_count(&self) -> usize {
+            self.nodes
+        }
+        fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+            (0..self.nodes).map(NodeId::new)
+        }
+    }
+    impl Successors for CountedLoop {
+        fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+            let next = node.index().saturating_add(1);
+            [NodeId::new(if next < self.nodes { next } else { 1 })].into_iter()
+        }
+    }
+    impl Predecessors for CountedLoop {
+        fn predecessors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+            let index = node.index();
+            let first = (index > 0).then(|| NodeId::new(index.saturating_sub(1)));
+            let back = (index == 1).then(|| NodeId::new(self.nodes.saturating_sub(1)));
+            [first, back]
+                .into_iter()
+                .flatten()
+                .inspect(|_| self.inspected.set(self.inspected.get().saturating_add(1)))
+        }
+    }
+
+    /// Iterative expansion covers a large loop's full body.
+    #[test]
+    fn loop_body_expansion_covers_a_deep_cycle() {
+        let graph = CountedLoop {
+            nodes: 4096,
+            inspected: Cell::new(0),
+        };
+        let dominators = compute_dominators(&graph, NodeId::new(0));
+        let forest = detect_loops(&graph, &dominators);
+        assert_eq!(
+            forest.loop_for_header(NodeId::new(1)).map(LoopInfo::size),
+            Some(4095)
+        );
+        assert!(graph.inspected.get() >= 4095);
+    }
+
+    /// Nested loop parent and depth selection agree with the explicit containment order.
+    #[test]
+    fn nesting_preserves_all_parent_relations() {
+        let mut loops: Vec<_> = (0..128)
+            .map(|header| {
+                let mut info = LoopInfo::new(NodeId::new(header), 128);
+                for member in header..128 {
+                    info.body.insert(member);
+                }
+                info
+            })
+            .collect();
+        compute_nesting(&mut loops);
+        assert_eq!(
+            loops.iter().filter(|info| info.parent.is_some()).count(),
+            127
+        );
+        assert_eq!(
+            loops.last().map(|info| (info.parent, info.depth)),
+            Some((Some(NodeId::new(126)), 127))
+        );
     }
 }

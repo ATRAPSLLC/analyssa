@@ -21,8 +21,14 @@
 //! |-----|------------|
 //! | `USE[B]` | Variables used in B before any definition |
 //! | `DEF[B]` | Variables defined in B (phi nodes + instruction defs) |
-//! | `OUT[B]` | `∪ { IN(s) for s in succ(B) }` |
+//! | `OUT[B]` | `∪ { IN(s) for s in succ(B) ∪ handlers(B) }` |
 //! | `IN[B]` | `USE[B] ∪ (OUT[B] \\ DEF[B])` |
+//!
+//! `handlers(B)` are the handler and filter entries a throw from inside `B`
+//! reaches ([`FunctionRoots::exceptional_successors`]): a value a handler reads
+//! is live across every block of its protected region, not only its guard.
+//!
+//! [`FunctionRoots::exceptional_successors`]: crate::analysis::exceptions::FunctionRoots::exceptional_successors
 //!
 //! ## PHI Operand Handling
 //!
@@ -35,7 +41,7 @@
 //!
 //! The `LivenessResult` lattice uses `MeetSemiLattice` with:
 //! - **Meet = union**: A variable is live if it's live on ANY successor path
-//!   (may analysis — over-approximate liveness)
+//!   (may analysis - over-approximate liveness)
 //! - **Boundary**: At function exit, no variables are live
 //! - **Initial**: All blocks start with empty live sets
 
@@ -60,8 +66,8 @@ use crate::{
 /// ```rust
 /// use analyssa::{
 ///     analysis::{
+///         SsaCfg,
 ///         dataflow::{DataFlowSolver, LiveVariables},
-///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing,
@@ -69,7 +75,7 @@ use crate::{
 ///
 /// // Block 1 defines the loop counter phi; block 2 returns it.
 /// let ssa = testing::loop_counter_fixture();
-/// let graph = EhCfg::from_ssa(&ssa);
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = LiveVariables::new(&ssa);
 /// let solver = DataFlowSolver::new(analysis);
@@ -93,14 +99,32 @@ pub struct LiveVariables {
     /// Values consumed by a successor's phi on each block's outgoing edges.
     ///
     /// `phi_out[b]` holds every variable that some successor of `b` reads as a
-    /// phi operand on the edge from `b` — *including* ones `b` itself defines.
+    /// phi operand on the edge from `b` - *including* ones `b` itself defines.
     /// See [`LiveVariables::live_out`] for why this cannot be recovered from the
     /// solver's `out_state`.
     phi_out: Vec<BitSet>,
 }
 
 impl LiveVariables {
-    /// Creates a new live variables analysis for the given SSA function.
+    /// Precomputes the per-block USE and DEF sets that drive the backward solve.
+    ///
+    /// Runs in two phases. The first walks each block in isolation, recording
+    /// every variable defined by a phi or an instruction into DEF and every use
+    /// that occurs before a definition in the same block into USE - the classic
+    /// upward-exposed use set. The second phase relocates phi-operand uses: an
+    /// operand `v` on the edge from predecessor `p` is a use at the *end* of `p`,
+    /// not at the phi, so it is added to `p`'s USE set (unless `p` already defines
+    /// it) and unconditionally recorded in `phi_out[p]`. Keeping those two notions
+    /// apart is what later lets [`LiveVariables::live_out`] recover a value that
+    /// crosses an edge purely as a phi operand.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose blocks supply the USE/DEF/phi sets.
+    ///
+    /// # Returns
+    ///
+    /// An analysis primed for the dataflow solver.
     #[must_use]
     pub fn new<T: Target>(ssa: &SsaFunction<T>) -> Self {
         let num_vars = ssa.variable_count();
@@ -186,13 +210,22 @@ impl LiveVariables {
     /// meet of the successors' IN sets, and a value consumed *only* by a
     /// successor's phi never appears there: phi-operand uses are relocated into
     /// the predecessor's USE set, which feeds `IN[pred]`, not `OUT[pred]`. The
-    /// value is genuinely live across the edge — the phi copy reads it — so raw
+    /// value is genuinely live across the edge - the phi copy reads it - so raw
     /// `out_state` under-approximates liveness, which is the unsafe direction
     /// for a may-analysis and would let a register allocator reuse a live
     /// register.
     ///
     /// This computes `OUT[B] = out_state(B) ∪ PhiUses(B)`, where `PhiUses(B)` is
     /// every value some successor reads as a phi operand on an edge from `B`.
+    ///
+    /// # Arguments
+    ///
+    /// * `block` - The block whose outgoing-edge liveness is wanted.
+    /// * `out_state` - The solver's raw `out_state` for that block.
+    ///
+    /// # Returns
+    ///
+    /// The live-out set with phi-operand uses folded back in.
     #[must_use]
     pub fn live_out(&self, block: usize, out_state: &LivenessResult) -> LivenessResult {
         let mut live = out_state.live.clone();
@@ -231,6 +264,7 @@ impl<T: Target> DataFlowAnalysis<T> for LiveVariables {
     type Lattice = LivenessResult;
     const DIRECTION: Direction = Direction::Backward;
 
+    /// Boundary value at function exit: nothing is live.
     fn boundary(&self, _ssa: &SsaFunction<T>) -> Self::Lattice {
         // At function exit, no variables are live
         // (unless we're tracking return values, which we could add)
@@ -239,6 +273,7 @@ impl<T: Target> DataFlowAnalysis<T> for LiveVariables {
         }
     }
 
+    /// Initial value for interior blocks: an empty live set.
     fn initial(&self, _ssa: &SsaFunction<T>) -> Self::Lattice {
         // Initially, no variables are live
         LivenessResult {
@@ -246,6 +281,10 @@ impl<T: Target> DataFlowAnalysis<T> for LiveVariables {
         }
     }
 
+    /// Backward transfer for one block: `IN = USE ∪ (OUT \ DEF)`.
+    ///
+    /// A variable is live on entry if the block uses it, or if it is live on exit
+    /// and the block does not redefine it.
     fn transfer(
         &self,
         block_id: usize,
@@ -341,7 +380,7 @@ impl MeetSemiLattice for LivenessResult {
         Self { live: result }
     }
 
-    /// Union in place — no temporary set per predecessor.
+    /// Union in place - no temporary set per predecessor.
     fn meet_into(&mut self, other: &Self) {
         self.live.union_with(&other.live);
     }
@@ -369,7 +408,7 @@ mod tests {
     /// A value consumed *only* by a successor's phi is live across the edge, but
     /// never appears in the solver's `out_state`: phi-operand uses are relocated
     /// into the predecessor's USE set, which feeds `IN[pred]`, not `OUT[pred]`.
-    /// Under-approximating live-out is the unsafe direction — a register
+    /// Under-approximating live-out is the unsafe direction - a register
     /// allocator reading it would reuse a register that is still live.
     #[test]
     fn live_out_includes_values_a_successor_phi_consumes() {
@@ -396,9 +435,7 @@ mod tests {
         let mut phi = PhiNode::new(merged, VariableOrigin::Local(1));
         phi.add_operand(PhiOperand::new(value, 0));
         b1.add_phi(phi);
-        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(merged),
-        }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(merged))));
         ssa.add_block(b1);
         ssa.recompute_uses();
 
@@ -430,6 +467,7 @@ mod tests {
         );
     }
 
+    /// Exercises the `LivenessResult` set operations: add, remove, membership, count.
     #[test]
     fn test_liveness_result() {
         let mut result = LivenessResult::new(10);
@@ -449,6 +487,7 @@ mod tests {
         assert_eq!(result.count(), 1);
     }
 
+    /// The meet of two liveness sets is their union.
     #[test]
     fn test_liveness_meet() {
         let mut a = LivenessResult::new(10);
@@ -466,6 +505,7 @@ mod tests {
         assert_eq!(result.count(), 3);
     }
 
+    /// `variables()` yields exactly the live variables, whatever their index spread.
     #[test]
     fn test_liveness_iterator() {
         let mut result = LivenessResult::new(100);

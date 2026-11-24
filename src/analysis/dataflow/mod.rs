@@ -38,6 +38,7 @@ pub mod liveness;
 pub mod reaching;
 pub mod sccp;
 pub mod solver;
+pub mod sparse;
 
 pub use framework::{AnalysisResults, DataFlowAnalysis, DataFlowCfg, Direction};
 pub use lattice::{JoinSemiLattice, Lattice, MeetSemiLattice};
@@ -45,3 +46,4 @@ pub use liveness::{LiveVariables, LivenessResult};
 pub use reaching::ReachingDefinitions;
 pub use sccp::{ConstantPropagation, ScalarValue, SccpResult};
 pub use solver::DataFlowSolver;
+pub use sparse::{SparseDenseProblem, SparseDenseRun, SparseDenseSchedule, solve_sparse_dense};

@@ -28,7 +28,7 @@
 //!
 //! # Usage with SsaEvaluator
 //!
-//! The [`SsaEvaluator`](super::SsaEvaluator) tracks path constraints during evaluation.
+//! The [`SsaEvaluator`](crate::analysis::SsaEvaluator) tracks path constraints during evaluation.
 //! When taking a branch, the evaluator records constraints that must hold on that path.
 //!
 //! For example, after taking the true branch of `if (x == 5)`:
@@ -87,23 +87,41 @@ pub enum Constraint<T: Target> {
 impl<T: Target> Constraint<T> {
     /// Checks if a concrete value satisfies this constraint.
     ///
-    /// Uses typed comparison methods from `ConstValue`.
+    /// Each arm dispatches to the matching typed comparison on [`ConstValue`]
+    /// (`ceq`/`cgt`/`clt` and their `_un` unsigned counterparts), so ordering
+    /// follows the operand's own signedness rather than the enum arm. A negated
+    /// bound is tested as the negation of its strict form - `x >= v` is
+    /// `!(x < v)` - and satisfaction always requires the comparison to have been
+    /// performed: an uncomparable pair yields `None` from the comparison and so
+    /// counts as *not* satisfied.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The concrete value to test against this constraint.
+    /// * `ptr_size` - Target pointer size, the width of the native integers.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `value` provably satisfies the constraint, `false` otherwise
+    /// (including when the two cannot be compared).
     #[must_use]
-    pub fn is_satisfied_by(&self, value: &ConstValue<T>) -> bool {
+    pub fn is_satisfied_by(&self, value: &ConstValue<T>, ptr_size: PointerSize) -> bool {
         match self {
-            Self::Equal(v) => value.ceq(v).is_some_and(|r| !r.is_zero()),
-            Self::NotEqual(v) => value.ceq(v).is_some_and(|r| r.is_zero()),
-            Self::GreaterThan(v) => value.cgt(v).is_some_and(|r| !r.is_zero()),
-            Self::LessThan(v) => value.clt(v).is_some_and(|r| !r.is_zero()),
-            Self::GreaterOrEqual(v) => value.clt(v).is_some_and(|r| r.is_zero()),
-            Self::LessOrEqual(v) => value.cgt(v).is_some_and(|r| r.is_zero()),
-            Self::GreaterThanUnsigned(v) => value.cgt_un(v).is_some_and(|r| !r.is_zero()),
-            Self::LessThanUnsigned(v) => value.clt_un(v).is_some_and(|r| !r.is_zero()),
+            Self::Equal(v) => value.ceq_at(v, ptr_size).is_some_and(|r| !r.is_zero()),
+            Self::NotEqual(v) => value.ceq_at(v, ptr_size).is_some_and(|r| r.is_zero()),
+            Self::GreaterThan(v) => value.cgt(v, ptr_size).is_some_and(|r| !r.is_zero()),
+            Self::LessThan(v) => value.clt(v, ptr_size).is_some_and(|r| !r.is_zero()),
+            Self::GreaterOrEqual(v) => value.clt(v, ptr_size).is_some_and(|r| r.is_zero()),
+            Self::LessOrEqual(v) => value.cgt(v, ptr_size).is_some_and(|r| r.is_zero()),
+            Self::GreaterThanUnsigned(v) => value.cgt_un(v, ptr_size).is_some_and(|r| !r.is_zero()),
+            Self::LessThanUnsigned(v) => value.clt_un(v, ptr_size).is_some_and(|r| !r.is_zero()),
             // `x >=u k` is exactly `!(x <u k)`, so satisfaction is the negation
-            // of the strict form — and still requires the comparison to have
+            // of the strict form - and still requires the comparison to have
             // been performed at all.
-            Self::GreaterOrEqualUnsigned(v) => value.clt_un(v).is_some_and(|r| r.is_zero()),
-            Self::LessOrEqualUnsigned(v) => value.cgt_un(v).is_some_and(|r| r.is_zero()),
+            Self::GreaterOrEqualUnsigned(v) => {
+                value.clt_un(v, ptr_size).is_some_and(|r| r.is_zero())
+            }
+            Self::LessOrEqualUnsigned(v) => value.cgt_un(v, ptr_size).is_some_and(|r| r.is_zero()),
         }
     }
 
@@ -119,8 +137,8 @@ impl<T: Target> Constraint<T> {
     /// Checks if this constraint conflicts with another (both can't be true).
     ///
     /// Returns `true` only when the conflict is *proved*. Constant pairs that
-    /// [`ConstValue`] cannot compare — mixed signedness, mixed non-promotable
-    /// widths, booleans against integers — yield `false` (no conflict known),
+    /// [`ConstValue`] cannot compare - mixed signedness, mixed non-promotable
+    /// widths, booleans against integers - yield `false` (no conflict known),
     /// because "cannot compare" is not evidence of infeasibility. Reporting a
     /// conflict there would mark a live path unreachable.
     ///
@@ -135,18 +153,20 @@ impl<T: Target> Constraint<T> {
             // Compared numerically, not structurally: `I32(5)` and `I64(5)` are
             // the same value, and `!=` on the enum would call them conflicting.
             // A pair `ceq` cannot compare proves nothing, so it is not a conflict.
-            (Self::Equal(a), Self::Equal(b)) => a.ceq(b).is_some_and(|r| r.is_zero()),
+            (Self::Equal(a), Self::Equal(b)) => a.ceq_at(b, ptr_size).is_some_and(|r| r.is_zero()),
             // x == a conflicts with x != a
-            (Self::Equal(a), Self::NotEqual(b)) | (Self::NotEqual(b), Self::Equal(a)) => a == b,
+            (Self::Equal(a), Self::NotEqual(b)) | (Self::NotEqual(b), Self::Equal(a)) => {
+                a.ceq_at(b, ptr_size).is_some_and(|value| !value.is_zero())
+            }
             // x == a conflicts with x > b when a <= b (i.e., a is not greater than b)
             (Self::Equal(a), Self::GreaterThan(b)) | (Self::GreaterThan(b), Self::Equal(a)) => {
                 // a <= b means a is not strictly greater than b
-                a.cgt(b).is_some_and(|r| r.is_zero())
+                a.cgt(b, ptr_size).is_some_and(|r| r.is_zero())
             }
             // x == a conflicts with x < b when a >= b (i.e., a is not less than b)
             (Self::Equal(a), Self::LessThan(b)) | (Self::LessThan(b), Self::Equal(a)) => {
                 // a >= b means a is not strictly less than b
-                a.clt(b).is_some_and(|r| r.is_zero())
+                a.clt(b, ptr_size).is_some_and(|r| r.is_zero())
             }
             // x > a conflicts with x < b if ranges don't overlap
             (Self::GreaterThan(a), Self::LessThan(b))
@@ -155,7 +175,7 @@ impl<T: Target> Constraint<T> {
                 // Conflicts when b <= a + 1
                 let one: ConstValue<T> = ConstValue::I32(1);
                 a.add(&one, ptr_size)
-                    .and_then(|a_plus_1| b.cgt(&a_plus_1))
+                    .and_then(|a_plus_1| b.cgt(&a_plus_1, ptr_size))
                     .is_some_and(|r| r.is_zero())
             }
             _ => false,
@@ -214,9 +234,14 @@ impl<T: Target> PathConstraint<T> {
     }
 
     /// Checks if a concrete value satisfies this constraint.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The concrete value to test.
+    /// * `ptr_size` - Target pointer size, the width of the native integers.
     #[must_use]
-    pub fn is_satisfied_by(&self, value: &ConstValue<T>) -> bool {
-        self.constraint.is_satisfied_by(value)
+    pub fn is_satisfied_by(&self, value: &ConstValue<T>, ptr_size: PointerSize) -> bool {
+        self.constraint.is_satisfied_by(value, ptr_size)
     }
 }
 
@@ -231,30 +256,54 @@ mod tests {
         Constraint::Equal(v)
     }
 
-    /// `ConstValue` comparison returns `None` for pairs it has no arm for —
-    /// mixed signedness, mixed non-promotable widths, booleans against integers.
-    /// "Cannot compare" is not evidence that both constraints are unsatisfiable,
-    /// so it must not be reported as a conflict: a conflict marks the path
-    /// infeasible and everything on it gets deleted.
+    /// `ConstValue` comparison returns `None` for a pair it cannot read as two
+    /// numbers - a float against an integer, a null against anything, a value
+    /// with no exact reading. "Cannot compare" is not evidence that both
+    /// constraints are unsatisfiable, so it must not be reported as a conflict:
+    /// a conflict marks the path infeasible and everything on it gets deleted.
     #[test]
     fn uncomparable_constants_are_not_a_conflict() {
-        // I32 vs U32: no comparison arm exists.
+        assert!(
+            !eq(ConstValue::from(5.0f64))
+                .conflicts_with(&Constraint::GreaterThan(ConstValue::I32(9)), PTR),
+            "a float and an integer are not two readings of one number"
+        );
+        assert!(
+            !eq(ConstValue::Null).conflicts_with(&Constraint::LessThan(ConstValue::I32(1)), PTR),
+            "a null names no number to compare"
+        );
+        assert!(
+            !eq(ConstValue::U64(u64::MAX))
+                .conflicts_with(&Constraint::LessThan(ConstValue::I32(1)), PTR),
+            "a u64 past i64::MAX has no exact signed reading"
+        );
+    }
+
+    /// An ordering compares the two *numbers*, whatever variants carry them.
+    ///
+    /// The variant a lift chose is not part of the question: a MIPS `slt`
+    /// against an immediate arrives as `U32` on one side and `I32` on the
+    /// other, and refusing that pair leaves every such guard undecided.
+    #[test]
+    fn an_ordering_compares_the_numbers_not_the_variants() {
         assert!(
             !eq(ConstValue::I32(5))
                 .conflicts_with(&Constraint::GreaterThan(ConstValue::U32(3)), PTR),
-            "mixed signedness cannot be compared, so no conflict is proved"
+            "5 > 3 holds, so the two constraints agree"
         );
         assert!(
-            !eq(ConstValue::I32(5)).conflicts_with(&Constraint::LessThan(ConstValue::U32(9)), PTR),
+            eq(ConstValue::I32(5))
+                .conflicts_with(&Constraint::GreaterThan(ConstValue::U32(9)), PTR),
+            "5 > 9 does not, and mixed variants must not hide it"
         );
-        // I8 vs I32: not promotable by `clt`/`cgt`.
         assert!(
             !eq(ConstValue::I8(5))
                 .conflicts_with(&Constraint::GreaterThan(ConstValue::I32(3)), PTR),
+            "widths that no promotion arm names are still two numbers"
         );
-        // A boolean against an integer.
         assert!(
-            !eq(ConstValue::True).conflicts_with(&Constraint::LessThan(ConstValue::I32(1)), PTR)
+            eq(ConstValue::True).conflicts_with(&Constraint::LessThan(ConstValue::I32(1)), PTR),
+            "true is one, and one is not less than one"
         );
     }
 
@@ -288,14 +337,18 @@ mod tests {
 
         // Taking the false edge of `x <u 10` proves `x >=u 10`, which 0xFFFF_FFFF
         // satisfies...
-        assert!(Constraint::GreaterOrEqualUnsigned(ten.clone()).is_satisfied_by(&big));
+        assert!(Constraint::GreaterOrEqualUnsigned(ten.clone()).is_satisfied_by(&big, PTR));
         // ...while it does *not* satisfy `x >= 10` in unsigned terms being
         // conflated with signed: the signed reading of the same bits is -1.
-        assert!(!Constraint::<MockTarget>::LessThanUnsigned(ten.clone()).is_satisfied_by(&big));
+        assert!(
+            !Constraint::<MockTarget>::LessThanUnsigned(ten.clone()).is_satisfied_by(&big, PTR)
+        );
 
         // And the mirror: the false edge of `x >u 10` proves `x <=u 10`.
-        assert!(Constraint::LessOrEqualUnsigned(ten.clone()).is_satisfied_by(&ConstValue::U32(10)));
-        assert!(!Constraint::LessOrEqualUnsigned(ten).is_satisfied_by(&big));
+        assert!(
+            Constraint::LessOrEqualUnsigned(ten.clone()).is_satisfied_by(&ConstValue::U32(10), PTR)
+        );
+        assert!(!Constraint::LessOrEqualUnsigned(ten).is_satisfied_by(&big, PTR));
     }
 
     /// The conflicts the analysis exists to find must still be found.

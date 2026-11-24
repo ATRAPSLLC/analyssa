@@ -27,7 +27,8 @@
 //!    - Array-aware: If an array is tainted, `StoreElement` operations to that
 //!      array are also tainted (critical for cleanup neutralization)
 //!
-//! 4. **Termination**: Repeats until no changes or `max_iterations` is reached.
+//! 4. **Termination**: Repeats until no changes, or until the host's
+//!    [`Budget::TaintRounds`] are spent, which [`TaintStats::exhausted`] records.
 //!
 //! # PHI Taint Modes for CFF Analysis
 //!
@@ -39,7 +40,7 @@
 //!
 //! # Complexity
 //!
-//! O(I * (V + P)) where I is iterations to fixpoint (bounded by max_iterations),
+//! O(I * (V + P)) where I is iterations to fixpoint (bounded by the rounds),
 //! V is the number of variables, and P is the number of PHI nodes.
 //!
 //! # Use Cases
@@ -52,7 +53,10 @@
 //!
 //! ```rust
 //! use analyssa::{
-//!     analysis::taint::{PhiTaintMode, TaintAnalysis, TaintConfig},
+//!     analysis::{
+//!         budget::WorkBudget,
+//!         taint::{PhiTaintMode, TaintAnalysis, TaintConfig},
+//!     },
 //!     ir::SsaVarId,
 //!     testing,
 //! };
@@ -65,10 +69,9 @@
 //!     forward: true,
 //!     backward: true,
 //!     phi_mode: PhiTaintMode::TaintAllOperands,
-//!     max_iterations: 100,
 //! };
 //!
-//! let mut taint = TaintAnalysis::new(config);
+//! let mut taint = TaintAnalysis::new(config, &WorkBudget::DEFAULT);
 //! taint.add_tainted_var(SsaVarId::from_index(0));
 //! taint.propagate(&ssa);
 //!
@@ -80,9 +83,10 @@
 //! assert!(!taint.is_var_tainted(SsaVarId::from_index(10)));
 //! ```
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
+    analysis::budget::{Budget, Exhaustion, Rounds, WorkBudget},
     ir::{
         function::SsaFunction,
         ops::SsaOp,
@@ -114,7 +118,7 @@ pub enum PhiTaintMode {
     ///
     /// Use this for path-sensitive analysis where only certain control
     /// flow paths should propagate taint.
-    TaintFromPredecessors(HashSet<usize>),
+    TaintFromPredecessors(FxHashSet<usize>),
 
     /// Selective backward taint through PHI chains for CFF analysis.
     ///
@@ -128,7 +132,7 @@ pub enum PhiTaintMode {
     SelectivePhi {
         /// Set of predecessor blocks whose operands should be tainted.
         /// For CFF, this is typically the set of blocks that jump to the dispatcher.
-        predecessors: HashSet<usize>,
+        predecessors: FxHashSet<usize>,
         /// Optional `VariableOrigin` to filter PHI chains.
         /// Only PHIs with matching origin will be traversed.
         origin_filter: Option<VariableOrigin>,
@@ -160,20 +164,19 @@ pub struct TaintConfig {
 
     /// How to handle PHI nodes.
     pub phi_mode: PhiTaintMode,
-
-    /// Maximum iterations for fixpoint computation.
-    ///
-    /// Prevents infinite loops in pathological cases.
-    pub max_iterations: usize,
 }
 
 impl Default for TaintConfig {
+    /// Forward-only propagation with `TaintIfAnyOperand` PHI handling.
+    ///
+    /// Backward propagation is left off by default because it taints every
+    /// operand of a tainted definition, which quickly over-approximates; callers
+    /// that need it opt in via [`TaintConfig::bidirectional`].
     fn default() -> Self {
         Self {
             forward: true,
             backward: false,
             phi_mode: PhiTaintMode::TaintIfAnyOperand,
-            max_iterations: 100,
         }
     }
 }
@@ -188,7 +191,6 @@ impl TaintConfig {
             forward: true,
             backward: false,
             phi_mode: PhiTaintMode::TaintIfAnyOperand,
-            max_iterations: 100,
         }
     }
 
@@ -202,7 +204,6 @@ impl TaintConfig {
             forward: true,
             backward: true,
             phi_mode: PhiTaintMode::TaintAllOperands,
-            max_iterations: 100,
         }
     }
 }
@@ -211,12 +212,17 @@ impl TaintConfig {
 ///
 /// Reports the number of iterations required to reach a fixpoint and the
 /// counts of tainted variables, instructions, and PHI nodes discovered.
-/// These statistics help tune the analysis parameters (particularly
-/// `max_iterations`) and assess the scope of taint propagation.
+/// These statistics help tune the host's [`Budget::TaintRounds`] and assess the
+/// scope of taint propagation.
 #[derive(Debug, Clone, Default)]
 pub struct TaintStats {
-    /// Number of fixpoint iterations performed (bounded by `TaintConfig::max_iterations`).
+    /// Number of fixpoint iterations performed (bounded by the host's
+    /// [`Budget::TaintRounds`]).
     pub iterations: usize,
+    /// The exhaustion of [`Budget::TaintRounds`] when propagation was still
+    /// spreading at its last allowed round: the taint found is then an
+    /// under-approximation of what is connected to the sources.
+    pub exhausted: Option<Exhaustion>,
     /// Number of SSA variables found to be tainted by the analysis.
     pub tainted_vars: usize,
     /// Number of instructions found to be tainted by the analysis.
@@ -235,16 +241,19 @@ pub struct TaintStats {
 #[derive(Debug, Clone)]
 pub struct TaintAnalysis {
     /// Tainted SSA variables.
-    tainted_vars: HashSet<SsaVarId>,
+    tainted_vars: FxHashSet<SsaVarId>,
 
     /// Tainted instructions: (block_idx, instr_idx).
-    tainted_instrs: HashSet<(usize, usize)>,
+    tainted_instrs: FxHashSet<(usize, usize)>,
 
     /// Tainted PHI nodes: (block_idx, phi_idx).
-    tainted_phis: HashSet<(usize, usize)>,
+    tainted_phis: FxHashSet<(usize, usize)>,
 
     /// Configuration.
     config: TaintConfig,
+
+    /// The rounds propagation may take, the host's [`Budget::TaintRounds`].
+    rounds: usize,
 
     /// Statistics from the last propagation.
     stats: TaintStats,
@@ -256,31 +265,22 @@ impl TaintAnalysis {
     /// # Arguments
     ///
     /// * `config` - Configuration controlling propagation behavior.
+    /// * `budget` - The host's work budget, whose [`Budget::TaintRounds`]
+    ///   bound propagation.
     ///
     /// # Returns
     ///
     /// A new `TaintAnalysis` with empty taint sets.
     #[must_use]
-    pub fn new(config: TaintConfig) -> Self {
+    pub fn new(config: TaintConfig, budget: &WorkBudget) -> Self {
         Self {
-            tainted_vars: HashSet::new(),
-            tainted_instrs: HashSet::new(),
-            tainted_phis: HashSet::new(),
+            tainted_vars: FxHashSet::default(),
+            tainted_instrs: FxHashSet::default(),
+            tainted_phis: FxHashSet::default(),
             config,
+            rounds: budget.limit(Budget::TaintRounds),
             stats: TaintStats::default(),
         }
-    }
-
-    /// Creates a taint analysis with default forward-only configuration.
-    #[must_use]
-    pub fn forward_only() -> Self {
-        Self::new(TaintConfig::forward_only())
-    }
-
-    /// Creates a taint analysis with bidirectional configuration.
-    #[must_use]
-    pub fn bidirectional() -> Self {
-        Self::new(TaintConfig::bidirectional())
     }
 
     /// Adds a variable as a taint source.
@@ -373,38 +373,49 @@ impl TaintAnalysis {
     /// * `ssa` - The SSA function to analyze.
     pub fn propagate<T: Target>(&mut self, ssa: &SsaFunction<T>) {
         let mut iterations: usize = 0;
-
-        loop {
-            if iterations >= self.config.max_iterations {
-                break;
-            }
+        let mut rounds = Rounds::new(Budget::TaintRounds, self.rounds);
+        while rounds.next_round() {
             iterations = iterations.saturating_add(1);
 
-            let mut changed = false;
-
             // Process PHI nodes first
-            changed |= self.propagate_phis(ssa);
+            let mut changed = self.propagate_phis(ssa);
 
             // Process instructions
             changed |= self.propagate_instructions(ssa);
 
             if !changed {
-                break;
+                rounds.settle();
             }
         }
 
         // Update statistics
         self.stats = TaintStats {
             iterations,
+            exhausted: rounds.exhausted(),
             tainted_vars: self.tainted_vars.len(),
             tainted_instrs: self.tainted_instrs.len(),
             tainted_phis: self.tainted_phis.len(),
         };
     }
 
-    /// Propagates taint through PHI nodes.
+    /// Propagates taint one step across every PHI node per the configured mode.
     ///
-    /// Returns `true` if any changes were made.
+    /// Visits every PHI in every block and applies the rule selected by
+    /// [`PhiTaintMode`]: `TaintAllOperands` pushes a tainted result down to all
+    /// operands, `TaintIfAnyOperand` lifts a tainted operand up to the result,
+    /// and the predecessor-filtered modes (`TaintFromPredecessors`,
+    /// `SelectivePhi`) only cross the edges whose predecessor is in the
+    /// configured set - with `SelectivePhi` additionally skipping PHIs whose
+    /// origin does not match the filter. Any PHI that gains taint is recorded in
+    /// `tainted_phis` so callers can identify the participating merge points.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose PHI nodes are scanned.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this step newly tainted at least one variable or PHI node.
     fn propagate_phis<T: Target>(&mut self, ssa: &SsaFunction<T>) -> bool {
         let mut changed = false;
 
@@ -493,9 +504,25 @@ impl TaintAnalysis {
         changed
     }
 
-    /// Propagates taint through instructions.
+    /// Propagates taint one step across every instruction.
     ///
-    /// Returns `true` if any changes were made.
+    /// Scans all instructions, reusing scratch def/use buffers to avoid
+    /// per-instruction allocation. Forward propagation taints an instruction's
+    /// def when any of its uses is tainted; backward propagation taints all uses
+    /// when a def is tainted. A backward-mode special case treats a
+    /// `StoreElement` into a tainted array as tainted (and taints the stored
+    /// value and index), because protection code often fills arrays passed to
+    /// methods that are about to be removed. Finally, any instruction that merely
+    /// reads a tainted variable is marked tainted even when it defines nothing
+    /// (e.g. stores), so def-less sinks are still captured.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose instructions are scanned.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this step newly tainted at least one variable or instruction.
     fn propagate_instructions<T: Target>(&mut self, ssa: &SsaFunction<T>) -> bool {
         let mut changed = false;
 
@@ -614,19 +641,19 @@ impl TaintAnalysis {
 
     /// Returns all tainted variables.
     #[must_use]
-    pub fn tainted_variables(&self) -> &HashSet<SsaVarId> {
+    pub fn tainted_variables(&self) -> &FxHashSet<SsaVarId> {
         &self.tainted_vars
     }
 
     /// Returns all tainted instructions.
     #[must_use]
-    pub fn tainted_instructions(&self) -> &HashSet<(usize, usize)> {
+    pub fn tainted_instructions(&self) -> &FxHashSet<(usize, usize)> {
         &self.tainted_instrs
     }
 
     /// Returns all tainted PHI nodes.
     #[must_use]
-    pub fn tainted_phis(&self) -> &HashSet<(usize, usize)> {
+    pub fn tainted_phis(&self) -> &FxHashSet<(usize, usize)> {
         &self.tainted_phis
     }
 
@@ -671,8 +698,8 @@ impl TaintAnalysis {
 ///
 /// A set of block indices that have a control flow edge to `target`.
 #[must_use]
-pub fn find_blocks_jumping_to<T: Target>(ssa: &SsaFunction<T>, target: usize) -> HashSet<usize> {
-    let mut jumpers = HashSet::new();
+pub fn find_blocks_jumping_to<T: Target>(ssa: &SsaFunction<T>, target: usize) -> FxHashSet<usize> {
+    let mut jumpers = FxHashSet::default();
 
     for block in ssa.blocks() {
         if let Some(terminator) = block.instructions().last() {
@@ -734,7 +761,6 @@ pub fn cff_taint_config<T: Target>(
             predecessors,
             origin_filter: state_origin,
         },
-        max_iterations: 100,
     }
 }
 
