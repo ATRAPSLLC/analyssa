@@ -91,7 +91,8 @@ const MAX_ADDRESS_DEPTH: usize = 16;
 /// # Arguments
 ///
 /// * `offset_bits` - The folded displacement in bits, before wrapping.
-/// * `ptr_size` - The target pointer width the displacement wraps at.
+/// * `ptr_size` - The width the displacement wraps at: the pointer width for an address,
+///   an integer's own width for an integer ([`AddressWalk`] chooses).
 ///
 /// # Returns
 ///
@@ -569,6 +570,20 @@ pub struct AddressWalk<'a, T: Target> {
 }
 
 impl<'a, T: Target> AddressWalk<'a, T> {
+    /// The width a displacement of `value` wraps at: an address, and an integer of no fixed
+    /// width, at the pointer width; any other integer at its own, which its arithmetic
+    /// wraps at. A 64-bit `x + 2^32` computed where pointers are 32 bits moves `x` by
+    /// `2^32`, which wrapped at the pointer width would read as no move at all.
+    fn wrap_width(&self, value: SsaVarId) -> PointerSize {
+        self.ir
+            .variable(value)
+            .map(|variable| variable.var_type())
+            .filter(|ty| T::is_integer(ty) && !T::is_pointer(ty))
+            .and_then(T::bit_width)
+            .and_then(|bits| PointerSize::try_from_bytes(bits / 8))
+            .unwrap_or(self.ptr_size)
+    }
+
     /// Opens the addresses of `ir` at `ptr_size`.
     #[must_use]
     pub const fn new(ir: &'a SsaFunction<T>, ptr_size: PointerSize) -> Self {
@@ -872,7 +887,7 @@ impl<'a, T: Target> AddressWalk<'a, T> {
             else {
                 return found;
             };
-            past_bits = canonical_offset_bits(bits, self.ptr_size);
+            past_bits = canonical_offset_bits(bits, self.wrap_width(current));
             current = from;
             // A copy is the value it copies, which the walk reaches next.
             let copies = matches!(
@@ -1019,7 +1034,7 @@ impl<'a, T: Target> AddressWalk<'a, T> {
                             root_offset_bits: 0,
                             index: None,
                             stride_bytes: 0,
-                            offset_bits: canonical_offset_bits(bits, self.ptr_size),
+                            offset_bits: canonical_offset_bits(bits, self.wrap_width(current)),
                         },
                         None => AddressExpr::identity(current),
                     };
@@ -1093,7 +1108,7 @@ impl<'a, T: Target> AddressWalk<'a, T> {
         };
         let mut result = root;
         for (at, offset) in steps.into_iter().rev() {
-            result = fold_offset(result, offset, at, self.ptr_size);
+            result = fold_offset(result, offset, at, self.wrap_width(at));
         }
         result
     }
@@ -1110,7 +1125,7 @@ impl<'a, T: Target> AddressWalk<'a, T> {
         let Some(bits) = offset.checked_mul(8) else {
             return AddressExpr::identity(value);
         };
-        let mut result = fold_offset(base, bits, value, self.ptr_size);
+        let mut result = fold_offset(base, bits, value, self.wrap_width(value));
         if result.base == AddressBase::Value(value) {
             return result;
         }
@@ -1168,7 +1183,7 @@ impl<'a, T: Target> AddressWalk<'a, T> {
             return if index.offset_bits == 0 {
                 indexed
             } else {
-                fold_offset(indexed, index.offset_bits, value, self.ptr_size)
+                fold_offset(indexed, index.offset_bits, value, self.wrap_width(value))
             };
         }
         AddressExpr::identity(value)
@@ -1183,7 +1198,8 @@ impl<'a, T: Target> AddressWalk<'a, T> {
 /// * `base` - The address expression to extend.
 /// * `offset` - The displacement to add, in bits.
 /// * `value` - The originating value, used as the identity fallback on overflow.
-/// * `ptr_size` - The target pointer width the summed offset is canonicalised into.
+/// * `width` - The width the summed offset is canonicalised into: the pointer width for an
+///   address, the integer's own width for an integer.
 ///
 /// # Returns
 ///
@@ -1193,17 +1209,17 @@ fn fold_offset(
     mut base: AddressExpr,
     offset: i64,
     value: SsaVarId,
-    ptr_size: PointerSize,
+    width: PointerSize,
 ) -> AddressExpr {
     match (
         base.offset_bits.checked_add(offset),
         base.root_offset_bits.checked_add(offset),
     ) {
         (Some(folded), Some(from_root)) => {
-            // Canonicalise into the target pointer width so the sign-extended
-            // and zero-extended lowerings of one displacement agree.
-            base.offset_bits = canonical_offset_bits(folded, ptr_size);
-            base.root_offset_bits = canonical_offset_bits(from_root, ptr_size);
+            // Canonicalise into the value's width so the sign-extended and
+            // zero-extended lowerings of one displacement agree.
+            base.offset_bits = canonical_offset_bits(folded, width);
+            base.root_offset_bits = canonical_offset_bits(from_root, width);
             base
         }
         _ => AddressExpr::identity(value),
@@ -2005,6 +2021,56 @@ mod tests {
         );
         // A sub-byte member offset rides along unchanged.
         assert_eq!(canonical_offset_bits(-64 + 3, PointerSize::Bit32), -64 + 3);
+    }
+
+    /// **An integer's displacement wraps at the integer's own width, not the
+    /// pointer's.** `x + 2^32` over a 64-bit `x` where pointers are 32 bits
+    /// moves `x` by `2^32`: wrapped at the pointer width it read as no move, and
+    /// the algebraic pass replaced the addition with `x`. A 32-bit integer where
+    /// pointers are 64 bits wraps at 32, as its arithmetic does: `x +
+    /// 0xFFFF_FFF8` is `x - 8` there.
+    #[test]
+    fn an_integers_displacement_wraps_at_its_own_width() {
+        fn address_for(
+            ty: MockType,
+            value: ConstValue<MockTarget>,
+            ptr_size: PointerSize,
+        ) -> (AddressExpr, SsaVarId) {
+            let mut ir = function();
+            let base = ir.create_variable(VariableOrigin::Argument(0), 0, DefSite::entry(), ty);
+            let offset = ir.create_variable(VariableOrigin::Local(1), 0, DefSite::entry(), ty);
+            let addr = ir.create_variable(VariableOrigin::Local(2), 0, DefSite::entry(), ty);
+            let mut block = SsaBlock::with_capacity(0, 0, 2);
+            block.add_instruction(instr(SsaOp::Const {
+                dest: offset,
+                value,
+            }));
+            block.add_instruction(instr(SsaOp::Add {
+                dest: addr,
+                left: base,
+                right: offset,
+                flags: None,
+            }));
+            ir.add_block(block);
+            ir.recompute_uses();
+            (AddressWalk::new(&ir, ptr_size).normalize(addr), base)
+        }
+
+        let (wide, base) = address_for(MockType::I64, ConstValue::I64(1 << 32), PointerSize::Bit32);
+        assert_eq!(wide.base, AddressBase::Value(base));
+        assert_eq!(
+            wide.offset_bits,
+            (1i64 << 32) * 8,
+            "a 64-bit move of 2^32 stays one"
+        );
+
+        let (narrow, base) = address_for(
+            MockType::I32,
+            ConstValue::U32(0xFFFF_FFF8),
+            PointerSize::Bit64,
+        );
+        assert_eq!(narrow.base, AddressBase::Value(base));
+        assert_eq!(narrow.offset_bits, -64, "a 32-bit integer wraps at 32 bits");
     }
 
     /// Ordinary displacements - including genuinely negative ones - must keep
