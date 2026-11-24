@@ -4,16 +4,21 @@
 //! CFG-shaping passes (block merging, jump threading, control-flow
 //! simplification) use when they splice blocks.
 
+use std::convert::Infallible;
+
 use crate::{
-    ir::{ops::def::SsaOp, variable::SsaVarId},
+    ir::{
+        ops::{def::SsaOp, execution::Computation, kinds::KindedVecData, vector::Contraction},
+        variable::SsaVarId,
+    },
     target::Target,
 };
 
 impl<T: Target> SsaOp<T> {
     /// Builds an integer conversion that cannot overflow.
     ///
-    /// A representation change — truncating a register to a subregister,
-    /// widening one, relabelling a sign — never traps, so the only
+    /// A representation change - truncating a register to a subregister,
+    /// widening one, relabelling a sign - never traps, so the only
     /// [`SsaOp::IntConv`] a lifter builds for one carries no overflow check.
     /// Naming that construction here keeps every caller from restating the same
     /// five fields, and keeps the question "which conversions does the lift
@@ -30,6 +35,28 @@ impl<T: Target> SsaOp<T> {
             overflow_check: false,
             unsigned,
         }
+    }
+
+    /// Builds the contraction `kind` defining `outputs` from `inputs`
+    /// ([`SsaOp::Contract`]).
+    #[must_use]
+    pub fn contract(kind: Contraction, outputs: Vec<SsaVarId>, inputs: Vec<SsaVarId>) -> Self {
+        Self::Contract(Box::new(KindedVecData {
+            kind,
+            outputs,
+            inputs,
+        }))
+    }
+
+    /// Builds the computation `kind` defining `outputs` from `inputs`
+    /// ([`SsaOp::Compute`]).
+    #[must_use]
+    pub fn compute(kind: Computation, outputs: Vec<SsaVarId>, inputs: Vec<SsaVarId>) -> Self {
+        Self::Compute(Box::new(KindedVecData {
+            kind,
+            outputs,
+            inputs,
+        }))
     }
 
     /// Returns `true` if this operation is a terminator (ends a basic block).
@@ -115,6 +142,64 @@ impl<T: Target> SsaOp<T> {
         }
     }
 
+    /// The `(true_target, false_target)` of a two-way conditional terminator.
+    ///
+    /// **There are three of them**, and that is the whole reason this exists.
+    /// `Branch` names a condition variable, `BranchCmp` states a relation
+    /// inline, and `BranchFlags` tests a bit of a flags value; they are the same
+    /// shape - one predicate, two arms - and a consumer that reasons about "a
+    /// conditional branch" wants all three or none. Enumerating them by hand
+    /// invites handling two of the three, and the omission is silent: the
+    /// missing kind falls to a conservative default and simply stops being
+    /// simplified.
+    ///
+    /// `None` for every other op, including `Switch` and `IndirectBranch` -
+    /// those have arms but not *two* of them, and a caller reasoning about a
+    /// predicate's two outcomes cannot use them. The arms are returned as they
+    /// are written, so a branch naming one block twice comes back as
+    /// `Some((n, n))`: whether that is a degenerate branch to collapse or a
+    /// condition that decides nothing is the caller's question, and both callers
+    /// want a different answer to it. Callers wanting the successor *set* want
+    /// [`SsaOp::successors`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use analyssa::{MockTarget, ir::{SsaOp, ops::native::FlagCondition, variable::SsaVarId}};
+    ///
+    /// let op: SsaOp<MockTarget> = SsaOp::BranchFlags {
+    ///     flags: SsaVarId::from_index(0),
+    ///     condition: FlagCondition::Zero,
+    ///     true_target: 1,
+    ///     false_target: 2,
+    /// };
+    /// assert_eq!(op.two_way_targets(), Some((1, 2)));
+    ///
+    /// let unconditional: SsaOp<MockTarget> = SsaOp::Jump { target: 1 };
+    /// assert_eq!(unconditional.two_way_targets(), None);
+    /// ```
+    #[must_use]
+    pub fn two_way_targets(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Branch {
+                true_target,
+                false_target,
+                ..
+            }
+            | Self::BranchCmp {
+                true_target,
+                false_target,
+                ..
+            }
+            | Self::BranchFlags {
+                true_target,
+                false_target,
+                ..
+            } => Some((*true_target, *false_target)),
+            _ => None,
+        }
+    }
+
     /// Calls `f` for every successor block index of this operation.
     ///
     /// Allocation-free equivalent of iterating [`SsaOp::successors`]; preferred
@@ -123,8 +208,26 @@ impl<T: Target> SsaOp<T> {
     where
         F: FnMut(usize),
     {
+        match self.try_for_each_successor(|target| {
+            f(target);
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+
+    /// Visits successors in operand order, stopping immediately on a visitor error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first visitor error without invoking it for any remaining target.
+    pub fn try_for_each_successor<E>(
+        &self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
-            Self::Jump { target } | Self::Leave { target } => f(*target),
+            Self::Jump { target } | Self::Leave { target } => f(*target)?,
             Self::Branch {
                 true_target,
                 false_target,
@@ -140,27 +243,28 @@ impl<T: Target> SsaOp<T> {
                 false_target,
                 ..
             } => {
-                f(*true_target);
-                f(*false_target);
+                f(*true_target)?;
+                f(*false_target)?;
             }
             Self::Switch {
                 targets, default, ..
             } => {
                 for target in targets {
-                    f(*target);
+                    f(*target)?;
                 }
-                f(*default);
+                f(*default)?;
             }
             Self::IndirectBranch {
                 resolved_targets, ..
             } => {
                 for target in resolved_targets {
-                    f(*target);
+                    f(*target)?;
                 }
             }
             // Return, Throw, Rethrow, EndFinally, EndFilter have no successors
             _ => {}
         }
+        Ok(())
     }
 
     /// Returns `true` if `block` is a successor of this operation.
@@ -231,68 +335,14 @@ impl<T: Target> SsaOp<T> {
         if old_target == new_target {
             return false;
         }
-
-        match self {
-            Self::Jump { target } | Self::Leave { target } if *target == old_target => {
+        let mut changed = false;
+        self.for_each_target_mut(|target| {
+            if *target == old_target {
                 *target = new_target;
-                true
+                changed = true;
             }
-            Self::Branch {
-                true_target,
-                false_target,
-                ..
-            }
-            | Self::BranchCmp {
-                true_target,
-                false_target,
-                ..
-            }
-            | Self::BranchFlags {
-                true_target,
-                false_target,
-                ..
-            } => {
-                let mut changed = false;
-                if *true_target == old_target {
-                    *true_target = new_target;
-                    changed = true;
-                }
-                if *false_target == old_target {
-                    *false_target = new_target;
-                    changed = true;
-                }
-                changed
-            }
-            Self::Switch {
-                targets, default, ..
-            } => {
-                let mut changed = false;
-                if *default == old_target {
-                    *default = new_target;
-                    changed = true;
-                }
-                for target in targets.iter_mut() {
-                    if *target == old_target {
-                        *target = new_target;
-                        changed = true;
-                    }
-                }
-                changed
-            }
-            Self::IndirectBranch {
-                resolved_targets, ..
-            } => {
-                let mut changed = false;
-                for target in resolved_targets.iter_mut() {
-                    if *target == old_target {
-                        *target = new_target;
-                        changed = true;
-                    }
-                }
-                changed
-            }
-            _ => false,
-        }
+        });
+        changed
     }
 
     /// Remaps branch target block indices using the provided mapping function.
@@ -308,12 +358,20 @@ impl<T: Target> SsaOp<T> {
     where
         F: Fn(usize) -> Option<usize>,
     {
-        match self {
-            Self::Jump { target } | Self::Leave { target } => {
-                if let Some(new_target) = remap(*target) {
-                    *target = new_target;
-                }
+        self.for_each_target_mut(|target| {
+            if let Some(new_target) = remap(*target) {
+                *target = new_target;
             }
+        });
+    }
+
+    /// Calls `visit` with every block index this terminator transfers to, in
+    /// place: a jump's or leave's target, both arms of a branch, a switch's
+    /// cases and default, and an indirect branch's resolved targets. Any other
+    /// operation has none.
+    fn for_each_target_mut(&mut self, mut visit: impl FnMut(&mut usize)) {
+        match self {
+            Self::Jump { target } | Self::Leave { target } => visit(target),
             Self::Branch {
                 true_target,
                 false_target,
@@ -329,35 +387,18 @@ impl<T: Target> SsaOp<T> {
                 false_target,
                 ..
             } => {
-                if let Some(new_target) = remap(*true_target) {
-                    *true_target = new_target;
-                }
-                if let Some(new_target) = remap(*false_target) {
-                    *false_target = new_target;
-                }
+                visit(true_target);
+                visit(false_target);
             }
             Self::Switch {
                 targets, default, ..
             } => {
-                for target in targets.iter_mut() {
-                    if let Some(new_target) = remap(*target) {
-                        *target = new_target;
-                    }
-                }
-                if let Some(new_target) = remap(*default) {
-                    *default = new_target;
-                }
+                targets.iter_mut().for_each(&mut visit);
+                visit(default);
             }
             Self::IndirectBranch {
                 resolved_targets, ..
-            } => {
-                for target in resolved_targets.iter_mut() {
-                    if let Some(new_target) = remap(*target) {
-                        *target = new_target;
-                    }
-                }
-            }
-            // All other operations don't have branch targets
+            } => resolved_targets.iter_mut().for_each(visit),
             _ => {}
         }
     }

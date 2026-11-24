@@ -1,4 +1,4 @@
-//! Decomposed SSA operations — the core opcode representation.
+//! Decomposed SSA operations - the core opcode representation.
 //!
 //! This module defines [`SsaOp`], the decomposed operation that puts a lifted
 //! instruction into clean `result = op(operands)` form, along with the helper
@@ -8,8 +8,8 @@
 //!
 //! - **Explicit definitions**: every value an operation produces is a named SSA
 //!   variable, including secondary outputs such as flags bundles and the
-//!   high/low halves of wide arithmetic — see [`SsaOp::defs`].
-//! - **Explicit operands**: all data dependencies are explicit SSA variables —
+//!   high/low halves of wide arithmetic - see [`SsaOp::defs`].
+//! - **Explicit operands**: all data dependencies are explicit SSA variables -
 //!   no implicit stack.
 //! - **Pattern matching**: enum variants enable easy destructuring for analysis
 //!   passes.
@@ -30,8 +30,8 @@
 //! | Memory | Field load/store, element load/store, indirect load/store |
 //! | Atomics | Fences, atomic RMW, compare-exchange, lock-prefixed forms |
 //! | Vector | Grouped unary/binary/ternary/compare, load/store, shuffle, reduce, mask ops |
-//! | Native | `NativeOpaque`, flag reads/writes, system and compute ops |
-//! | Calls | `Call`, `CallVirt`, `CallIndirect` |
+//! | Native | flag reads/writes, system and compute ops |
+//! | Calls | `Call` (direct, virtual, constrained, indirect: `Callee`) |
 //! | Synthetic | `Phi`, `Copy`, `Pop`, `Nop` |
 //!
 //! # Field Naming Conventions
@@ -49,7 +49,7 @@
 //!
 //! # Module Layout
 //!
-//! [`SsaOp`] has 200 variants, so its surface is split by concern rather than
+//! [`SsaOp`] has 208 variants, so its surface is split by concern rather than
 //! kept in one file. Every submodule is public and every *type* is re-exported
 //! here, so the paths callers use for the data model are unchanged; the
 //! inherent `impl SsaOp` blocks live in [`classify`], [`control`] and
@@ -64,6 +64,7 @@
 //! | [`native`] | Machine state accesses and condition-flag semantics |
 //! | [`table`] | The [`OpKindTable`] contract shared by every kind enum |
 //! | [`effects`] | Effect classification: `effects`, `may_throw`, `is_pure` |
+//! | [`calls`] | What a call does: [`CallEffects`] |
 //! | [`visit`] | Operand and definition access and substitution |
 //! | [`control`] | Terminator and branch-target queries |
 //! | [`classify`] | Taxonomy, similarity tokens, structural views |
@@ -77,11 +78,11 @@
 //!
 //! # The boxed-payload variants
 //!
-//! Forty-five variants carry a `Box<...Data>` whose whole operand storage is an
-//! `outputs` list and an `inputs` list. What those lists *mean* — `outputs` are
+//! Forty-six variants carry a `Box<...Data>` whose whole operand storage is an
+//! `outputs` list and an `inputs` list. What those lists *mean* - `outputs` are
 //! the operation's definitions, `inputs` are its uses, definitions come first,
 //! `outputs[0]` is the primary destination, and the stack effect is
-//! `(inputs.len(), outputs.len())` — is written once, in the blanket
+//! `(inputs.len(), outputs.len())` - is written once, in the blanket
 //! `KindedOperands` impl in the crate-private `operands` module, and the arms in
 //! [`visit`], [`classify`] and [`display`] delegate to it. Restating the policy
 //! per variant is what let an arm be present and wrong: exhaustiveness forces an
@@ -93,7 +94,7 @@
 //! expands to a destructuring with no `..`, so a payload that later grows a
 //! field does not compile until someone decides whether that field is an
 //! operand; a payload nobody registers does not compile at the match arm.
-//! `SsaOp::defs` needs no arm at all — it is the `Def`- and `FlagsDef`-role
+//! `SsaOp::defs` needs no arm at all - it is the `Def`- and `FlagsDef`-role
 //! operands of [`SsaOp::visit_operands`], so it cannot disagree with the walk
 //! that [`SsaOp::dest`], [`SsaOp::flags_dest`] and [`SsaOp::replace_def`] also
 //! read.
@@ -102,14 +103,24 @@
 //! type system forces that, so the registry in `table::all_tables` is where a
 //! new enum joins the count, spelling and injectivity checks.
 
+// The payload registry macro (`impl_kinded_payload!`) is in scope for every
+// module declared after it.
+#[macro_use]
+mod operands;
+pub mod access;
+pub mod calls;
 pub mod classify;
 pub mod control;
+pub mod controlled;
+pub mod convert;
 pub mod def;
 pub mod display;
 pub mod effects;
+/// Computations: kernels over a whole value or over vector lanes.
+pub mod execution;
 pub mod kinds;
 pub mod native;
-mod operands;
+pub mod references;
 pub mod table;
 pub mod vector;
 pub mod visit;
@@ -117,4 +128,22 @@ pub mod visit;
 #[cfg(test)]
 mod tests;
 
-pub use self::{def::*, effects::*, kinds::*, native::*, table::*, vector::*, visit::*};
+pub use self::{
+    access::*,
+    calls::*,
+    controlled::{LaneExecution, LaneOperand},
+    convert::*,
+    def::*,
+    effects::*,
+    execution::{
+        BitfieldPosition, Computation, Kernel, LaneControl, VectorFixedKind, VectorFloatCapability,
+        VectorInactivePolicy, VectorLaneAction, VectorMaskPrefix, VectorPredicateLayout,
+        VectorRounding, VectorSlideSource, VectorStatus,
+    },
+    kinds::*,
+    native::*,
+    references::*,
+    table::*,
+    vector::*,
+    visit::*,
+};

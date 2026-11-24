@@ -13,21 +13,21 @@ use crate::{
     error::{Error, Result},
     ir::{
         block::SsaBlock,
-        function::SsaFunction,
+        float::FloatClassLayout,
+        function::{EntryRule, SsaConstructOptions, SsaFunction},
         instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind, BreakpointOp, CmpKind,
-            FenceKind, FlagAdjustKind, FlagCondition, FlagsMask, KindedVecData,
-            NativeInstructionMetadata, NativeOpaqueData, SsaEffects, SsaOp, UnaryOpKind,
-            VectorBinaryKind, VectorBitmaskKind, VectorCastKind, VectorCompareKind, VectorElement,
-            VectorFaultMode, VectorMaskBinaryKind, VectorMaskMode, VectorMaskUnaryKind,
-            VectorReduceKind, VectorSegmentLayout, VectorTernaryKind, VectorUnaryKind,
+            AccessQualifiers, AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind,
+            BreakpointOp, CallData, Callee, CmpKind, FenceKind, FlagCondition, FlagsMask, SsaOp,
+            UnaryOpKind, VectorBinaryKind, VectorBitmaskKind, VectorCastKind, VectorCompareKind,
+            VectorElement, VectorFaultMode, VectorMaskMode, VectorReduceKind, VectorSegmentLayout,
+            VectorShuffleSelector, VectorTernaryKind, VectorUnaryKind,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
-    target::{Target, VectorShuffleMask},
+    target::Target,
 };
 
 /// Describes a definition that a builder-created instruction or phi node will produce.
@@ -86,8 +86,8 @@ pub struct AtomicCmpXchgSpec<T: Target> {
     pub width: AtomicAccessWidth,
     /// Whether the compare-exchange may fail spuriously.
     pub weak: bool,
-    /// Whether the operation is volatile.
-    pub volatile: bool,
+    /// How the access is made, volatility included ([`AccessQualifiers`]).
+    pub access: AccessQualifiers,
 }
 
 /// Describes a vector gather operation emitted by [`SsaBlockBuilder`].
@@ -145,8 +145,8 @@ pub struct AtomicLockRmwSpec<T: Target> {
     pub ordering: AtomicOrdering,
     /// Access width used by the atomic operation.
     pub width: AtomicAccessWidth,
-    /// Whether the operation is volatile.
-    pub volatile: bool,
+    /// How the access is made, volatility included ([`AccessQualifiers`]).
+    pub access: AccessQualifiers,
 }
 
 /// Fluent builder for constructing a fresh [`SsaFunction`].
@@ -208,6 +208,20 @@ impl<T: Target> SsaFunctionBuilder<T> {
     }
 
     /// Ensures that a dense block with `block_idx` exists and returns it.
+    ///
+    /// Blocks are stored in a dense vector indexed by id, so reaching
+    /// `block_idx` requires that every lower index already exist. This appends
+    /// fresh empty blocks one at a time until the count exceeds `block_idx`,
+    /// back-filling any gap rather than requiring callers to create
+    /// intermediate blocks in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Index of the block to guarantee exists.
+    ///
+    /// # Returns
+    ///
+    /// `block_idx`, now known to be a valid block index.
     pub fn ensure_block(&mut self, block_idx: usize) -> usize {
         while self.function.block_count() <= block_idx {
             let id = self.function.block_count();
@@ -225,7 +239,22 @@ impl<T: Target> SsaFunctionBuilder<T> {
 
     /// Builds instructions or phi nodes inside `block_idx`.
     ///
-    /// The block is created automatically if it does not already exist.
+    /// Scopes construction to a single block: [`ensure_block`](Self::ensure_block)
+    /// guarantees the target exists, then a short-lived [`SsaBlockBuilder`]
+    /// borrows this builder so the closure can append phi nodes and
+    /// instructions. Threading the closure through a borrowed sub-builder is
+    /// what lets each emitted definition record a def site pointing at the
+    /// block currently under construction without the caller passing the block
+    /// index into every call.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Block to build into; created on demand if absent.
+    /// * `build` - Closure that appends to the block via the [`SsaBlockBuilder`].
+    ///
+    /// # Returns
+    ///
+    /// The value the closure returns.
     ///
     /// # Errors
     ///
@@ -244,6 +273,20 @@ impl<T: Target> SsaFunctionBuilder<T> {
     }
 
     /// Adds an operand to an existing phi node identified by its result variable.
+    ///
+    /// Completes a phi that was created without all of its operands, the shape
+    /// [`empty_phi`](SsaBlockBuilder::empty_phi) leaves behind for loop
+    /// backedges: the incoming value from a predecessor is not yet defined when
+    /// the header phi is emitted, so its operand is filled in here once that
+    /// block has been built. The phi is located by matching its result variable
+    /// rather than by position, so operands may be added in any order.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Block holding the phi node.
+    /// * `phi_result` - Result variable that identifies the phi node.
+    /// * `predecessor` - Predecessor block the incoming value arrives from.
+    /// * `value` - Variable flowing in along that predecessor edge.
     ///
     /// # Errors
     ///
@@ -270,6 +313,24 @@ impl<T: Target> SsaFunctionBuilder<T> {
 
     /// Finishes construction and recomputes use lists.
     ///
+    /// The builder tracks definitions as it emits them but never maintains the
+    /// reverse use lists, so those are stale until this final pass rebuilds
+    /// them from scratch. Before doing so it checks that each block sits at the
+    /// array index equal to its own id: the rest of the crate indexes blocks by
+    /// id and assumes that invariant, so a builder that produced a
+    /// non-dense or misordered set of blocks is rejected here rather than
+    /// handed on as a subtly corrupt function.
+    ///
+    /// Block numbering is the caller's, so a function whose entry block is a
+    /// branch target is finished as built: the verifier reports it
+    /// ([`EntryHasPredecessors`](crate::analysis::VerifierError::EntryHasPredecessors)),
+    /// and [`SsaFunction::ensure_entry_has_no_predecessors`] is the repair,
+    /// called by a caller that can account for every block moving up by one.
+    ///
+    /// # Returns
+    ///
+    /// The completed function with fully populated use lists.
+    ///
     /// # Errors
     ///
     /// Returns an error if block identifiers are not dense and ordered.
@@ -282,11 +343,39 @@ impl<T: Target> SsaFunctionBuilder<T> {
                 )));
             }
         }
-        self.function.recompute_uses();
-        Ok(self.function)
+        // The shared finishing sequence, with everything optional turned off: a
+        // builder states its own phis, its own block set and its own numbering,
+        // so pruning, folding or renumbering any of it would answer a question
+        // the caller did not ask. What is left - identities, address-taken
+        // slots, definition sites, use lists - is the part no caller can state
+        // and every consumer assumes.
+        self.function
+            .finish_construction(&SsaConstructOptions {
+                entry_rule: EntryRule::Keep,
+                prune_unreachable: false,
+                simplify_phis: false,
+                compact_variables: false,
+                verify: None,
+                settle_conversions: None,
+            })
+            .map(|_| self.function)
     }
 
     /// Finishes construction, recomputes uses, and verifies the function.
+    ///
+    /// Runs [`finish`](Self::finish) and then the [`SsaVerifier`] at the
+    /// requested level, folding any reported errors into a single failure. This
+    /// is the entry point tests and fixtures use to assert that a hand-built
+    /// function is well-formed SSA, so a non-empty error list is surfaced as an
+    /// `Err` rather than left for a caller to inspect.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - Verification depth applied to the finished function.
+    ///
+    /// # Returns
+    ///
+    /// The completed, verified function.
     ///
     /// # Errors
     ///
@@ -304,6 +393,23 @@ impl<T: Target> SsaFunctionBuilder<T> {
         }
     }
 
+    /// Creates a new SSA variable for `spec` and advances its origin version.
+    ///
+    /// Each [`VariableOrigin`] carries an independent monotonic version counter,
+    /// so successive definitions of the same source variable get distinct
+    /// versions - the numbering SSA rename groups rely on. The counter is looked
+    /// up (defaulting to zero for a first definition), stamped onto the new
+    /// variable, then saturated-incremented so the next allocation for the same
+    /// origin is one higher.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - Origin and type of the variable to create.
+    /// * `site` - Definition site recorded for the new variable.
+    ///
+    /// # Returns
+    ///
+    /// The id of the newly created variable.
     fn allocate_var(&mut self, spec: SsaDefSpec<T>, site: DefSite) -> SsaVarId {
         let version = self.next_versions.entry(spec.origin).or_insert(0);
         let id = self
@@ -329,6 +435,18 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
 
     /// Emits an instruction that must not define any variables.
     ///
+    /// The value-producing `emit_*` entry points allocate a variable and record
+    /// its def site; this is the counterpart for effect-only operations (stores,
+    /// terminators, prefixes). Rejecting an `op` that carries a definition guards
+    /// against routing a result-producing operation through the path that would
+    /// leave its result unallocated and without a def site. The instruction is
+    /// tagged with a synthetic original, since a builder-created op has no
+    /// backing machine instruction.
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - Effect-only operation to append.
+    ///
     /// # Errors
     ///
     /// Returns an error when the operation has definitions.
@@ -342,6 +460,17 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits an original-instruction-backed instruction that must not define variables.
+    ///
+    /// Like [`emit_no_defs`](Self::emit_no_defs), but preserves a caller-supplied
+    /// original machine instruction and result type instead of substituting a
+    /// synthetic one. Frontends use this to keep the provenance of a lifted
+    /// effect-only instruction attached to its SSA form.
+    ///
+    /// # Arguments
+    ///
+    /// * `original` - Backing machine instruction to record as provenance.
+    /// * `result_type` - Result type carried by the instruction, if any.
+    /// * `op` - Effect-only operation to append.
     ///
     /// # Errors
     ///
@@ -362,6 +491,18 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
 
     /// Emits an instruction with an already-registered set of definitions.
     ///
+    /// Unlike the allocating `emit_*` methods, the variables this operation
+    /// defines were created earlier (for example by another builder pass), so no
+    /// fresh allocation happens here. What is still missing is their def site:
+    /// this rebinds each defined variable's [`DefSite`] to the position the
+    /// instruction is about to occupy, keeping the def site accurate now that the
+    /// definition has a concrete home. A definition the function does not know
+    /// about is rejected, since its def site could not be updated.
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - Operation whose definitions are already registered variables.
+    ///
     /// # Errors
     ///
     /// Returns an error if any definition is not registered in the function.
@@ -379,6 +520,24 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits a one-result instruction.
+    ///
+    /// This is the core value-producing primitive the scalar `emit_*` wrappers
+    /// funnel through. The def site is computed from the block's current
+    /// instruction count before anything is pushed, so the freshly allocated
+    /// variable records a [`DefSite`] pointing at the very instruction it will
+    /// name. The `build` closure then receives that variable id and returns the
+    /// operation, which is cross-checked against the allocation so a closure that
+    /// wires up the wrong destination is caught here rather than surfacing as a
+    /// mismatched def later.
+    ///
+    /// # Arguments
+    ///
+    /// * `def` - Origin and type of the variable to define.
+    /// * `build` - Closure that builds the operation from the allocated variable.
+    ///
+    /// # Returns
+    ///
+    /// The id of the newly defined variable.
     ///
     /// # Errors
     ///
@@ -400,6 +559,23 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits a two-result instruction.
+    ///
+    /// The two-output counterpart to [`emit_def`](Self::emit_def), used by
+    /// operations that produce a value plus a secondary output such as a flags
+    /// register. Both variables are allocated against the same pending
+    /// instruction index, so they share a def site, and the `build` closure must
+    /// return an operation defining exactly those two in the order they were
+    /// allocated.
+    ///
+    /// # Arguments
+    ///
+    /// * `first` - Origin and type of the first (primary) result.
+    /// * `second` - Origin and type of the second result.
+    /// * `build` - Closure that builds the operation from both allocated variables.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the two newly defined variables in allocation order.
     ///
     /// # Errors
     ///
@@ -425,6 +601,21 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits an instruction with any number of results.
+    ///
+    /// The variadic form of [`emit_def`](Self::emit_def), for operations such as
+    /// native-opaque or segmented vector loads that define an arbitrary tuple of
+    /// results. Every entry of `defs` is allocated against the same pending
+    /// instruction index and passed to `build` as a slice, and the returned
+    /// operation must define exactly that slice in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `defs` - Origin and type of each result, in definition order.
+    /// * `build` - Closure that builds the operation from the allocated variables.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the newly defined variables, in the order of `defs`.
     ///
     /// # Errors
     ///
@@ -452,6 +643,22 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
 
     /// Emits a one-result instruction with original-instruction metadata.
     ///
+    /// Behaves like [`emit_def`](Self::emit_def) but attaches a caller-supplied
+    /// backing machine instruction and result type in place of the synthetic
+    /// defaults, so a frontend lifting real code keeps each SSA definition tied
+    /// to the instruction it came from.
+    ///
+    /// # Arguments
+    ///
+    /// * `def` - Origin and type of the variable to define.
+    /// * `original` - Backing machine instruction to record as provenance.
+    /// * `result_type` - Result type carried by the instruction, if any.
+    /// * `build` - Closure that builds the operation from the allocated variable.
+    ///
+    /// # Returns
+    ///
+    /// The id of the newly defined variable.
+    ///
     /// # Errors
     ///
     /// Returns an error if the constructed operation does not define exactly the
@@ -474,6 +681,23 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits a two-result instruction with original-instruction metadata.
+    ///
+    /// Behaves like [`emit_two_defs`](Self::emit_two_defs) but attaches a
+    /// caller-supplied backing machine instruction and result type in place of
+    /// the synthetic defaults, preserving provenance for a lifted two-output
+    /// instruction.
+    ///
+    /// # Arguments
+    ///
+    /// * `first` - Origin and type of the first (primary) result.
+    /// * `second` - Origin and type of the second result.
+    /// * `original` - Backing machine instruction to record as provenance.
+    /// * `result_type` - Result type carried by the instruction, if any.
+    /// * `build` - Closure that builds the operation from both allocated variables.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the two newly defined variables in allocation order.
     ///
     /// # Errors
     ///
@@ -501,6 +725,22 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits an instruction with any number of results and original-instruction metadata.
+    ///
+    /// Behaves like [`emit_many_defs`](Self::emit_many_defs) but attaches a
+    /// caller-supplied backing machine instruction and result type in place of
+    /// the synthetic defaults, preserving provenance for a lifted multi-output
+    /// instruction.
+    ///
+    /// # Arguments
+    ///
+    /// * `defs` - Origin and type of each result, in definition order.
+    /// * `original` - Backing machine instruction to record as provenance.
+    /// * `result_type` - Result type carried by the instruction, if any.
+    /// * `build` - Closure that builds the operation from the allocated variables.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the newly defined variables, in the order of `defs`.
     ///
     /// # Errors
     ///
@@ -530,6 +770,21 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
 
     /// Creates a phi node with incoming operands.
     ///
+    /// Convenience over [`empty_phi`](Self::empty_phi) for the common case where
+    /// every incoming value is already defined: it creates the phi and then
+    /// attaches each `(predecessor, value)` operand. Use `empty_phi` plus
+    /// [`add_phi_operand`](SsaFunctionBuilder::add_phi_operand) when an operand
+    /// arrives on a backedge and is not yet available at phi-creation time.
+    ///
+    /// # Arguments
+    ///
+    /// * `def` - Origin and type of the phi result variable.
+    /// * `operands` - `(predecessor block, incoming value)` pairs to attach.
+    ///
+    /// # Returns
+    ///
+    /// The id of the phi result variable.
+    ///
     /// # Errors
     ///
     /// Returns an error if the block does not exist.
@@ -547,6 +802,22 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Creates a phi node without operands for later backedge completion.
+    ///
+    /// A loop header's phi needs an operand for the value flowing in along the
+    /// backedge, but that value is defined inside the loop body and so does not
+    /// exist when the header is first built. This allocates the phi result now -
+    /// with a phi def site rather than an instruction one - so the value can be
+    /// referenced immediately, leaving the operands to be filled in with
+    /// [`add_phi_operand`](SsaFunctionBuilder::add_phi_operand) once the
+    /// predecessors have been built.
+    ///
+    /// # Arguments
+    ///
+    /// * `def` - Origin and type of the phi result variable.
+    ///
+    /// # Returns
+    ///
+    /// The id of the operand-less phi result variable.
     ///
     /// # Errors
     ///
@@ -593,14 +864,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     ///
     /// Returns an error if instruction insertion fails.
     pub fn const_bool(&mut self, def: SsaDefSpec<T>, value: bool) -> Result<SsaVarId> {
-        self.const_value(
-            def,
-            if value {
-                ConstValue::True
-            } else {
-                ConstValue::False
-            },
-        )
+        self.const_value(def, ConstValue::from_bool(value))
     }
 
     /// Emits a copy operation.
@@ -710,18 +974,25 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                 unsigned,
                 flags: None,
             },
-            BinaryOpKind::Ceq => SsaOp::Ceq { dest, left, right },
+            BinaryOpKind::Ceq => SsaOp::Ceq {
+                dest,
+                left,
+                right,
+                signaling: false,
+            },
             BinaryOpKind::Clt => SsaOp::Clt {
                 dest,
                 left,
                 right,
                 unsigned,
+                signaling: false,
             },
             BinaryOpKind::Cgt => SsaOp::Cgt {
                 dest,
                 left,
                 right,
                 unsigned,
+                signaling: false,
             },
             BinaryOpKind::Rol => SsaOp::Rol {
                 dest,
@@ -729,16 +1000,6 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                 amount: right,
             },
             BinaryOpKind::Ror => SsaOp::Ror {
-                dest,
-                value: left,
-                amount: right,
-            },
-            BinaryOpKind::Rcl => SsaOp::Rcl {
-                dest,
-                value: left,
-                amount: right,
-            },
-            BinaryOpKind::Rcr => SsaOp::Rcr {
                 dest,
                 value: left,
                 amount: right,
@@ -865,18 +1126,14 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                     | BinaryOpKind::Clt
                     | BinaryOpKind::Cgt
                     | BinaryOpKind::Rol
-                    | BinaryOpKind::Ror
-                    | BinaryOpKind::Rcl
-                    | BinaryOpKind::Rcr => unreachable!("filtered above"),
+                    | BinaryOpKind::Ror => unreachable!("filtered above"),
                 }
             }),
             BinaryOpKind::Ceq
             | BinaryOpKind::Clt
             | BinaryOpKind::Cgt
             | BinaryOpKind::Rol
-            | BinaryOpKind::Ror
-            | BinaryOpKind::Rcl
-            | BinaryOpKind::Rcr => Err(Error::new(format!(
+            | BinaryOpKind::Ror => Err(Error::new(format!(
                 "{kind} does not have a flags-producing SSA form"
             ))),
         }
@@ -1272,42 +1529,6 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         })
     }
 
-    /// Emits a rotate-through-carry-left operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn rcl(
-        &mut self,
-        def: SsaDefSpec<T>,
-        value: SsaVarId,
-        amount: SsaVarId,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::Rcl {
-            dest,
-            value,
-            amount,
-        })
-    }
-
-    /// Emits a rotate-through-carry-right operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn rcr(
-        &mut self,
-        def: SsaDefSpec<T>,
-        value: SsaVarId,
-        amount: SsaVarId,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::Rcr {
-            dest,
-            value,
-            amount,
-        })
-    }
-
     /// Emits a byte-swap operation.
     ///
     /// # Errors
@@ -1368,7 +1589,12 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     ///
     /// Returns an error if instruction insertion fails.
     pub fn ceq(&mut self, def: SsaDefSpec<T>, left: SsaVarId, right: SsaVarId) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::Ceq { dest, left, right })
+        self.emit_def(def, |dest| SsaOp::Ceq {
+            dest,
+            left,
+            right,
+            signaling: false,
+        })
     }
 
     /// Emits a less-than comparison.
@@ -1388,6 +1614,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             left,
             right,
             unsigned,
+            signaling: false,
         })
     }
 
@@ -1408,6 +1635,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             left,
             right,
             unsigned,
+            signaling: false,
         })
     }
 
@@ -1504,75 +1732,12 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         })
     }
 
-    /// Emits a flag adjustment whose whole architectural write is a value.
-    ///
-    /// For a kind whose [`FlagAdjustKind::result`] is
-    /// [`FlagAdjustResult::Flags`] or [`FlagAdjustResult::Register`] — `clc`,
-    /// `stc`, `sahf`, `lahf`, `setf8` and friends. Use
-    /// [`flag_adjust_state`](Self::flag_adjust_state) for one that writes a
-    /// control flag instead.
-    ///
-    /// [`FlagAdjustResult::Flags`]: crate::ir::ops::FlagAdjustResult::Flags
-    /// [`FlagAdjustResult::Register`]: crate::ir::ops::FlagAdjustResult::Register
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `kind` declares no SSA result, or if instruction
-    /// insertion fails.
-    pub fn flag_adjust(
-        &mut self,
-        def: SsaDefSpec<T>,
-        kind: FlagAdjustKind,
-        inputs: Vec<SsaVarId>,
-    ) -> Result<SsaVarId> {
-        if kind.output_arity() == 0 {
-            return Err(Error::new(format!(
-                "{} writes a control flag and defines no value; use flag_adjust_state",
-                kind.kind_str()
-            )));
-        }
-        self.emit_def(def, |dest| {
-            SsaOp::FlagAdjust(Box::new(KindedVecData {
-                kind,
-                outputs: vec![dest],
-                inputs,
-            }))
-        })
-    }
-
-    /// Emits a flag adjustment that writes a control flag the IR cannot name.
-    ///
-    /// `cld`, `std`, `clac`, `stac`, `cli`, `sti`. These define no SSA value —
-    /// there is nothing to represent DF, AC or IF with — which is why they are
-    /// classified [`SsaEffectKind::Opaque`] rather than pure: a pure operation
-    /// with no definition is one dead-code elimination deletes.
-    ///
-    /// [`SsaEffectKind::Opaque`]: crate::ir::ops::SsaEffectKind::Opaque
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `kind` declares an SSA result, or if instruction
-    /// insertion fails.
-    pub fn flag_adjust_state(&mut self, kind: FlagAdjustKind) -> Result<()> {
-        if kind.output_arity() != 0 {
-            return Err(Error::new(format!(
-                "{} defines a value; use flag_adjust",
-                kind.kind_str()
-            )));
-        }
-        self.emit_no_defs(SsaOp::FlagAdjust(Box::new(KindedVecData {
-            kind,
-            outputs: Vec::new(),
-            inputs: Vec::new(),
-        })))
-    }
-
     /// Emits a read-flags operation.
     ///
     /// The mask must name only flags [`FlagsMask::NAMED`] defines. A bit
     /// outside that table selects a flag nothing downstream can interpret, and
     /// refusing it here is what keeps such a mask out of the IR in the first
-    /// place — the verifier's matching check exists for the masks that arrive
+    /// place - the verifier's matching check exists for the masks that arrive
     /// from a persisted blob rather than from this builder.
     ///
     /// # Errors
@@ -1638,7 +1803,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         self.emit_no_defs(SsaOp::Pop { value })
     }
 
-    /// Emits a direct call with a result.
+    /// Emits a call of `callee` with a result.
     ///
     /// # Errors
     ///
@@ -1646,97 +1811,19 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     pub fn call(
         &mut self,
         def: SsaDefSpec<T>,
-        method: T::MethodRef,
+        callee: Callee<T>,
         args: Vec<SsaVarId>,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::Call {
-            dest: Some(dest),
-            method,
-            args,
-        })
+        self.emit_def(def, |dest| CallData::new(Some(dest), callee, args).into())
     }
 
-    /// Emits a direct call without a result.
+    /// Emits a call of `callee` without a result.
     ///
     /// # Errors
     ///
     /// Returns an error if instruction insertion fails.
-    pub fn call_void(&mut self, method: T::MethodRef, args: Vec<SsaVarId>) -> Result<()> {
-        self.emit_no_defs(SsaOp::Call {
-            dest: None,
-            method,
-            args,
-        })
-    }
-
-    /// Emits a virtual call with a result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn call_virt(
-        &mut self,
-        def: SsaDefSpec<T>,
-        method: T::MethodRef,
-        args: Vec<SsaVarId>,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::CallVirt {
-            dest: Some(dest),
-            method,
-            args,
-        })
-    }
-
-    /// Emits a virtual call without a result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn call_virt_void(&mut self, method: T::MethodRef, args: Vec<SsaVarId>) -> Result<()> {
-        self.emit_no_defs(SsaOp::CallVirt {
-            dest: None,
-            method,
-            args,
-        })
-    }
-
-    /// Emits an indirect call with a result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn call_indirect(
-        &mut self,
-        def: SsaDefSpec<T>,
-        fptr: SsaVarId,
-        signature: T::SigRef,
-        args: Vec<SsaVarId>,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::CallIndirect {
-            dest: Some(dest),
-            fptr,
-            signature,
-            args,
-        })
-    }
-
-    /// Emits an indirect call without a result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn call_indirect_void(
-        &mut self,
-        fptr: SsaVarId,
-        signature: T::SigRef,
-        args: Vec<SsaVarId>,
-    ) -> Result<()> {
-        self.emit_no_defs(SsaOp::CallIndirect {
-            dest: None,
-            fptr,
-            signature,
-            args,
-        })
+    pub fn call_void(&mut self, callee: Callee<T>, args: Vec<SsaVarId>) -> Result<()> {
+        self.emit_no_defs(CallData::new(None, callee, args).into())
     }
 
     /// Emits a load-field operation.
@@ -1751,6 +1838,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         field: T::FieldRef,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::LoadField {
+            access: AccessQualifiers::FLAT,
             dest,
             object,
             field,
@@ -1769,6 +1857,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         value: SsaVarId,
     ) -> Result<()> {
         self.emit_no_defs(SsaOp::StoreField {
+            access: AccessQualifiers::FLAT,
             object,
             field,
             value,
@@ -1785,7 +1874,11 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         def: SsaDefSpec<T>,
         field: T::FieldRef,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::LoadStaticField { dest, field })
+        self.emit_def(def, |dest| SsaOp::LoadStaticField {
+            access: AccessQualifiers::FLAT,
+            dest,
+            field,
+        })
     }
 
     /// Emits a store-static-field operation.
@@ -1794,7 +1887,11 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     ///
     /// Returns an error if instruction insertion fails.
     pub fn store_static_field(&mut self, field: T::FieldRef, value: SsaVarId) -> Result<()> {
-        self.emit_no_defs(SsaOp::StoreStaticField { field, value })
+        self.emit_no_defs(SsaOp::StoreStaticField {
+            access: AccessQualifiers::FLAT,
+            field,
+            value,
+        })
     }
 
     /// Emits a load-field-address operation.
@@ -1881,6 +1978,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         elem_type: T::TypeRef,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::LoadElementAddr {
+            readonly: false,
             dest,
             array,
             index,
@@ -1912,7 +2010,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             dest,
             addr,
             value_type,
-            address_space: None,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -1931,7 +2029,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             addr,
             value,
             value_type,
-            address_space: None,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -1967,7 +2065,8 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         })
     }
 
-    /// Emits a load-function-pointer operation.
+    /// Emits a load-function-pointer operation: of `method`, or of
+    /// `constraint`'s implementation of a static virtual `method`.
     ///
     /// # Errors
     ///
@@ -1976,8 +2075,13 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         &mut self,
         def: SsaDefSpec<T>,
         method: T::MethodRef,
+        constraint: Option<T::TypeRef>,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::LoadFunctionPtr { dest, method })
+        self.emit_def(def, |dest| SsaOp::LoadFunctionPtr {
+            dest,
+            method,
+            constraint,
+        })
     }
 
     /// Emits a load-virtual-function-pointer operation.
@@ -2116,13 +2220,14 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         dest_addr: SsaVarId,
         value: SsaVarId,
         size: SsaVarId,
-        reverse: bool,
+        backward: Option<SsaVarId>,
     ) -> Result<()> {
         self.emit_no_defs(SsaOp::InitBlk {
             dest_addr,
             value,
             size,
-            reverse,
+            backward,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2136,13 +2241,55 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         dest_addr: SsaVarId,
         src_addr: SsaVarId,
         size: SsaVarId,
-        reverse: bool,
+        backward: Option<SsaVarId>,
+    ) -> Result<()> {
+        self.copy_blk_elements(dest_addr, src_addr, size, 1, backward)
+    }
+
+    /// Emits a streamed block copy with an explicit complete-element read width.
+    ///
+    /// Addresses name the first elements. `size` is a byte count divisible by
+    /// the nonzero `element_bytes`; each element is read before any of its writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instruction insertion fails.
+    pub fn copy_blk_elements(
+        &mut self,
+        dest_addr: SsaVarId,
+        src_addr: SsaVarId,
+        size: SsaVarId,
+        element_bytes: u32,
+        backward: Option<SsaVarId>,
     ) -> Result<()> {
         self.emit_no_defs(SsaOp::CopyBlk {
             dest_addr,
             src_addr,
             size,
-            reverse,
+            element_bytes,
+            backward,
+            dest_access: AccessQualifiers::FLAT,
+            src_access: AccessQualifiers::FLAT,
+        })
+    }
+
+    /// Emits a move-block operation: a copy whose regions may overlap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instruction insertion fails.
+    pub fn move_blk(
+        &mut self,
+        dest_addr: SsaVarId,
+        src_addr: SsaVarId,
+        size: SsaVarId,
+    ) -> Result<()> {
+        self.emit_no_defs(SsaOp::MoveBlk {
+            dest_addr,
+            src_addr,
+            size,
+            dest_access: AccessQualifiers::FLAT,
+            src_access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2188,6 +2335,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         value_type: T::TypeRef,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::LoadObj {
+            access: AccessQualifiers::FLAT,
             dest,
             src_addr,
             value_type,
@@ -2206,19 +2354,26 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         value_type: T::TypeRef,
     ) -> Result<()> {
         self.emit_no_defs(SsaOp::StoreObj {
+            access: AccessQualifiers::FLAT,
             dest_addr,
             value,
             value_type,
         })
     }
 
-    /// Emits a local allocation operation.
+    /// Emits an allocation of `size` bytes of the frame, holding zero where
+    /// `zeroed`.
     ///
     /// # Errors
     ///
     /// Returns an error if instruction insertion fails.
-    pub fn local_alloc(&mut self, def: SsaDefSpec<T>, size: SsaVarId) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::LocalAlloc { dest, size })
+    pub fn local_alloc(
+        &mut self,
+        def: SsaDefSpec<T>,
+        size: SsaVarId,
+        zeroed: bool,
+    ) -> Result<SsaVarId> {
+        self.emit_def(def, |dest| SsaOp::LocalAlloc { dest, size, zeroed })
     }
 
     /// Emits a check-finite operation.
@@ -2235,32 +2390,16 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     /// # Errors
     ///
     /// Returns an error if instruction insertion fails.
-    pub fn fp_classify(&mut self, def: SsaDefSpec<T>, operand: SsaVarId) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::FpClassify { dest, operand })
-    }
-
-    /// Emits a native opaque operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn native_opaque(
+    pub fn fp_classify(
         &mut self,
-        defs: &[SsaDefSpec<T>],
-        mnemonic: impl Into<String>,
-        metadata: Option<NativeInstructionMetadata>,
-        inputs: Vec<SsaVarId>,
-        effects: SsaEffects,
-    ) -> Result<Vec<SsaVarId>> {
-        let mnemonic = mnemonic.into();
-        self.emit_many_defs(defs, |outputs| {
-            SsaOp::NativeOpaque(Box::new(NativeOpaqueData {
-                mnemonic,
-                metadata,
-                outputs: outputs.to_vec(),
-                inputs,
-                effects,
-            }))
+        def: SsaDefSpec<T>,
+        operand: SsaVarId,
+        layout: FloatClassLayout,
+    ) -> Result<SsaVarId> {
+        self.emit_def(def, |dest| SsaOp::FpClassify {
+            dest,
+            operand,
+            layout,
         })
     }
 
@@ -2276,7 +2415,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         value: SsaVarId,
         ordering: AtomicOrdering,
         width: AtomicAccessWidth,
-        volatile: bool,
+        access: AccessQualifiers,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::AtomicExchange {
             dest,
@@ -2284,11 +2423,28 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             value,
             ordering,
             width,
-            volatile,
+            access,
         })
     }
 
     /// Emits an atomic compare-exchange operation with old and success results.
+    ///
+    /// A compare-exchange always yields the previous memory value and may
+    /// additionally yield a boolean success flag. Whether that second result
+    /// exists changes the operation's definition count, so the spec's
+    /// `success_def` selects the arity: present routes through
+    /// [`emit_two_defs`](Self::emit_two_defs) and returns `Some` success id,
+    /// absent routes through [`emit_def`](Self::emit_def) and returns `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - Operands, orderings, width, and result definitions for the
+    ///   exchange; its `success_def` decides whether a success flag is produced.
+    ///
+    /// # Returns
+    ///
+    /// The old-value variable and, when a success definition was requested, the
+    /// success-flag variable.
     ///
     /// # Errors
     ///
@@ -2307,7 +2463,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             failure_ordering,
             width,
             weak,
-            volatile,
+            access,
         } = spec;
         if let Some(success_def) = success_def {
             let (old, success) =
@@ -2321,7 +2477,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                     failure_ordering,
                     width,
                     weak,
-                    volatile,
+                    access,
                 })?;
             Ok((old, Some(success)))
         } else {
@@ -2335,7 +2491,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                 failure_ordering,
                 width,
                 weak,
-                volatile,
+                access,
             })?;
             Ok((old, None))
         }
@@ -2406,6 +2562,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             value,
             kind,
             element,
+            environment: None,
         })
     }
 
@@ -2428,6 +2585,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             right,
             kind,
             element,
+            environment: None,
         })
     }
 
@@ -2443,6 +2601,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         second: SsaVarId,
         third: SsaVarId,
         kind: VectorTernaryKind,
+        element: VectorElement,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::VectorTernary {
             dest,
@@ -2450,6 +2609,8 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             second,
             third,
             kind,
+            element,
+            environment: None,
         })
     }
 
@@ -2464,14 +2625,15 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         left: SsaVarId,
         right: SsaVarId,
         kind: VectorCompareKind,
-        unsigned: bool,
+        element: VectorElement,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::VectorCompare {
             dest,
             left,
             right,
             kind,
-            unsigned,
+            element,
+            signaling: false,
         })
     }
 
@@ -2490,6 +2652,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             dest,
             addr,
             vector_type,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2514,6 +2677,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             passthrough,
             vector_type,
             mode,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2532,6 +2696,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             addr,
             value,
             vector_type,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2552,6 +2717,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             value,
             mask,
             vector_type,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2570,6 +2736,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             dest,
             addr,
             vector_type,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2596,6 +2763,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             passthrough,
             vector_type,
             mode,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2618,6 +2786,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             value,
             mask,
             vector_type,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2673,7 +2842,8 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         })
     }
 
-    /// Emits a vector shuffle operation.
+    /// Emits a vector shuffle selecting lanes of `left` and `right` by
+    /// `selector`.
     ///
     /// # Errors
     ///
@@ -2683,17 +2853,18 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         def: SsaDefSpec<T>,
         left: SsaVarId,
         right: Option<SsaVarId>,
-        mask: VectorShuffleMask,
+        selector: VectorShuffleSelector,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::VectorShuffle {
             dest,
             left,
             right,
-            mask,
+            selector,
         })
     }
 
-    /// Emits a vector cast operation.
+    /// Emits a vector cast operation reading its source lanes as `from` and
+    /// writing its destination lanes as `to`.
     ///
     /// # Errors
     ///
@@ -2703,13 +2874,19 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         def: SsaDefSpec<T>,
         value: SsaVarId,
         target_type: T::Type,
-        kind: VectorCastKind,
+        from: VectorCastKind,
+        to: VectorCastKind,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::VectorCast {
             dest,
             value,
             target_type,
-            kind,
+            from,
+            to,
+            rounding: None,
+            saturate: false,
+            environment: None,
+            format: None,
         })
     }
 
@@ -2732,6 +2909,24 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     }
 
     /// Emits a faulting vector load with an optional fault-status output.
+    ///
+    /// A first-faulting load always yields the loaded vector and may also yield
+    /// a mask recording which lanes faulted. As with
+    /// [`atomic_cmp_xchg`](Self::atomic_cmp_xchg), the optional second result
+    /// changes the operation's definition count, so the spec's `fault_def`
+    /// selects the arity: present routes through
+    /// [`emit_two_defs`](Self::emit_two_defs) and returns `Some` fault mask,
+    /// absent routes through [`emit_def`](Self::emit_def) and returns `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - Address, mask, passthrough, vector type, and modes for the
+    ///   load; its `fault_def` decides whether a fault-status mask is produced.
+    ///
+    /// # Returns
+    ///
+    /// The loaded-vector variable and, when a fault definition was requested, the
+    /// fault-status mask variable.
     ///
     /// # Errors
     ///
@@ -2761,6 +2956,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                     vector_type,
                     fault_mode,
                     mask_mode,
+                    access: AccessQualifiers::FLAT,
                 }
             })?;
             Ok((dest, Some(fault)))
@@ -2774,6 +2970,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
                 vector_type,
                 fault_mode,
                 mask_mode,
+                access: AccessQualifiers::FLAT,
             })?;
             Ok((dest, None))
         }
@@ -2800,6 +2997,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             vector_type,
             segments,
             layout,
+            access: AccessQualifiers::FLAT,
         })
     }
 
@@ -2824,44 +3022,12 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             vector_type,
             segments,
             layout,
+            access: AccessQualifiers::FLAT,
         })
     }
 
-    /// Emits a vector mask unary operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn vector_mask_unary(
-        &mut self,
-        def: SsaDefSpec<T>,
-        mask: SsaVarId,
-        kind: VectorMaskUnaryKind,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::VectorMaskUnary { dest, mask, kind })
-    }
-
-    /// Emits a vector mask binary operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn vector_mask_binary(
-        &mut self,
-        def: SsaDefSpec<T>,
-        left: SsaVarId,
-        right: SsaVarId,
-        kind: VectorMaskBinaryKind,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::VectorMaskBinary {
-            dest,
-            left,
-            right,
-            kind,
-        })
-    }
-
-    /// Emits a vector reduce operation.
+    /// Emits a vector reduce operation over lanes described by `element`: of
+    /// the lanes alone, in an order it does not state.
     ///
     /// # Errors
     ///
@@ -2871,8 +3037,18 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         def: SsaDefSpec<T>,
         value: SsaVarId,
         kind: VectorReduceKind,
+        element: VectorElement,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::VectorReduce { dest, value, kind })
+        self.emit_def(def, |dest| SsaOp::VectorReduce {
+            dest,
+            value,
+            kind,
+            element,
+            initial: None,
+            ordered: false,
+            groups: None,
+            environment: None,
+        })
     }
 
     /// Emits a vector bitmask operation.
@@ -2979,7 +3155,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
     ///
     /// Returns an error if instruction insertion fails.
     pub fn ret(&mut self, value: Option<SsaVarId>) -> Result<()> {
-        self.emit_no_defs(SsaOp::Return { value })
+        self.emit_no_defs(SsaOp::returns(value))
     }
 
     /// Emits a throw terminator.
@@ -3072,91 +3248,6 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         self.emit_no_defs(SsaOp::Break(op))
     }
 
-    /// Emits a constrained-call prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn constrained(&mut self, constraint_type: T::TypeRef) -> Result<()> {
-        self.emit_no_defs(SsaOp::Constrained { constraint_type })
-    }
-
-    /// Emits a volatile prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn volatile(&mut self) -> Result<()> {
-        self.emit_no_defs(SsaOp::Volatile)
-    }
-
-    /// Emits an unaligned prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn unaligned(&mut self, alignment: u8) -> Result<()> {
-        self.emit_no_defs(SsaOp::Unaligned { alignment })
-    }
-
-    /// Emits a tail-call prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn tail_prefix(&mut self) -> Result<()> {
-        self.emit_no_defs(SsaOp::TailPrefix)
-    }
-
-    /// Emits a readonly prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn readonly(&mut self) -> Result<()> {
-        self.emit_no_defs(SsaOp::Readonly)
-    }
-
-    /// Emits an atomic read-modify-write operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn atomic_rmw(
-        &mut self,
-        def: SsaDefSpec<T>,
-        addr: SsaVarId,
-        value: SsaVarId,
-        op: AtomicRmwOp,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::AtomicRmw {
-            dest,
-            addr,
-            value,
-            op,
-        })
-    }
-
-    /// Emits a baseline compare-exchange operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if instruction insertion fails.
-    pub fn cmp_xchg(
-        &mut self,
-        def: SsaDefSpec<T>,
-        addr: SsaVarId,
-        expected: SsaVarId,
-        desired: SsaVarId,
-    ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::CmpXchg {
-            dest,
-            addr,
-            expected,
-            desired,
-        })
-    }
-
     /// Emits a lock-prefixed atomic read-modify-write operation.
     ///
     /// # Errors
@@ -3170,7 +3261,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             op,
             ordering,
             width,
-            volatile,
+            access,
         } = spec;
         self.emit_def(def, |dest| SsaOp::AtomicLockRmw {
             dest,
@@ -3179,10 +3270,15 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             op,
             ordering,
             width,
-            volatile,
+            access,
         })
     }
 
+    /// Returns the block being built, or an error if it no longer exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block index is out of range.
     fn block_mut(&mut self) -> Result<&mut SsaBlock<T>> {
         self.builder
             .function
@@ -3190,6 +3286,15 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             .ok_or_else(|| Error::new(format!("block {} does not exist", self.block_idx)))
     }
 
+    /// Returns the index the next appended instruction will occupy.
+    ///
+    /// This is the block's current instruction count, taken before an emit
+    /// pushes anything, so an `emit_*` method can stamp a variable's def site
+    /// with the position its defining instruction is about to land at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block index is out of range.
     fn next_instruction_index(&self) -> Result<usize> {
         self.builder
             .function
@@ -3198,6 +3303,22 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
             .ok_or_else(|| Error::new(format!("block {} does not exist", self.block_idx)))
     }
 
+    /// Wraps an operation in an instruction and appends it to the block.
+    ///
+    /// The shared tail of every emit path: it pairs the operation with its
+    /// backing original (synthetic for builder-created ops) and result type,
+    /// then appends the instruction. Def-site bookkeeping has already happened in
+    /// the caller, so this only performs the append.
+    ///
+    /// # Arguments
+    ///
+    /// * `original` - Backing machine instruction recorded as provenance.
+    /// * `op` - Operation to wrap.
+    /// * `result_type` - Result type carried by the instruction, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block index is out of range.
     fn push_instruction(
         &mut self,
         original: T::OriginalInstruction,
@@ -3210,6 +3331,23 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         Ok(())
     }
 
+    /// Checks that an operation defines exactly the expected variables in order.
+    ///
+    /// The allocating emit paths hand a `build` closure the ids they reserved and
+    /// trust it to wire them in as the operation's destinations. This verifies
+    /// that trust: the operation's actual definitions must equal `expected`
+    /// element for element, catching a closure that returns the wrong `SsaOp`
+    /// shape or transposes its outputs before the mismatch can corrupt the
+    /// function's def/use structure.
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - Operation whose definitions are inspected.
+    /// * `expected` - Variables the caller allocated, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation's definitions do not match `expected`.
     fn require_defs(&self, op: &SsaOp<T>, expected: &[SsaVarId]) -> Result<()> {
         let actual = op.defs().collect::<Vec<_>>();
         if actual == expected {
@@ -3227,12 +3365,12 @@ mod tests {
     use crate::{
         analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
         ir::{
-            ConstValue, SsaDefSpec, SsaFunctionBuilder,
+            BinaryOpKind, ConstValue, SsaDefSpec, SsaFunctionBuilder, UnaryOpKind,
             function::VectorFaultingLoadSpec,
             ops::{
-                AtomicAccessWidth, AtomicOrdering, FlagAdjustKind, FlagCondition, FlagsMask,
-                SsaEffectKind, SsaEffects, VectorBinaryKind, VectorCompareKind, VectorElement,
-                VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
+                AccessQualifiers, AtomicAccessWidth, AtomicOrdering, FlagCondition, FlagsMask,
+                NativeKindedData, SsaOp, SystemOpKind, VectorBinaryKind, VectorCompareKind,
+                VectorElement, VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
             },
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
@@ -3262,7 +3400,7 @@ mod tests {
     /// A masked vector op whose lane count the target does not model as a
     /// distinct mask type must still verify. `MockTarget` maps only 4-lane
     /// masks (`Mask4`), so a 2-lane (`V2F64`) masked load's
-    /// `vector_mask_descriptor_type` is `None` — meaning "target models no
+    /// `vector_mask_descriptor_type` is `None` - meaning "target models no
     /// mask type for this shape", exactly like `VisusTarget` (which returns
     /// `None` for every shape and carries an AVX `vmaskmov` mask in a plain
     /// vector register). The verifier must skip the mask-shape check in that
@@ -3275,7 +3413,7 @@ mod tests {
         builder
             .in_block(0, |block| {
                 let addr = block.const_value(ptr_tmp(), ConstValue::NativeUInt(0x2000))?;
-                // The mask register carries a concrete 2-lane vector type — the
+                // The mask register carries a concrete 2-lane vector type - the
                 // shape `MockTarget` does not model as a distinct mask type.
                 let mask = block.vector_load(v2f64_tmp(), addr, MockType::V2F64)?;
                 let loaded = block.vector_masked_load(
@@ -3303,6 +3441,8 @@ mod tests {
         );
     }
 
+    /// A straight-line block records each definition's site and recomputes its
+    /// use count on finish.
     #[test]
     fn builds_scalar_block_with_registered_defs_and_uses() {
         let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
@@ -3329,6 +3469,7 @@ mod tests {
         );
     }
 
+    /// A diamond CFG with a merge-block phi verifies and tracks its uses.
     #[test]
     fn builds_diamond_with_phi_operands() {
         let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
@@ -3369,6 +3510,8 @@ mod tests {
         assert_eq!(ssa.block(3).unwrap().phi_count(), 1);
     }
 
+    /// An empty phi at a loop header can be completed with a backedge operand
+    /// after the body is built.
     #[test]
     fn supports_empty_phi_and_later_backedge_operand() {
         let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
@@ -3407,8 +3550,10 @@ mod tests {
         assert_eq!(ssa.block(1).unwrap().phi_nodes()[0].operand_count(), 2);
     }
 
+    /// Multi-output operations - flag-producing arithmetic, atomics, and
+    /// native-opaque ops - build and verify with all their definitions tracked.
     #[test]
-    fn supports_multi_output_flags_atomcs_and_native_opaque() {
+    fn supports_multi_output_flags_atomics_and_system_ops() {
         let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
         builder
             .in_block(0, |block| {
@@ -3418,12 +3563,12 @@ mod tests {
                 let (sum, flags) = block.binary_op_with_flags(
                     i32_tmp(),
                     i32_tmp(),
-                    crate::ir::BinaryOpKind::Add,
+                    BinaryOpKind::Add,
                     left,
                     right,
                     false,
                 )?;
-                let _negated = block.unary_op(i32_tmp(), crate::ir::UnaryOpKind::Neg, sum)?;
+                let _negated = block.unary_op(i32_tmp(), UnaryOpKind::Neg, sum)?;
                 let zero = block.read_flags(i32_tmp(), flags, FlagsMask::ZERO)?;
                 let _old = block.atomic_exchange(
                     i32_tmp(),
@@ -3431,15 +3576,17 @@ mod tests {
                     sum,
                     AtomicOrdering::SeqCst,
                     AtomicAccessWidth::Bits32,
-                    false,
+                    AccessQualifiers::FLAT,
                 )?;
-                let _ = block.native_opaque(
-                    &[i32_tmp(), i32_tmp()],
-                    "opaque",
-                    None,
-                    vec![zero],
-                    SsaEffects::new(SsaEffectKind::Opaque, false),
-                )?;
+                let _ = block.emit_many_defs(&[i32_tmp(), i32_tmp()], |outputs| {
+                    SsaOp::SystemOp(Box::new(NativeKindedData {
+                        kind: SystemOpKind::CpuId,
+                        mnemonic: "cpuid".into(),
+                        metadata: None,
+                        outputs: outputs.to_vec(),
+                        inputs: vec![zero],
+                    }))
+                })?;
                 block.branch_flags(flags, FlagCondition::Zero, 1, 1)?;
                 Ok(())
             })
@@ -3469,7 +3616,7 @@ mod tests {
             let (_sum, flags) = block.binary_op_with_flags(
                 i32_tmp(),
                 i32_tmp(),
-                crate::ir::BinaryOpKind::Add,
+                BinaryOpKind::Add,
                 left,
                 right,
                 false,
@@ -3487,41 +3634,8 @@ mod tests {
         );
     }
 
-    /// `flag_adjust` and `flag_adjust_state` each refuse the other's kinds, so
-    /// the output count an operation carries is the one its kind declares.
-    #[test]
-    fn flag_adjust_builders_split_on_the_kind_declared_result() {
-        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
-        builder
-            .in_block(0, |block| {
-                let flags = block.const_i32(i32_tmp(), 0)?;
-                // `lahf` writes a register, so it defines a value.
-                let _reg =
-                    block.flag_adjust(i32_tmp(), FlagAdjustKind::StoreStatusToReg, vec![flags])?;
-                // `cli` writes IF, which no SSA value models.
-                block.flag_adjust_state(FlagAdjustKind::ClearInterrupt)?;
-                block.ret(None)?;
-                Ok(())
-            })
-            .unwrap();
-        let ssa = builder.finish_verified(VerifyLevel::Standard).unwrap();
-        assert_eq!(ssa.block(0).map(|b| b.instructions().len()), Some(4));
-
-        let mut wrong = SsaFunctionBuilder::<MockTarget>::new(0, 0);
-        let outcome = wrong.in_block(0, |block| {
-            block.flag_adjust_state(FlagAdjustKind::StoreStatusToReg)?;
-            Ok(())
-        });
-        assert!(outcome.is_err(), "`lahf` defines a value");
-
-        let mut wrong = SsaFunctionBuilder::<MockTarget>::new(0, 0);
-        let outcome = wrong.in_block(0, |block| {
-            let _ = block.flag_adjust(i32_tmp(), FlagAdjustKind::ClearInterrupt, Vec::new())?;
-            Ok(())
-        });
-        assert!(outcome.is_err(), "`cli` defines no value");
-    }
-
+    /// The vector emit surface - splat, load, binary, compare, faulting load,
+    /// and segmented load/store - builds and verifies as a fixture.
     #[test]
     fn supports_vector_fixture_construction() {
         let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
@@ -3543,7 +3657,7 @@ mod tests {
                     added,
                     loaded,
                     VectorCompareKind::Eq,
-                    false,
+                    VectorElement::default(),
                 )?;
                 let (_faulting, fault) = block.vector_faulting_load(VectorFaultingLoadSpec {
                     dest_def: v4i32_tmp(),

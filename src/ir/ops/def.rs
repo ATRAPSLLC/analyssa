@@ -1,41 +1,44 @@
-//! The [`SsaOp`] enum itself — every operation variant and its operands.
+//! The [`SsaOp`] enum itself - every operation variant and its operands.
 //!
-//! Behaviour lives in the sibling modules: operand access in [`super::visit`],
-//! effect classification in [`super::effects`], taxonomy and tokens in
-//! [`super::classify`], control-flow queries in [`super::control`], and
-//! rendering in [`super::display`].
+//! Behaviour lives in the sibling modules: operand access in [`crate::ir::ops::visit`],
+//! effect classification in [`crate::ir::ops::effects`], taxonomy and tokens in
+//! [`crate::ir::ops::classify`], control-flow queries in [`crate::ir::ops::control`], and
+//! rendering in [`crate::ir::ops::display`].
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ir::{
+        float::{
+            FloatClassLayout, FloatExceptionLayout, FloatExceptions, FloatFormat, FloatRounding,
+        },
         ops::{
+            calls::{CallData, CallInput, CallOutput, ReturnTransfer},
+            execution::Computation,
             kinds::{
-                AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BcdAdjustData, BreakpointOp,
-                CmpKind, ComputeKind, FenceKind, FpuControlKind, KindedVecData, NativeKindedData,
-                NativeOpaqueData, SystemOpKind, TranscendentalKind, VecImm8Data,
+                AccessQualifiers, AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, AtomicStatus,
+                BreakpointOp, CmpKind, CompareBlkData, FenceKind, FloatFunctionKind,
+                FpuControlKind, KindedVecData, NativeKindedData, RcwProtection, RuntimeValueKind,
+                SystemOpKind,
             },
-            native::{BlockStringOpData, FlagCondition, FlagsMask, WideCmpXchgData},
+            native::{CompareCondition, FlagCondition, FlagsMask},
             vector::{
-                ComplexMulKind, FlagAdjustKind, FpHelperKind, PredicateGenKind, SvePermuteKind,
-                TileOpKind, VectorBinaryKind, VectorBitfieldData, VectorBitmaskKind,
-                VectorCastKind, VectorCompareKind, VectorComplexAddData, VectorConditionalMoveData,
-                VectorCountAdjustData, VectorCryptoKind, VectorDotProductData, VectorElement,
-                VectorElementCountData, VectorExtendInLaneData, VectorFaultMode,
-                VectorHorizontalMinPosData, VectorHorizontalReduceData, VectorIntDotProductData,
-                VectorIntersectData, VectorMaddKind, VectorMaskBinaryKind, VectorMaskMode,
-                VectorMaskUnaryKind, VectorMatrixMulAccData, VectorNarrowSaturateData,
-                VectorPackKind, VectorPackNarrowData, VectorPermuteData, VectorPredicateBreakData,
-                VectorPredicateOpData, VectorPredicateWhileData, VectorReduceKind,
-                VectorReverseChunksData, VectorSegmentLayout, VectorShuffleBitsData,
-                VectorSmeMiscData, VectorSmeOuterProductData, VectorStringCompareData,
-                VectorStructLoadReplicateData, VectorSveAddressGenData, VectorSveComputeData,
-                VectorTernaryKind, VectorUnaryKind,
+                Contraction, ReduceGroups, VectorBinaryKind, VectorBitmaskKind, VectorCastKind,
+                VectorCompareKind, VectorElement, VectorElementCountData, VectorExtendInLaneData,
+                VectorFaultMode, VectorMaskMode, VectorPackKind, VectorPredicateWhileData,
+                VectorReduceKind, VectorSegmentLayout, VectorShuffleSelector,
+                VectorStructLoadReplicateData, VectorSveComputeData, VectorTernaryKind,
+                VectorUnaryKind,
             },
         },
         value::ConstValue,
         variable::SsaVarId,
     },
-    target::{Target, VectorShuffleMask},
+    target::Target,
 };
+
+mod emit;
 
 /// A decomposed SSA operation.
 ///
@@ -50,7 +53,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
         serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
                      T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize, \
@@ -203,8 +206,39 @@ pub enum SsaOp<T: Target> {
         left: SsaVarId,
         /// Right operand variable.
         right: SsaVarId,
-        /// Whether signaling NaNs may raise a floating-point exception.
+        /// Whether the compare is signalling (IEEE 754 compareSignaling): a
+        /// quiet NaN raises the invalid-operation exception as well as a
+        /// signalling one.
         signaling: bool,
+    },
+
+    /// The floating-point exceptions an operation raises, laid out as a status
+    /// register keeps them: `dest = raised(op)`, the bit `layout` keeps each
+    /// flag of `raises` at set where computing `op` raises the flag, every
+    /// other bit clear.
+    ///
+    /// `op` is the float operation on its own operands, which are this
+    /// operation's uses; its definitions are `dest` and are not read. A
+    /// status register's accrual reads it (`fflags = fflags | raised(fadd)`),
+    /// and `raises` bounds what it can set: a round to an integral value that
+    /// does not signal inexact (`frinti`) cannot set the inexact flag, and an
+    /// operation sets no flag its architecture does not have. Where an
+    /// instruction computes only some of `op`'s lanes (an AVX-512 opmask that
+    /// masks the result), `lanes` names them, and the others raise nothing.
+    FloatRaise {
+        /// Destination SSA variable: the raised flags, at their register bits.
+        dest: SsaVarId,
+        /// The float operation whose exceptions these are.
+        op: Box<SsaOp<T>>,
+        /// The lanes the operation computes: one bit per lane, bit `i`
+        /// governing lane `i` (an AVX-512 opmask register), or a vector of the
+        /// operation's lanes, each all ones where the lane is active. `None`
+        /// where it computes every lane.
+        lanes: Option<SsaVarId>,
+        /// The flags the operation can raise.
+        raises: FloatExceptions,
+        /// The bit each flag is kept at.
+        layout: FloatExceptionLayout,
     },
 
     /// Native wide divide consuming high:low dividend halves.
@@ -305,7 +339,8 @@ pub enum SsaOp<T: Target> {
         flags: Option<SsaVarId>,
     },
 
-    /// Rotate left: `dest = value <<< amount`
+    /// Rotate left: `dest = value <<< amount`, by `amount` modulo the value's
+    /// width - a rotation is periodic in the width, so every amount is defined.
     Rol {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -315,28 +350,9 @@ pub enum SsaOp<T: Target> {
         amount: SsaVarId,
     },
 
-    /// Rotate right: `dest = value >>> amount`
+    /// Rotate right: `dest = value >>> amount`, by `amount` modulo the value's
+    /// width - a rotation is periodic in the width, so every amount is defined.
     Ror {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Value operand variable.
-        value: SsaVarId,
-        /// Shift or rotate amount variable.
-        amount: SsaVarId,
-    },
-
-    /// Rotate through carry left
-    Rcl {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Value operand variable.
-        value: SsaVarId,
-        /// Shift or rotate amount variable.
-        amount: SsaVarId,
-    },
-
-    /// Rotate through carry right
-    Rcr {
         /// Destination SSA variable.
         dest: SsaVarId,
         /// Value operand variable.
@@ -385,7 +401,7 @@ pub enum SsaOp<T: Target> {
         src: SsaVarId,
     },
 
-    /// Parity: `dest = parity(src)` — 1 if odd number of set bits, 0 if even
+    /// Parity: `dest = parity(src)` - 1 if odd number of set bits, 0 if even
     Parity {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -401,6 +417,10 @@ pub enum SsaOp<T: Target> {
         left: SsaVarId,
         /// Right operand variable.
         right: SsaVarId,
+        /// Whether a float compare is signalling (IEEE 754 compareSignaling):
+        /// a quiet NaN raises the invalid-operation exception as well as a
+        /// signalling one. `false` for integers.
+        signaling: bool,
     },
 
     /// Compare less than: `dest = (left < right) ? 1 : 0`
@@ -413,6 +433,10 @@ pub enum SsaOp<T: Target> {
         right: SsaVarId,
         /// Whether operands use unsigned interpretation.
         unsigned: bool,
+        /// Whether a float compare is signalling (IEEE 754 compareSignaling):
+        /// a quiet NaN raises the invalid-operation exception as well as a
+        /// signalling one. `false` for integers.
+        signaling: bool,
     },
 
     /// Compare greater than: `dest = (left > right) ? 1 : 0`
@@ -425,9 +449,15 @@ pub enum SsaOp<T: Target> {
         right: SsaVarId,
         /// Whether operands use unsigned interpretation.
         unsigned: bool,
+        /// Whether a float compare is signalling (IEEE 754 compareSignaling):
+        /// a quiet NaN raises the invalid-operation exception as well as a
+        /// signalling one. `false` for integers.
+        signaling: bool,
     },
 
     /// Boolean conjunction: `dest = left && right`.
+    ///
+    /// The operands are truth values: any non-zero integer is true.
     BoolAnd {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -438,6 +468,8 @@ pub enum SsaOp<T: Target> {
     },
 
     /// Boolean disjunction: `dest = left || right`.
+    ///
+    /// The operands are truth values: any non-zero integer is true.
     BoolOr {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -447,7 +479,10 @@ pub enum SsaOp<T: Target> {
         right: SsaVarId,
     },
 
-    /// Boolean exclusive-or: `dest = left != right`.
+    /// Boolean exclusive-or: `dest = (left != 0) != (right != 0)`.
+    ///
+    /// The operands are truth values, compared as such: `2 xor 1` is false,
+    /// because both are true, not true because their bit patterns differ.
     BoolXor {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -458,6 +493,8 @@ pub enum SsaOp<T: Target> {
     },
 
     /// Boolean negation: `dest = !value`.
+    ///
+    /// The operand is a truth value: any non-zero integer is true.
     BoolNot {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -469,11 +506,17 @@ pub enum SsaOp<T: Target> {
     ///
     /// Covers widening (`movzx`/`movsx`, CIL `conv.u*`/`conv.i*` from a narrower
     /// source), narrowing (sub-register extraction, `conv.*` from a wider
-    /// source), and equal-width reinterpretation — the physical widen/narrow is a
+    /// source), and equal-width reinterpretation - the physical widen/narrow is a
     /// consequence of the source and `target` widths, not a distinct operation,
     /// so it is derived on demand rather than committed at lift time (the lifter
     /// does not always know the source width). `unsigned` selects zero- vs
     /// sign-extension semantics; `overflow_check` is CIL `conv.ovf.*` (may throw).
+    ///
+    /// Its operand and target are integers or pointers: a float's bits move
+    /// with [`SsaOp::Bitcast`], and a float's value converts with
+    /// [`SsaOp::FloatToInt`], [`SsaOp::IntToFloat`] or [`SsaOp::FloatConv`].
+    /// The verifier refuses a float or a vector on either side; a type the
+    /// target classifies as neither is not judged.
     IntConv {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -522,12 +565,27 @@ pub enum SsaOp<T: Target> {
         target: T::Type,
         /// Whether the integer source is interpreted unsigned.
         unsigned: bool,
+        /// The rounding the conversion applies where its result is inexact, or
+        /// `None` for the environment's current mode.
+        rounding: Option<FloatRounding>,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
-    /// Floating-point→integer conversion: `dest = (target_int)operand`
-    /// (`fptosi`/`fptoui`, x87 store-as-integer, CIL `conv.ovf.*` from a float).
-    /// `unsigned` selects the destination interpretation; `overflow_check` is the
-    /// CIL checked form (may throw).
+    /// Floating-point→integer conversion: `dest = (target_int)operand`,
+    /// rounded toward zero (`fptosi`/`fptoui`, x87 `fisttp`, CIL `conv.ovf.*`
+    /// from a float; a conversion that rounds otherwise, x87 `fist`, rounds
+    /// first). `unsigned` selects the destination interpretation, and agrees
+    /// with an integer `target`'s sign (the verifier checks); `overflow_check`
+    /// is the CIL checked form (may throw).
     FloatToInt {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -539,6 +597,13 @@ pub enum SsaOp<T: Target> {
         overflow_check: bool,
         /// Whether the integer destination is interpreted unsigned.
         unsigned: bool,
+        /// The format of the float converted, where the producer states it.
+        ///
+        /// It decides how the operand is read once its own type is gone - a
+        /// value stored and loaded back as an integer of its width - which the
+        /// width alone does not at 16 bits, where binary16 and bfloat16 meet
+        /// ([`SsaOp::restated_for_operand`]). `None` where nothing states it.
+        source: Option<FloatFormat>,
     },
 
     /// Floating-point→floating-point width change: `dest = (target_float)operand`
@@ -550,6 +615,22 @@ pub enum SsaOp<T: Target> {
         operand: SsaVarId,
         /// Target floating-point type metadata.
         target: T::Type,
+        /// The rounding the conversion applies where its result is inexact, or
+        /// `None` for the environment's current mode.
+        rounding: Option<FloatRounding>,
+        /// The format of the float converted, where the producer states it, as
+        /// [`SsaOp::FloatToInt`]'s states it.
+        source: Option<FloatFormat>,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Representation-preserving scalar bitcast: `dest = bitcast(target)operand`.
@@ -607,6 +688,42 @@ pub enum SsaOp<T: Target> {
         mask: FlagsMask,
     },
 
+    /// Compose a flags value from two: the bits `mask` selects come from
+    /// `update`, every other bit from `base`.
+    ///
+    /// A partial flag write. An instruction that defines some condition flags
+    /// and leaves the rest as they were - x86 `inc` keeps the carry, an ARM
+    /// `muls` sets only the sign and zero flags - produces the flags of its
+    /// operation merged over the flags it inherited, so a later read of a bit
+    /// it left alone reads the instruction that last set it.
+    MergeFlags {
+        /// Destination flags variable.
+        dest: SsaVarId,
+        /// The flags every bit outside `mask` comes from.
+        base: SsaVarId,
+        /// The flags every bit inside `mask` comes from.
+        update: SsaVarId,
+        /// The bits taken from `update`.
+        mask: FlagsMask,
+    },
+
+    /// Set one flag of a flags value from a boolean: `dest` is `base` with the
+    /// single bit `mask` names replaced by `bit`.
+    ///
+    /// The dual of [`Self::ReadFlags`], for a flag no operation's own flags
+    /// describe: an ARM logical instruction's carry is its shifter's carry out,
+    /// and a two-step add-with-carry's carry is the or of its steps' carries.
+    InsertFlag {
+        /// Destination flags variable.
+        dest: SsaVarId,
+        /// The flags every other bit comes from.
+        base: SsaVarId,
+        /// The boolean the bit takes.
+        bit: SsaVarId,
+        /// The single bit replaced.
+        mask: FlagsMask,
+    },
+
     /// Lane-wise unary vector operation.
     VectorUnary {
         /// Destination SSA variable.
@@ -615,8 +732,18 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Vector operation kind.
         kind: VectorUnaryKind,
-        /// Lane element descriptor (class / width / scalar).
+        /// Lane element descriptor (class / width / scalar / signedness).
         element: VectorElement,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Lane-wise binary vector operation.
@@ -629,8 +756,18 @@ pub enum SsaOp<T: Target> {
         right: SsaVarId,
         /// Vector operation kind.
         kind: VectorBinaryKind,
-        /// Lane element descriptor (class / width / scalar).
+        /// Lane element descriptor (class / width / scalar / signedness).
         element: VectorElement,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Lane-wise ternary vector operation.
@@ -645,6 +782,18 @@ pub enum SsaOp<T: Target> {
         third: SsaVarId,
         /// Vector operation kind.
         kind: VectorTernaryKind,
+        /// Lane element descriptor (class / width / scalar / signedness).
+        element: VectorElement,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Predicated lane-wise unary vector operation.
@@ -653,14 +802,28 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Value operand variable.
         value: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive lanes.
         passthrough: Option<SsaVarId>,
         /// Vector operation kind.
         kind: VectorUnaryKind,
+        /// Lane element descriptor (class / width / scalar / signedness).
+        element: VectorElement,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Predicated lane-wise binary vector operation.
@@ -671,14 +834,28 @@ pub enum SsaOp<T: Target> {
         left: SsaVarId,
         /// Right operand variable.
         right: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive lanes.
         passthrough: Option<SsaVarId>,
         /// Vector operation kind.
         kind: VectorBinaryKind,
+        /// Lane element descriptor (class / width / scalar / signedness).
+        element: VectorElement,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Predicated lane-wise ternary vector operation.
@@ -691,17 +868,34 @@ pub enum SsaOp<T: Target> {
         second: SsaVarId,
         /// Third vector operand variable.
         third: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive lanes.
         passthrough: Option<SsaVarId>,
         /// Vector operation kind.
         kind: VectorTernaryKind,
+        /// Lane element descriptor (class / width / scalar / signedness).
+        element: VectorElement,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
-    /// Lane-wise vector comparison producing a vector mask.
+    /// Lane-wise vector comparison producing a vector mask: each lane all
+    /// ones where the relation holds and zero where it does not, the lanes
+    /// laid out as the operands' ([`Self::VectorBitmask`] gathers them into
+    /// one bit per lane).
     VectorCompare {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -711,8 +905,14 @@ pub enum SsaOp<T: Target> {
         right: SsaVarId,
         /// Vector comparison kind.
         kind: VectorCompareKind,
-        /// Whether operands use unsigned interpretation.
-        unsigned: bool,
+        /// The lanes compared: integers ordered as their stated signedness
+        /// reads them, or floats ordered as IEEE does, a NaN unordered with
+        /// everything.
+        element: VectorElement,
+        /// Whether a float compare is signalling (IEEE 754 compareSignaling):
+        /// a quiet NaN lane raises the invalid-operation exception as well as
+        /// a signalling one. `false` for integer lanes.
+        signaling: bool,
     },
 
     /// Vector load from memory.
@@ -723,6 +923,8 @@ pub enum SsaOp<T: Target> {
         addr: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Vector store to memory.
@@ -733,6 +935,8 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Predicated vector load from memory.
@@ -741,7 +945,9 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Address operand variable.
         addr: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive lanes.
         passthrough: Option<SsaVarId>,
@@ -749,6 +955,8 @@ pub enum SsaOp<T: Target> {
         vector_type: T::Type,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Predicated vector store to memory.
@@ -757,10 +965,14 @@ pub enum SsaOp<T: Target> {
         addr: SsaVarId,
         /// Value operand variable.
         value: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Loads one scalar value and broadcasts it to all vector lanes.
@@ -771,17 +983,24 @@ pub enum SsaOp<T: Target> {
         addr: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
-    /// Gathers vector lanes from memory using vector indices.
+    /// Gathers vector lanes from memory using vector indices: lane `i` from
+    /// `base` plus lane `i` of `indices`.
     VectorGather {
         /// Destination SSA variable.
         dest: SsaVarId,
         /// Base address operand variable.
         base: SsaVarId,
-        /// Vector index operand variable.
+        /// The byte offset of each lane's address from `base`, lane `i` lane
+        /// `i`'s, a signed integer of its lane's width: an index already
+        /// extended and scaled.
         indices: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive lanes.
         passthrough: Option<SsaVarId>,
@@ -789,13 +1008,16 @@ pub enum SsaOp<T: Target> {
         vector_type: T::Type,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Vector load with first-fault or fault-only-first behavior.
     VectorFaultingLoad {
         /// Destination SSA variable.
         dest: SsaVarId,
-        /// Optional fault/status output variable.
+        /// The elements the load read, one bit per element (bit `i` element
+        /// `i`'s): every active element but those a fault suppressed.
         fault: Option<SsaVarId>,
         /// Address operand variable.
         addr: SsaVarId,
@@ -809,6 +1031,8 @@ pub enum SsaOp<T: Target> {
         fault_mode: VectorFaultMode,
         /// Inactive lane behavior.
         mask_mode: VectorMaskMode,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Loads multiple vector segments from memory.
@@ -817,7 +1041,11 @@ pub enum SsaOp<T: Target> {
         dests: Vec<SsaVarId>,
         /// Base address operand variable.
         base: SsaVarId,
-        /// Optional mask operand variable.
+        /// The structures it loads, where not every one: one bit per lane,
+        /// bit `i` governing structure `i` (lane `i` of every segment), or a
+        /// vector of the lanes, each all ones where active (an SVE predicate,
+        /// `ld2w {z0.s, z1.s}, p0/z, [x0]`). An inactive structure reads no
+        /// memory and loads zero into each segment's lane.
         mask: Option<SsaVarId>,
         /// Vector type metadata for each segment.
         vector_type: T::Type,
@@ -825,20 +1053,27 @@ pub enum SsaOp<T: Target> {
         segments: u32,
         /// Segment memory layout.
         layout: VectorSegmentLayout,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Scatters vector lanes to memory using vector indices.
     VectorScatter {
         /// Base address operand variable.
         base: SsaVarId,
-        /// Vector index operand variable.
+        /// The byte offset of each lane's address from `base`, as
+        /// [`SsaOp::VectorGather`] states it.
         indices: SsaVarId,
         /// Value operand variable.
         value: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Stores multiple vector segments to memory.
@@ -847,7 +1082,9 @@ pub enum SsaOp<T: Target> {
         base: SsaVarId,
         /// Vector values to store, one per segment.
         values: Vec<SsaVarId>,
-        /// Optional mask operand variable.
+        /// The structures it stores, where not every one, as
+        /// [`SsaOp::VectorSegmentLoad`]'s mask states them (`st2w {z0.s,
+        /// z1.s}, p0, [x0]`): an inactive structure writes no memory.
         mask: Option<SsaVarId>,
         /// Vector type metadata for each segment.
         vector_type: T::Type,
@@ -855,6 +1092,8 @@ pub enum SsaOp<T: Target> {
         segments: u32,
         /// Segment memory layout.
         layout: VectorSegmentLayout,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Extracts one scalar lane from a vector.
@@ -889,7 +1128,10 @@ pub enum SsaOp<T: Target> {
         vector_type: T::Type,
     },
 
-    /// Shuffles lanes from one or two vector inputs.
+    /// Selects lanes from one or two vector inputs laid end to end, the left
+    /// lowest: by a mask the instruction fixes, or by an index vector it
+    /// computes ([`VectorShuffleSelector`]). Several tables (`tbl` of four
+    /// registers) are joined by mask into the two inputs first.
     VectorShuffle {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -897,11 +1139,12 @@ pub enum SsaOp<T: Target> {
         left: SsaVarId,
         /// Optional second shuffle input vector.
         right: Option<SsaVarId>,
-        /// Vector shuffle lane selector.
-        mask: VectorShuffleMask,
+        /// Which input lane each result lane takes.
+        selector: VectorShuffleSelector,
     },
 
-    /// Converts vector lane values to another vector type.
+    /// Converts each lane of a vector to another lane type: an integer of
+    /// another width or signedness, a float, or a float of another format.
     VectorCast {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -909,8 +1152,34 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Target vector type metadata.
         target_type: T::Type,
-        /// Vector cast kind.
-        kind: VectorCastKind,
+        /// How the source lanes are read.
+        from: VectorCastKind,
+        /// How the destination lanes are written.
+        to: VectorCastKind,
+        /// The rounding a lane's conversion applies where its result is
+        /// inexact (a narrowing between floats, an integer to a float), or
+        /// `None` for the environment's current mode.
+        rounding: Option<FloatRounding>,
+        /// Whether an integer conversion clamps a lane to the range of the
+        /// destination's lane, as `to` reads it, rather than keeping its low
+        /// bits: a saturating narrowing (`sqxtn`, `sqxtun`, `packsswb`).
+        saturate: bool,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
+        /// The value that names, at run time, the encoding and scale of a
+        /// format the instruction does not state: Arm's FP8 lanes, which FPMR
+        /// selects. `None` where every lane's format is stated. Two
+        /// conversions of one value under different ones are different
+        /// values, so this is an input like any other.
+        format: Option<SsaVarId>,
     },
 
     /// Reinterprets vector bits as another vector type of the same total width.
@@ -929,7 +1198,9 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Value operand variable.
         value: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive destination lanes.
         passthrough: Option<SsaVarId>,
@@ -949,7 +1220,9 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Base address operand variable.
         addr: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Optional passthrough vector for inactive destination lanes.
         passthrough: Option<SsaVarId>,
@@ -961,6 +1234,8 @@ pub enum SsaOp<T: Target> {
         kind: VectorPackKind,
         /// Inactive lane behavior.
         mode: VectorMaskMode,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Compresses active vector lanes and stores them contiguously to memory.
@@ -969,7 +1244,9 @@ pub enum SsaOp<T: Target> {
         addr: SsaVarId,
         /// Value operand variable.
         value: SsaVarId,
-        /// Mask operand variable.
+        /// The mask: one bit per lane, bit `i` governing lane `i` (an
+        /// AVX-512 opmask register), or a vector of the operation's lanes,
+        /// each all ones where the lane is active (an SVE predicate).
         mask: SsaVarId,
         /// Vector type metadata.
         vector_type: T::Type,
@@ -977,37 +1254,12 @@ pub enum SsaOp<T: Target> {
         element_bits: u32,
         /// Packing direction. Must be [`VectorPackKind::Compress`].
         kind: VectorPackKind,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
-    /// Clears vector upper lanes according to target vector aliasing rules.
-    VectorZeroUpper {
-        /// `true` to clear all vector state; `false` to clear upper lanes.
-        all: bool,
-    },
-
-    /// Applies a unary operation to vector mask lanes.
-    VectorMaskUnary {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Mask operand variable.
-        mask: SsaVarId,
-        /// Vector mask operation kind.
-        kind: VectorMaskUnaryKind,
-    },
-
-    /// Applies a binary operation to vector mask lanes.
-    VectorMaskBinary {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Left mask operand variable.
-        left: SsaVarId,
-        /// Right mask operand variable.
-        right: SsaVarId,
-        /// Vector mask operation kind.
-        kind: VectorMaskBinaryKind,
-    },
-
-    /// Reduces vector lanes to one scalar result.
+    /// Reduces vector lanes to one scalar result, or, grouped, each run of
+    /// adjacent lanes to one lane of the result ([`ReduceGroups`]).
     VectorReduce {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -1015,6 +1267,32 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Reduction operation kind.
         kind: VectorReduceKind,
+        /// Lane element descriptor of the reduced operand: its class, width
+        /// and, for [`VectorReduceKind::Min`] and [`VectorReduceKind::Max`] over
+        /// integers, its signedness.
+        element: VectorElement,
+        /// The scalar of the lane type the reduction starts from, combined
+        /// before every lane: SVE `fadda`'s accumulator, RISC-V's `vs1[0]`.
+        /// `None` reduces the lanes alone.
+        initial: Option<SsaVarId>,
+        /// Whether the lanes combine one at a time in lane order, the initial
+        /// value first (SVE `fadda`, RISC-V `vfredosum`), each step rounded,
+        /// rather than in an order the operation does not state. Only float
+        /// lanes tell the two apart.
+        ordered: bool,
+        /// The runs of lanes each lane of a vector result reduces, and that
+        /// lane's width; `None` reduces every lane to one scalar.
+        groups: Option<ReduceGroups>,
+        /// The rounding mode of the floating-point environment the operation
+        /// rounds by, where it rounds by the environment's mode: an integer in
+        /// [`VectorRounding::FloatingEnvironment`]'s encoding (0 nearest even,
+        /// 1 toward zero, 2 down, 3 up, 4 nearest away), which the host reads
+        /// from the unit's control register. `None` where the operation states
+        /// its rounding, rounds nothing, or the mode is the target's own
+        /// ([`Target::environment_rounding`]).
+        ///
+        /// [`VectorRounding::FloatingEnvironment`]: crate::ir::ops::VectorRounding::FloatingEnvironment
+        environment: Option<SsaVarId>,
     },
 
     /// Extracts lane predicate bits into a scalar integer mask.
@@ -1091,12 +1369,43 @@ pub enum SsaOp<T: Target> {
         target: SsaVarId,
         /// Statically recovered successor block indices, if known.
         resolved_targets: Vec<usize>,
+        /// The machine state the branch hands to code the lift has not seen:
+        /// each register's value at the branch, under a key the host defines.
+        /// An unresolved branch continues where any register may be read, so
+        /// each is an ordinary use; the host binds them to the entry values
+        /// of the code it lifts there. The last occurrence of a key supplies
+        /// it.
+        #[cfg_attr(feature = "serde", serde(default))]
+        state: Box<[CallInput]>,
     },
 
-    /// Return from method with optional value.
+    /// Return from method with optional value, reading the processor state
+    /// a caller observes after the return.
+    ///
+    /// `state` holds the values of that state the return leaves to its
+    /// caller beside the value: the sticky status flags the function accrued
+    /// (x87's and `MXCSR`'s exception flags, Arm's `FPSR` and `Q`, RISC-V's
+    /// `fflags`, MIPS's `DSPControl` flags), which a caller's `fetestexcept`
+    /// or `rddsp` reads after the call. Read here, an accrual stays live to
+    /// the return as the effect it is ([`Self::returns_with`]).
     Return {
         /// Optional return value variable.
         value: Option<SsaVarId>,
+        /// The processor state a caller observes after the return.
+        state: Box<[SsaVarId]>,
+        /// The values the return hands its caller beside `value`, each under
+        /// the key a call receives it by ([`CallData::results`]): a second
+        /// register the function leaves a value in, which its callers read.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "<[CallInput]>::is_empty")
+        )]
+        results: Box<[CallInput]>,
+        /// What the return states for static execution alone: the value it
+        /// transfers control through and the registers it hands its caller
+        /// ([`ReturnTransfer`]). `None` where it states neither.
+        #[cfg_attr(feature = "serde", serde(default))]
+        transfer: Option<Box<ReturnTransfer>>,
     },
 
     /// Load instance field: `dest = object.field`
@@ -1107,6 +1416,9 @@ pub enum SsaOp<T: Target> {
         object: SsaVarId,
         /// Field reference metadata.
         field: T::FieldRef,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// Store instance field: `object.field = value`
@@ -1117,6 +1429,9 @@ pub enum SsaOp<T: Target> {
         field: T::FieldRef,
         /// Value operand variable.
         value: SsaVarId,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// Load static field: `dest = ClassName.field`
@@ -1125,6 +1440,9 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Field reference metadata.
         field: T::FieldRef,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// Store static field: `ClassName.field = value`
@@ -1133,6 +1451,9 @@ pub enum SsaOp<T: Target> {
         field: T::FieldRef,
         /// Value operand variable.
         value: SsaVarId,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// Load field address: `dest = &object.field`
@@ -1187,6 +1508,10 @@ pub enum SsaOp<T: Target> {
         index: SsaVarId,
         /// Element type metadata.
         elem_type: T::TypeRef,
+        /// Whether the address is never written through (CIL `readonly.`),
+        /// which spares the runtime the element type check of an array of
+        /// references.
+        readonly: bool,
     },
 
     /// Get array length: `dest = array.Length`
@@ -1205,18 +1530,8 @@ pub enum SsaOp<T: Target> {
         addr: SsaVarId,
         /// Value type metadata.
         value_type: T::Type,
-        /// Address space the access is qualified by, or `None` for the
-        /// target's default (flat) space.
-        ///
-        /// Opaque and host-defined: on x86 a frontend maps a segment override
-        /// (`fs:`/`gs:`) to a distinct id here. It qualifies the *access*, not
-        /// the address arithmetic — `lea rax, fs:[0x30]` computes `0x30`,
-        /// because segmentation is applied on dereference — which is why this
-        /// rides the load/store rather than [`SsaOp::PtrAdd`].
-        ///
-        /// Alias analysis treats different address spaces as disjoint; without
-        /// it, `fs:[0x30]` and a flat `[0x30]` decode to one memory location.
-        address_space: Option<u16>,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Store through pointer: `*ptr = value`
@@ -1227,18 +1542,8 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Value type metadata.
         value_type: T::Type,
-        /// Address space the access is qualified by, or `None` for the
-        /// target's default (flat) space.
-        ///
-        /// Opaque and host-defined: on x86 a frontend maps a segment override
-        /// (`fs:`/`gs:`) to a distinct id here. It qualifies the *access*, not
-        /// the address arithmetic — `lea rax, fs:[0x30]` computes `0x30`,
-        /// because segmentation is applied on dereference — which is why this
-        /// rides the load/store rather than [`SsaOp::PtrAdd`].
-        ///
-        /// Alias analysis treats different address spaces as disjoint; without
-        /// it, `fs:[0x30]` and a flat `[0x30]` decode to one memory location.
-        address_space: Option<u16>,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Create new object: `dest = new Type(args...)`
@@ -1327,37 +1632,87 @@ pub enum SsaOp<T: Target> {
         token: T::TypeRef,
     },
 
-    /// Direct method call: `dest = method(args...)`
-    Call {
-        /// Optional destination SSA variable.
-        dest: Option<SsaVarId>,
-        /// Method reference metadata.
-        method: T::MethodRef,
-        /// Call argument variables.
-        args: Vec<SsaVarId>,
+    /// The arguments the current call received past its declared parameters:
+    /// `dest = __arglist`, a C `va_list` or a CIL `arglist` handle.
+    ///
+    /// What it designates is the current call's own argument area, so the
+    /// value is fixed for the activation and reads no program state.
+    ArgList {
+        /// Destination SSA variable.
+        dest: SsaVarId,
     },
 
-    /// Virtual method call: `dest = obj.method(args...)`
-    CallVirt {
-        /// Optional destination SSA variable.
-        dest: Option<SsaVarId>,
-        /// Method reference metadata.
-        method: T::MethodRef,
-        /// Call argument variables.
-        args: Vec<SsaVarId>,
+    /// Reads the next variadic argument and moves the list past it:
+    /// `dest = va_arg(*list, ty)`.
+    ///
+    /// `list` is the address of the list object. How the list locates and
+    /// steps past an argument is its ABI's, so the operation reads and writes
+    /// that object and reads wherever the argument lies: the save areas or
+    /// the stack.
+    ArgNext {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// Address of the list object.
+        list: SsaVarId,
+        /// The type of the argument read.
+        ty: T::Type,
     },
 
-    /// Indirect call through function pointer: `dest = fptr(args...)`
-    CallIndirect {
-        /// Optional destination SSA variable.
-        dest: Option<SsaVarId>,
-        /// Function pointer operand variable.
-        fptr: SsaVarId,
-        /// Indirect call signature metadata.
-        signature: T::SigRef,
-        /// Call argument variables.
-        args: Vec<SsaVarId>,
+    /// Reads the next variadic argument of a list held as a value, and states
+    /// the list past it: `dest = va_arg(list, ty)`, `next` the moved list.
+    ///
+    /// The value form of [`SsaOp::ArgNext`], for a list that is the address of
+    /// the next argument where no list object exists: an optimiser keeps
+    /// that address in a register. It reads the argument and writes nothing.
+    ArgStep {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// The list past the argument.
+        next: SsaVarId,
+        /// The list, the address of the argument read.
+        list: SsaVarId,
+        /// The type of the argument read.
+        ty: T::Type,
     },
+
+    /// Make a typed reference to the value at an address (CIL `mkrefany`):
+    /// `dest = __makeref(*address)`, typed `value_type`.
+    MakeTypedRef {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// The address the reference designates.
+        address: SsaVarId,
+        /// The type of the value at the address.
+        value_type: T::TypeRef,
+    },
+
+    /// The address a typed reference designates (CIL `refanyval`):
+    /// `dest = &__refvalue(typed_ref, Type)`. Throws when the reference is not
+    /// of `value_type`.
+    TypedRefValue {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// The typed reference.
+        typed_ref: SsaVarId,
+        /// The type the reference must have.
+        value_type: T::TypeRef,
+    },
+
+    /// The type of a typed reference, as a runtime type handle (CIL
+    /// `refanytype`): `dest = __reftype(typed_ref).TypeHandle`.
+    TypedRefType {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// The typed reference.
+        typed_ref: SsaVarId,
+    },
+
+    /// A call ([`CallData`]): the code it runs and how it reaches it
+    /// ([`Callee`](crate::ir::ops::Callee): direct, virtual, constrained or
+    /// through a pointer), its arguments and result, and what it does beyond
+    /// computing it ([`CallEffects`](crate::ir::ops::CallEffects)). Boxed: a call carries more than any other
+    /// operation, and every operation is as large as the largest.
+    Call(Box<CallData<T>>),
 
     /// Load function pointer: `dest = &method`
     LoadFunctionPtr {
@@ -1365,6 +1720,10 @@ pub enum SsaOp<T: Target> {
         dest: SsaVarId,
         /// Method reference metadata.
         method: T::MethodRef,
+        /// The type whose implementation of a static virtual `method` the
+        /// pointer names (CIL `constrained. ldftn`); `None` for the method
+        /// itself.
+        constraint: Option<T::TypeRef>,
     },
 
     /// Load virtual function pointer: `dest = &obj.method`
@@ -1441,6 +1800,29 @@ pub enum SsaOp<T: Target> {
         result: SsaVarId,
     },
 
+    /// A value the execution context supplies: `dest = runtime(kind)`.
+    ///
+    /// No computation produces `dest`. For the exception object a catch
+    /// handler or a filter is entered with, and the state a handler is entered
+    /// holding, entering the block is what makes it hold, so the operation is
+    /// legal only as a leading instruction of a block control can enter that
+    /// way, and the verifier says so. A value the specification leaves to the
+    /// implementation ([`crate::ir::ops::RuntimeValueKind::Unspecified`])
+    /// holds where control reaches it, anywhere in a block.
+    ///
+    /// It is fixed where it stands. Hoisting it, copying it into a duplicated
+    /// block or numbering two of them equal would each assert something the
+    /// runtime never promised, which its
+    /// [`RuntimeDefined`](crate::ir::ops::SsaEffectKind::RuntimeDefined) effect class
+    /// prevents. Deleting it when `dest` is dead is fine, and dead-code
+    /// elimination does.
+    RuntimeValue {
+        /// Destination SSA variable.
+        dest: SsaVarId,
+        /// Which value the context supplies.
+        kind: RuntimeValueKind,
+    },
+
     /// Return from interrupt / exception handler
     InterruptReturn,
 
@@ -1453,20 +1835,52 @@ pub enum SsaOp<T: Target> {
         target: usize,
     },
 
-    /// Initialize block of memory to zero
+    /// Fills a block of memory with copies of a value: `size` bytes at
+    /// `dest_addr`, element after element using the value type's attested
+    /// storage representation. This is a byte for CIL `initblk` and `memset`,
+    /// and the accumulator's storage width for x86 `rep stosw`/`stosd`/`stosq`.
+    /// Logical value width alone does not establish a storage extent.
     InitBlk {
         /// Destination address operand variable.
         dest_addr: SsaVarId,
-        /// Value operand variable.
+        /// The element written using its declared storage representation.
         value: SsaVarId,
-        /// Size operand variable.
+        /// The number of bytes filled.
         size: SsaVarId,
-        /// `true` when the fill proceeds from high to low addresses (x86 `rep
-        /// stos` with the direction flag set); `false` is the forward default.
-        reverse: bool,
+        /// The direction flag the fill reads (x86 `DF`): set, it proceeds
+        /// from high to low addresses (`rep stos` after `std`); `None` for a
+        /// fill that proceeds upward by definition (CIL `initblk`). Downward
+        /// fills require a whole number of storage elements. An upward fill
+        /// may end after a prefix of its last element. A zero size accesses
+        /// no address and needs no element representation.
+        backward: Option<SsaVarId>,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
-    /// Copy block of memory
+    /// Copies a block of memory as if through a temporary buffer, so that
+    /// overlapping regions copy as the source held them before the copy:
+    /// `memmove`, which AArch64 FEAT_MOPS `cpyp`/`cpym`/`cpye` perform (they
+    /// choose the direction by the overlap). A zero size accesses neither
+    /// address and needs no source bytes.
+    MoveBlk {
+        /// Destination address operand variable.
+        dest_addr: SsaVarId,
+        /// Source address operand variable.
+        src_addr: SsaVarId,
+        /// Size operand variable, in bytes.
+        size: SsaVarId,
+        /// How the read of the source is made ([`AccessQualifiers`]).
+        src_access: AccessQualifiers,
+        /// How the write of the destination is made ([`AccessQualifiers`]).
+        dest_access: AccessQualifiers,
+    },
+
+    /// Copies complete elements in stream order, reading each element before writing it.
+    ///
+    /// Addresses name the first element. `size` is a byte count divisible by
+    /// `element_bytes`; reverse streams subtract the element width between steps.
+    /// A zero size accesses neither address. The element width remains nonzero.
     CopyBlk {
         /// Destination address operand variable.
         dest_addr: SsaVarId,
@@ -1474,10 +1888,19 @@ pub enum SsaOp<T: Target> {
         src_addr: SsaVarId,
         /// Size operand variable.
         size: SsaVarId,
-        /// `true` when the copy proceeds from high to low addresses (x86 `rep
-        /// movs` with the direction flag set), which matters for overlapping
-        /// regions; `false` is the forward default.
-        reverse: bool,
+        /// Nonzero bytes read together before writing one complete element.
+        ///
+        /// One for byte copies; x86 `rep movsw`/`movsd`/`movsq` use two/four/eight.
+        element_bytes: u32,
+        /// The direction flag the copy reads (x86 `DF`): set, it proceeds
+        /// from high to low addresses (`rep movs` after `std`), which matters
+        /// for overlapping regions; `None` for a copy that proceeds upward by
+        /// definition (CIL `cpblk`).
+        backward: Option<SsaVarId>,
+        /// How the read of the source is made ([`AccessQualifiers`]).
+        src_access: AccessQualifiers,
+        /// How the write of the destination is made ([`AccessQualifiers`]).
+        dest_access: AccessQualifiers,
     },
 
     /// Memory fence / barrier
@@ -1486,244 +1909,112 @@ pub enum SsaOp<T: Target> {
         kind: FenceKind,
     },
 
-    /// Target-specific native instruction with explicit operands, outputs, and
-    /// effects.
-    ///
-    /// Opaque native instruction with explicit inputs/outputs and a
-    /// conservative effect summary. The payload is boxed (see
-    /// [`NativeOpaqueData`]) to keep `SsaOp` small.
-    NativeOpaque(Box<NativeOpaqueData>),
-
     /// Typed native **system / privileged** operation (`cpuid`, time-stamp reads,
     /// system/control-register access, syscalls, traps, cache/TLB maintenance,
-    /// privileged state ops). The first-class typed replacement for the system
-    /// cases of `NativeOpaque`: a structured
-    /// [`SystemOpKind`] identity drives a precise effect summary and a distinct
-    /// similarity class. The payload is boxed (see [`NativeKindedData`]).
+    /// privileged state ops). A structured [`SystemOpKind`] identity drives a
+    /// precise effect summary and a distinct similarity class. The payload is boxed (see [`NativeKindedData`]).
     SystemOp(Box<NativeKindedData<SystemOpKind>>),
 
-    /// Typed native **compute** intrinsic (`pdep`/`pext`, `crc32`,
-    /// `rdrand`/`rdseed`, pointer authentication). The first-class typed
-    /// replacement for the hardware compute intrinsics: a structured
-    /// [`ComputeKind`] identity drives a precise effect summary (pure, except
-    /// nondeterministic random sources) and a distinct similarity class. The
-    /// payload is boxed (see [`NativeKindedData`]).
-    ComputeOp(Box<NativeKindedData<ComputeKind>>),
+    /// A **contraction**: products of lanes summed into lanes, as its
+    /// [`Contraction`] states (dot products of every width and sign, the
+    /// bfloat16 dots, the 52-bit multiply-adds, the masked float dot, matrix
+    /// and outer products, and the complex products and rotations). Pure. The payload is boxed (see [`KindedVecData`]).
+    Contract(Box<KindedVecData<Contraction>>),
 
-    /// Typed legacy x86 **binary-coded-decimal adjust**
-    /// (`daa`/`das`/`aaa`/`aas`/`aam`/`aad`). The [`BcdAdjustKind`] identity
-    /// drives a pure effect summary and an arithmetic similarity class; the
-    /// accumulator and flags flow through as typed SSA values. The payload is
-    /// boxed (see [`BcdAdjustData`]).
-    ///
-    /// [`BcdAdjustKind`]: crate::ir::ops::kinds::BcdAdjustKind
-    BcdAdjust(Box<BcdAdjustData>),
-
-    /// Typed hardware **vector cryptographic** operation (AES / SHA / SM3 /
-    /// SM4 / GF(2^8) / carry-less multiply). The first-class, named replacement
-    /// for what would otherwise be an opaque crypto blob: a [`VectorCryptoKind`]
-    /// identity drives a precise (pure) effect summary and the `Vector`
-    /// similarity class. The payload is boxed (see [`KindedVecData`]).
-    VectorCrypto(Box<KindedVecData<VectorCryptoKind>>),
-
-    /// Typed AMX **tile** operation (matrix multiply-accumulate, tile load /
-    /// store / zero / release, configuration load / store). A [`TileOpKind`]
-    /// identity drives a precise effect summary (pure / read / write). The
-    /// payload is boxed (see [`KindedVecData`]).
-    TileOp(Box<KindedVecData<TileOpKind>>),
-
-    /// Typed vector **lane permute by a runtime index vector** (x86
-    /// `vpermd`/`vpermps`/`vpermb`/`vpshufb`/`vpermt2*`/`vpermi2*` and the
-    /// variable `vpermilps`/`vpermilpd`). Distinct from [`Self::VectorShuffle`]
-    /// (static mask). Pure. The payload is boxed (see [`VectorPermuteData`]).
-    VectorPermute(Box<VectorPermuteData>),
-
-    /// Typed vector **fused multiply-then-horizontal-add** (x86 `pmaddwd`/
-    /// `pmaddubsw`/`vpdpbusd[s]`/`vpdpwssd[s]`/`vpmadd52luq`/`vpmadd52huq`).
-    /// Multiplies two source vectors and horizontally sums adjacent products,
-    /// optionally accumulating into a running destination. Pure. The payload is
-    /// boxed (see [`KindedVecData`]).
-    VectorMultiplyAdd(Box<KindedVecData<VectorMaddKind>>),
-
-    /// Typed vector **two-source saturating narrowing pack** (x86 `packsswb`/
-    /// `packssdw`/`packuswb`/`packusdw`). Pure. The payload is boxed (see
-    /// [`VectorPackNarrowData`]).
-    VectorPackNarrow(Box<VectorPackNarrowData>),
-    /// Single-source saturating narrowing (see [`VectorNarrowSaturateData`]).
-    VectorNarrowSaturate(Box<VectorNarrowSaturateData>),
     /// Predicate-generation from scalar loop bounds (see [`VectorPredicateWhileData`]).
     VectorPredicateWhile(Box<VectorPredicateWhileData>),
-    /// Predicate-break generation (see [`VectorPredicateBreakData`]).
-    VectorPredicateBreak(Box<VectorPredicateBreakData>),
-    /// Complex-number add with rotation (see [`VectorComplexAddData`]).
-    VectorComplexAdd(Box<VectorComplexAddData>),
-    /// Adjust a register by an implicit element/predicate count (see [`VectorCountAdjustData`]).
-    VectorCountAdjust(Box<VectorCountAdjustData>),
     /// Sign/zero-extend the low field of each lane in place (see [`VectorExtendInLaneData`]).
     VectorExtendInLane(Box<VectorExtendInLaneData>),
     /// Read the symbolic element count `VL / element_bits` into a scalar (see
     /// [`VectorElementCountData`]).
     VectorElementCount(Box<VectorElementCountData>),
-    /// SVE vector address generation `base + (extend(index) << shift)` (see
-    /// [`VectorSveAddressGenData`]).
-    VectorSveAddressGen(Box<VectorSveAddressGenData>),
-    /// Manipulate the condition flags directly (see [`KindedVecData`]).
-    FlagAdjust(Box<KindedVecData<FlagAdjustKind>>),
     /// Load-and-replicate a 2/3/4-element structure (see [`VectorStructLoadReplicateData`]).
     VectorStructLoadReplicate(Box<VectorStructLoadReplicateData>),
-    /// SME ZA-tile accumulate/zero (see [`VectorSmeMiscData`]).
-    VectorSmeMisc(Box<VectorSmeMiscData>),
-    /// SVE predicate/first-fault-register operation (see [`VectorPredicateOpData`]).
-    VectorPredicateOp(Box<VectorPredicateOpData>),
     /// SVE2/NEON compute op named by its kind (see [`VectorSveComputeData`]).
     VectorSveCompute(Box<VectorSveComputeData>),
-    /// Reverse chunks within each element (see [`VectorReverseChunksData`]).
-    VectorReverseChunks(Box<VectorReverseChunksData>),
-    /// Matrix multiply-accumulate over vectors (see [`VectorMatrixMulAccData`]).
-    VectorMatrixMulAcc(Box<VectorMatrixMulAccData>),
-    /// SME outer-product accumulate into a ZA tile (see [`VectorSmeOuterProductData`]).
-    VectorSmeOuterProduct(Box<VectorSmeOuterProductData>),
-    /// Predicate generation (const/iterate/ffr/unpack/select; see [`KindedVecData`]).
-    VectorPredicateGen(Box<KindedVecData<PredicateGenKind>>),
-    /// SVE floating-point transcendental helper (see [`KindedVecData`]).
-    VectorFpHelper(Box<KindedVecData<FpHelperKind>>),
-    /// SVE data-movement permute/extract (see [`KindedVecData`]).
-    VectorSvePermute(Box<KindedVecData<SvePermuteKind>>),
 
-    /// Typed vector **arbitrary three-input bitwise logic** (x86 `vpternlogd`/
-    /// `vpternlogq`), selected by an 8-bit truth table. Pure. The payload is
-    /// boxed (see [`VecImm8Data`]).
-    VectorTernaryLogic(Box<VecImm8Data>),
+    /// Compares two blocks element by element, from `left` and `right`,
+    /// while the elements agree as its data says and fewer than `count`
+    /// were compared (x86 `repe cmps`, `repne cmps`). Each compare sets the
+    /// flags as subtracting the second block's element from the first's.
+    /// The payload is boxed (see [`CompareBlkData`]).
+    CompareBlk(Box<CompareBlkData>),
 
-    /// Typed vector **floating-point dot product** (x86 SSE4.1 `dpps`/`dppd`,
-    /// VEX `vdpps`/`vdppd`), selected by an 8-bit lane-participation / result-
-    /// broadcast immediate. Pure. The payload is boxed (see
-    /// [`VectorDotProductData`]).
-    VectorDotProduct(Box<VectorDotProductData>),
-
-    /// Typed vector **multi-block sum of absolute differences** (x86 SSE4.1
-    /// `mpsadbw`, VEX `vmpsadbw`, AVX-512 `vdbpsadbw`), selected by an 8-bit
-    /// block-offset immediate. Pure. The payload is boxed (see
-    /// [`VecImm8Data`]).
-    VectorMultiSad(Box<VecImm8Data>),
-
-    /// Typed vector **integer dot-product-accumulate** (ARM/AArch64 `sdot`/
-    /// `udot`/`usdot`): each lane accumulates the sum of a group of widened
-    /// integer element products. Pure. The payload is boxed (see
-    /// [`VectorIntDotProductData`]).
-    VectorIntDotProduct(Box<VectorIntDotProductData>),
-
-    /// Typed vector **packed string comparison** (SSE4.2 `pcmpestri`/
-    /// `pcmpestrm`/`pcmpistri`/`pcmpistrm` and VEX peers), selected by an 8-bit
-    /// format / aggregation / polarity immediate. Pure. The payload is boxed
-    /// (see [`VectorStringCompareData`]).
-    VectorStringCompare(Box<VectorStringCompareData>),
-
-    /// Typed vector **bit-field extract / insert** over the low 64 bits of a
-    /// vector register (SSE4a `extrq`/`insertq`). Pure. The payload is boxed
-    /// (see [`VectorBitfieldData`]).
-    VectorBitfield(Box<VectorBitfieldData>),
-
-    /// Typed vector **element-intersection to a mask pair** (AVX-512
-    /// `vp2intersectd`/`vp2intersectq`). Pure. The payload is boxed (see
-    /// [`VectorIntersectData`]).
-    VectorIntersect(Box<VectorIntersectData>),
-
-    /// Typed vector **bit-shuffle to a mask** (AVX-512 `vpshufbitqmb`). Pure.
-    /// The payload is boxed (see [`VectorShuffleBitsData`]).
-    VectorShuffleBits(Box<VectorShuffleBitsData>),
-
-    /// Typed vector **per-byte conditional move** (Cyrix EMMI `pmvzb`/`pmvnzb`/
-    /// `pmvlzb`/`pmvgezb`). Pure. The payload is boxed (see
-    /// [`VectorConditionalMoveData`]).
-    VectorConditionalMove(Box<VectorConditionalMoveData>),
-
-    /// Typed vector **horizontal minimum with position** (SSE4.1 `phminposuw`):
-    /// the smallest unsigned 16-bit lane and its source index. Pure. The
-    /// payload is boxed (see [`VectorHorizontalMinPosData`]).
-    VectorHorizontalMinPos(Box<VectorHorizontalMinPosData>),
-
-    /// Typed vector **complex-number floating-point multiply** (x86 `vfmulcph`/
-    /// `vfcmulcph`/`vfmaddcph`/`vfcmaddcph` and `sh` peers). Pure. The payload
-    /// is boxed (see [`KindedVecData`]).
-    VectorComplexMul(Box<KindedVecData<ComplexMulKind>>),
-
-    /// Typed vector **floating-point lane classification to a mask** (x86
-    /// `vfpclass*`), selected by an 8-bit category immediate. Pure. The payload
-    /// is boxed (see [`VecImm8Data`]).
-    VectorClassify(Box<VecImm8Data>),
-
-    /// Typed vector **grouped widening horizontal add / subtract** (AMD XOP
-    /// `vphadd*`/`vphsub*`). Pure. The payload is boxed (see
-    /// [`VectorHorizontalReduceData`]).
-    VectorHorizontalReduce(Box<VectorHorizontalReduceData>),
-
-    /// Typed native **block-string** operation (`rep`/`repe`/`repne`
-    /// `cmps`/`scas`/`lods`). The first-class typed replacement for the
-    /// rep-string-stream case of `NativeOpaque`: a structured
-    /// [`BlockStringKind`] identity drives a precise effect summary (memory
-    /// read / read-write) and a distinct similarity class. The payload is boxed
-    /// (see [`BlockStringOpData`]). (`rep movs`/`rep stos` use `CopyBlk`/
-    /// `InitBlk`, not this op.)
-    ///
-    /// [`BlockStringKind`]: crate::ir::ops::native::BlockStringKind
-    BlockString(Box<BlockStringOpData>),
-
-    /// Typed native **wide compare-and-swap** (`cmpxchg8b` / `cmpxchg16b`). The
-    /// first-class typed replacement for the wide-CAS case of `NativeOpaque`: a
-    /// sequentially-consistent atomic op with explicit register-pair inputs /
-    /// outputs (see [`WideCmpXchgData`]). Single-width CAS uses [`Self::CmpXchg`].
-    WideCompareExchange(Box<WideCmpXchgData>),
-
-    /// Typed native **flags computation** — defines an architectural-flags
-    /// value (`EFLAGS` / NZCV) as a pure function of its inputs, for operations
-    /// whose precise per-flag semantics the lifter does not decompose (`bsf`/
-    /// `bsr`/`popcnt`/`bt` zero-flag side effects). The first-class typed
-    /// replacement for the flags-only case of `NativeOpaque`: it is pure and
-    /// deterministic, so optimization can still reason about and eliminate it.
-    ComputeFlags {
-        /// The defined architectural-flags value.
-        dest: SsaVarId,
-        /// The input values the flags are computed from.
-        inputs: Vec<SsaVarId>,
+    /// Compares a value with a block's elements, from `address`, while they
+    /// agree as `while_equal` says and fewer than `count` were compared (x86
+    /// `repe scas`, `repne scas`). Each compare sets the flags as subtracting
+    /// the element from the value.
+    ScanBlk {
+        /// The elements left unscanned when the scan stopped.
+        remaining: SsaVarId,
+        /// The address after the last element scanned.
+        next: SsaVarId,
+        /// The flags of the last compare, or `flags_in` where none was.
+        flags: SsaVarId,
+        /// The block's first element.
+        address: SsaVarId,
+        /// The value each element is compared with.
+        value: SsaVarId,
+        /// The most elements scanned.
+        count: SsaVarId,
+        /// The flags an empty scan leaves; `None` where `count` is never
+        /// zero, so no scan is empty and nothing reads them.
+        flags_in: Option<SsaVarId>,
+        /// The direction flag the scan reads (x86 `DF`): set, it walks from
+        /// high to low addresses.
+        backward: Option<SsaVarId>,
+        /// The width of an element, in bytes.
+        element_bytes: u32,
+        /// Whether the scan goes on while the elements equal the value
+        /// (`repe`) rather than while they differ (`repne`).
+        while_equal: bool,
+        /// How the block is read ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
-    /// Typed native **call-clobber** marker — defines fresh, undefined values
+    /// Reads a block's `count` elements in turn, from `address`, keeping the
+    /// last (x86 `rep lods`): `value` is the last element read, or
+    /// `value_in` where `count` is zero.
+    LoadBlk {
+        /// The last element read, or `value_in`.
+        value: SsaVarId,
+        /// The address after the last element read.
+        next: SsaVarId,
+        /// The block's first element.
+        address: SsaVarId,
+        /// The elements read.
+        count: SsaVarId,
+        /// The value an empty read leaves; `None` where `count` is never
+        /// zero, so no read is empty and nothing reads it.
+        value_in: Option<SsaVarId>,
+        /// The direction flag the read reads (x86 `DF`): set, it walks from
+        /// high to low addresses.
+        backward: Option<SsaVarId>,
+        /// The width of an element, in bytes.
+        element_bytes: u32,
+        /// How the block is read ([`AccessQualifiers`]).
+        access: AccessQualifiers,
+    },
+
+    /// Typed native **call-clobber** marker - defines fresh, undefined values
     /// for the caller-saved registers a preceding [`Self::Call`] clobbers (the
     /// `Call` op carries a single `dest`, so the remaining clobbered registers
-    /// need an owning def for the verifier). The first-class typed replacement
-    /// for the call-clobber case of `NativeOpaque`: pure (the call already
+    /// need an owning def for the verifier). It is pure (the call already
     /// happened) and freely eliminable when its outputs are unread.
     CallClobber {
         /// The caller-saved register values invalidated by the call.
         outputs: Vec<SsaVarId>,
+        /// Physical keys bound to fresh output definitions by their list positions.
+        ///
+        /// Missing entries remain unknown. A key never rewrites a pre-call SSA value.
+        #[cfg_attr(feature = "serde", serde(default))]
+        machine: Option<Box<[CallOutput]>>,
     },
 
-    /// Compare-and-swap: `old = *addr; if old == expected { *addr = desired; } return old`
-    CmpXchg {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Address operand variable.
-        addr: SsaVarId,
-        /// Expected compare-exchange value.
-        expected: SsaVarId,
-        /// Desired compare-exchange value.
-        desired: SsaVarId,
-    },
-
-    /// Atomic read-modify-write: `old = *addr; *addr = op(old, value); return old`
-    AtomicRmw {
-        /// Destination SSA variable.
-        dest: SsaVarId,
-        /// Address operand variable.
-        addr: SsaVarId,
-        /// Value operand variable.
-        value: SsaVarId,
-        /// Atomic read-modify-write operation.
-        op: AtomicRmwOp,
-    },
-
-    /// Native atomic load with explicit ordering, width, and volatility.
+    /// Native atomic load with explicit ordering, width, and volatility: an
+    /// ordered load (AArch64 `ldar`, RISC-V `lw.aq`), or, where it
+    /// [`reserves`](Self::AtomicLoad::reserves), an exclusive load that opens
+    /// the reservation a store-conditional tests (`ldxr`, `lr.w`, `ll`).
     AtomicLoad {
         /// Destination SSA variable.
         dest: SsaVarId,
@@ -1735,8 +2026,11 @@ pub enum SsaOp<T: Target> {
         ordering: AtomicOrdering,
         /// Atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// Whether the load opens a reservation on its address, which a later
+        /// store-conditional to it tests: an exclusive load.
+        reserves: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native atomic store with explicit ordering, width, and volatility.
@@ -1751,14 +2045,21 @@ pub enum SsaOp<T: Target> {
         ordering: AtomicOrdering,
         /// Atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native store-conditional with explicit status output and ordering.
     AtomicStoreConditional {
         /// Store status output variable.
         status: SsaVarId,
+        /// Native success/failure encoding, independently of the stored value.
+        #[cfg_attr(feature = "serde", serde(default))]
+        status_encoding: AtomicStatus,
+        /// Whether every completion consumes the reservation. A missing
+        /// contract leaves a possible reservation live after the operation.
+        #[cfg_attr(feature = "serde", serde(default))]
+        consumes_reservation: bool,
         /// Address operand variable.
         addr: SsaVarId,
         /// Value operand variable.
@@ -1771,11 +2072,15 @@ pub enum SsaOp<T: Target> {
         failure_ordering: AtomicOrdering,
         /// Atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
-    /// Native atomic pair load with explicit ordering, width, and volatility.
+    /// Native exclusive pair load with explicit ordering, width, and volatility.
+    ///
+    /// The first result reads the lower address and the second reads the next
+    /// half-width span. Like a reserving [`Self::AtomicLoad`], it permits a
+    /// subsequent conditional store to succeed without guaranteeing success.
     AtomicPairLoad {
         /// First destination SSA variable.
         first: SsaVarId,
@@ -1791,14 +2096,21 @@ pub enum SsaOp<T: Target> {
         ordering: AtomicOrdering,
         /// Total atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native pair store-conditional with one shared status output.
     AtomicPairStoreConditional {
         /// Store status output variable.
         status: SsaVarId,
+        /// Native success/failure encoding, independently of the stored value.
+        #[cfg_attr(feature = "serde", serde(default))]
+        status_encoding: AtomicStatus,
+        /// Whether every completion consumes the reservation. A missing
+        /// contract leaves a possible reservation live after the operation.
+        #[cfg_attr(feature = "serde", serde(default))]
+        consumes_reservation: bool,
         /// Address operand variable.
         addr: SsaVarId,
         /// First value operand variable.
@@ -1815,8 +2127,8 @@ pub enum SsaOp<T: Target> {
         failure_ordering: AtomicOrdering,
         /// Total atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native atomic exchange with explicit ordering, width, and volatility.
@@ -1831,8 +2143,8 @@ pub enum SsaOp<T: Target> {
         ordering: AtomicOrdering,
         /// Atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native lock-prefixed read-modify-write operation.
@@ -1849,8 +2161,33 @@ pub enum SsaOp<T: Target> {
         ordering: AtomicOrdering,
         /// Atomic memory access width.
         width: AtomicAccessWidth,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
+    },
+
+    /// Native atomic conditional read-modify-write: `old = *addr; if
+    /// condition(old, compare) { *addr = op(old, value) }; return old`, as one
+    /// atomic access (x86 `cmp<cc>xadd`). The condition is a relation of `old`
+    /// and `compare`, or one flag of `old - compare` ([`CompareCondition`]).
+    AtomicCondRmw {
+        /// Old memory value output variable.
+        old: SsaVarId,
+        /// Address operand variable.
+        addr: SsaVarId,
+        /// The value the old one is compared with.
+        compare: SsaVarId,
+        /// Value operand variable.
+        value: SsaVarId,
+        /// Atomic read-modify-write operation, applied where the condition holds.
+        op: AtomicRmwOp,
+        /// What the comparison of the old value with `compare` must satisfy.
+        condition: CompareCondition,
+        /// Atomic memory ordering.
+        ordering: AtomicOrdering,
+        /// Atomic memory access width.
+        width: AtomicAccessWidth,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native atomic compare-exchange with optional success-status output.
@@ -1873,8 +2210,8 @@ pub enum SsaOp<T: Target> {
         width: AtomicAccessWidth,
         /// Whether compare-exchange may fail spuriously.
         weak: bool,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Native atomic pair compare-exchange.
@@ -1901,8 +2238,93 @@ pub enum SsaOp<T: Target> {
         width: AtomicAccessWidth,
         /// Whether compare-exchange may fail spuriously.
         weak: bool,
-        /// Whether the access is volatile.
-        volatile: bool,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
+    },
+
+    /// Native atomic read-modify-write of a register pair as one access of
+    /// twice a register's width (AArch64 FEAT_LSE128 `swpp`, `ldsetp`,
+    /// `ldclrp`): memory becomes `op` of its old value and the pair, and the
+    /// old pair is returned.
+    ///
+    /// The first register is the half at the lower address, as in the other
+    /// pair operations: the low-order half of a little-endian access and the
+    /// high-order half of a big-endian one. An operation that carries between
+    /// the halves (`Add`, `Sub`) reads the pair as one value in the access's
+    /// byte order.
+    AtomicPairRmw {
+        /// Old memory value of the half at the lower address.
+        old_first: SsaVarId,
+        /// Old memory value of the half at the higher address.
+        old_second: SsaVarId,
+        /// Address operand variable.
+        addr: SsaVarId,
+        /// Half of the value stored at the lower address.
+        value_first: SsaVarId,
+        /// Half of the value stored at the higher address.
+        value_second: SsaVarId,
+        /// Atomic read-modify-write operation.
+        op: AtomicRmwOp,
+        /// Memory ordering.
+        ordering: AtomicOrdering,
+        /// Total atomic memory access width.
+        width: AtomicAccessWidth,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
+    },
+
+    /// Native atomic read-check-write (AArch64 FEAT_THE `rcwcas`, `rcwclr`,
+    /// `rcwset`, `rcwswp`, their `rcws` soft forms and `p` pairs), one
+    /// single-copy-atomic access as Arm's `MemAtomicRCW` makes it.
+    ///
+    /// The new value is `op` of the old one and `value` (`AndNot` clears the
+    /// bits `value` sets, `Or` sets them, `Xchg` replaces the old value).
+    /// With a `compare` it is a compare-and-swap: where the old value differs
+    /// from `compare` the compare fails, memory keeps the old value and
+    /// `status` is `0b1010`. Otherwise the change from the old value to the
+    /// new one is checked (`RCWCheck`): the read-check-write check against
+    /// `rcw_mask`, the effective mask of `RCWMASK_EL1`, wherever the
+    /// protected bit (52 of 64 bits, 114 of 128) is enabled, and for a soft
+    /// form the soft check against `rcws_mask` (`RCWSMASK_EL1`) as well.
+    /// `status` is then `0`, `rcw_fail`, `!rcws_fail`, `0` as NZCV, so
+    /// `0b0010` where both pass, and the new value is written where it is.
+    /// Where a check fails the architecture leaves it to the implementation
+    /// whether the new value is written anyway
+    /// (`Unpredictable_WRITEFAILEDRCWCAS`), so memory then holds the old value
+    /// or the new one. `old` is the old value, or, after a compare that
+    /// passed, the old value or `compare` (`Unpredictable_CASRETURNOLDVALUE`),
+    /// which are equal.
+    ///
+    /// A pair form accesses 128 bits as one value: its registers' halves are
+    /// the frontend's to join and split, in the access's byte order.
+    AtomicCheckedRmw {
+        /// Old memory value output variable.
+        old: SsaVarId,
+        /// The check's NZCV, bit 3 `N` to bit 0 `V`.
+        status: SsaVarId,
+        /// Address operand variable.
+        addr: SsaVarId,
+        /// The value a compare-and-swap expects; `None` for any other form.
+        compare: Option<SsaVarId>,
+        /// The operand `op` combines with the old value.
+        value: SsaVarId,
+        /// What the new value is of the old one and `value`: `AndNot`, `Or`
+        /// or `Xchg`.
+        op: AtomicRmwOp,
+        /// `RCWMASK_EL1`, the bits a protected value may change.
+        rcw_mask: SsaVarId,
+        /// `RCWSMASK_EL1`, the bits a soft-protected value may change: the
+        /// soft forms' second check; `None` for a form that makes only the
+        /// first.
+        rcws_mask: Option<SsaVarId>,
+        /// Whether the protected bit is enabled ([`RcwProtection`]).
+        protection: RcwProtection,
+        /// Atomic memory ordering.
+        ordering: AtomicOrdering,
+        /// Atomic memory access width: 64 bits, or 128 for a pair.
+        width: AtomicAccessWidth,
+        /// How the access is made ([`AccessQualifiers`]).
+        access: AccessQualifiers,
     },
 
     /// Initialize object (for value types): `*dest = default(T)`
@@ -1931,6 +2353,9 @@ pub enum SsaOp<T: Target> {
         src_addr: SsaVarId,
         /// Value type metadata.
         value_type: T::TypeRef,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// Store object (value type copy): `*dest = value`
@@ -1941,6 +2366,9 @@ pub enum SsaOp<T: Target> {
         value: SsaVarId,
         /// Value type metadata.
         value_type: T::TypeRef,
+        /// How the access is made ([`AccessQualifiers`]): CIL `volatile.` and
+        /// `unaligned.` state it.
+        access: AccessQualifiers,
     },
 
     /// No operation (for nop instructions)
@@ -1961,54 +2389,47 @@ pub enum SsaOp<T: Target> {
         operand: SsaVarId,
     },
 
-    /// Classify a floating-point value, producing an integer mask describing the
-    /// operand's IEEE-754 category (RISC-V `fclass`, MIPS `class.fmt`). The exact
-    /// bit layout is the native instruction's; the result is a plain integer.
+    /// Classify a floating-point value, producing the class of the operand's
+    /// IEEE-754 category in the encoding `layout` states: a mask of one bit
+    /// (RISC-V `fclass`, MIPS `class.fmt`) or x87's condition codes (`fxam`).
     FpClassify {
-        /// Destination SSA variable (integer classification mask).
+        /// Destination SSA variable (the class).
         dest: SsaVarId,
         /// Floating-point operand variable.
         operand: SsaVarId,
+        /// The encoding of the class.
+        layout: FloatClassLayout,
     },
 
-    /// Hardware floating-point transcendental / residue op with no primitive
-    /// closed form (x87 `fsin`/`fcos`/`fpatan`/`f2xm1`/`fyl2x`/`fprem`/…). The
-    /// payload ([`KindedVecData`]) is boxed to keep `SsaOp` compact.
-    FpTranscendental(Box<KindedVecData<TranscendentalKind>>),
+    /// A floating-point function the machine computes as one operation, named
+    /// by its [`FloatFunctionKind`]: the transcendentals (x87 `fsin`, `fcos`,
+    /// `fpatan`, `f2xm1`, `fyl2x`), which no closed form of the primitive
+    /// operations states and which do not fold, and the exact functions
+    /// `fscale`, `fxtract`, `fprem` and `fprem1`, which fold
+    /// ([`crate::analysis::Machine::evaluate_results`]). Pure: its condition
+    /// codes are outputs of its own. The payload ([`KindedVecData`]) is boxed
+    /// to keep `SsaOp` compact.
+    FloatFunction(Box<KindedVecData<FloatFunctionKind>>),
 
     /// Floating-point unit control / state op (x87 `fldcw`/`fnstcw`/`fnstsw`/
     /// `fldenv`/`fnsave`/`frstor`/`fnclex`/`fdecstp`/`ffree`/`fxsave`/…). The
     /// payload ([`KindedVecData`]) is boxed to keep `SsaOp` compact.
     FpuControl(Box<KindedVecData<FpuControlKind>>),
 
-    /// Localloc: allocate stack space
+    /// Allocates `size` bytes of the function's own frame, released when it
+    /// returns, and defines their address: CIL `localloc`, C's `alloca`, a
+    /// variable-length array, which a native frame lowers to moving the stack
+    /// pointer.
     LocalAlloc {
         /// Destination SSA variable.
         dest: SsaVarId,
         /// Size operand variable.
         size: SsaVarId,
+        /// Whether the bytes hold zero when allocated (CIL `localloc` in a
+        /// method that zeroes its locals); otherwise they hold whatever the
+        /// stack did.
+        zeroed: bool,
     },
-
-    /// Constrained virtual call prefix (affects next callvirt)
-    Constrained {
-        /// Constrained call type metadata.
-        constraint_type: T::TypeRef,
-    },
-
-    /// Volatile prefix (next memory access must not be reordered/cached)
-    Volatile,
-
-    /// Unaligned prefix (next memory access may be unaligned)
-    Unaligned {
-        /// Required alignment in bytes.
-        alignment: u8,
-    },
-
-    /// Tail call prefix (next call is a tail call)
-    TailPrefix,
-
-    /// Readonly prefix (next ldelema returns a controlled-mutability managed pointer)
-    Readonly,
 
     /// Phi node: merges values from different predecessors.
     ///
@@ -2019,4 +2440,71 @@ pub enum SsaOp<T: Target> {
         /// Incoming phi operands by predecessor block.
         operands: Vec<(usize, SsaVarId)>,
     },
+
+    /// Extracts a runtime-positioned bit range into the target layout.
+    ///
+    /// Result bit `i` is source bit `offset + i`, with bits outside the source
+    /// zero. Both the unsigned offset and length are explicit bit counts.
+    /// The target layout must agree with that length, including when the width
+    /// scales at runtime. The bit count survives representations without type
+    /// metadata.
+    VectorSlice {
+        /// Destination variable.
+        dest: SsaVarId,
+        /// Source storage value.
+        vector: SsaVarId,
+        /// Unsigned bit offset supplied at runtime.
+        offset: SsaVarId,
+        /// Unsigned result bit length supplied at runtime.
+        length: SsaVarId,
+        /// Result layout, with total width equal to `length`.
+        target_type: T::Type,
+    },
+
+    /// Replaces a runtime-positioned bit range while preserving every other bit.
+    ///
+    /// Bit `offset + i` takes bit `i` of `value` when it is inside the base
+    /// storage. Bits beyond the base are discarded. The unsigned offset is in
+    /// bits, and the result width equals the base width at runtime.
+    VectorInsertSlice {
+        /// Destination variable.
+        dest: SsaVarId,
+        /// Base storage whose other bits are preserved.
+        vector: SsaVarId,
+        /// Unsigned bit offset supplied at runtime.
+        offset: SsaVarId,
+        /// Bits inserted at the offset.
+        value: SsaVarId,
+        /// Result layout, with the same total width as the base.
+        target_type: T::Type,
+    },
+
+    /// Concatenates two whole fixed or scalable storage values, low part first.
+    ///
+    /// The result width is the sum of the operand widths at runtime. Larger
+    /// register groups are built by composing this operation.
+    VectorConcat {
+        /// Destination variable.
+        dest: SsaVarId,
+        /// Low bits of the result.
+        left: SsaVarId,
+        /// High bits of the result.
+        right: SsaVarId,
+        /// Result layout, with the sum of the input widths.
+        target_type: T::Type,
+    },
+
+    /// A computation the machine performs as one operation ([`Computation`]):
+    /// a [`Kernel`] over a whole value (a checksum step, a bit deposit, a
+    /// decimal adjust, an AES round, a ternary logic function, a packed string
+    /// comparison) or over the lanes of a vector under an explicit restart
+    /// index, active length and mask (RISC-V's vector extension).
+    ///
+    /// Inactive elements never execute, access memory or produce exceptions.
+    /// The computation defines its complete runtime interface, independent of
+    /// any machine instruction encoding, and retains each inactive policy. The
+    /// payload ([`KindedVecData`]) is boxed to keep `SsaOp` compact.
+    ///
+    /// [`Kernel`]: crate::ir::ops::Kernel
+    Compute(Box<KindedVecData<Computation>>),
 }

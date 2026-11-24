@@ -26,8 +26,9 @@
 //!    places phi nodes at dominance frontiers, and renames to achieve single-assignment.
 //! 2. **Optimization**: Analysis passes operate on the SSA form (constant propagation,
 //!    copy propagation, DCE, GVN, etc.).
-//! 3. **Repair/Rebuild**: After passes, `repair_ssa()` handles instruction-only changes;
-//!    `rebuild_ssa()` performs full SSA reconstruction after CFG modifications.
+//! 3. **Repair**: After passes, `repair_ssa()` handles instruction-only changes; a
+//!    pass that modifies the CFG reconstructs the values it disturbed with
+//!    `reconstruct_values()`.
 //! 4. **Canonicalize**: Final cleanup (strip nops, remove empty blocks, compact indices)
 //!    before code generation.
 //!
@@ -41,17 +42,31 @@
 //!   enabling direct def-use chain construction without scanning.
 //! - **Thread safety**: All IR types implement `Send` and `Sync`.
 
+mod aes;
 pub mod block;
+/// Canonical visitation of operation content.
+pub mod content;
+pub mod division;
+pub mod evaluation;
 pub mod exception;
+pub mod float;
 pub mod function;
+mod ghash;
+mod identity;
 pub mod instruction;
+pub mod integer;
+pub mod lanes;
 pub mod ops;
 pub mod phi;
+mod sha;
+mod sm3;
+mod sm4;
 pub mod value;
 pub mod variable;
 pub mod varstore;
 
-pub use block::{ReplaceResult, SsaBlock};
+pub use block::{BlockProvenance, ReplaceResult, SsaBlock};
+pub use evaluation::{ArithmeticTrap, Evaluation};
 pub use exception::{
     BlockRange, ClauseLayout, ClausePart, ExceptionBlocks, ExceptionTableError, HandlerKind,
     LaidOutHandler, SsaExceptionHandler,
@@ -60,12 +75,29 @@ pub use function::{
     CheckedReplaceResult, FunctionKind, MethodPurity, ReplacementSkipReason, ReturnInfo,
     SkippedReplacement, SsaBlockBuilder, SsaDefSpec, SsaEditOptions, SsaEditReport, SsaEditScope,
     SsaEditor, SsaFunction, SsaFunctionBuilder, SsaRollbackPolicy, TrivialPhiOptions,
+    VariableRemap,
 };
-pub use instruction::SsaInstruction;
-pub use ops::{
-    BinaryOpInfo, BinaryOpKind, CmpKind, FlagCondition, FlagsMask, SsaOp, UnaryOpInfo, UnaryOpKind,
-};
-pub use phi::{PhiNode, PhiOperand};
+pub use instruction::{InstrId, InstructionRole, SsaInstruction};
+pub use integer::IntegerType;
+pub use lanes::VectorConst;
+pub use phi::{OperandReplacement, PhiEdge, PhiNode, PhiOperand};
 pub use value::{AbstractValue, ComputedOp, ComputedValue, ConstValue};
-pub use variable::{DefSite, FunctionVarAllocator, SsaVarId, SsaVariable, UseSite, VariableOrigin};
-pub use varstore::{VarMap, VarSet};
+pub use variable::{
+    DefSite, FunctionVarAllocator, SsaVarId, SsaVariable, UseSite, VariableOrigin, VariableRole,
+};
+pub use varstore::{SharedVarMap, VarMap, VarMapIntoIter, VarMapIter, VarSet};
+
+pub use self::{
+    float::{
+        DefaultNan, FloatBinary, FloatBits, FloatClassLayout, FloatComparison,
+        FloatExceptionLayout, FloatExceptions, FloatFormat, FloatIntegerResult, FloatResult,
+        FloatRounding, FloatRules, NanEncoding, NanOperands, NanPropagation, OutOfRangeConversion,
+        RaisingArithmetic,
+    },
+    ops::{
+        AccessMode, BinaryOpInfo, BinaryOpKind, CallAccess, CallData, CallEffects, CallInput,
+        CallInputKey, CallLocation, CallMemory, CallOutput, CallResult, CallTermination, Callee,
+        Capture, CmpKind, FlagCondition, FlagsMask, FrameOrigin, PointeeExtent, ReturnTransfer,
+        RuntimeValueKind, SsaOp, StagedValue, UnaryOpInfo, UnaryOpKind,
+    },
+};

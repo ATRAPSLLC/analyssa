@@ -30,19 +30,15 @@
 //!
 //! All types in this module are `Send` and `Sync`.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-};
+use std::{collections::VecDeque, fmt, mem, ops::Add};
+
+use rustc_hash::FxHashMap;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::{
     BitSet,
-    ir::{
-        instruction::SsaInstruction,
-        ops::SsaOp,
-        phi::{PhiNode, PhiOperand},
-        variable::SsaVarId,
-    },
+    ir::{instruction::SsaInstruction, ops::SsaOp, phi::PhiNode, variable::SsaVarId},
     target::Target,
 };
 
@@ -70,12 +66,265 @@ impl ReplaceResult {
     }
 }
 
-impl std::ops::Add for ReplaceResult {
+impl Add for ReplaceResult {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         Self {
             replaced: self.replaced.saturating_add(rhs.replaced),
             skipped: self.skipped.saturating_add(rhs.skipped),
+        }
+    }
+}
+
+/// The host blocks an SSA block stands for.
+///
+/// A host lifts each of its own blocks - a decoded basic block, a bytecode
+/// range - into one SSA block and names it here, by whatever `u64` identifies
+/// it to the host. The passes keep the record true as they rework the graph:
+///
+/// - A block a pass creates (a loop preheader, a unified latch, a new entry)
+///   stands for nothing: it holds no code of the host's own.
+/// - A block that absorbs its successor stands for both, its own first
+///   ([`Self::absorb`]).
+/// - A block whose edge is redirected past blocks that execute nothing on it -
+///   a forwarding chain, the path a decided branch no longer takes, a loop
+///   whose effect was computed - records them as passed through on that edge
+///   ([`Self::pass_through_on`]): their code still ran on it, only none of it
+///   is left. What runs ahead of every way out is passed on all of them
+///   ([`Self::pass_through`]). An edge retargeted keeps what it passes
+///   ([`Self::retarget`]), since that runs on the way out of the block.
+/// - A cleared block stands for nothing: a block nothing reaches is dead code,
+///   and a merged one handed its record over first.
+///
+/// So a host block no SSA block carries or passes through is dead code, and the
+/// first host block a block carries is where control enters it. What the host
+/// does with that - which bytes a lowered block holds - is its own business.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct BlockProvenance {
+    /// The host blocks whose code this block holds, in the order control runs
+    /// through them: the one it was lifted from, then each one a merge
+    /// appended.
+    carried: Vec<u64>,
+    /// The host blocks an edge out of this block runs through with nothing of
+    /// them left to execute: for every edge out (`None`) or for the edge to
+    /// one successor, by block index, ascending by edge with `None` first,
+    /// and each list ascending; none of them is also carried.
+    passed: Vec<(Option<usize>, Vec<u64>)>,
+    /// The host blocks, among those carried or passed, whose code ends in a
+    /// test: more than one way on, a conditional branch or a dispatch, as the
+    /// host states ([`Self::carry_test`]). Ascending.
+    tests: Vec<u64>,
+}
+
+impl BlockProvenance {
+    /// The host blocks whose code the block holds, in the order control runs
+    /// through them: the first is where control enters the block.
+    #[must_use]
+    pub fn carried(&self) -> &[u64] {
+        &self.carried
+    }
+
+    /// The host blocks an edge out of the block runs through with nothing of
+    /// them left to execute, on any edge, ascending.
+    #[must_use]
+    pub fn passed(&self) -> Vec<u64> {
+        let mut all: Vec<u64> = self
+            .passed
+            .iter()
+            .flat_map(|(_, hosts)| hosts.iter().copied())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// The host blocks the edge to the successor `successor` runs through
+    /// with nothing of them left to execute, ascending: those passed on it,
+    /// and those passed on every edge out. A record of an edge to a block
+    /// that is no successor of the block is read by
+    /// [`SsaBlock::passed_on`], which knows the successors.
+    #[must_use]
+    pub fn passed_on(&self, successor: usize) -> Vec<u64> {
+        let mut on: Vec<u64> = self
+            .passed
+            .iter()
+            .filter(|(edge, _)| edge.is_none_or(|edge| edge == successor))
+            .flat_map(|(_, hosts)| hosts.iter().copied())
+            .collect();
+        on.sort_unstable();
+        on.dedup();
+        on
+    }
+
+    /// The edges the record passes host blocks on: `None` for every edge
+    /// out, or the successor of one, ascending with `None` first.
+    pub fn passed_edges(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+        self.passed.iter().map(|(edge, _)| *edge)
+    }
+
+    /// Every host block the block holds or runs through: the host code that
+    /// still executes, or is passed on the way, through this block. A host
+    /// block no block of the function names here is dead code.
+    pub fn hosts(&self) -> impl Iterator<Item = u64> + '_ {
+        self.carried.iter().copied().chain(
+            self.passed
+                .iter()
+                .flat_map(|(_, hosts)| hosts.iter().copied()),
+        )
+    }
+
+    /// Whether the host block `host` ends in a test ([`Self::carry_test`]):
+    /// code an edge passing it runs is a decision the binary makes there.
+    #[must_use]
+    pub fn ends_in_a_test(&self, host: u64) -> bool {
+        self.tests.binary_search(&host).is_ok()
+    }
+
+    /// Records that the block holds the code of the host block `host`, as
+    /// [`Self::carry`] does, and that `host` ends in a test: more than one way
+    /// on.
+    pub fn carry_test(&mut self, host: u64) {
+        self.carry(host);
+        self.mark_tests([host]);
+    }
+
+    /// Takes in the hosts `hosts` mark as ending in a test.
+    fn mark_tests(&mut self, hosts: impl IntoIterator<Item = u64>) {
+        for host in hosts {
+            if let Err(at) = self.tests.binary_search(&host) {
+                self.tests.insert(at, host);
+            }
+        }
+    }
+
+    /// Whether the block stands for no host block at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.carried.is_empty() && self.passed.is_empty()
+    }
+
+    /// Records that the block holds the code of the host block `host`, which
+    /// control reaches after every host block it already holds.
+    pub fn carry(&mut self, host: u64) {
+        if !self.carried.contains(&host) {
+            self.carried.push(host);
+        }
+        for (_, hosts) in &mut self.passed {
+            if let Ok(at) = hosts.binary_search(&host) {
+                hosts.remove(at);
+            }
+        }
+        self.passed.retain(|(_, hosts)| !hosts.is_empty());
+    }
+
+    /// Forgets what each edge out of the block runs through to one successor:
+    /// the block's ways out were replaced, and the code they ran after it,
+    /// on to each block, runs on no way out now. What every edge out runs
+    /// through, ahead of all of them, stays.
+    pub fn forget_exits(&mut self) {
+        self.passed.retain(|(edge, _)| edge.is_none());
+        let kept: Vec<u64> = self.hosts().collect();
+        self.tests.retain(|host| kept.contains(host));
+    }
+
+    /// Takes in what `other`, the block's one successor `successor`, stands
+    /// for, as a block does when it absorbs `other`'s code: control runs
+    /// through `other`'s host blocks after its own. What the edge between
+    /// them passed now runs ahead of every way out, and so does what `other`
+    /// passed on every way out of it; what `other` passed on an edge out of
+    /// it stays on that edge, which is the block's now.
+    pub fn absorb(&mut self, successor: usize, other: &Self) {
+        for &host in &other.carried {
+            self.carry(host);
+        }
+        let merged: Vec<(Option<usize>, Vec<u64>)> = mem::take(&mut self.passed);
+        for (edge, hosts) in merged {
+            let edge = edge.filter(|edge| *edge != successor);
+            for host in hosts {
+                self.pass(edge, host);
+            }
+        }
+        for (edge, hosts) in &other.passed {
+            for &host in hosts {
+                self.pass(*edge, host);
+            }
+        }
+        self.mark_tests(other.tests.iter().copied());
+    }
+
+    /// Records that every edge out of the block now runs past `other`: every
+    /// host block `other` holds or passes through is passed through on each.
+    pub fn pass_through(&mut self, other: &Self) {
+        let hosts: Vec<u64> = other.hosts().collect();
+        for host in hosts {
+            self.pass(None, host);
+        }
+        self.mark_tests(other.tests.iter().copied());
+    }
+
+    /// Records that the edge out of the block to `successor` now runs past
+    /// `other`: every host block `other` holds or passes through is passed
+    /// through on it.
+    pub fn pass_through_on(&mut self, successor: usize, other: &Self) {
+        let hosts: Vec<u64> = other.hosts().collect();
+        for host in hosts {
+            self.pass(Some(successor), host);
+        }
+        self.mark_tests(other.tests.iter().copied());
+    }
+
+    /// Restates every edge the record names through `target`: the block an
+    /// edge to `successor` now leads to, or `None` where it leads nowhere the
+    /// mapping knows, whose hosts are then passed on every edge out. An edge
+    /// redirected keeps what it passes, which runs on the way out of the
+    /// block; two edges made one pass what both did.
+    pub fn retarget(&mut self, target: impl Fn(usize) -> Option<usize>) {
+        let restated: Vec<(Option<usize>, Vec<u64>)> = mem::take(&mut self.passed);
+        for (edge, hosts) in restated {
+            let edge = edge.and_then(&target);
+            for host in hosts {
+                self.pass(edge, host);
+            }
+        }
+    }
+
+    /// Hands what each edge out of the block runs through to `other`, whose
+    /// edges they are now: the block's terminator moved there, to the same
+    /// successors, and its own way out runs through nothing.
+    pub fn hand_passed_to(&mut self, other: &mut Self) {
+        for (edge, hosts) in mem::take(&mut self.passed) {
+            for host in hosts {
+                other.pass(edge, host);
+            }
+        }
+        other.mark_tests(self.tests.iter().copied());
+    }
+
+    /// Forgets every host block.
+    pub fn clear(&mut self) {
+        self.carried.clear();
+        self.passed.clear();
+        self.tests.clear();
+    }
+
+    /// Records `host` as passed through on `edge` (`None`: every edge out),
+    /// unless the block holds it.
+    fn pass(&mut self, edge: Option<usize>, host: u64) {
+        if self.carried.contains(&host) {
+            return;
+        }
+        let at = match self.passed.binary_search_by(|(known, _)| known.cmp(&edge)) {
+            Ok(at) => at,
+            Err(at) => {
+                self.passed.insert(at, (edge, Vec::new()));
+                at
+            }
+        };
+        if let Some((_, hosts)) = self.passed.get_mut(at)
+            && let Err(slot) = hosts.binary_search(&host)
+        {
+            hosts.insert(slot, host);
         }
     }
 }
@@ -102,19 +351,21 @@ impl std::ops::Add for ReplaceResult {
 /// block.add_phi(phi);
 ///
 /// // Add instructions
-/// block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(result) }));
+/// block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(result))));
 /// ```
 #[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
         serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
                      T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize, \
-                     T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize",
+                     T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize, \
+                     T::InstructionFacts: serde::Serialize",
         deserialize = "T::Type: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>, \
                        T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, T::SymbolRef: serde::Deserialize<'de>, \
-                       T::SigRef: serde::Deserialize<'de>, T::OriginalInstruction: serde::Deserialize<'de>"
+                       T::SigRef: serde::Deserialize<'de>, T::OriginalInstruction: serde::Deserialize<'de>, \
+                       T::InstructionFacts: serde::Deserialize<'de>"
     ))
 )]
 pub struct SsaBlock<T: Target> {
@@ -128,6 +379,9 @@ pub struct SsaBlock<T: Target> {
 
     /// SSA instructions in execution order.
     instructions: Vec<SsaInstruction<T>>,
+
+    /// The host blocks this block stands for.
+    provenance: BlockProvenance,
 }
 
 impl<T: Target> Clone for SsaBlock<T> {
@@ -136,11 +390,13 @@ impl<T: Target> Clone for SsaBlock<T> {
             id,
             phi_nodes,
             instructions,
+            provenance,
         } = self;
         Self {
             id: *id,
             phi_nodes: phi_nodes.clone(),
             instructions: instructions.clone(),
+            provenance: provenance.clone(),
         }
     }
 
@@ -154,7 +410,7 @@ impl<T: Target> Clone for SsaBlock<T> {
     /// `phi_nodes` and `instructions` buffers on every call. `Vec::clone_from`
     /// calls `clone_from` element-wise over the overlap, so specializing here is
     /// what lets a `SsaFunction` snapshot's capacity reuse reach *inside* the
-    /// per-block vectors instead of stopping at the `blocks` spine — the
+    /// per-block vectors instead of stopping at the `blocks` spine - the
     /// instruction buffer is the largest per-block allocation the optimization
     /// pipeline's repeated rollback snapshots would otherwise re-make.
     ///
@@ -165,10 +421,12 @@ impl<T: Target> Clone for SsaBlock<T> {
             id,
             phi_nodes,
             instructions,
+            provenance,
         } = source;
         self.id = *id;
         self.phi_nodes.clone_from(phi_nodes);
         self.instructions.clone_from(instructions);
+        self.provenance.clone_from(provenance);
     }
 }
 
@@ -184,6 +442,7 @@ impl<T: Target> SsaBlock<T> {
             id,
             phi_nodes: Vec::new(),
             instructions: Vec::new(),
+            provenance: BlockProvenance::default(),
         }
     }
 
@@ -200,6 +459,7 @@ impl<T: Target> SsaBlock<T> {
             id,
             phi_nodes: Vec::with_capacity(phi_capacity),
             instructions: Vec::with_capacity(instr_capacity),
+            provenance: BlockProvenance::default(),
         }
     }
 
@@ -239,6 +499,17 @@ impl<T: Target> SsaBlock<T> {
         &mut self.instructions
     }
 
+    /// Releases the capacity the phi nodes and instructions grew past their
+    /// length.
+    ///
+    /// Building a block by pushing leaves each vector with up to twice the room
+    /// it holds, and nothing returns it. Cheap to call once a block has stopped
+    /// growing, and a no-op on a block that is already exact.
+    pub fn shrink_to_fit(&mut self) {
+        self.phi_nodes.shrink_to_fit();
+        self.instructions.shrink_to_fit();
+    }
+
     /// Returns the number of phi nodes.
     #[must_use]
     pub fn phi_count(&self) -> usize {
@@ -269,13 +540,48 @@ impl<T: Target> SsaBlock<T> {
         self.phi_nodes.is_empty() && self.instructions.is_empty()
     }
 
-    /// Clears all phi nodes and instructions from this block.
+    /// Clears all phi nodes and instructions from this block, and the host
+    /// blocks it stood for.
     ///
     /// After calling this method, `is_empty()` will return `true`.
-    /// The block ID is preserved.
+    /// The block ID is preserved. A block that hands its code to another hands
+    /// its [`BlockProvenance`] over before it is cleared.
     pub fn clear(&mut self) {
         self.phi_nodes.clear();
         self.instructions.clear();
+        self.provenance.clear();
+    }
+
+    /// The host blocks this block stands for.
+    #[must_use]
+    pub const fn provenance(&self) -> &BlockProvenance {
+        &self.provenance
+    }
+
+    /// The host blocks this block stands for, to record what a transform
+    /// changes.
+    pub fn provenance_mut(&mut self) -> &mut BlockProvenance {
+        &mut self.provenance
+    }
+
+    /// The host blocks the edge to `successor` runs through with nothing of
+    /// them left to execute, ascending ([`BlockProvenance::passed_on`]), with
+    /// those the record passes on an edge to a block that is no successor of
+    /// this one any more: a rewrite that sent an edge elsewhere without saying
+    /// so leaves its passed code to run on every way out, which is where the
+    /// record could last place it.
+    #[must_use]
+    pub fn passed_on(&self, successor: usize) -> Vec<u64> {
+        let successors = self.successors();
+        let mut on = self.provenance.passed_on(successor);
+        for edge in self.provenance.passed_edges().flatten() {
+            if edge != successor && !successors.contains(&edge) {
+                on.extend(self.provenance.passed_on(edge));
+            }
+        }
+        on.sort_unstable();
+        on.dedup();
+        on
     }
 
     /// Adds a phi node to this block.
@@ -335,7 +641,7 @@ impl<T: Target> SsaBlock<T> {
     /// instruction transfers control.
     ///
     /// This is the crate's single definition of "the terminator". A block whose
-    /// last instruction is not a terminator has none — it does not fall back to
+    /// last instruction is not a terminator has none - it does not fall back to
     /// an earlier terminator buried in the block, because control would not
     /// reach it. Such a block is exactly what the verifier reports as
     /// `TerminatorNotLast`, and it therefore contributes no CFG edges rather
@@ -355,7 +661,7 @@ impl<T: Target> SsaBlock<T> {
     #[must_use]
     pub fn successors(&self) -> Vec<usize> {
         self.control_terminator()
-            .map_or_else(Vec::new, super::SsaOp::successors)
+            .map_or_else(Vec::new, SsaOp::successors)
     }
 
     /// Calls `f` for every successor block index of this block, without
@@ -402,8 +708,8 @@ impl<T: Target> SsaBlock<T> {
     /// to the same value. For other terminators (like `Return` or `Throw`),
     /// the terminator is replaced with an unconditional `Jump`.
     ///
-    /// If the block has no [`control_terminator`](Self::control_terminator) — an
-    /// empty block, or one whose last instruction is an ordinary computation —
+    /// If the block has no [`control_terminator`](Self::control_terminator) - an
+    /// empty block, or one whose last instruction is an ordinary computation -
     /// a `Jump` is **appended**. It is not written over the last instruction,
     /// because that would delete a computation the block still needs.
     ///
@@ -453,9 +759,9 @@ impl<T: Target> SsaBlock<T> {
 
     /// Replaces all instruction uses of `old_var` with `new_var` (skips phi operands).
     ///
-    /// This is the safe default for optimization passes. It avoids creating
-    /// cross-origin phi operand references that can break `rebuild_ssa`'s
-    /// assumption that each variable flows to at most one phi origin.
+    /// This is the safe default for optimization passes. It never makes a phi
+    /// read a value of another rename group, which a renaming construction does
+    /// not keep: it fills each phi operand from the phi's own group.
     ///
     /// Instructions whose destination equals `new_var` are skipped to prevent
     /// self-referential instructions (e.g., `v5 = add(v5, v3)`).
@@ -464,6 +770,9 @@ impl<T: Target> SsaBlock<T> {
     ///
     /// * `old_var` - The variable ID whose uses should be replaced
     /// * `new_var` - The replacement variable ID
+    /// * `carried` - The facts of `old_var`'s computation each reader takes
+    ///   in, where it computes in its place
+    ///   ([`SsaFunction::substituted_facts`](crate::ir::function::SsaFunction::substituted_facts)).
     ///
     /// # Returns
     ///
@@ -475,12 +784,17 @@ impl<T: Target> SsaBlock<T> {
     ///
     /// - [`replace_uses_including_phis`](Self::replace_uses_including_phis) for
     ///   internal operations that need phi operand replacement
-    pub fn replace_uses(&mut self, old_var: SsaVarId, new_var: SsaVarId) -> ReplaceResult {
+    pub fn replace_uses(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        carried: &[T::InstructionFacts],
+    ) -> ReplaceResult {
         let mut replaced: usize = 0;
         let mut skipped: usize = 0;
 
         for instr in &mut self.instructions {
-            let op = instr.op_mut();
+            let op = instr.op();
             // Skip if this would create a self-referential instruction
             if op.defs().any(|dest| dest == new_var) {
                 if op.uses_var(old_var) {
@@ -488,7 +802,7 @@ impl<T: Target> SsaBlock<T> {
                 }
                 continue;
             }
-            replaced = replaced.saturating_add(op.replace_uses(old_var, new_var));
+            replaced = replaced.saturating_add(instr.replace_uses(old_var, new_var, carried));
         }
 
         ReplaceResult { replaced, skipped }
@@ -504,19 +818,19 @@ impl<T: Target> SsaBlock<T> {
     ///
     /// * `old_var` - The variable ID to find and replace.
     /// * `new_var` - The variable ID to use as the replacement.
+    /// * `carried` - The facts of `old_var`'s computation each reading
+    ///   instruction takes in ([`Self::replace_uses`]).
     ///
     /// # Returns
     ///
     /// The number of uses that were replaced (in both instructions and PHI operands).
     ///
-    /// # Safety
+    /// # Phi groups
     ///
-    /// This method is `pub(crate)` because it can create cross-origin PHI operand
-    /// references if misused. The issue: `rebuild_ssa` uses a `phi_operand_origins`
-    /// map that can only store ONE origin per variable. If a variable becomes a PHI
-    /// operand for PHIs with different origins (e.g., Local(0) and Local(1)), only
-    /// one origin is stored, causing incorrect def site classification and broken
-    /// PHI placement.
+    /// Misused, it makes a phi read a value of another rename group, which a
+    /// renaming construction does not keep: it fills each phi operand from the
+    /// phi's own group, so the operand is replaced by whatever version of that
+    /// group reaches the edge.
     ///
     /// # When to Use
     ///
@@ -533,20 +847,93 @@ impl<T: Target> SsaBlock<T> {
         &mut self,
         old_var: SsaVarId,
         new_var: SsaVarId,
+        carried: &[T::InstructionFacts],
     ) -> ReplaceResult {
-        let mut result = self.replace_uses(old_var, new_var);
+        let mut result = self.replace_uses(old_var, new_var, carried);
 
         // Replace in phi node operands
         for phi in &mut self.phi_nodes {
             for operand in phi.operands_mut() {
                 if operand.value() == old_var {
-                    *operand = PhiOperand::new(new_var, operand.predecessor());
+                    // The value changes; the edge it arrived on does not.
+                    operand.set_value(new_var);
                     result.replaced = result.replaced.saturating_add(1);
                 }
             }
         }
 
         result
+    }
+
+    /// Restores the block invariant "exactly one terminator, and it is last"
+    /// after a lift that produced a terminator elsewhere in the stream.
+    ///
+    /// Delay-slot ISAs (MIPS, SPARC) place the delay-slot instruction *after* the
+    /// branch in the block stream. A front end lifting in stream order lifts the
+    /// branch terminator first - capturing its pre-delay operand values (a delay
+    /// slot that rewrites a branch operand still leaves the branch reading the old
+    /// value, which is the correct MIPS semantics) - and the delay slot is lifted
+    /// after. That leaves the terminator op not-last, which the SSA verifier rejects
+    /// (`TerminatorNotLast`).
+    ///
+    /// Two shapes must be handled:
+    ///
+    /// - **Branch + delay slot** - a single terminator that is not last, with an
+    ///   ordinary op (the delay slot) after it. The delay slot executes before the
+    ///   transfer, so the branch is hoisted to the end: a pure reorder that keeps
+    ///   the pre-delay values it read.
+    /// - **A second terminator** - a branch whose own delay slot is itself a
+    ///   control-flow instruction (architecturally undefined) lifts two terminators
+    ///   into one block. The block has one real exit, so every terminator but the
+    ///   last is neutralized to a [`SsaOp::Nop`]. Only `Unreachable` - which has no
+    ///   successors and defines no value - is neutralized; a non-last terminator
+    ///   that carries edges would be a block-splitting bug this must not mask.
+    ///
+    /// Instructions are never dropped: an unreachable op left in the block is
+    /// harmless dead code that later DCE removes, whereas dropping it here would
+    /// orphan any SSA value it defined. It only rewrites a block that
+    /// *already* violates the invariant, so it is a no-op for every non-delay ISA.
+    pub fn settle_terminator(&mut self) {
+        let instructions = self.instructions_mut();
+        let terminators: Vec<usize> = instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| instruction.op().is_terminator())
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&first) = terminators.first() else {
+            return;
+        };
+        let last = instructions.len().saturating_sub(1);
+        // Already well-formed: exactly one terminator, and it is last.
+        if terminators == [last] {
+            return;
+        }
+
+        // Delay-slot reorder: one terminator, not last. The instructions after it
+        // are the delay slot(s), which must run first.
+        if terminators.len() == 1 {
+            let branch = instructions.remove(first);
+            instructions.push(branch);
+            return;
+        }
+
+        // Multiple terminators. Keep the final one as the block's exit; make sure it
+        // is actually last (it is, for every observed case, but be defensive), then
+        // neutralize the earlier no-successor terminators in place.
+        let last_is_terminator = instructions
+            .last()
+            .is_some_and(|instruction| instruction.op().is_terminator());
+        if !last_is_terminator {
+            let end_terminator = instructions.remove(*terminators.last().unwrap_or(&first));
+            instructions.push(end_terminator);
+        }
+        let new_last = instructions.len().saturating_sub(1);
+        for instruction in instructions.iter_mut().take(new_last) {
+            if matches!(instruction.op(), SsaOp::Unreachable) {
+                instruction.set_op(SsaOp::Nop);
+            }
+        }
     }
 
     /// Finds a phi node that defines the given variable.
@@ -604,7 +991,7 @@ impl<T: Target> SsaBlock<T> {
     }
 
     /// Returns the target when this block's only instruction is an
-    /// unconditional transfer — either [`SsaOp::Jump`] or [`SsaOp::Leave`].
+    /// unconditional transfer - either [`SsaOp::Jump`] or [`SsaOp::Leave`].
     ///
     /// Unlike [`Self::is_trampoline`] this includes `Leave`, so it answers
     /// "does this block do nothing but transfer control" rather than "may this
@@ -705,7 +1092,7 @@ impl<T: Target> SsaBlock<T> {
 
         // Build map of var_id -> instruction index that defines it (within this block)
         // Only for non-terminator instructions
-        let mut def_index: HashMap<SsaVarId, usize> = HashMap::new();
+        let mut def_index: FxHashMap<SsaVarId, usize> = FxHashMap::default();
         for &idx in &non_terminator_indices {
             let Some(instr) = self.instructions.get(idx) else {
                 continue;
@@ -730,7 +1117,7 @@ impl<T: Target> SsaBlock<T> {
 
         // Build dependency graph for non-terminator instructions only
         // Map from original index to position in non_terminator_indices
-        let idx_to_pos: HashMap<usize, usize> = non_terminator_indices
+        let idx_to_pos: FxHashMap<usize, usize> = non_terminator_indices
             .iter()
             .enumerate()
             .map(|(pos, &idx)| (idx, pos))
@@ -749,7 +1136,7 @@ impl<T: Target> SsaBlock<T> {
         let mut rdeps: Vec<Vec<usize>> = vec![Vec::new(); n];
 
         // Track the previous side-effecting instruction position to preserve ordering.
-        // Side-effecting operations (Call, CallVirt, Stfld, etc.) must execute in their
+        // Side-effecting operations (calls, field stores, etc.) must execute in their
         // original order to preserve program semantics (I/O ordering, memory effects).
         let mut prev_side_effect_pos: Option<usize> = None;
 
@@ -895,6 +1282,156 @@ mod tests {
         block
     }
 
+    /// **A host that ends in a test does wherever its code goes.** The mark
+    /// [`BlockProvenance::carry_test`] makes travels with the host when a
+    /// block absorbs another, an edge passes one, or a block hands its passed
+    /// code on, and a cleared block marks nothing. A host carried plainly is
+    /// no test anywhere.
+    #[test]
+    fn a_host_that_ends_in_a_test_does_wherever_its_code_goes() {
+        let mut test = BlockProvenance::default();
+        test.carry_test(0x40);
+        let mut plain = BlockProvenance::default();
+        plain.carry(0x50);
+
+        let mut absorbing = BlockProvenance::default();
+        absorbing.carry(0x10);
+        absorbing.absorb(1, &test);
+        assert!(absorbing.ends_in_a_test(0x40), "absorbed");
+
+        let mut passing = BlockProvenance::default();
+        passing.pass_through(&test);
+        passing.pass_through_on(2, &plain);
+        assert!(passing.ends_in_a_test(0x40), "passed on every edge");
+        assert!(!passing.ends_in_a_test(0x50), "a plain host");
+
+        let mut edge = BlockProvenance::default();
+        edge.pass_through_on(3, &test);
+        let mut handed = BlockProvenance::default();
+        edge.hand_passed_to(&mut handed);
+        assert!(handed.ends_in_a_test(0x40), "handed on");
+
+        handed.clear();
+        assert!(!handed.ends_in_a_test(0x40), "cleared");
+    }
+
+    /// A host block is held or passed through, never both; what is held keeps
+    /// the order control runs through it, and what is passed stays ascending,
+    /// each free of repeats.
+    #[test]
+    fn provenance_keeps_what_is_held_apart_from_what_is_passed() {
+        let mut through = BlockProvenance::default();
+        through.carry(0x30);
+        through.carry(0x10);
+        through.carry(0x30);
+        assert_eq!(
+            through.carried(),
+            &[0x30, 0x10],
+            "in the order control runs"
+        );
+
+        let mut block = BlockProvenance::default();
+        block.carry(0x20);
+        block.pass_through(&through);
+        assert_eq!(block.carried(), &[0x20]);
+        assert_eq!(block.passed(), &[0x10, 0x30], "what the edge runs past");
+
+        // Absorbing a block that holds a passed-through host block makes it
+        // held: its code is here now.
+        let mut absorbed = BlockProvenance::default();
+        absorbed.carry(0x30);
+        block.absorb(1, &absorbed);
+        assert_eq!(block.carried(), &[0x20, 0x30]);
+        assert_eq!(block.passed(), &[0x10]);
+
+        // And passing through a held host block does not demote it.
+        block.pass_through(&absorbed);
+        assert_eq!(block.carried(), &[0x20, 0x30]);
+        assert_eq!(block.passed(), &[0x10]);
+
+        // A successor merged in runs after, wherever its code lies.
+        let mut below = BlockProvenance::default();
+        below.carry(0x08);
+        block.absorb(2, &below);
+        assert_eq!(block.carried(), &[0x20, 0x30, 0x08]);
+
+        assert_eq!(
+            block.hosts().collect::<Vec<u64>>(),
+            [0x20, 0x30, 0x08, 0x10],
+            "what is held, then what is passed"
+        );
+
+        block.clear();
+        assert!(block.is_empty());
+        assert_eq!(block.hosts().count(), 0);
+    }
+
+    /// **What an edge passes is the edge's.** A block that branches to B1 and
+    /// B2 passes 0x10 on its edge to B1 alone, and 0x20 on every edge out: B1's
+    /// edge runs past both, B2's past 0x20 only. Retargeted, the edge to B1
+    /// keeps 0x10 on its way to B3. Absorbing its one successor B3, the block
+    /// passes what the edge between them did on every way out, and what B3
+    /// passed on its own edge to B4 stays on it. A host the block comes to hold
+    /// is passed on no edge. And a record of an edge to a block that is no
+    /// successor any more passes its hosts on every way out
+    /// ([`SsaBlock::passed_on`]).
+    #[test]
+    fn what_an_edge_passes_is_the_edges() {
+        let host = |hosts: &[u64]| {
+            let mut provenance = BlockProvenance::default();
+            for host in hosts {
+                provenance.carry(*host);
+            }
+            provenance
+        };
+        let mut block = BlockProvenance::default();
+        block.carry(0x01);
+        block.pass_through_on(1, &host(&[0x10]));
+        block.pass_through(&host(&[0x20]));
+        assert_eq!(block.passed_on(1), [0x10, 0x20]);
+        assert_eq!(block.passed_on(2), [0x20]);
+        assert_eq!(block.passed(), [0x10, 0x20]);
+
+        block.retarget(|edge| Some(if edge == 1 { 3 } else { edge }));
+        assert_eq!(block.passed_on(1), [0x20]);
+        assert_eq!(block.passed_on(3), [0x10, 0x20]);
+
+        let mut successor = host(&[0x30]);
+        successor.pass_through_on(4, &host(&[0x40]));
+        block.absorb(3, &successor);
+        assert_eq!(block.carried(), &[0x01, 0x30]);
+        assert_eq!(block.passed_on(5), [0x10, 0x20], "ahead of every way out");
+        assert_eq!(block.passed_on(4), [0x10, 0x20, 0x40]);
+
+        block.carry(0x40);
+        assert_eq!(block.passed_on(4), [0x10, 0x20], "held, so passed on none");
+
+        // A block whose branch to B6 left the record of its edge to B7.
+        let mut branching = block_ending_in_a_computation();
+        branching.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 6 }));
+        branching
+            .provenance_mut()
+            .pass_through_on(7, &host(&[0x70]));
+        assert_eq!(branching.passed_on(6), [0x70]);
+    }
+
+    /// A block's record travels with its clones, and a cleared block stands
+    /// for nothing.
+    #[test]
+    fn provenance_is_cloned_with_the_block_and_cleared_with_it() {
+        let mut block = block_ending_in_a_computation();
+        block.provenance_mut().carry(0x40);
+        assert_eq!(block.clone().provenance().carried(), &[0x40]);
+        let mut snapshot: SsaBlock<MockTarget> = SsaBlock::new(3);
+        snapshot.clone_from(&block);
+        assert_eq!(snapshot.provenance().carried(), &[0x40]);
+        block.clear();
+        assert!(block.provenance().is_empty());
+        assert!(SsaBlock::<MockTarget>::new(1).provenance().is_empty());
+    }
+
+    /// A block whose last instruction is an ordinary computation has a last op
+    /// but no control terminator, and therefore no successors.
     #[test]
     fn a_computation_is_not_a_control_terminator() {
         let block = block_ending_in_a_computation();
@@ -906,6 +1443,8 @@ mod tests {
         assert!(block.successors().is_empty());
     }
 
+    /// `set_target` on a block with no control terminator appends a `Jump`
+    /// rather than overwriting the trailing computation.
     #[test]
     fn set_target_on_a_block_without_a_control_terminator_appends_rather_than_replaces() {
         let mut block = block_ending_in_a_computation();
@@ -927,6 +1466,8 @@ mod tests {
         ));
     }
 
+    /// `set_target` on a block that already ends in a terminator retargets it
+    /// in place without adding an instruction.
     #[test]
     fn set_target_still_rewrites_a_real_terminator_in_place() {
         let mut block = SsaBlock::<MockTarget>::new(0);
@@ -940,10 +1481,70 @@ mod tests {
         ));
     }
 
+    /// `redirect_target` reports `false` and changes nothing when the block has
+    /// no control terminator.
     #[test]
     fn redirect_target_answers_false_without_a_control_terminator() {
         let mut block = block_ending_in_a_computation();
         assert!(!block.redirect_target(1, 2));
         assert_eq!(block.instructions().len(), 1, "and changes nothing");
+    }
+
+    /// Builds a block from a sequence of ops.
+    fn block_of(ops: Vec<SsaOp<MockTarget>>) -> SsaBlock<MockTarget> {
+        let mut block = SsaBlock::new(0);
+        for op in ops {
+            block.add_instruction(SsaInstruction::synthetic(op));
+        }
+        block
+    }
+
+    /// The ops of a block by variant name, in order.
+    fn op_names(block: &SsaBlock<MockTarget>) -> Vec<String> {
+        block
+            .instructions()
+            .iter()
+            .map(|instruction| format!("{:?}", instruction.op()))
+            .map(|text| text.split_whitespace().next().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    /// A block whose sole terminator is already last is left unchanged.
+    #[test]
+    fn settle_terminator_leaves_a_well_formed_block() {
+        let mut block = block_of(vec![SsaOp::Nop, SsaOp::Nop, SsaOp::returns(None)]);
+        block.settle_terminator();
+        assert_eq!(op_names(&block), ["Nop", "Nop", "Return"]);
+    }
+
+    /// A single terminator followed by its delay slot is moved to the end so
+    /// the slot runs first.
+    #[test]
+    fn settle_terminator_hoists_a_terminator_past_its_delay_slot() {
+        let mut block = block_of(vec![SsaOp::Nop, SsaOp::returns(None), SsaOp::Nop]);
+        block.settle_terminator();
+        assert_eq!(op_names(&block), ["Nop", "Nop", "Return"]);
+    }
+
+    /// Two no-successor terminators collapse to one: the earlier `Unreachable`
+    /// becomes a `Nop` and no instruction is dropped.
+    #[test]
+    fn settle_terminator_neutralizes_a_redundant_unreachable() {
+        let mut block = block_of(vec![
+            SsaOp::Nop,
+            SsaOp::Unreachable,
+            SsaOp::Unreachable,
+            SsaOp::Unreachable,
+        ]);
+        block.settle_terminator();
+        assert_eq!(op_names(&block), ["Nop", "Nop", "Nop", "Unreachable"]);
+    }
+
+    /// A block with no terminator at all is left unchanged.
+    #[test]
+    fn settle_terminator_leaves_a_block_without_one() {
+        let mut block = block_of(vec![SsaOp::Nop, SsaOp::Nop]);
+        block.settle_terminator();
+        assert_eq!(op_names(&block), ["Nop", "Nop"]);
     }
 }

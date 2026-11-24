@@ -1,4 +1,4 @@
-//! Operand and definition access for [`SsaOp`] — reading, iterating, and
+//! Operand and definition access for [`SsaOp`] - reading, iterating, and
 //! substituting the SSA variables an operation mentions.
 //!
 //! [`SsaOp::visit_operands`] and [`SsaOp::visit_operands_mut`] are the two
@@ -17,9 +17,18 @@
 //! walks themselves delegate to one shared operand policy, so their arms carry
 //! no per-variant statement of that policy either.
 
+use std::convert::Infallible;
+
 use crate::{
     ir::{
-        ops::{def::SsaOp, kinds::OperandRole, operands::KindedOperands},
+        float::{FloatExceptionLayout, FloatExceptions},
+        ops::{
+            calls::{CallData, CallInput, Callee},
+            def::SsaOp,
+            kinds::{CompareBlkData, OperandRole},
+            operands::KindedOperands,
+            vector::VectorShuffleSelector,
+        },
         variable::SsaVarId,
     },
     target::Target,
@@ -30,15 +39,13 @@ use crate::{
 ///
 /// Owns its contents. [`SsaOp::defs`] collects the `Def` and `FlagsDef`
 /// operands of one walk over the operation, so this iterator cannot disagree
-/// with that walk — or with [`SsaOp::dest`], [`SsaOp::flags_dest`] and
-/// [`SsaOp::replace_def`], which read the same walk — about what the
+/// with that walk - or with [`SsaOp::dest`], [`SsaOp::flags_dest`] and
+/// [`SsaOp::replace_def`], which read the same walk - about what the
 /// definitions are, and it does not borrow the operation it came from.
 ///
-/// Two definitions live in named slots and any further ones spill to a `Vec`.
-/// No operation in the crate defines more than two variables, so the spill
-/// stays empty — and therefore unallocated — on every `defs()` call the crate
-/// itself makes; a host-built operation with a longer output list allocates
-/// once.
+/// Two definitions live in fixed slots, so single- and double-result operations
+/// allocate nothing. Additional outputs spill to a `Vec`, appended in payload
+/// order and reversed once so construction is linear in the number of outputs.
 ///
 /// The shape is chosen for the hot path, because `defs()` runs per instruction
 /// in def-use index construction, liveness and the verifier. Two fixed slots
@@ -52,9 +59,8 @@ pub struct SsaDefs {
     first: Option<SsaVarId>,
     /// The second definition.
     second: Option<SsaVarId>,
-    /// Definitions past the second, in reverse so that iteration pops. Empty
-    /// for every operation the crate defines, and an empty `Vec` does not
-    /// allocate.
+    /// Definitions past the second, reversed after collection so iteration
+    /// pops in payload order. Empty for single- and double-result operations.
     rest: Vec<SsaVarId>,
 }
 
@@ -73,15 +79,12 @@ impl SsaDefs {
 
     /// Appends a definition past the second.
     ///
-    /// Kept out of line: no operation in the crate reaches it, and an
-    /// allocation inlined into the hot path is paid for by every caller that
-    /// never spills.
+    /// Kept out of line so spill allocation is absent from the common path
+    /// for one or two definitions.
     #[cold]
     #[inline(never)]
     fn push_rest(&mut self, var: SsaVarId) {
-        // Reversed on the way in so that iteration is a `pop`, which needs no
-        // cursor of its own.
-        self.rest.insert(0, var);
+        self.rest.push(var);
     }
 
     /// Returns how many definitions the iterator has yet to yield.
@@ -114,17 +117,88 @@ impl Iterator for SsaDefs {
 
 impl ExactSizeIterator for SsaDefs {}
 
+/// Where an operation's governing mask and passthrough are among its uses
+/// ([`SsaOp::uses`]), for one whose mask governs the lanes it writes or
+/// accesses ([`SsaOp::governing_uses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GoverningUses {
+    /// The position of the mask.
+    pub mask: usize,
+    /// The position of the value the lanes the mask leaves inactive keep,
+    /// where the operation merges rather than zeroes them.
+    pub passthrough: Option<usize>,
+}
+
 impl<T: Target> SsaOp<T> {
     /// Returns the destination variable if this operation produces one.
     #[must_use]
     pub fn dest(&self) -> Option<SsaVarId> {
-        let mut dest = None;
-        self.visit_operands(|role, var| {
-            if dest.is_none() && matches!(role, OperandRole::Def) {
-                dest = Some(var);
-            }
-        });
-        dest
+        self.try_visit_operands(|role, var| match role {
+            OperandRole::Def => Err(Some(var)),
+            OperandRole::Use => Err(None),
+            OperandRole::FlagsDef => Ok(()),
+        })
+        .err()
+        .flatten()
+    }
+
+    /// The operand whose width this operation computes in, for an operation
+    /// whose result has the width of its operands.
+    ///
+    /// **An operation's width is the operation's, not its destination
+    /// variable's recovered type.** `Mul { dest, left, right }` is documented as
+    /// `dest = left * right` - one width throughout, `WideMul` being the
+    /// separate op for a widening product - so when type recovery leaves `dest`
+    /// `Unknown`, the operands still say what width the machine multiplied in.
+    ///
+    /// Reading the width from `dest` alone made "the destination has no
+    /// recovered type" indistinguishable from "this value could be anything":
+    /// `passes::ranges` clamps an arithmetic result to its width, and an unknown
+    /// width answers `Top`, discarding a bound the operands had proved: `[0,
+    /// 32767]` squared is `[0, 1073676289]`, and an untyped destination would
+    /// turn it into nothing.
+    ///
+    /// The operands only settle it when they agree. CIL computes `int32 +
+    /// native int` as a native int, so an operand pair of different widths -
+    /// or one whose width `width_of` cannot tell - names no single width, and
+    /// this answers `None` rather than guess the narrower.
+    ///
+    /// `None` for anything that is not same-width: loads and stores, calls,
+    /// conversions - whose whole purpose is to change width, and which carry
+    /// their target type anyway - comparisons, and the terminators.
+    ///
+    /// The shift and rotate operations answer with the value shifted, never the
+    /// shift amount: `dest` and `value` share a width, and `amount` need not.
+    /// A rotate is same-width by construction - it is the width that decides
+    /// which bits wrap - so `Rol` and `Ror` answer here exactly as `Shl` and
+    /// `Shr` do.
+    ///
+    /// # Arguments
+    ///
+    /// * `width_of` - The width of an operand's type in bits, when known.
+    #[must_use]
+    pub fn width_operand(&self, width_of: impl Fn(SsaVarId) -> Option<u32>) -> Option<SsaVarId> {
+        let (first, second) = match self {
+            Self::Add { left, right, .. }
+            | Self::Sub { left, right, .. }
+            | Self::Mul { left, right, .. }
+            | Self::Div { left, right, .. }
+            | Self::Rem { left, right, .. }
+            | Self::And { left, right, .. }
+            | Self::Or { left, right, .. }
+            | Self::Xor { left, right, .. } => (*left, Some(*right)),
+            Self::Neg { operand, .. } | Self::Not { operand, .. } => (*operand, None),
+            Self::Shl { value, .. }
+            | Self::Shr { value, .. }
+            | Self::Rol { value, .. }
+            | Self::Ror { value, .. } => (*value, None),
+            _ => return None,
+        };
+        let width = width_of(first)?;
+        match second {
+            Some(other) if width_of(other) != Some(width) => None,
+            _ => Some(first),
+        }
     }
 
     /// Returns all variables defined by this operation, in the order
@@ -142,21 +216,34 @@ impl<T: Target> SsaOp<T> {
     #[inline]
     pub fn defs(&self) -> SsaDefs {
         let mut defs = SsaDefs::default();
-        self.visit_operands(|role, var| {
-            if matches!(role, OperandRole::Def | OperandRole::FlagsDef) {
-                defs.push(var);
-            }
-        });
+        match self.try_for_each_def(|var| {
+            defs.push(var);
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(()) => (),
+            Err(error) => match error {},
+        }
+        // Store the spill in reverse once, preserving payload order on pop.
+        defs.rest.reverse();
         defs
     }
 
     /// Replaces a definition variable without touching operand uses.
     ///
-    /// Replaces every definition equal to `old_var` — the primary
-    /// destination, secondary outputs (high halves, status/fault outputs,
-    /// native output lists), and flag outputs. Returns `true` when at least
-    /// one definition was changed. This is used by SSA renaming, where
-    /// definitions and uses have different scoping rules.
+    /// Rewrites every definition equal to `old_var` - the primary destination,
+    /// secondary outputs (high halves, status/fault outputs, native output
+    /// lists), and flag outputs - and leaves `Use` operands untouched. This is
+    /// used by SSA renaming, where definitions and uses have different scoping
+    /// rules and are renamed in separate walks.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The definition variable to rewrite.
+    /// * `new_var` - The variable to define in its place.
+    ///
+    /// # Returns
+    ///
+    /// `true` if at least one definition was changed.
     pub fn replace_def(&mut self, old_var: SsaVarId, new_var: SsaVarId) -> bool {
         let mut changed = false;
         self.visit_operands_mut(|role, var| {
@@ -168,38 +255,315 @@ impl<T: Target> SsaOp<T> {
         changed
     }
 
-    /// Returns the flags destination if this operation defines flags.
-    pub fn flags_dest(&self) -> Option<SsaVarId> {
-        let mut flags = None;
-        self.visit_operands(|role, var| {
-            if flags.is_none() && matches!(role, OperandRole::FlagsDef) {
-                flags = Some(var);
+    /// A return of `value` that leaves its caller no processor state of its
+    /// own ([`Self::Return`]).
+    #[must_use]
+    pub fn returns(value: Option<SsaVarId>) -> Self {
+        Self::Return {
+            value,
+            state: Box::default(),
+            results: Box::default(),
+            transfer: None,
+        }
+    }
+
+    /// A return of `value` that leaves its caller the processor state
+    /// `state`: the sticky status flags the function accrued, which a caller
+    /// reads after the call ([`Self::Return`]).
+    #[must_use]
+    pub fn returns_with(value: Option<SsaVarId>, state: Vec<SsaVarId>) -> Self {
+        Self::Return {
+            value,
+            state: state.into_boxed_slice(),
+            results: Box::default(),
+            transfer: None,
+        }
+    }
+
+    /// A return of `value` that hands its caller `results` beside it, each
+    /// under the key a call receives it by ([`CallData::results`]).
+    #[must_use]
+    pub fn returns_results(value: Option<SsaVarId>, results: Vec<CallInput>) -> Self {
+        Self::Return {
+            value,
+            state: Box::default(),
+            results: results.into_boxed_slice(),
+            transfer: None,
+        }
+    }
+
+    /// The raise ([`Self::FloatRaise`]) of the flags of `raises` that
+    /// computing `op` sets, at the bits `layout` keeps them at, into `dest`,
+    /// over the lanes `lanes` names (every lane for `None`).
+    ///
+    /// `op`'s definitions become `dest`: the raise reads what `op` reads and
+    /// defines nothing but its flags.
+    #[must_use]
+    pub fn float_raise(
+        dest: SsaVarId,
+        mut op: Self,
+        lanes: Option<SsaVarId>,
+        raises: FloatExceptions,
+        layout: FloatExceptionLayout,
+    ) -> Self {
+        op.visit_operands_mut(|role, var| {
+            if matches!(role, OperandRole::Def | OperandRole::FlagsDef) {
+                *var = dest;
             }
         });
-        flags
+        Self::FloatRaise {
+            dest,
+            op: Box::new(op),
+            lanes,
+            raises,
+            layout,
+        }
+    }
+
+    /// Returns the flags destination if this operation defines flags.
+    pub fn flags_dest(&self) -> Option<SsaVarId> {
+        self.try_visit_operands(|role, var| match role {
+            OperandRole::FlagsDef => Err(Some(var)),
+            OperandRole::Use => Err(None),
+            OperandRole::Def => Ok(()),
+        })
+        .err()
+        .flatten()
+    }
+
+    /// This operation with its two operands exchanged, where exchanging them
+    /// computes the same value: an `Add`, `Mul`, `And`, `Or` or `Xor` that
+    /// sets no flags. `None` for any other operation.
+    ///
+    /// A comparison of two computations reads both ways: `v + c` and `c + v`
+    /// are one sum.
+    #[must_use]
+    pub fn commuted(&self) -> Option<Self> {
+        Some(match self {
+            Self::Add {
+                dest,
+                left,
+                right,
+                flags: None,
+            } => Self::Add {
+                dest: *dest,
+                left: *right,
+                right: *left,
+                flags: None,
+            },
+            Self::Mul {
+                dest,
+                left,
+                right,
+                flags: None,
+            } => Self::Mul {
+                dest: *dest,
+                left: *right,
+                right: *left,
+                flags: None,
+            },
+            Self::And {
+                dest,
+                left,
+                right,
+                flags: None,
+            } => Self::And {
+                dest: *dest,
+                left: *right,
+                right: *left,
+                flags: None,
+            },
+            Self::Or {
+                dest,
+                left,
+                right,
+                flags: None,
+            } => Self::Or {
+                dest: *dest,
+                left: *right,
+                right: *left,
+                flags: None,
+            },
+            Self::Xor {
+                dest,
+                left,
+                right,
+                flags: None,
+            } => Self::Xor {
+                dest: *dest,
+                left: *right,
+                right: *left,
+                flags: None,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Whether `other` is this operation over other operands: every field
+    /// alike but the operands, which pair up in order with roles alike, each
+    /// pair accepted by `agrees` (a definition of this operation with
+    /// `other`'s, a use with its use).
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The operation compared with this one.
+    /// * `agrees` - Whether this operation's operand, of the role given,
+    ///   stands for `other`'s in its place.
+    #[must_use]
+    pub fn same_under(
+        &self,
+        other: &Self,
+        mut agrees: impl FnMut(OperandRole, SsaVarId, SsaVarId) -> bool,
+    ) -> bool
+    where
+        T::Type: PartialEq,
+    {
+        let (mut mine, mut theirs) = (Vec::new(), Vec::new());
+        self.visit_operands(|role, var| mine.push((role, var)));
+        other.visit_operands(|role, var| theirs.push((role, var)));
+        if mine.len() != theirs.len()
+            || mine
+                .iter()
+                .zip(&theirs)
+                .any(|((role, own), (other_role, their))| {
+                    role != other_role || !agrees(*role, *own, *their)
+                })
+        {
+            return false;
+        }
+        let mut aligned = self.clone();
+        let mut operands = theirs.iter().map(|(_, var)| *var);
+        aligned.visit_operands_mut(|_, var| {
+            if let Some(their) = operands.next() {
+                *var = their;
+            }
+        });
+        aligned == *other
     }
 
     /// Visits every SSA variable operand together with its [`OperandRole`].
     ///
     /// Operands are visited in payload order: definitions first (the primary
     /// destination, then secondary and flag outputs), then uses in payload
-    /// order. This is the single source of truth for operand traversal —
+    /// order. This is the single source of truth for operand traversal -
     /// [`Self::dest`], [`Self::flags_dest`], [`Self::for_each_use`],
     /// [`Self::replace_uses`], and [`Self::replace_def`] are expressed over
     /// it.
-    #[allow(clippy::match_same_arms)] // Kept separate for clarity by operation category
     pub fn visit_operands<F>(&self, mut f: F)
     where
         F: FnMut(OperandRole, SsaVarId),
     {
+        match self.try_visit_operands(|role, var| {
+            f(role, var);
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(()) => (),
+            Err(error) => match error {},
+        }
+    }
+
+    /// Visits the uses of a nested raise with constant stack depth and
+    /// inner-to-outer mask order.
+    ///
+    /// The leaf's uses precede every lane mask, and a callback error stops
+    /// before the remaining operands. Only the outer definition is visible, and
+    /// the caller visits it.
+    fn try_visit_raised_uses<E>(
+        &self,
+        visit: &mut dyn FnMut(OperandRole, SsaVarId) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut first = None;
+        let mut masks = Vec::new();
+        let mut operation = self;
+        while let Self::FloatRaise { op, lanes, .. } = operation {
+            if let Some(lanes) = lanes {
+                if first.is_none() {
+                    first = Some(*lanes);
+                } else {
+                    masks.push(*lanes);
+                }
+            }
+            operation = op;
+        }
+        operation.try_for_each_use(|var| visit(OperandRole::Use, var))?;
+        for mask in masks.into_iter().rev().chain(first) {
+            visit(OperandRole::Use, mask)?;
+        }
+        Ok(())
+    }
+
+    /// Visits operands in payload order, stopping at the first callback error.
+    ///
+    /// Definitions precede uses, with the same roles, duplicates and order as
+    /// [`Self::visit_operands`]. No operand is visited after an error, including
+    /// operands in variable-length native payloads. Ordinary operands allocate
+    /// nothing; nested raises retain scratch proportional to their lane masks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error returned by `f`, without inspecting later operands.
+    #[inline]
+    pub fn try_visit_operands<E, F>(&self, f: F) -> Result<(), E>
+    where
+        F: FnMut(OperandRole, SsaVarId) -> Result<(), E>,
+    {
+        self.try_visit_operands_mode::<false, _, _>(f)
+    }
+
+    /// Applies the shared operand policy with a compile-time definition-only view.
+    ///
+    /// The raise arm can stop after its definition without adding a separate
+    /// variant check to every ordinary operation's definition query.
+    #[allow(clippy::match_same_arms)] // Kept separate for clarity by operation category
+    fn try_visit_operands_mode<const DEFINITIONS_ONLY: bool, E, F>(&self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(OperandRole, SsaVarId) -> Result<(), E>,
+    {
         match self {
+            Self::FloatRaise { dest, .. } => {
+                f(OperandRole::Def, *dest)?;
+                if !DEFINITIONS_ONLY {
+                    self.try_visit_raised_uses(&mut f)?;
+                }
+            }
+            Self::VectorSlice {
+                dest,
+                vector,
+                offset,
+                length,
+                ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *vector)?;
+                f(OperandRole::Use, *offset)?;
+                f(OperandRole::Use, *length)?;
+            }
+            Self::VectorInsertSlice {
+                dest,
+                vector,
+                offset,
+                value,
+                ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *vector)?;
+                f(OperandRole::Use, *offset)?;
+                f(OperandRole::Use, *value)?;
+            }
+            Self::VectorConcat {
+                dest, left, right, ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
+            }
             Self::PtrAdd {
                 dest, base, index, ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *base);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *base)?;
                 if let Some(index) = index {
-                    f(OperandRole::Use, *index);
+                    f(OperandRole::Use, *index)?;
                 }
             }
             Self::Const { dest, .. }
@@ -207,22 +571,33 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadStaticFieldAddr { dest, .. }
             | Self::SizeOf { dest, .. }
             | Self::LoadToken { dest, .. }
+            | Self::ArgList { dest }
             | Self::LoadFunctionPtr { dest, .. }
             | Self::LoadArg { dest, .. }
             | Self::LoadLocal { dest, .. }
             | Self::LoadArgAddr { dest, .. }
-            | Self::LoadLocalAddr { dest, .. } => f(OperandRole::Def, *dest),
+            | Self::LoadLocalAddr { dest, .. }
+            | Self::RuntimeValue { dest, .. } => f(OperandRole::Def, *dest)?,
 
-            Self::ComputeFlags { dest, inputs } => {
-                f(OperandRole::Def, *dest);
-                for input in inputs {
-                    f(OperandRole::Use, *input);
-                }
+            Self::MergeFlags {
+                dest, base, update, ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *base)?;
+                f(OperandRole::Use, *update)?;
             }
 
-            Self::CallClobber { outputs } => {
+            Self::InsertFlag {
+                dest, base, bit, ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *base)?;
+                f(OperandRole::Use, *bit)?;
+            }
+
+            Self::CallClobber { outputs, .. } => {
                 for output in outputs {
-                    f(OperandRole::Def, *output);
+                    f(OperandRole::Def, *output)?;
                 }
             }
 
@@ -303,12 +678,12 @@ impl<T: Target> SsaOp<T> {
                 flags,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 if let Some(flags_v) = flags {
-                    f(OperandRole::FlagsDef, *flags_v);
+                    f(OperandRole::FlagsDef, *flags_v)?;
                 }
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
             }
 
             Self::Neg {
@@ -323,11 +698,11 @@ impl<T: Target> SsaOp<T> {
                 flags,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 if let Some(flags_v) = flags {
-                    f(OperandRole::FlagsDef, *flags_v);
+                    f(OperandRole::FlagsDef, *flags_v)?;
                 }
-                f(OperandRole::Use, *operand);
+                f(OperandRole::Use, *operand)?;
             }
 
             Self::Shl {
@@ -344,12 +719,12 @@ impl<T: Target> SsaOp<T> {
                 flags,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 if let Some(flags_v) = flags {
-                    f(OperandRole::FlagsDef, *flags_v);
+                    f(OperandRole::FlagsDef, *flags_v)?;
                 }
-                f(OperandRole::Use, *value);
-                f(OperandRole::Use, *amount);
+                f(OperandRole::Use, *value)?;
+                f(OperandRole::Use, *amount)?;
             }
 
             Self::Rol {
@@ -363,22 +738,10 @@ impl<T: Target> SsaOp<T> {
                 value,
                 amount,
                 ..
-            }
-            | Self::Rcl {
-                dest,
-                value,
-                amount,
-                ..
-            }
-            | Self::Rcr {
-                dest,
-                value,
-                amount,
-                ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *value);
-                f(OperandRole::Use, *amount);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *value)?;
+                f(OperandRole::Use, *amount)?;
             }
 
             Self::WideMul {
@@ -388,10 +751,10 @@ impl<T: Target> SsaOp<T> {
                 right,
                 ..
             } => {
-                f(OperandRole::Def, *low);
-                f(OperandRole::Def, *high);
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
+                f(OperandRole::Def, *low)?;
+                f(OperandRole::Def, *high)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
             }
 
             Self::WideDiv {
@@ -402,11 +765,11 @@ impl<T: Target> SsaOp<T> {
                 divisor,
                 ..
             } => {
-                f(OperandRole::Def, *quotient);
-                f(OperandRole::Def, *remainder);
-                f(OperandRole::Use, *high);
-                f(OperandRole::Use, *low);
-                f(OperandRole::Use, *divisor);
+                f(OperandRole::Def, *quotient)?;
+                f(OperandRole::Def, *remainder)?;
+                f(OperandRole::Use, *high)?;
+                f(OperandRole::Use, *low)?;
+                f(OperandRole::Use, *divisor)?;
             }
 
             Self::Ceq {
@@ -432,26 +795,23 @@ impl<T: Target> SsaOp<T> {
             }
             | Self::VectorCompare {
                 dest, left, right, ..
-            }
-            | Self::VectorMaskBinary {
-                dest, left, right, ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
             }
 
             Self::FloatCompareFlags {
                 flags, left, right, ..
             } => {
-                f(OperandRole::FlagsDef, *flags);
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
+                f(OperandRole::FlagsDef, *flags)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
             }
 
             Self::BranchCmp { left, right, .. } => {
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
             }
 
             Self::BoolNot { dest, value, .. }
@@ -537,6 +897,9 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadIndirect {
                 dest, addr: value, ..
             }
+            | Self::ArgNext {
+                dest, list: value, ..
+            }
             | Self::AtomicLoad {
                 dest, addr: value, ..
             }
@@ -555,10 +918,6 @@ impl<T: Target> SsaOp<T> {
                 vector: value,
                 ..
             }
-            | Self::VectorMaskUnary {
-                dest, mask: value, ..
-            }
-            | Self::VectorReduce { dest, value, .. }
             | Self::VectorBitmask { dest, value, .. }
             | Self::NewArr {
                 dest,
@@ -599,11 +958,25 @@ impl<T: Target> SsaOp<T> {
                 src_addr: value,
                 ..
             }
+            | Self::MakeTypedRef {
+                dest,
+                address: value,
+                ..
+            }
+            | Self::TypedRefValue {
+                dest,
+                typed_ref: value,
+                ..
+            }
+            | Self::TypedRefType {
+                dest,
+                typed_ref: value,
+            }
             | Self::ReadFlags {
                 dest, flags: value, ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *value);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *value)?;
             }
 
             Self::Branch {
@@ -617,8 +990,14 @@ impl<T: Target> SsaOp<T> {
             | Self::InitObj {
                 dest_addr: value, ..
             }
-            | Self::IndirectBranch { target: value, .. }
-            | Self::BranchFlags { flags: value, .. } => f(OperandRole::Use, *value),
+            | Self::BranchFlags { flags: value, .. } => f(OperandRole::Use, *value)?,
+
+            Self::IndirectBranch { target, state, .. } => {
+                f(OperandRole::Use, *target)?;
+                for input in state.iter() {
+                    f(OperandRole::Use, input.value)?;
+                }
+            }
 
             Self::LoadElement {
                 dest,
@@ -630,12 +1009,6 @@ impl<T: Target> SsaOp<T> {
                 dest,
                 array: a,
                 index: b,
-                ..
-            }
-            | Self::AtomicRmw {
-                dest,
-                addr: a,
-                value: b,
                 ..
             }
             | Self::AtomicExchange {
@@ -662,9 +1035,9 @@ impl<T: Target> SsaOp<T> {
                 value: b,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *a);
-                f(OperandRole::Use, *b);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
             }
 
             Self::StoreField {
@@ -691,8 +1064,8 @@ impl<T: Target> SsaOp<T> {
                 value: b,
                 ..
             } => {
-                f(OperandRole::Use, *a);
-                f(OperandRole::Use, *b);
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
             }
 
             Self::Select {
@@ -700,13 +1073,6 @@ impl<T: Target> SsaOp<T> {
                 condition: a,
                 true_val: b,
                 false_val: c,
-                ..
-            }
-            | Self::CmpXchg {
-                dest,
-                addr: a,
-                expected: b,
-                desired: c,
                 ..
             }
             | Self::VectorTernary {
@@ -723,10 +1089,10 @@ impl<T: Target> SsaOp<T> {
                 second_value: c,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *a);
-                f(OperandRole::Use, *b);
-                f(OperandRole::Use, *c);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
+                f(OperandRole::Use, *c)?;
             }
 
             Self::StoreElement {
@@ -747,21 +1113,47 @@ impl<T: Target> SsaOp<T> {
                 mask: c,
                 ..
             }
-            | Self::InitBlk {
+            | Self::MoveBlk {
+                dest_addr: a,
+                src_addr: b,
+                size: c,
+                ..
+            } => {
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
+                f(OperandRole::Use, *c)?;
+            }
+
+            // A block operation that walks as a direction flag says reads the
+            // flag last.
+            Self::InitBlk {
                 dest_addr: a,
                 value: b,
                 size: c,
+                backward,
                 ..
             }
             | Self::CopyBlk {
                 dest_addr: a,
                 src_addr: b,
                 size: c,
+                backward,
                 ..
             } => {
-                f(OperandRole::Use, *a);
-                f(OperandRole::Use, *b);
-                f(OperandRole::Use, *c);
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
+                f(OperandRole::Use, *c)?;
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, *flag)?;
+                }
+            }
+
+            Self::ArgStep {
+                dest, next, list, ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Def, *next)?;
+                f(OperandRole::Use, *list)?;
             }
 
             Self::VectorScatter {
@@ -771,10 +1163,10 @@ impl<T: Target> SsaOp<T> {
                 mask: d,
                 ..
             } => {
-                f(OperandRole::Use, *a);
-                f(OperandRole::Use, *b);
-                f(OperandRole::Use, *c);
-                f(OperandRole::Use, *d);
+                f(OperandRole::Use, *a)?;
+                f(OperandRole::Use, *b)?;
+                f(OperandRole::Use, *c)?;
+                f(OperandRole::Use, *d)?;
             }
 
             Self::AtomicCmpXchg {
@@ -785,13 +1177,13 @@ impl<T: Target> SsaOp<T> {
                 desired,
                 ..
             } => {
-                f(OperandRole::Def, *old);
+                f(OperandRole::Def, *old)?;
                 if let Some(success_v) = success {
-                    f(OperandRole::Def, *success_v);
+                    f(OperandRole::Def, *success_v)?;
                 }
-                f(OperandRole::Use, *addr);
-                f(OperandRole::Use, *expected);
-                f(OperandRole::Use, *desired);
+                f(OperandRole::Use, *addr)?;
+                f(OperandRole::Use, *expected)?;
+                f(OperandRole::Use, *desired)?;
             }
 
             Self::AtomicPairLoad {
@@ -800,9 +1192,60 @@ impl<T: Target> SsaOp<T> {
                 addr,
                 ..
             } => {
-                f(OperandRole::Def, *first);
-                f(OperandRole::Def, *second);
-                f(OperandRole::Use, *addr);
+                f(OperandRole::Def, *first)?;
+                f(OperandRole::Def, *second)?;
+                f(OperandRole::Use, *addr)?;
+            }
+
+            Self::AtomicCondRmw {
+                old,
+                addr,
+                compare,
+                value,
+                ..
+            } => {
+                f(OperandRole::Def, *old)?;
+                f(OperandRole::Use, *addr)?;
+                f(OperandRole::Use, *compare)?;
+                f(OperandRole::Use, *value)?;
+            }
+
+            Self::AtomicPairRmw {
+                old_first,
+                old_second,
+                addr,
+                value_first,
+                value_second,
+                ..
+            } => {
+                f(OperandRole::Def, *old_first)?;
+                f(OperandRole::Def, *old_second)?;
+                f(OperandRole::Use, *addr)?;
+                f(OperandRole::Use, *value_first)?;
+                f(OperandRole::Use, *value_second)?;
+            }
+
+            Self::AtomicCheckedRmw {
+                old,
+                status,
+                addr,
+                compare,
+                value,
+                rcw_mask,
+                rcws_mask,
+                ..
+            } => {
+                f(OperandRole::Def, *old)?;
+                f(OperandRole::Def, *status)?;
+                f(OperandRole::Use, *addr)?;
+                if let Some(compare) = compare {
+                    f(OperandRole::Use, *compare)?;
+                }
+                f(OperandRole::Use, *value)?;
+                f(OperandRole::Use, *rcw_mask)?;
+                if let Some(rcws_mask) = rcws_mask {
+                    f(OperandRole::Use, *rcws_mask)?;
+                }
             }
 
             Self::AtomicPairCmpXchg {
@@ -815,13 +1258,13 @@ impl<T: Target> SsaOp<T> {
                 desired_second,
                 ..
             } => {
-                f(OperandRole::Def, *old_first);
-                f(OperandRole::Def, *old_second);
-                f(OperandRole::Use, *addr);
-                f(OperandRole::Use, *expected_first);
-                f(OperandRole::Use, *expected_second);
-                f(OperandRole::Use, *desired_first);
-                f(OperandRole::Use, *desired_second);
+                f(OperandRole::Def, *old_first)?;
+                f(OperandRole::Def, *old_second)?;
+                f(OperandRole::Use, *addr)?;
+                f(OperandRole::Use, *expected_first)?;
+                f(OperandRole::Use, *expected_second)?;
+                f(OperandRole::Use, *desired_first)?;
+                f(OperandRole::Use, *desired_second)?;
             }
 
             Self::VectorPredicatedUnary {
@@ -852,11 +1295,11 @@ impl<T: Target> SsaOp<T> {
                 passthrough,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *value);
-                f(OperandRole::Use, *mask);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *value)?;
+                f(OperandRole::Use, *mask)?;
                 if let Some(passthrough_v) = passthrough {
-                    f(OperandRole::Use, *passthrough_v);
+                    f(OperandRole::Use, *passthrough_v)?;
                 }
             }
 
@@ -876,12 +1319,12 @@ impl<T: Target> SsaOp<T> {
                 passthrough,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *left);
-                f(OperandRole::Use, *right);
-                f(OperandRole::Use, *mask);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
+                f(OperandRole::Use, *mask)?;
                 if let Some(passthrough_v) = passthrough {
-                    f(OperandRole::Use, *passthrough_v);
+                    f(OperandRole::Use, *passthrough_v)?;
                 }
             }
 
@@ -894,13 +1337,13 @@ impl<T: Target> SsaOp<T> {
                 passthrough,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *first);
-                f(OperandRole::Use, *second);
-                f(OperandRole::Use, *third);
-                f(OperandRole::Use, *mask);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *first)?;
+                f(OperandRole::Use, *second)?;
+                f(OperandRole::Use, *third)?;
+                f(OperandRole::Use, *mask)?;
                 if let Some(passthrough_v) = passthrough {
-                    f(OperandRole::Use, *passthrough_v);
+                    f(OperandRole::Use, *passthrough_v)?;
                 }
             }
 
@@ -912,16 +1355,16 @@ impl<T: Target> SsaOp<T> {
                 passthrough,
                 ..
             } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 if let Some(fault_v) = fault {
-                    f(OperandRole::Def, *fault_v);
+                    f(OperandRole::Def, *fault_v)?;
                 }
-                f(OperandRole::Use, *addr);
+                f(OperandRole::Use, *addr)?;
                 if let Some(mask_v) = mask {
-                    f(OperandRole::Use, *mask_v);
+                    f(OperandRole::Use, *mask_v)?;
                 }
                 if let Some(passthrough_v) = passthrough {
-                    f(OperandRole::Use, *passthrough_v);
+                    f(OperandRole::Use, *passthrough_v)?;
                 }
             }
 
@@ -929,120 +1372,208 @@ impl<T: Target> SsaOp<T> {
                 dests, base, mask, ..
             } => {
                 for item in dests {
-                    f(OperandRole::Def, *item);
+                    f(OperandRole::Def, *item)?;
                 }
-                f(OperandRole::Use, *base);
+                f(OperandRole::Use, *base)?;
                 if let Some(mask_v) = mask {
-                    f(OperandRole::Use, *mask_v);
+                    f(OperandRole::Use, *mask_v)?;
                 }
             }
 
             Self::VectorSegmentStore {
                 base, values, mask, ..
             } => {
-                f(OperandRole::Use, *base);
+                f(OperandRole::Use, *base)?;
                 for item in values {
-                    f(OperandRole::Use, *item);
+                    f(OperandRole::Use, *item)?;
                 }
                 if let Some(mask_v) = mask {
-                    f(OperandRole::Use, *mask_v);
+                    f(OperandRole::Use, *mask_v)?;
                 }
             }
 
             Self::VectorShuffle {
-                dest, left, right, ..
+                dest,
+                left,
+                right,
+                selector,
             } => {
-                f(OperandRole::Def, *dest);
-                f(OperandRole::Use, *left);
+                f(OperandRole::Def, *dest)?;
+                f(OperandRole::Use, *left)?;
                 if let Some(right_v) = right {
-                    f(OperandRole::Use, *right_v);
+                    f(OperandRole::Use, *right_v)?;
+                }
+                if let VectorShuffleSelector::Index(index) = selector {
+                    f(OperandRole::Use, *index)?;
                 }
             }
 
-            Self::NativeOpaque(data) => data.visit(&mut f),
-            Self::SystemOp(data) => data.visit(&mut f),
-            Self::ComputeOp(data) => data.visit(&mut f),
-            Self::BcdAdjust(data) => data.visit(&mut f),
-            Self::VectorCrypto(data) => data.visit(&mut f),
-            Self::TileOp(data) => data.visit(&mut f),
-            Self::VectorPermute(data) => data.visit(&mut f),
-            Self::VectorMultiplyAdd(data) => data.visit(&mut f),
-            Self::VectorPackNarrow(data) => data.visit(&mut f),
-            Self::VectorNarrowSaturate(data) => data.visit(&mut f),
-            Self::VectorPredicateWhile(data) => data.visit(&mut f),
-            Self::VectorPredicateBreak(data) => data.visit(&mut f),
-            Self::VectorComplexAdd(data) => data.visit(&mut f),
-            Self::VectorCountAdjust(data) => data.visit(&mut f),
-            Self::VectorExtendInLane(data) => data.visit(&mut f),
-            Self::VectorElementCount(data) => data.visit(&mut f),
-            Self::VectorSveAddressGen(data) => data.visit(&mut f),
-            Self::FlagAdjust(data) => data.visit(&mut f),
-            Self::VectorStructLoadReplicate(data) => data.visit(&mut f),
-            Self::VectorSmeMisc(data) => data.visit(&mut f),
-            Self::VectorPredicateOp(data) => data.visit(&mut f),
-            Self::VectorSveCompute(data) => data.visit(&mut f),
-            Self::VectorReverseChunks(data) => data.visit(&mut f),
-            Self::VectorMatrixMulAcc(data) => data.visit(&mut f),
-            Self::VectorSmeOuterProduct(data) => data.visit(&mut f),
-            Self::VectorPredicateGen(data) => data.visit(&mut f),
-            Self::VectorFpHelper(data) => data.visit(&mut f),
-            Self::VectorSvePermute(data) => data.visit(&mut f),
-            Self::VectorTernaryLogic(data)
-            | Self::VectorMultiSad(data)
-            | Self::VectorClassify(data) => data.visit(&mut f),
-            Self::VectorDotProduct(data) => data.visit(&mut f),
-            Self::VectorIntDotProduct(data) => data.visit(&mut f),
-            Self::VectorStringCompare(data) => data.visit(&mut f),
-            Self::VectorBitfield(data) => data.visit(&mut f),
-            Self::VectorIntersect(data) => data.visit(&mut f),
-            Self::VectorShuffleBits(data) => data.visit(&mut f),
-            Self::VectorConditionalMove(data) => data.visit(&mut f),
-            Self::VectorHorizontalMinPos(data) => data.visit(&mut f),
-            Self::VectorComplexMul(data) => data.visit(&mut f),
-            Self::VectorHorizontalReduce(data) => data.visit(&mut f),
-            Self::BlockString(data) => data.visit(&mut f),
-            Self::WideCompareExchange(data) => data.visit(&mut f),
-            Self::FpTranscendental(data) => data.visit(&mut f),
-            Self::FpuControl(data) => data.visit(&mut f),
+            Self::VectorReduce {
+                dest,
+                value,
+                initial,
+                ..
+            } => {
+                f(OperandRole::Def, *dest)?;
+                // The initial value first, as it combines first.
+                if let Some(initial) = initial {
+                    f(OperandRole::Use, *initial)?;
+                }
+                f(OperandRole::Use, *value)?;
+            }
+
+            Self::SystemOp(data) => data.try_visit(&mut f)?,
+            Self::Compute(data) => data.try_visit(&mut f)?,
+            Self::Contract(data) => data.try_visit(&mut f)?,
+            Self::VectorPredicateWhile(data) => data.try_visit(&mut f)?,
+            Self::VectorExtendInLane(data) => data.try_visit(&mut f)?,
+            Self::VectorElementCount(data) => data.try_visit(&mut f)?,
+            Self::VectorStructLoadReplicate(data) => data.try_visit(&mut f)?,
+            Self::VectorSveCompute(data) => data.try_visit(&mut f)?,
+            Self::CompareBlk(data) => {
+                let CompareBlkData {
+                    remaining,
+                    left_next,
+                    right_next,
+                    flags,
+                    left,
+                    right,
+                    count,
+                    flags_in,
+                    backward,
+                    ..
+                } = data.as_ref();
+                f(OperandRole::Def, *remaining)?;
+                f(OperandRole::Def, *left_next)?;
+                f(OperandRole::Def, *right_next)?;
+                f(OperandRole::Def, *flags)?;
+                f(OperandRole::Use, *left)?;
+                f(OperandRole::Use, *right)?;
+                f(OperandRole::Use, *count)?;
+                if let Some(flags_in) = flags_in {
+                    f(OperandRole::Use, *flags_in)?;
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, *flag)?;
+                }
+            }
+            Self::ScanBlk {
+                remaining,
+                next,
+                flags,
+                address,
+                value,
+                count,
+                flags_in,
+                backward,
+                ..
+            } => {
+                f(OperandRole::Def, *remaining)?;
+                f(OperandRole::Def, *next)?;
+                f(OperandRole::Def, *flags)?;
+                f(OperandRole::Use, *address)?;
+                f(OperandRole::Use, *value)?;
+                f(OperandRole::Use, *count)?;
+                if let Some(flags_in) = flags_in {
+                    f(OperandRole::Use, *flags_in)?;
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, *flag)?;
+                }
+            }
+            Self::LoadBlk {
+                value,
+                next,
+                address,
+                count,
+                value_in,
+                backward,
+                ..
+            } => {
+                f(OperandRole::Def, *value)?;
+                f(OperandRole::Def, *next)?;
+                f(OperandRole::Use, *address)?;
+                f(OperandRole::Use, *count)?;
+                if let Some(value_in) = value_in {
+                    f(OperandRole::Use, *value_in)?;
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, *flag)?;
+                }
+            }
+            Self::FloatFunction(data) => data.try_visit(&mut f)?,
+            Self::FpuControl(data) => data.try_visit(&mut f)?,
 
             Self::NewObj { dest, args, .. } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 for item in args {
-                    f(OperandRole::Use, *item);
+                    f(OperandRole::Use, *item)?;
                 }
             }
 
-            Self::Call { dest, args, .. } | Self::CallVirt { dest, args, .. } => {
+            // The result and the values returned beside it, then an indirect
+            // call's function pointer, then the ordinary arguments, implicit
+            // inputs, then staged stack values.
+            Self::Call(call) => {
+                let CallData {
+                    dest,
+                    callee,
+                    args,
+                    staged,
+
+                    implicit_inputs,
+                    results,
+                    ..
+                } = &**call;
                 if let Some(dest_v) = dest {
-                    f(OperandRole::Def, *dest_v);
+                    f(OperandRole::Def, *dest_v)?;
+                }
+                for result in results {
+                    f(OperandRole::Def, result.value)?;
+                }
+                if let Callee::Indirect { fptr, .. } = callee {
+                    f(OperandRole::Use, *fptr)?;
                 }
                 for item in args {
-                    f(OperandRole::Use, *item);
+                    f(OperandRole::Use, *item)?;
+                }
+                for input in implicit_inputs {
+                    f(OperandRole::Use, input.value)?;
+                }
+                for item in staged {
+                    f(OperandRole::Use, item.value)?;
                 }
             }
 
-            Self::CallIndirect {
-                dest, fptr, args, ..
+            Self::Return {
+                value,
+                state,
+                results,
+                transfer,
             } => {
-                if let Some(dest_v) = dest {
-                    f(OperandRole::Def, *dest_v);
-                }
-                f(OperandRole::Use, *fptr);
-                for item in args {
-                    f(OperandRole::Use, *item);
-                }
-            }
-
-            Self::Return { value } => {
                 if let Some(value_v) = value {
-                    f(OperandRole::Use, *value_v);
+                    f(OperandRole::Use, *value_v)?;
+                }
+                for held in state {
+                    f(OperandRole::Use, *held)?;
+                }
+                for result in results {
+                    f(OperandRole::Use, result.value)?;
+                }
+                if let Some(transfer) = transfer {
+                    if let Some(target) = transfer.target {
+                        f(OperandRole::Use, target)?;
+                    }
+                    for input in &transfer.handover {
+                        f(OperandRole::Use, input.value)?;
+                    }
                 }
             }
 
             Self::Phi { dest, operands } => {
-                f(OperandRole::Def, *dest);
+                f(OperandRole::Def, *dest)?;
                 for (_, item) in operands {
-                    f(OperandRole::Use, *item);
+                    f(OperandRole::Use, *item)?;
                 }
             }
 
@@ -1052,16 +1583,20 @@ impl<T: Target> SsaOp<T> {
             | Self::Leave { .. }
             | Self::Nop
             | Self::Break(_)
-            | Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly
             | Self::Fence { .. }
             | Self::InterruptReturn
-            | Self::VectorZeroUpper { .. }
             | Self::Unreachable => {}
         }
+        // The environment's rounding mode an operation rounds by is read
+        // after its other operands, a run-time format just before it, so a
+        // lowered row can leave the mode out by position.
+        if !DEFINITIONS_ONLY && let Some(format) = self.format_source() {
+            f(OperandRole::Use, format)?;
+        }
+        if !DEFINITIONS_ONLY && let Some(environment) = self.environment() {
+            f(OperandRole::Use, environment)?;
+        }
+        Ok(())
     }
 
     /// Visits every SSA variable operand mutably together with its [`OperandRole`].
@@ -1075,6 +1610,78 @@ impl<T: Target> SsaOp<T> {
         F: FnMut(OperandRole, &mut SsaVarId),
     {
         match self {
+            // The operation's definitions follow the raise's, so that they
+            // stay its destination however it is renamed.
+            Self::FloatRaise {
+                dest, op, lanes, ..
+            } => {
+                f(OperandRole::Def, dest);
+                let raised = *dest;
+                let mut operation = op.as_mut();
+                let mut masks = Vec::new();
+                loop {
+                    match operation {
+                        Self::FloatRaise {
+                            dest, op, lanes, ..
+                        } => {
+                            *dest = raised;
+                            if let Some(mask) = lanes.as_mut() {
+                                masks.push(mask);
+                            }
+                            operation = op.as_mut();
+                        }
+                        leaf => {
+                            let uses: &mut dyn FnMut(OperandRole, &mut SsaVarId) =
+                                &mut |role, var| {
+                                    if role == OperandRole::Use {
+                                        f(role, var);
+                                    } else {
+                                        *var = raised;
+                                    }
+                                };
+                            leaf.visit_operands_mut(uses);
+                            break;
+                        }
+                    }
+                }
+                for mask in masks.into_iter().rev() {
+                    f(OperandRole::Use, mask);
+                }
+                if let Some(lanes) = lanes {
+                    f(OperandRole::Use, lanes);
+                }
+            }
+            Self::VectorSlice {
+                dest,
+                vector,
+                offset,
+                length,
+                ..
+            } => {
+                f(OperandRole::Def, dest);
+                f(OperandRole::Use, vector);
+                f(OperandRole::Use, offset);
+                f(OperandRole::Use, length);
+            }
+            Self::VectorInsertSlice {
+                dest,
+                vector,
+                offset,
+                value,
+                ..
+            } => {
+                f(OperandRole::Def, dest);
+                f(OperandRole::Use, vector);
+                f(OperandRole::Use, offset);
+                f(OperandRole::Use, value);
+            }
+            Self::VectorConcat {
+                dest, left, right, ..
+            } => {
+                f(OperandRole::Def, dest);
+                f(OperandRole::Use, left);
+                f(OperandRole::Use, right);
+            }
             Self::PtrAdd {
                 dest, base, index, ..
             } => {
@@ -1089,20 +1696,31 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadStaticFieldAddr { dest, .. }
             | Self::SizeOf { dest, .. }
             | Self::LoadToken { dest, .. }
+            | Self::ArgList { dest }
             | Self::LoadFunctionPtr { dest, .. }
             | Self::LoadArg { dest, .. }
             | Self::LoadLocal { dest, .. }
             | Self::LoadArgAddr { dest, .. }
-            | Self::LoadLocalAddr { dest, .. } => f(OperandRole::Def, dest),
+            | Self::LoadLocalAddr { dest, .. }
+            | Self::RuntimeValue { dest, .. } => f(OperandRole::Def, dest),
 
-            Self::ComputeFlags { dest, inputs } => {
+            Self::MergeFlags {
+                dest, base, update, ..
+            } => {
                 f(OperandRole::Def, dest);
-                for input in inputs {
-                    f(OperandRole::Use, input);
-                }
+                f(OperandRole::Use, base);
+                f(OperandRole::Use, update);
             }
 
-            Self::CallClobber { outputs } => {
+            Self::InsertFlag {
+                dest, base, bit, ..
+            } => {
+                f(OperandRole::Def, dest);
+                f(OperandRole::Use, base);
+                f(OperandRole::Use, bit);
+            }
+
+            Self::CallClobber { outputs, .. } => {
                 for output in outputs {
                     f(OperandRole::Def, output);
                 }
@@ -1245,18 +1863,6 @@ impl<T: Target> SsaOp<T> {
                 value,
                 amount,
                 ..
-            }
-            | Self::Rcl {
-                dest,
-                value,
-                amount,
-                ..
-            }
-            | Self::Rcr {
-                dest,
-                value,
-                amount,
-                ..
             } => {
                 f(OperandRole::Def, dest);
                 f(OperandRole::Use, value);
@@ -1313,9 +1919,6 @@ impl<T: Target> SsaOp<T> {
                 dest, left, right, ..
             }
             | Self::VectorCompare {
-                dest, left, right, ..
-            }
-            | Self::VectorMaskBinary {
                 dest, left, right, ..
             } => {
                 f(OperandRole::Def, dest);
@@ -1419,6 +2022,9 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadIndirect {
                 dest, addr: value, ..
             }
+            | Self::ArgNext {
+                dest, list: value, ..
+            }
             | Self::AtomicLoad {
                 dest, addr: value, ..
             }
@@ -1437,10 +2043,6 @@ impl<T: Target> SsaOp<T> {
                 vector: value,
                 ..
             }
-            | Self::VectorMaskUnary {
-                dest, mask: value, ..
-            }
-            | Self::VectorReduce { dest, value, .. }
             | Self::VectorBitmask { dest, value, .. }
             | Self::NewArr {
                 dest,
@@ -1481,6 +2083,20 @@ impl<T: Target> SsaOp<T> {
                 src_addr: value,
                 ..
             }
+            | Self::MakeTypedRef {
+                dest,
+                address: value,
+                ..
+            }
+            | Self::TypedRefValue {
+                dest,
+                typed_ref: value,
+                ..
+            }
+            | Self::TypedRefType {
+                dest,
+                typed_ref: value,
+            }
             | Self::ReadFlags {
                 dest, flags: value, ..
             } => {
@@ -1499,8 +2115,14 @@ impl<T: Target> SsaOp<T> {
             | Self::InitObj {
                 dest_addr: value, ..
             }
-            | Self::IndirectBranch { target: value, .. }
             | Self::BranchFlags { flags: value, .. } => f(OperandRole::Use, value),
+
+            Self::IndirectBranch { target, state, .. } => {
+                f(OperandRole::Use, target);
+                for input in state.iter_mut() {
+                    f(OperandRole::Use, &mut input.value);
+                }
+            }
 
             Self::LoadElement {
                 dest,
@@ -1512,12 +2134,6 @@ impl<T: Target> SsaOp<T> {
                 dest,
                 array: a,
                 index: b,
-                ..
-            }
-            | Self::AtomicRmw {
-                dest,
-                addr: a,
-                value: b,
                 ..
             }
             | Self::AtomicExchange {
@@ -1584,13 +2200,6 @@ impl<T: Target> SsaOp<T> {
                 false_val: c,
                 ..
             }
-            | Self::CmpXchg {
-                dest,
-                addr: a,
-                expected: b,
-                desired: c,
-                ..
-            }
             | Self::VectorTernary {
                 dest,
                 first: a,
@@ -1629,13 +2238,7 @@ impl<T: Target> SsaOp<T> {
                 mask: c,
                 ..
             }
-            | Self::InitBlk {
-                dest_addr: a,
-                value: b,
-                size: c,
-                ..
-            }
-            | Self::CopyBlk {
+            | Self::MoveBlk {
                 dest_addr: a,
                 src_addr: b,
                 size: c,
@@ -1644,6 +2247,36 @@ impl<T: Target> SsaOp<T> {
                 f(OperandRole::Use, a);
                 f(OperandRole::Use, b);
                 f(OperandRole::Use, c);
+            }
+
+            Self::InitBlk {
+                dest_addr: a,
+                value: b,
+                size: c,
+                backward,
+                ..
+            }
+            | Self::CopyBlk {
+                dest_addr: a,
+                src_addr: b,
+                size: c,
+                backward,
+                ..
+            } => {
+                f(OperandRole::Use, a);
+                f(OperandRole::Use, b);
+                f(OperandRole::Use, c);
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, flag);
+                }
+            }
+
+            Self::ArgStep {
+                dest, next, list, ..
+            } => {
+                f(OperandRole::Def, dest);
+                f(OperandRole::Def, next);
+                f(OperandRole::Use, list);
             }
 
             Self::VectorScatter {
@@ -1685,6 +2318,57 @@ impl<T: Target> SsaOp<T> {
                 f(OperandRole::Def, first);
                 f(OperandRole::Def, second);
                 f(OperandRole::Use, addr);
+            }
+
+            Self::AtomicCondRmw {
+                old,
+                addr,
+                compare,
+                value,
+                ..
+            } => {
+                f(OperandRole::Def, old);
+                f(OperandRole::Use, addr);
+                f(OperandRole::Use, compare);
+                f(OperandRole::Use, value);
+            }
+
+            Self::AtomicPairRmw {
+                old_first,
+                old_second,
+                addr,
+                value_first,
+                value_second,
+                ..
+            } => {
+                f(OperandRole::Def, old_first);
+                f(OperandRole::Def, old_second);
+                f(OperandRole::Use, addr);
+                f(OperandRole::Use, value_first);
+                f(OperandRole::Use, value_second);
+            }
+
+            Self::AtomicCheckedRmw {
+                old,
+                status,
+                addr,
+                compare,
+                value,
+                rcw_mask,
+                rcws_mask,
+                ..
+            } => {
+                f(OperandRole::Def, old);
+                f(OperandRole::Def, status);
+                f(OperandRole::Use, addr);
+                if let Some(compare) = compare {
+                    f(OperandRole::Use, compare);
+                }
+                f(OperandRole::Use, value);
+                f(OperandRole::Use, rcw_mask);
+                if let Some(rcws_mask) = rcws_mask {
+                    f(OperandRole::Use, rcws_mask);
+                }
             }
 
             Self::AtomicPairCmpXchg {
@@ -1832,59 +2516,115 @@ impl<T: Target> SsaOp<T> {
             }
 
             Self::VectorShuffle {
-                dest, left, right, ..
+                dest,
+                left,
+                right,
+                selector,
             } => {
                 f(OperandRole::Def, dest);
                 f(OperandRole::Use, left);
                 if let Some(right_v) = right {
                     f(OperandRole::Use, right_v);
                 }
+                if let VectorShuffleSelector::Index(index) = selector {
+                    f(OperandRole::Use, index);
+                }
             }
 
-            Self::NativeOpaque(data) => data.visit_mut(&mut f),
+            Self::VectorReduce {
+                dest,
+                value,
+                initial,
+                ..
+            } => {
+                f(OperandRole::Def, dest);
+                // The initial value first, as it combines first.
+                if let Some(initial) = initial {
+                    f(OperandRole::Use, initial);
+                }
+                f(OperandRole::Use, value);
+            }
+
             Self::SystemOp(data) => data.visit_mut(&mut f),
-            Self::ComputeOp(data) => data.visit_mut(&mut f),
-            Self::BcdAdjust(data) => data.visit_mut(&mut f),
-            Self::VectorCrypto(data) => data.visit_mut(&mut f),
-            Self::TileOp(data) => data.visit_mut(&mut f),
-            Self::VectorPermute(data) => data.visit_mut(&mut f),
-            Self::VectorMultiplyAdd(data) => data.visit_mut(&mut f),
-            Self::VectorPackNarrow(data) => data.visit_mut(&mut f),
-            Self::VectorNarrowSaturate(data) => data.visit_mut(&mut f),
+            Self::Compute(data) => data.visit_mut(&mut f),
+            Self::Contract(data) => data.visit_mut(&mut f),
             Self::VectorPredicateWhile(data) => data.visit_mut(&mut f),
-            Self::VectorPredicateBreak(data) => data.visit_mut(&mut f),
-            Self::VectorComplexAdd(data) => data.visit_mut(&mut f),
-            Self::VectorCountAdjust(data) => data.visit_mut(&mut f),
             Self::VectorExtendInLane(data) => data.visit_mut(&mut f),
             Self::VectorElementCount(data) => data.visit_mut(&mut f),
-            Self::VectorSveAddressGen(data) => data.visit_mut(&mut f),
-            Self::FlagAdjust(data) => data.visit_mut(&mut f),
             Self::VectorStructLoadReplicate(data) => data.visit_mut(&mut f),
-            Self::VectorSmeMisc(data) => data.visit_mut(&mut f),
-            Self::VectorPredicateOp(data) => data.visit_mut(&mut f),
             Self::VectorSveCompute(data) => data.visit_mut(&mut f),
-            Self::VectorReverseChunks(data) => data.visit_mut(&mut f),
-            Self::VectorMatrixMulAcc(data) => data.visit_mut(&mut f),
-            Self::VectorSmeOuterProduct(data) => data.visit_mut(&mut f),
-            Self::VectorPredicateGen(data) => data.visit_mut(&mut f),
-            Self::VectorFpHelper(data) => data.visit_mut(&mut f),
-            Self::VectorSvePermute(data) => data.visit_mut(&mut f),
-            Self::VectorTernaryLogic(data)
-            | Self::VectorMultiSad(data)
-            | Self::VectorClassify(data) => data.visit_mut(&mut f),
-            Self::VectorDotProduct(data) => data.visit_mut(&mut f),
-            Self::VectorIntDotProduct(data) => data.visit_mut(&mut f),
-            Self::VectorStringCompare(data) => data.visit_mut(&mut f),
-            Self::VectorBitfield(data) => data.visit_mut(&mut f),
-            Self::VectorIntersect(data) => data.visit_mut(&mut f),
-            Self::VectorShuffleBits(data) => data.visit_mut(&mut f),
-            Self::VectorConditionalMove(data) => data.visit_mut(&mut f),
-            Self::VectorHorizontalMinPos(data) => data.visit_mut(&mut f),
-            Self::VectorComplexMul(data) => data.visit_mut(&mut f),
-            Self::VectorHorizontalReduce(data) => data.visit_mut(&mut f),
-            Self::BlockString(data) => data.visit_mut(&mut f),
-            Self::WideCompareExchange(data) => data.visit_mut(&mut f),
-            Self::FpTranscendental(data) => data.visit_mut(&mut f),
+            Self::CompareBlk(data) => {
+                let CompareBlkData {
+                    remaining,
+                    left_next,
+                    right_next,
+                    flags,
+                    left,
+                    right,
+                    count,
+                    flags_in,
+                    backward,
+                    ..
+                } = data.as_mut();
+                f(OperandRole::Def, remaining);
+                f(OperandRole::Def, left_next);
+                f(OperandRole::Def, right_next);
+                f(OperandRole::Def, flags);
+                f(OperandRole::Use, left);
+                f(OperandRole::Use, right);
+                f(OperandRole::Use, count);
+                if let Some(flags_in) = flags_in {
+                    f(OperandRole::Use, flags_in);
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, flag);
+                }
+            }
+            Self::ScanBlk {
+                remaining,
+                next,
+                flags,
+                address,
+                value,
+                count,
+                flags_in,
+                backward,
+                ..
+            } => {
+                f(OperandRole::Def, remaining);
+                f(OperandRole::Def, next);
+                f(OperandRole::Def, flags);
+                f(OperandRole::Use, address);
+                f(OperandRole::Use, value);
+                f(OperandRole::Use, count);
+                if let Some(flags_in) = flags_in {
+                    f(OperandRole::Use, flags_in);
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, flag);
+                }
+            }
+            Self::LoadBlk {
+                value,
+                next,
+                address,
+                count,
+                value_in,
+                backward,
+                ..
+            } => {
+                f(OperandRole::Def, value);
+                f(OperandRole::Def, next);
+                f(OperandRole::Use, address);
+                f(OperandRole::Use, count);
+                if let Some(value_in) = value_in {
+                    f(OperandRole::Use, value_in);
+                }
+                if let Some(flag) = backward {
+                    f(OperandRole::Use, flag);
+                }
+            }
+            Self::FloatFunction(data) => data.visit_mut(&mut f),
             Self::FpuControl(data) => data.visit_mut(&mut f),
 
             Self::NewObj { dest, args, .. } => {
@@ -1894,30 +2634,62 @@ impl<T: Target> SsaOp<T> {
                 }
             }
 
-            Self::Call { dest, args, .. } | Self::CallVirt { dest, args, .. } => {
+            // The result and the values returned beside it, then an indirect
+            // call's function pointer, then the ordinary arguments, implicit
+            // inputs, then staged stack values.
+            Self::Call(call) => {
+                let CallData {
+                    dest,
+                    callee,
+                    args,
+                    staged,
+
+                    implicit_inputs,
+                    results,
+                    ..
+                } = &mut **call;
                 if let Some(dest_v) = dest {
                     f(OperandRole::Def, dest_v);
+                }
+                for result in results {
+                    f(OperandRole::Def, &mut result.value);
+                }
+                if let Callee::Indirect { fptr, .. } = callee {
+                    f(OperandRole::Use, fptr);
                 }
                 for item in args {
                     f(OperandRole::Use, item);
                 }
+                for input in implicit_inputs {
+                    f(OperandRole::Use, &mut input.value);
+                }
+                for item in staged {
+                    f(OperandRole::Use, &mut item.value);
+                }
             }
 
-            Self::CallIndirect {
-                dest, fptr, args, ..
+            Self::Return {
+                value,
+                state,
+                results,
+                transfer,
             } => {
-                if let Some(dest_v) = dest {
-                    f(OperandRole::Def, dest_v);
-                }
-                f(OperandRole::Use, fptr);
-                for item in args {
-                    f(OperandRole::Use, item);
-                }
-            }
-
-            Self::Return { value } => {
                 if let Some(value_v) = value {
                     f(OperandRole::Use, value_v);
+                }
+                for held in state {
+                    f(OperandRole::Use, held);
+                }
+                for result in results {
+                    f(OperandRole::Use, &mut result.value);
+                }
+                if let Some(transfer) = transfer {
+                    if let Some(target) = &mut transfer.target {
+                        f(OperandRole::Use, target);
+                    }
+                    for input in &mut transfer.handover {
+                        f(OperandRole::Use, &mut input.value);
+                    }
                 }
             }
 
@@ -1934,15 +2706,19 @@ impl<T: Target> SsaOp<T> {
             | Self::Leave { .. }
             | Self::Nop
             | Self::Break(_)
-            | Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly
             | Self::Fence { .. }
             | Self::InterruptReturn
-            | Self::VectorZeroUpper { .. }
             | Self::Unreachable => {}
+        }
+        if let Self::VectorCast {
+            format: Some(format),
+            ..
+        } = self
+        {
+            f(OperandRole::Use, format);
+        }
+        if let Some(Some(environment)) = self.environment_mut() {
+            f(OperandRole::Use, environment);
         }
     }
 
@@ -1951,11 +2727,72 @@ impl<T: Target> SsaOp<T> {
     where
         F: FnMut(SsaVarId),
     {
-        self.visit_operands(|role, var| {
+        match self.try_for_each_use(|var| {
+            f(var);
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(()) => (),
+            Err(error) => match error {},
+        }
+    }
+
+    /// Visits uses in payload order, stopping at the first callback error.
+    ///
+    /// Preserves duplicates and allocates no operand list. Definitions are
+    /// skipped; use [`Self::try_visit_operands`] to account for every operand.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error returned by `f`, without visiting later uses.
+    pub fn try_for_each_use<E, F>(&self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(SsaVarId) -> Result<(), E>,
+    {
+        self.try_visit_operands(|role, var| {
             if matches!(role, OperandRole::Use) {
-                f(var);
+                f(var)
+            } else {
+                Ok(())
             }
+        })
+    }
+
+    /// Visits definitions in payload order without allocating a definition list.
+    ///
+    /// Includes primary, secondary and flag definitions. Stops before scanning uses.
+    pub fn for_each_def(&self, mut visit: impl FnMut(SsaVarId)) {
+        let result = self.try_for_each_def(|var| {
+            visit(var);
+            Ok::<(), Infallible>(())
         });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    /// Visits definitions in payload order, stopping before uses or on error.
+    ///
+    /// Visits primary, secondary and flag definitions without allocating a
+    /// definition list. Definitions precede uses in the shared operand policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error returned by `f`, without visiting later definitions.
+    pub fn try_for_each_def<E, F>(&self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(SsaVarId) -> Result<(), E>,
+    {
+        match self.try_visit_operands_mode::<true, _, _>(|role, var| {
+            if matches!(role, OperandRole::Use) {
+                Err(None)
+            } else {
+                f(var).map_err(Some)
+            }
+        }) {
+            Ok(()) | Err(None) => Ok(()),
+            Err(Some(error)) => Err(error),
+        }
     }
 
     /// Returns all variables used by this operation.
@@ -1966,26 +2803,62 @@ impl<T: Target> SsaOp<T> {
         uses
     }
 
+    /// Where the mask governing the lanes this operation writes or accesses
+    /// is among its uses, and the passthrough the lanes it leaves inactive
+    /// keep: the predicated lane operations, the masked, faulting, segment
+    /// and pack accesses, gathers and scatters. A mask an operation computes
+    /// with is data and governs nothing (`Kernel::MaskBinary`), and an operation
+    /// over lanes under lane control states its controls in its computation.
+    ///
+    /// # Returns
+    ///
+    /// The positions, or `None` for an operation no mask governs.
+    #[must_use]
+    pub fn governing_uses(&self) -> Option<GoverningUses> {
+        // The mask after `before` uses, the passthrough after it.
+        let after = |before: usize, passthrough: &Option<SsaVarId>| GoverningUses {
+            mask: before,
+            passthrough: passthrough.map(|_| before.saturating_add(1)),
+        };
+        Some(match self {
+            Self::VectorPredicatedUnary { passthrough, .. }
+            | Self::VectorMaskedLoad { passthrough, .. }
+            | Self::VectorPack { passthrough, .. }
+            | Self::VectorPackLoad { passthrough, .. } => after(1, passthrough),
+            Self::VectorPredicatedBinary { passthrough, .. }
+            | Self::VectorGather { passthrough, .. } => after(2, passthrough),
+            Self::VectorPredicatedTernary { passthrough, .. } => after(3, passthrough),
+            Self::VectorFaultingLoad {
+                mask: Some(_),
+                passthrough,
+                ..
+            } => after(1, passthrough),
+            Self::VectorSegmentLoad { mask: Some(_), .. } => after(1, &None),
+            Self::VectorMaskedStore { .. } | Self::VectorPackStore { .. } => after(2, &None),
+            Self::VectorScatter { .. } => after(3, &None),
+            Self::VectorSegmentStore {
+                values,
+                mask: Some(_),
+                ..
+            } => after(values.len().saturating_add(1), &None),
+            _ => return None,
+        })
+    }
+
     /// Returns the first variable used by this operation, in operand order.
     ///
     /// Equivalent to `self.uses().first().copied()` without the `Vec`: like
     /// [`use_count`](Self::use_count) and [`uses_var`](Self::uses_var) it walks
     /// [`for_each_use`](Self::for_each_use) directly, so a caller that wants
-    /// one operand — the type of the value an identity is being checked
-    /// against, say — pays no allocation for it.
+    /// one operand - the type of the value an identity is being checked
+    /// against, say - pays no allocation for it.
     ///
     /// # Returns
     ///
     /// The operation's first use, or `None` when it reads no variables.
     #[must_use]
     pub fn first_use(&self) -> Option<SsaVarId> {
-        let mut first = None;
-        self.for_each_use(|var| {
-            if first.is_none() {
-                first = Some(var);
-            }
-        });
-        first
+        self.try_for_each_use(Err).err()
     }
 
     /// Returns the number of variables used by this operation.
@@ -2002,13 +2875,8 @@ impl<T: Target> SsaOp<T> {
     /// first match, preferable to `self.uses().contains(&var)` in hot paths.
     #[must_use]
     pub fn uses_var(&self, var: SsaVarId) -> bool {
-        let mut found = false;
-        self.for_each_use(|used| {
-            if used == var {
-                found = true;
-            }
-        });
-        found
+        self.try_for_each_use(|used| if used == var { Err(()) } else { Ok(()) })
+            .is_err()
     }
 
     /// Replaces all uses of `old_var` with `new_var` in this operation.
@@ -2039,7 +2907,7 @@ impl<T: Target> SsaOp<T> {
     /// The batch counterpart to [`Self::replace_uses`]: a substitution with many
     /// `(old → new)` pairs visits each operand **once** and consults `lookup`,
     /// instead of calling `replace_uses` per pair (which re-walks every operand
-    /// for every pair — `O(operands × pairs)`). `lookup` returns the replacement
+    /// for every pair - `O(operands × pairs)`). `lookup` returns the replacement
     /// for a used variable, or `None` to leave it unchanged. Returns the number
     /// of operands rewritten.
     pub fn replace_uses_with<F>(&mut self, mut lookup: F) -> usize
@@ -2088,5 +2956,231 @@ impl<T: Target> SsaOp<T> {
             }
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ir::ops::{
+            AccessQualifiers, VectorBinaryKind, VectorElement, VectorFaultMode, VectorMaskMode,
+            VectorPackKind, VectorSegmentLayout, VectorTernaryKind, VectorUnaryKind,
+        },
+        testing::{MockTarget, MockType},
+    };
+
+    /// The operands name the operation's width only when they agree on it.
+    ///
+    /// `int32 + native int` is a native int in CIL, so a pair of different
+    /// widths - or one whose width is unknown - names no single width.
+    #[test]
+    fn operands_name_a_width_only_when_they_agree() {
+        let (left, right) = (SsaVarId::from_index(0), SsaVarId::from_index(1));
+        let add: SsaOp<MockTarget> = SsaOp::Add {
+            dest: SsaVarId::from_index(2),
+            left,
+            right,
+            flags: None,
+        };
+        let widths = |narrow: Option<u32>, other: Option<u32>| {
+            move |var: SsaVarId| if var == left { narrow } else { other }
+        };
+        assert_eq!(add.width_operand(widths(Some(32), Some(32))), Some(left));
+        assert_eq!(add.width_operand(widths(Some(32), Some(64))), None);
+        assert_eq!(add.width_operand(widths(Some(32), None)), None);
+        assert_eq!(add.width_operand(widths(None, Some(32))), None);
+
+        // A shift computes in its value's width, whatever the count's is.
+        let shift: SsaOp<MockTarget> = SsaOp::Shl {
+            dest: SsaVarId::from_index(2),
+            value: left,
+            amount: right,
+            flags: None,
+        };
+        assert_eq!(shift.width_operand(widths(Some(8), Some(32))), Some(left));
+    }
+
+    /// **The mask and the passthrough are found among the uses.** For every
+    /// operation a mask governs, the use at the stated mask position is the
+    /// operation's mask and the one at the passthrough position its
+    /// passthrough, with and without one; an operation computing with a mask,
+    /// and a faulting load no mask governs, state none.
+    #[test]
+    fn the_governing_mask_and_passthrough_are_found_among_the_uses() {
+        let v = SsaVarId::from_index;
+        let (mask, passthrough) = (v(90), v(91));
+        let element = VectorElement::default();
+        let merge = VectorMaskMode::Merge;
+        let access = AccessQualifiers::default();
+        let ty = MockType::V4I32;
+        let ops = |passthrough: Option<SsaVarId>| -> Vec<SsaOp<MockTarget>> {
+            vec![
+                SsaOp::VectorPredicatedUnary {
+                    dest: v(0),
+                    value: v(1),
+                    mask,
+                    passthrough,
+                    kind: VectorUnaryKind::Neg,
+                    element,
+                    mode: merge,
+                    environment: None,
+                },
+                SsaOp::VectorPredicatedBinary {
+                    dest: v(0),
+                    left: v(1),
+                    right: v(2),
+                    mask,
+                    passthrough,
+                    kind: VectorBinaryKind::Add,
+                    element,
+                    mode: merge,
+                    environment: None,
+                },
+                SsaOp::VectorPredicatedTernary {
+                    dest: v(0),
+                    first: v(1),
+                    second: v(2),
+                    third: v(3),
+                    mask,
+                    passthrough,
+                    kind: VectorTernaryKind::Fma,
+                    element,
+                    mode: merge,
+                    environment: None,
+                },
+                SsaOp::VectorMaskedLoad {
+                    dest: v(0),
+                    addr: v(1),
+                    mask,
+                    passthrough,
+                    vector_type: ty,
+                    mode: merge,
+                    access,
+                },
+                SsaOp::VectorGather {
+                    dest: v(0),
+                    base: v(1),
+                    indices: v(2),
+                    mask,
+                    passthrough,
+                    vector_type: ty,
+                    mode: merge,
+                    access,
+                },
+                SsaOp::VectorFaultingLoad {
+                    dest: v(0),
+                    fault: Some(v(5)),
+                    addr: v(1),
+                    mask: Some(mask),
+                    passthrough,
+                    vector_type: ty,
+                    fault_mode: VectorFaultMode::FirstFault,
+                    mask_mode: merge,
+                    access,
+                },
+                SsaOp::VectorPack {
+                    dest: v(0),
+                    value: v(1),
+                    mask,
+                    passthrough,
+                    vector_type: ty,
+                    element_bits: 32,
+                    kind: VectorPackKind::Compress,
+                    mode: merge,
+                },
+                SsaOp::VectorPackLoad {
+                    dest: v(0),
+                    addr: v(1),
+                    mask,
+                    passthrough,
+                    vector_type: ty,
+                    element_bits: 32,
+                    kind: VectorPackKind::Expand,
+                    mode: merge,
+                    access,
+                },
+            ]
+        };
+        for passthrough in [Some(passthrough), None] {
+            for op in ops(passthrough) {
+                let uses = op.uses();
+                let governing = op.governing_uses().expect("a mask governs it");
+                assert_eq!(uses.get(governing.mask), Some(&mask), "{op:?}");
+                assert_eq!(
+                    governing.passthrough.and_then(|at| uses.get(at)).copied(),
+                    passthrough,
+                    "{op:?}"
+                );
+            }
+        }
+        let stores: Vec<SsaOp<MockTarget>> = vec![
+            SsaOp::VectorMaskedStore {
+                addr: v(1),
+                value: v(2),
+                mask,
+                vector_type: ty,
+                access,
+            },
+            SsaOp::VectorScatter {
+                base: v(1),
+                indices: v(2),
+                value: v(3),
+                mask,
+                vector_type: ty,
+                access,
+            },
+            SsaOp::VectorPackStore {
+                addr: v(1),
+                value: v(2),
+                mask,
+                vector_type: ty,
+                element_bits: 32,
+                kind: VectorPackKind::Compress,
+                access,
+            },
+            SsaOp::VectorSegmentStore {
+                base: v(1),
+                values: vec![v(2), v(3), v(4)],
+                mask: Some(mask),
+                vector_type: ty,
+                segments: 3,
+                layout: VectorSegmentLayout::Interleaved,
+                access,
+            },
+            SsaOp::VectorSegmentLoad {
+                dests: vec![v(2), v(3)],
+                base: v(1),
+                mask: Some(mask),
+                vector_type: ty,
+                segments: 2,
+                layout: VectorSegmentLayout::Interleaved,
+                access,
+            },
+        ];
+        for op in stores {
+            let governing = op.governing_uses().expect("a mask governs it");
+            assert_eq!(op.uses().get(governing.mask), Some(&mask), "{op:?}");
+            assert_eq!(governing.passthrough, None, "{op:?}");
+        }
+        let unmasked: SsaOp<MockTarget> = SsaOp::VectorFaultingLoad {
+            dest: v(0),
+            fault: None,
+            addr: v(1),
+            mask: None,
+            passthrough: None,
+            vector_type: ty,
+            fault_mode: VectorFaultMode::Normal,
+            mask_mode: merge,
+            access,
+        };
+        assert_eq!(unmasked.governing_uses(), None);
+        let add: SsaOp<MockTarget> = SsaOp::Add {
+            dest: v(0),
+            left: v(1),
+            right: v(2),
+            flags: None,
+        };
+        assert_eq!(add.governing_uses(), None);
     }
 }

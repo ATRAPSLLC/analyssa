@@ -26,9 +26,9 @@
 //!
 //! CIL has three sources of values that become SSA variables:
 //!
-//! 1. **Arguments** — Method parameters (including `this` for instance methods)
-//! 2. **Locals** — Local variables declared in the method signature
-//! 3. **Phi** — Phi node results (synthetic, no corresponding CIL instruction)
+//! 1. **Arguments** - Method parameters (including `this` for instance methods)
+//! 2. **Locals** - Local variables declared in the method signature
+//! 3. **Phi** - Phi node results (synthetic, no corresponding CIL instruction)
 //!
 //! Stack temporaries and other intermediate values use `Phi` origin.
 //!
@@ -45,6 +45,9 @@
 //! all instructions, supporting dead code elimination and constant propagation.
 
 use std::{cmp::Ordering, fmt, num::NonZeroU32};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::target::Target;
 
@@ -136,6 +139,23 @@ impl SsaVarId {
     }
 }
 
+/// Reads a compact value id back as a variable id, as [`SsaVarId::from_index`]
+/// does: the two ids at the reserved top of the range read as
+/// [`SsaVarId::PLACEHOLDER`].
+impl From<u32> for SsaVarId {
+    fn from(index: u32) -> Self {
+        Self::from_index(index as usize)
+    }
+}
+
+/// Writes a variable id as the compact value id hosts persist, as
+/// [`SsaVarId::as_u32`] does.
+impl From<SsaVarId> for u32 {
+    fn from(var: SsaVarId) -> Self {
+        var.as_u32()
+    }
+}
+
 impl Default for SsaVarId {
     fn default() -> Self {
         Self::from_index(0)
@@ -160,20 +180,20 @@ impl Ord for SsaVarId {
 ///
 /// `SsaVarId` stores the bitwise complement of its index to give the type an
 /// `Option` niche. That encoding is an internal layout optimization, so the wire
-/// format is the index itself — deriving would publish the complement and pin it
+/// format is the index itself - deriving would publish the complement and pin it
 /// as the on-disk format forever.
 #[cfg(feature = "serde")]
-impl serde::Serialize for SsaVarId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+impl Serialize for SsaVarId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u32(self.as_u32())
     }
 }
 
 /// Deserializes from the logical index; see [`SsaVarId`]'s `Serialize` impl.
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for SsaVarId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let index = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+impl<'de> Deserialize<'de> for SsaVarId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let index = <u32 as Deserialize>::deserialize(deserializer)?;
         Ok(Self::from_index(index as usize))
     }
 }
@@ -210,7 +230,7 @@ impl fmt::Display for SsaVarId {
 /// signature and a declared local table. A machine-code lifter has neither: a
 /// register read before any write in the function body is a value the caller
 /// supplied, but its position in the (unrecovered) signature is unknown at lift
-/// time. That case is [`EntryLiveIn`](Self::EntryLiveIn) — not `Argument`, which
+/// time. That case is [`EntryLiveIn`](Self::EntryLiveIn) - not `Argument`, which
 /// would assert a signature position the lifter cannot yet know.
 ///
 /// # Examples
@@ -224,7 +244,7 @@ impl fmt::Display for SsaVarId {
 /// let live_in = VariableOrigin::EntryLiveIn;     // Caller-supplied, position unknown
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum VariableOrigin {
     /// Method argument (parameter).
     ///
@@ -251,8 +271,8 @@ pub enum VariableOrigin {
     ///
     /// Produced by machine-code front ends for a storage location (typically a
     /// register) that is read before the function body ever writes it. Like
-    /// [`Argument`](Self::Argument) it needs no definition in the body — the
-    /// verifier treats it as entry-defined — but unlike `Argument` it makes no
+    /// [`Argument`](Self::Argument) it needs no definition in the body - the
+    /// verifier treats it as entry-defined - but unlike `Argument` it makes no
     /// claim about argument position, because at lift time the calling
     /// convention has not been recovered.
     ///
@@ -262,6 +282,43 @@ pub enum VariableOrigin {
 }
 
 impl VariableOrigin {
+    /// Returns the rename group this origin belongs to by construction.
+    ///
+    /// Every version of one argument or local slot shares a version stack
+    /// during SSA renaming, so the slot itself names the group: argument `i`
+    /// is group `i`, local `i` is group `num_args + i`. A phi or entry live-in
+    /// has no slot, and its group (if any) is assigned by connectivity during
+    /// reconstruction.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_args` - The function's argument count, which offsets the locals.
+    ///
+    /// # Returns
+    ///
+    /// The group for an argument or local origin, `None` otherwise.
+    #[must_use]
+    pub const fn canonical_rename_group(self, num_args: usize) -> Option<u32> {
+        match self {
+            Self::Argument(index) => Some(index as u32),
+            Self::Local(index) => Some((num_args as u32).saturating_add(index as u32)),
+            Self::Phi | Self::EntryLiveIn => None,
+        }
+    }
+
+    /// Returns `true` if this origin names one storage slot: an argument or a
+    /// local.
+    ///
+    /// Only such an origin has a type of its own. [`Self::Phi`] and
+    /// [`Self::EntryLiveIn`] are shared by every value that has no slot - every
+    /// stack temporary, every merge, every register live on entry - so a type
+    /// recorded against one of them is the type of whichever value happened to
+    /// be first, and says nothing about the next.
+    #[must_use]
+    pub const fn names_a_slot(&self) -> bool {
+        matches!(self, Self::Argument(_) | Self::Local(_))
+    }
+
     /// Returns `true` if this is an argument origin.
     #[must_use]
     pub const fn is_argument(&self) -> bool {
@@ -343,7 +400,7 @@ impl fmt::Display for VariableOrigin {
 /// assert_eq!(alloc.count(), 2);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FunctionVarAllocator {
     next_id: usize,
 }
@@ -362,6 +419,18 @@ impl FunctionVarAllocator {
     #[must_use]
     pub fn starting_from(start_id: usize) -> Self {
         Self { next_id: start_id }
+    }
+
+    /// Moves the next ID past a table of `len` rows, so the ID it hands out
+    /// next is the index of the row that follows them.
+    ///
+    /// A function's table can be longer than the IDs allocated for it: rows
+    /// appended through the table itself, or read from a function that carries
+    /// a row naming no variable. An ID drawn from the allocator then names a
+    /// row that already exists. Does nothing when the allocator is already past
+    /// the table.
+    pub fn advance_past(&mut self, len: usize) {
+        self.next_id = self.next_id.max(len);
     }
 
     /// Allocates the next dense variable ID.
@@ -389,34 +458,42 @@ impl Default for FunctionVarAllocator {
 /// Records where in the program a variable is defined. For most variables,
 /// this is a specific instruction within a block. For phi nodes, the definition
 /// is at the block entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+///
+/// Every variable holds one, so its indices are held in 32 bits, as a
+/// [`UseSite`]'s are, the instruction's past every real index where the
+/// definition is at the block's entry: 8 bytes rather than 24. It serializes
+/// as the block and an optional instruction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "DefSiteWire", into = "DefSiteWire"))]
 pub struct DefSite {
     /// The block where this variable is defined.
-    pub block: usize,
-    /// The instruction index within the block, or `None` for phi nodes.
-    ///
-    /// Phi nodes are considered to be defined at the "top" of the block,
-    /// before any real instructions execute.
-    pub instruction: Option<usize>,
+    block: u32,
+    /// The instruction index within the block, [`Self::AT_ENTRY`] for a phi
+    /// node or the function's entry, which are defined at the "top" of the
+    /// block, before any real instructions execute.
+    instruction: u32,
 }
 
 impl DefSite {
+    /// The instruction index of a definition at its block's entry.
+    const AT_ENTRY: u32 = u32::MAX;
+
     /// Creates a definition site for a regular instruction.
     #[must_use]
-    pub const fn instruction(block: usize, instr_idx: usize) -> Self {
+    pub fn instruction(block: usize, instr_idx: usize) -> Self {
         Self {
-            block,
-            instruction: Some(instr_idx),
+            block: narrowed(block),
+            instruction: narrowed(instr_idx).min(Self::AT_ENTRY.saturating_sub(1)),
         }
     }
 
     /// Creates a definition site for a phi node (at block entry).
     #[must_use]
-    pub const fn phi(block: usize) -> Self {
+    pub fn phi(block: usize) -> Self {
         Self {
-            block,
-            instruction: None,
+            block: narrowed(block),
+            instruction: Self::AT_ENTRY,
         }
     }
 
@@ -427,54 +504,158 @@ impl DefSite {
     pub const fn entry() -> Self {
         Self {
             block: 0,
-            instruction: None,
+            instruction: Self::AT_ENTRY,
+        }
+    }
+
+    /// Returns the block where the variable is defined.
+    #[must_use]
+    pub const fn block(&self) -> usize {
+        self.block as usize
+    }
+
+    /// Returns the instruction index within the block, or `None` for a
+    /// definition at the block's entry (a phi node, the function's entry).
+    #[must_use]
+    pub const fn index(&self) -> Option<usize> {
+        if self.instruction == Self::AT_ENTRY {
+            None
+        } else {
+            Some(self.instruction as usize)
         }
     }
 
     /// Returns `true` if this is a phi node definition.
     #[must_use]
     pub const fn is_phi(&self) -> bool {
-        self.instruction.is_none()
+        self.instruction == Self::AT_ENTRY
+    }
+
+    /// The same definition in `block`: at the same instruction, or at the
+    /// block's entry.
+    #[must_use]
+    pub fn with_block(self, block: usize) -> Self {
+        Self {
+            block: narrowed(block),
+            instruction: self.instruction,
+        }
+    }
+}
+
+impl fmt::Debug for DefSite {
+    /// Writes the block and the optional instruction, as the site reads: the
+    /// text a function's `Debug` form is digested from does not depend on
+    /// how the site is held.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DefSite")
+            .field("block", &self.block())
+            .field("instruction", &self.index())
+            .finish()
+    }
+}
+
+/// [`DefSite`] as it is serialized: the block and an optional instruction.
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
+struct DefSiteWire {
+    /// [`DefSite::block`].
+    block: usize,
+    /// [`DefSite::index`].
+    instruction: Option<usize>,
+}
+
+#[cfg(feature = "serde")]
+impl From<DefSiteWire> for DefSite {
+    /// Reads the block and the optional instruction.
+    fn from(wire: DefSiteWire) -> Self {
+        wire.instruction.map_or_else(
+            || Self::phi(wire.block),
+            |instruction| Self::instruction(wire.block, instruction),
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<DefSite> for DefSiteWire {
+    /// Writes the block and the optional instruction.
+    fn from(site: DefSite) -> Self {
+        Self {
+            block: site.block(),
+            instruction: site.index(),
+        }
     }
 }
 
 /// Use site of an SSA variable.
 ///
 /// Records where in the program a variable is used (read).
+///
+/// Every variable keeps one per use, so a function holds as many as it has
+/// operands: the indices are held in 32 bits, which a function's blocks and a
+/// block's rows never outnumber (the tables indexed by them could not be held
+/// in memory if they did), and the site is 12 bytes rather than 24.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct UseSite {
     /// The block where this variable is used.
-    pub block: usize,
-    /// The instruction index within the block.
-    ///
-    /// For phi node operands, this refers to the phi node's index in the
-    /// block's phi node list (not the instruction list).
-    pub instruction: usize,
+    block: u32,
+    /// The instruction index within the block, or the phi node's index in
+    /// the block's phi node list for a phi operand.
+    instruction: u32,
     /// Whether this use is in a phi node operand.
-    pub is_phi_operand: bool,
+    is_phi_operand: bool,
 }
 
 impl UseSite {
     /// Creates a use site for a regular instruction.
     #[must_use]
-    pub const fn instruction(block: usize, instr_idx: usize) -> Self {
-        Self {
-            block,
-            instruction: instr_idx,
-            is_phi_operand: false,
-        }
+    pub fn instruction(block: usize, instr_idx: usize) -> Self {
+        Self::at(block, instr_idx, false)
     }
 
     /// Creates a use site for a phi node operand.
     #[must_use]
-    pub const fn phi_operand(block: usize, phi_idx: usize) -> Self {
+    pub fn phi_operand(block: usize, phi_idx: usize) -> Self {
+        Self::at(block, phi_idx, true)
+    }
+
+    /// The site at `index` of `block`, a phi node's where `is_phi_operand`.
+    fn at(block: usize, index: usize, is_phi_operand: bool) -> Self {
         Self {
-            block,
-            instruction: phi_idx,
-            is_phi_operand: true,
+            block: narrowed(block),
+            instruction: narrowed(index),
+            is_phi_operand,
         }
     }
+
+    /// Returns the block where the variable is used.
+    #[must_use]
+    pub const fn block(&self) -> usize {
+        self.block as usize
+    }
+
+    /// Returns the instruction index within the block, or the phi node's
+    /// index in the block's phi node list for a phi operand.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.instruction as usize
+    }
+
+    /// Returns whether this use is in a phi node operand.
+    #[must_use]
+    pub const fn is_phi_operand(&self) -> bool {
+        self.is_phi_operand
+    }
+}
+
+/// `index` in the 32 bits a [`UseSite`] holds it in.
+///
+/// A function's blocks and a block's rows are indexed by `usize` but never
+/// reach 2^32 (see [`UseSite`]); an index that did would be no index of a
+/// function this process holds, and saturates to one past every real index
+/// rather than wrapping onto one.
+fn narrowed(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
 }
 
 /// Complete metadata for an SSA variable.
@@ -497,10 +678,10 @@ impl UseSite {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
-        serialize = "T::Type: serde::Serialize",
-        deserialize = "T::Type: serde::Deserialize<'de>"
+        serialize = "T::Type: serde::Serialize, T::VariableFacts: serde::Serialize",
+        deserialize = "T::Type: serde::Deserialize<'de>, T::VariableFacts: serde::Deserialize<'de>"
     ))
 )]
 pub struct SsaVariable<T: Target> {
@@ -547,6 +728,64 @@ pub struct SsaVariable<T: Target> {
     /// ineligible for copy propagation, dead store elimination, and other
     /// optimizations that assume single-assignment immutability.
     address_taken: bool,
+
+    /// What the host declares this value to be, beyond where it came from.
+    ///
+    /// A fact only a front end can state - which of the values live on entry is
+    /// the stack pointer, say - carried on the variable itself so it moves with
+    /// it through every renumbering. `None` for every value the host says
+    /// nothing about.
+    #[cfg_attr(feature = "serde", serde(default))]
+    role: Option<VariableRole>,
+
+    /// What the host knows about this value.
+    ///
+    /// Carried here rather than in a table beside the function, so it moves
+    /// with the value through renumbering and is restored with it when an edit
+    /// rolls back. [`VariableFacts`](crate::facts::VariableFacts) states what
+    /// happens to it when a value is derived, joined or substituted.
+    #[cfg_attr(feature = "serde", serde(default))]
+    facts: T::VariableFacts,
+}
+
+/// A host-declared fact about what an SSA value *is*.
+///
+/// Distinct from [`VariableOrigin`], which says where a value came from and
+/// drives renaming. A role is a claim about the value's meaning that analyses
+/// may act on, and only the front end that lifted the function can make it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum VariableRole {
+    /// The stack pointer the caller hands the function, on a stack that grows
+    /// toward lower addresses.
+    ///
+    /// Memory strictly below it is the function's own frame: nothing outside
+    /// the function can reach it once the function returns, so a write there
+    /// that the function itself never reads again is dead.
+    ///
+    /// # Host obligations
+    ///
+    /// Declaring this role is a promise the memory pass acts on, and removes
+    /// stores and loads on the strength of:
+    ///
+    /// - **The stack grows downward.** A cell counts as the frame only when its
+    ///   whole extent, `[offset, offset + size)`, ends at or below this value
+    ///   (`offset + size <= 0`). On an upward-growing stack that region is
+    ///   the caller's, and the role must not be declared.
+    /// - **The word at it is the caller's.** The stack is full-descending and
+    ///   unbiased: the pointer-wide cell at this value is the last word the
+    ///   caller's stack holds (the return address an x86 `call` pushes), so a
+    ///   read of it cannot fault, and an unread one is removed.
+    /// - **Every stack-pointer-relative address is derived from this value.**
+    ///   The pass recognises a frame address by following it back to this
+    ///   value through address arithmetic and phis. A stack pointer the host
+    ///   models as a fresh value - reloaded after a call, or after a stack
+    ///   switch - is not derived from it, and an access through it is read as
+    ///   one through a pointer the caller handed in, which cannot name the
+    ///   frame. Thread the stack pointer through as arithmetic on this value
+    ///   (for example `sp' = sp + delta` across a call), or do not declare the
+    ///   role.
+    EntryStackPointer,
 }
 
 impl<T: Target> Clone for SsaVariable<T> {
@@ -559,6 +798,8 @@ impl<T: Target> Clone for SsaVariable<T> {
             var_type,
             uses,
             address_taken,
+            role,
+            facts,
         } = self;
         Self {
             id: *id,
@@ -568,6 +809,8 @@ impl<T: Target> Clone for SsaVariable<T> {
             var_type: var_type.clone(),
             uses: uses.clone(),
             address_taken: *address_taken,
+            role: *role,
+            facts: facts.clone(),
         }
     }
 
@@ -596,6 +839,8 @@ impl<T: Target> Clone for SsaVariable<T> {
             var_type,
             uses,
             address_taken,
+            role,
+            facts,
         } = source;
         self.id = *id;
         self.origin = *origin;
@@ -604,6 +849,8 @@ impl<T: Target> Clone for SsaVariable<T> {
         self.var_type.clone_from(var_type);
         self.uses.clone_from(uses);
         self.address_taken = *address_taken;
+        self.role = *role;
+        self.facts.clone_from(facts);
     }
 }
 
@@ -638,6 +885,8 @@ impl<T: Target> SsaVariable<T> {
             var_type,
             uses: Vec::new(),
             address_taken: false,
+            role: None,
+            facts: T::VariableFacts::default(),
         }
     }
 
@@ -666,7 +915,7 @@ impl<T: Target> SsaVariable<T> {
     /// A def site is *metadata about* the definition, not the definition. Every
     /// edit that inserts, removes or reorders an instruction has to restate it,
     /// and one that does not leaves the site naming whatever instruction now
-    /// occupies that index — very often a real instruction defining a different
+    /// occupies that index - very often a real instruction defining a different
     /// variable. Dereferencing it unchecked therefore does not fail loudly; it
     /// answers with a foreign operation.
     ///
@@ -681,6 +930,13 @@ impl<T: Target> SsaVariable<T> {
     #[must_use]
     pub const fn def_site(&self) -> DefSite {
         self.def_site
+    }
+
+    /// Returns whether this is a value the function is entered with: the
+    /// first version, defined at entry before any instruction.
+    #[must_use]
+    pub const fn is_entry_definition(&self) -> bool {
+        self.version == 0 && self.def_site.block() == 0 && self.def_site.index().is_none()
     }
 
     /// Returns the type of this variable.
@@ -737,7 +993,7 @@ impl<T: Target> SsaVariable<T> {
     /// Drops the use sites for which `keep` returns `false`.
     ///
     /// Lets a caller that knows exactly which uses it rewrote keep this list
-    /// exact without a whole-function rescan — the difference between an O(1)
+    /// exact without a whole-function rescan - the difference between an O(1)
     /// index update and an O(function) walk per replacement.
     pub fn retain_uses<F>(&mut self, keep: F)
     where
@@ -759,9 +1015,65 @@ impl<T: Target> SsaVariable<T> {
         self.uses.clear();
     }
 
+    /// Releases the capacity the use list grew past its length.
+    ///
+    /// Uses are appended one at a time, so the list ends up with up to twice the
+    /// room it holds. Cheap to call once the uses have stopped changing.
+    pub fn shrink_to_fit(&mut self) {
+        self.uses.shrink_to_fit();
+    }
+
     /// Marks this variable as having its address taken.
     pub fn set_address_taken(&mut self) {
         self.address_taken = true;
+    }
+
+    /// Records that this value's slot no longer has its address taken.
+    ///
+    /// The pair to [`Self::set_address_taken`], for the refresh that re-derives
+    /// the flag from the function: an edit that removed the last address-taking
+    /// operation makes the slot an ordinary value again, and a flag that only
+    /// ever went one way would keep pessimizing it.
+    pub fn clear_address_taken(&mut self) {
+        self.address_taken = false;
+    }
+
+    /// Returns what the host declared this value to be, if anything.
+    #[must_use]
+    pub const fn role(&self) -> Option<VariableRole> {
+        self.role
+    }
+
+    /// Records what the host declares this value to be.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - The fact the front end states about the value.
+    pub fn set_role(&mut self, role: VariableRole) {
+        self.role = Some(role);
+    }
+
+    /// Withdraws what the host declared this value to be: the pair to
+    /// [`Self::set_role`], for a host that learns the declaration no longer
+    /// holds (a value it called a save turns out to be passed).
+    pub fn clear_role(&mut self) {
+        self.role = None;
+    }
+
+    /// Returns what the host knows about this value.
+    #[must_use]
+    pub const fn facts(&self) -> &T::VariableFacts {
+        &self.facts
+    }
+
+    /// Returns what the host knows about this value, for updating.
+    pub const fn facts_mut(&mut self) -> &mut T::VariableFacts {
+        &mut self.facts
+    }
+
+    /// Replaces what the host knows about this value.
+    pub fn set_facts(&mut self, facts: T::VariableFacts) {
+        self.facts = facts;
     }
 
     /// Sets the origin of this variable.
@@ -789,16 +1101,21 @@ impl<T: Target> fmt::Display for SsaVariable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockTarget, MockType};
+    use crate::{
+        ir::{function::SsaFunction, variable::SsaVariable as GenericSsaVariable},
+        testing::{MockTarget, MockType},
+    };
 
-    type SsaVariable = super::SsaVariable<MockTarget>;
+    type SsaVariable = GenericSsaVariable<MockTarget>;
 
+    /// An id round-trips: the index it is built from is the index it reports.
     #[test]
     fn test_ssa_var_id_creation() {
         let id = SsaVarId::from_index(42);
         assert_eq!(id.index(), 42);
     }
 
+    /// Both `Display` and `Debug` render an id as `v<index>`.
     #[test]
     fn test_ssa_var_id_display() {
         let id = SsaVarId::from_index(0);
@@ -807,6 +1124,7 @@ mod tests {
         assert_eq!(format!("{id:?}"), expected);
     }
 
+    /// Ids compare equal exactly when they carry the same index.
     #[test]
     fn test_ssa_var_id_equality() {
         let id1 = SsaVarId::from_index(10);
@@ -817,6 +1135,8 @@ mod tests {
         assert_ne!(id1, id3);
     }
 
+    /// An argument origin reports itself as an argument, exposes its index, and
+    /// renders as `arg<n>`.
     #[test]
     fn test_variable_origin_argument() {
         let origin = VariableOrigin::Argument(0);
@@ -828,6 +1148,8 @@ mod tests {
         assert_eq!(format!("{origin}"), "arg0");
     }
 
+    /// A local origin reports itself as a local, exposes its index, and renders
+    /// as `loc<n>`.
     #[test]
     fn test_variable_origin_local() {
         let origin = VariableOrigin::Local(3);
@@ -839,6 +1161,7 @@ mod tests {
         assert_eq!(format!("{origin}"), "loc3");
     }
 
+    /// A phi origin reports itself as phi and renders as `phi`.
     #[test]
     fn test_variable_origin_phi() {
         let origin = VariableOrigin::Phi;
@@ -848,38 +1171,48 @@ mod tests {
         assert_eq!(format!("{origin}"), "phi");
     }
 
+    /// An instruction def site records its block and instruction index and is
+    /// not a phi definition.
     #[test]
     fn test_def_site_instruction() {
         let site = DefSite::instruction(2, 5);
-        assert_eq!(site.block, 2);
-        assert_eq!(site.instruction, Some(5));
+        assert_eq!(site.block(), 2);
+        assert_eq!(site.index(), Some(5));
         assert!(!site.is_phi());
     }
 
+    /// A phi def site records its block, carries no instruction index, and
+    /// reports itself as a phi definition.
     #[test]
     fn test_def_site_phi() {
         let site = DefSite::phi(3);
-        assert_eq!(site.block, 3);
-        assert_eq!(site.instruction, None);
+        assert_eq!(site.block(), 3);
+        assert_eq!(site.index(), None);
         assert!(site.is_phi());
     }
 
+    /// An instruction use site records its block and index and is not a phi
+    /// operand.
     #[test]
     fn test_use_site_instruction() {
         let site = UseSite::instruction(1, 4);
-        assert_eq!(site.block, 1);
-        assert_eq!(site.instruction, 4);
-        assert!(!site.is_phi_operand);
+        assert_eq!(site.block(), 1);
+        assert_eq!(site.index(), 4);
+        assert!(!site.is_phi_operand());
     }
 
+    /// A phi-operand use site records its block and phi index and is flagged as
+    /// a phi operand.
     #[test]
     fn test_use_site_phi_operand() {
         let site = UseSite::phi_operand(2, 0);
-        assert_eq!(site.block, 2);
-        assert_eq!(site.instruction, 0);
-        assert!(site.is_phi_operand);
+        assert_eq!(site.block(), 2);
+        assert_eq!(site.index(), 0);
+        assert!(site.is_phi_operand());
     }
 
+    /// A freshly created variable exposes its origin, version, and def site and
+    /// starts with no uses, no address taken, and thus dead.
     #[test]
     fn test_ssa_variable_creation() {
         let var = SsaVariable::new(
@@ -899,6 +1232,7 @@ mod tests {
         assert!(var.is_dead());
     }
 
+    /// Adding use sites makes a variable no longer dead and grows its use list.
     #[test]
     fn test_ssa_variable_add_use() {
         let mut var = SsaVariable::new(
@@ -918,6 +1252,72 @@ mod tests {
         assert_eq!(var.uses().len(), 2);
     }
 
+    /// Shrinking a variable releases the room its use list grew past its
+    /// uses and keeps the uses.
+    #[test]
+    fn test_ssa_variable_shrink_to_fit() {
+        let mut var = SsaVariable::new(
+            SsaVarId::from_index(0),
+            VariableOrigin::Local(0),
+            1,
+            DefSite::instruction(0, 0),
+            MockType::Unknown,
+        );
+        for index in 0..3 {
+            var.add_use(UseSite::instruction(0, index));
+        }
+        assert!(var.uses.capacity() > 3);
+
+        var.shrink_to_fit();
+
+        assert_eq!(var.uses.capacity(), 3);
+        assert_eq!(
+            var.uses(),
+            [
+                UseSite::instruction(0, 0),
+                UseSite::instruction(0, 1),
+                UseSite::instruction(0, 2),
+            ]
+        );
+    }
+
+    /// Shrinking a function reaches the use list of every variable in it.
+    #[test]
+    fn a_function_shrinks_the_use_lists_of_its_variables() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
+        let ids: Vec<SsaVarId> = (0..2)
+            .map(|index| {
+                ssa.create_variable(
+                    VariableOrigin::Local(index),
+                    1,
+                    DefSite::instruction(0, 0),
+                    MockType::Unknown,
+                )
+            })
+            .collect();
+        for id in &ids {
+            for index in 0..3 {
+                if let Some(variable) = ssa.variable_mut(*id) {
+                    variable.add_use(UseSite::instruction(0, index));
+                }
+            }
+        }
+        assert!(
+            ssa.variables()
+                .iter()
+                .all(|variable| variable.uses.capacity() > 3)
+        );
+
+        ssa.shrink_to_fit();
+
+        assert!(
+            ssa.variables()
+                .iter()
+                .all(|variable| variable.uses.capacity() == 3)
+        );
+    }
+
+    /// `set_address_taken` flips the address-taken flag from false to true.
     #[test]
     fn test_ssa_variable_address_taken() {
         let mut var = SsaVariable::new(
@@ -933,6 +1333,26 @@ mod tests {
         assert!(var.is_address_taken());
     }
 
+    /// A declared role is withdrawn by `clear_role`, and nothing else of the
+    /// variable changes with it.
+    #[test]
+    fn a_declared_role_is_withdrawn() {
+        let mut var = SsaVariable::new(
+            SsaVarId::from_index(0),
+            VariableOrigin::Local(1),
+            0,
+            DefSite::phi(0),
+            MockType::Unknown,
+        );
+        var.set_role(VariableRole::EntryStackPointer);
+        assert_eq!(var.role(), Some(VariableRole::EntryStackPointer));
+        var.clear_role();
+        assert_eq!(var.role(), None);
+        assert_eq!(var.origin(), VariableOrigin::Local(1));
+    }
+
+    /// A variable renders as `<origin>_<version>`, for both argument and local
+    /// origins.
     #[test]
     fn test_ssa_variable_display() {
         let var = SsaVariable::new(

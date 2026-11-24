@@ -6,11 +6,11 @@
 //! uses, definitions are visited first, `outputs[0]` is the primary
 //! destination, and the stack effect is `(inputs.len(), outputs.len())`.
 //!
-//! That policy lives here, in the four bodies of the blanket
+//! That policy lives here, in the three bodies of the blanket
 //! `impl<P: KindedPayload> KindedOperands for P`, and nowhere else. A blanket
 //! impl cannot be specialised, so no payload type can give an input a `Def`
 //! role or reverse the ordering, and [`KindedPayload`] is sealed, so no type
-//! can join the policy except through [`impl_kinded_payload!`], whose body
+//! can join the policy except through `impl_kinded_payload!`, whose body
 //! literally writes `&self.outputs` and `&self.inputs` and therefore cannot
 //! transpose them either.
 //!
@@ -19,7 +19,7 @@
 //! `outputs` and `inputs` are the payload's **complete** operand storage. A
 //! payload with a third `SsaVarId` field would silently keep that field out of
 //! def-use construction, liveness, renaming and the verifier, so
-//! [`impl_kinded_payload!`] takes each payload's full field list and expands to
+//! `impl_kinded_payload!` takes each payload's full field list and expands to
 //! an exhaustive destructuring with no `..`. Adding a field to a registered
 //! payload is E0027 at the registration, which forces a decision about whether
 //! the new field is an operand.
@@ -28,9 +28,9 @@ use crate::ir::{ops::kinds::OperandRole, variable::SsaVarId};
 
 /// Seals [`KindedPayload`] against implementations outside this module's
 /// macro.
-pub(super) mod sealed {
-    /// The seal itself. Only [`impl_kinded_payload!`](super::impl_kinded_payload)
-    /// implements it, so a hand-written [`KindedPayload`](super::KindedPayload)
+pub mod sealed {
+    /// The seal itself. Only `impl_kinded_payload!`
+    /// implements it, so a hand-written [`KindedPayload`](crate::ir::ops::operands::KindedPayload)
     /// -- which could transpose `outputs` and `inputs`, or answer with a subset
     /// -- does not compile.
     pub trait Sealed {}
@@ -39,10 +39,10 @@ pub(super) mod sealed {
 /// A boxed `SsaOp` payload whose complete operand storage is an `outputs` list
 /// and an `inputs` list.
 ///
-/// Implemented only by [`impl_kinded_payload!`]. Implementors get
+/// Implemented only by `impl_kinded_payload!`. Implementors get
 /// [`KindedOperands`] for free through the blanket impl, which is where the
 /// operand policy is written.
-pub(super) trait KindedPayload: sealed::Sealed {
+pub trait KindedPayload: sealed::Sealed {
     /// Returns the variables this operation defines, in payload order.
     fn outputs(&self) -> &[SsaVarId];
 
@@ -62,15 +62,19 @@ pub(super) trait KindedPayload: sealed::Sealed {
 /// the role assignment, the definitions-before-uses ordering and the stack
 /// effect then exist in exactly three function bodies for the whole crate, and
 /// a payload type cannot opt out of any of them.
-pub(super) trait KindedOperands: KindedPayload {
+pub trait KindedOperands: KindedPayload {
     /// Visits every operand with its role: outputs as [`OperandRole::Def`],
     /// then inputs as [`OperandRole::Use`].
-    fn visit<F>(&self, f: &mut F)
+    ///
+    /// # Errors
+    ///
+    /// Returns the first callback error without visiting subsequent operands.
+    fn try_visit<E, F>(&self, f: &mut F) -> Result<(), E>
     where
-        F: FnMut(OperandRole, SsaVarId);
+        F: FnMut(OperandRole, SsaVarId) -> Result<(), E>;
 
     /// Visits every operand mutably, in the order and with the roles
-    /// [`Self::visit`] reports.
+    /// [`Self::try_visit`] reports.
     fn visit_mut<F>(&mut self, f: &mut F)
     where
         F: FnMut(OperandRole, &mut SsaVarId);
@@ -81,16 +85,17 @@ pub(super) trait KindedOperands: KindedPayload {
 }
 
 impl<P: KindedPayload> KindedOperands for P {
-    fn visit<F>(&self, f: &mut F)
+    fn try_visit<E, F>(&self, f: &mut F) -> Result<(), E>
     where
-        F: FnMut(OperandRole, SsaVarId),
+        F: FnMut(OperandRole, SsaVarId) -> Result<(), E>,
     {
         for output in self.outputs() {
-            f(OperandRole::Def, *output);
+            f(OperandRole::Def, *output)?;
         }
         for input in self.inputs() {
-            f(OperandRole::Use, *input);
+            f(OperandRole::Use, *input)?;
         }
+        Ok(())
     }
 
     fn visit_mut<F>(&mut self, f: &mut F)
@@ -128,11 +133,13 @@ impl<P: KindedPayload> KindedOperands for P {
 ///
 /// ```text
 /// impl_kinded_payload! {
-///     VecImm8Data { imm8, outputs, inputs };
+///     VectorExtendInLaneData { signed, source_bits, element_bits, outputs, inputs };
 ///     KindedVecData<K> { kind, outputs, inputs };
-///     outputs_only VectorElementCountData { element_bits, multiplier, outputs };
+///     optional_input VectorElementCountData (streaming) { element_bits, streaming, outputs };
 /// }
 /// ```
+///
+/// An `optional_input` payload's one input is its `Option<SsaVarId>` field.
 macro_rules! impl_kinded_payload {
     () => {};
 
@@ -186,7 +193,7 @@ macro_rules! impl_kinded_payload {
         impl_kinded_payload!($($rest)*);
     };
 
-    (outputs_only $ty:ident { $($field:ident),+ $(,)? }; $($rest:tt)*) => {
+    (optional_input $ty:ident ($input:ident) { $($field:ident),+ $(,)? }; $($rest:tt)*) => {
         impl $crate::ir::ops::operands::sealed::Sealed for $ty {}
 
         impl $crate::ir::ops::operands::KindedPayload for $ty {
@@ -199,11 +206,11 @@ macro_rules! impl_kinded_payload {
             }
 
             fn inputs(&self) -> &[$crate::ir::variable::SsaVarId] {
-                &[]
+                self.$input.as_slice()
             }
 
             fn inputs_mut(&mut self) -> &mut [$crate::ir::variable::SsaVarId] {
-                &mut []
+                self.$input.as_mut_slice()
             }
         }
 
@@ -235,5 +242,3 @@ macro_rules! impl_kinded_payload {
         };
     };
 }
-
-pub(super) use impl_kinded_payload;

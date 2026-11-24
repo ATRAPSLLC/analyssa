@@ -44,11 +44,71 @@ use std::{
     mem,
 };
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::{
     PointerSize,
-    ir::variable::SsaVarId,
-    target::{Endianness, Target},
+    ir::{
+        float::{FloatBits, FloatFormat, FloatRules},
+        integer::BitWidth,
+        lanes::VectorConst,
+        ops::{FlagsMask, VectorBinaryKind, VectorElement, VectorElementKind},
+    },
+    target::Target,
 };
+
+mod abstracts;
+mod arithmetic;
+mod bits;
+mod computed;
+mod convert;
+mod emit;
+mod encoding;
+mod order;
+
+pub use self::{
+    abstracts::AbstractValue,
+    computed::{ComputedOp, ComputedValue},
+};
+
+/// The scalar bit count computed from a complete register pattern.
+#[derive(Clone, Copy)]
+pub enum RegisterBitCount {
+    /// Index of the least significant set bit; zero has no index.
+    First,
+    /// Index of the most significant set bit; zero has no index.
+    Last,
+    /// Number of set bits.
+    Population,
+    /// Number of set bits modulo two.
+    Parity,
+}
+
+impl RegisterBitCount {
+    /// Counts primitive register bits without a 128-bit intermediate.
+    #[inline]
+    fn narrow(self, pattern: u64) -> Option<u32> {
+        match self {
+            Self::First if pattern != 0 => Some(pattern.trailing_zeros()),
+            Self::Last if pattern != 0 => 63u32.checked_sub(pattern.leading_zeros()),
+            Self::Population => Some(pattern.count_ones()),
+            Self::Parity => Some(pattern.count_ones() % 2),
+            _ => None,
+        }
+    }
+
+    /// Counts packed or wide register bits over their complete domain.
+    fn wide(self, pattern: u128) -> Option<u32> {
+        match self {
+            Self::First if pattern != 0 => Some(pattern.trailing_zeros()),
+            Self::Last if pattern != 0 => 127u32.checked_sub(pattern.leading_zeros()),
+            Self::Population => Some(pattern.count_ones()),
+            Self::Parity => Some(pattern.count_ones() % 2),
+            _ => None,
+        }
+    }
+}
 
 /// Compile-time constant values tracked through SSA analysis.
 ///
@@ -65,13 +125,13 @@ use crate::{
 /// these the same constant?", not "would these compare equal at runtime?".
 /// Floating-point arms are therefore compared and hashed **bitwise**, which is
 /// what makes [`Eq`] sound (`NaN` is reflexive here) and lets constants be used
-/// as hash-map keys — global value numbering keys on exactly this.
+/// as hash-map keys - global value numbering keys on exactly this.
 ///
 /// Two consequences follow, both deliberate:
 ///
-/// - `F64(NAN) == F64(NAN)` is `true` (identical bit patterns).
-/// - `F64(0.0) == F64(-0.0)` is `false` (distinct bit patterns, and
-///   distinguishable at runtime via `1.0 / x`).
+/// - a NaN equals the same NaN (identical bit patterns).
+/// - `0.0` and `-0.0` differ (distinct bit patterns, and distinguishable at
+///   runtime via `1.0 / x`).
 ///
 /// IEEE-754 *semantic* comparison is a separate operation: use [`Self::ceq`]
 /// and the `c*_un` family, which implement CIL/IEEE ordering and unordered
@@ -79,7 +139,7 @@ use crate::{
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
         serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
                      T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize",
@@ -122,17 +182,11 @@ pub enum ConstValue<T: Target> {
     /// Width depends on the target pointer size.
     NativeUInt(u64),
 
-    /// 32-bit IEEE 754 floating point constant.
-    F32(f32),
+    /// A float constant of any format, by its bits.
+    Float(FloatBits),
 
-    /// 64-bit IEEE 754 floating point constant.
-    F64(f64),
-
-    /// Vector constant with one constant per lane.
-    ///
-    /// Boxed so the rarely-used vector arm does not widen every scalar
-    /// [`ConstValue`].
-    Vector(Box<[ConstValue<T>]>),
+    /// A vector constant: its bits, laid out in its lanes.
+    Vector(VectorConst),
 
     /// String constant referenced by its metadata token (index into #US heap).
     /// The actual string content is resolved during code generation.
@@ -167,9 +221,9 @@ pub enum ConstValue<T: Target> {
     ///
     /// Distinct from the integer arms so a symbolic address survives constant
     /// propagation, GVN and any lowering **as a symbol**, instead of degrading
-    /// to a number a consumer would have to re-resolve. Folds like the other
-    /// reference constants — that is, not at all: address arithmetic is the
-    /// address model's job, and it reaches the number through
+    /// to a number a consumer would have to re-resolve. Equal-symbol subtraction
+    /// and XOR establish zero without exposing an address. Displacements and
+    /// numeric address projection require the address model and
     /// [`Target::symbol_address`].
     Symbol(T::SymbolRef),
 
@@ -186,7 +240,7 @@ impl<T: Target> PartialEq for ConstValue<T> {
     /// Compares two constants for structural identity.
     ///
     /// Constants of different arms are never equal, even when they denote the
-    /// same mathematical value (`I32(4) != I64(4)`) — the arm is part of the
+    /// same mathematical value (`I32(4) != I64(4)`) - the arm is part of the
     /// constant's identity. Floats compare bitwise; see the type-level
     /// documentation for why.
     fn eq(&self, other: &Self) -> bool {
@@ -202,8 +256,7 @@ impl<T: Target> PartialEq for ConstValue<T> {
             (Self::NativeInt(a), Self::NativeInt(b)) => a == b,
             (Self::NativeUInt(a), Self::NativeUInt(b)) => a == b,
             // Bitwise, so `Eq` is reflexive for `NaN`.
-            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
-            (Self::F64(a), Self::F64(b)) => a.to_bits() == b.to_bits(),
+            (Self::Float(a), Self::Float(b)) => a == b,
             (Self::Vector(a), Self::Vector(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::DecryptedString(a), Self::DecryptedString(b)) => a == b,
@@ -240,8 +293,7 @@ impl<T: Target> Hash for ConstValue<T> {
             Self::U64(v) => v.hash(state),
             Self::NativeInt(v) => v.hash(state),
             Self::NativeUInt(v) => v.hash(state),
-            Self::F32(v) => v.to_bits().hash(state),
-            Self::F64(v) => v.to_bits().hash(state),
+            Self::Float(v) => v.hash(state),
             Self::Vector(v) => v.hash(state),
             Self::String(v) => v.hash(state),
             Self::DecryptedString(v) => v.hash(state),
@@ -259,7 +311,7 @@ impl<T: Target> Hash for ConstValue<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
         serialize = "T::TypeRef: serde::Serialize",
         deserialize = "T::TypeRef: serde::Deserialize<'de>"
@@ -275,6 +327,17 @@ pub struct DecryptedArrayData<T: Target> {
 
     /// Size of each array element in bytes (1 for byte, 4 for int32, etc.).
     pub element_size: usize,
+}
+
+/// The checked integer operation, with width supplied by its operands.
+#[derive(Clone, Copy)]
+pub enum CheckedArithmetic {
+    /// Checked addition.
+    Add,
+    /// Checked subtraction.
+    Sub,
+    /// Checked multiplication.
+    Mul,
 }
 
 impl<T: Target> ConstValue<T> {
@@ -326,10 +389,35 @@ impl<T: Target> ConstValue<T> {
         )
     }
 
+    /// This constant's bits as an integer of the same width and the given
+    /// sign: `I32(-1)` is `U32(0xffff_ffff)` unsigned. A constant that is no
+    /// integer of a fixed width (a native-width integer, a float, a symbol) is
+    /// itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `signed` - Whether the result is a signed integer.
+    #[must_use]
+    // A reinterpretation of the same bits is the point.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    pub fn with_sign(self, signed: bool) -> Self {
+        match (self, signed) {
+            (Self::U8(v), true) => Self::I8(v as i8),
+            (Self::I8(v), false) => Self::U8(v as u8),
+            (Self::U16(v), true) => Self::I16(v as i16),
+            (Self::I16(v), false) => Self::U16(v as u16),
+            (Self::U32(v), true) => Self::I32(v as i32),
+            (Self::I32(v), false) => Self::U32(v as u32),
+            (Self::U64(v), true) => Self::I64(v as i64),
+            (Self::I64(v), false) => Self::U64(v as u64),
+            (value, _) => value,
+        }
+    }
+
     /// Returns `true` if this is a floating-point constant.
     #[must_use]
     pub const fn is_float(&self) -> bool {
-        matches!(self, Self::F32(_) | Self::F64(_))
+        matches!(self, Self::Float(_))
     }
 
     /// Returns `true` if this is a vector constant.
@@ -359,9 +447,76 @@ impl<T: Target> ConstValue<T> {
         }
     }
 
+    /// Measures inline payload copied with a constant or retained in publication.
+    ///
+    /// Strings, arrays and packed vectors contribute their actual payload bytes.
+    /// Scalar variants and host identities contribute zero; fixed headers and
+    /// external storage are excluded. This borrows the value without allocation.
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Vector(vector) => vector.bits().div_ceil(8) as usize,
+            Self::DecryptedString(value) => value.len(),
+            Self::DecryptedArray(array) => array.data.len(),
+            _ => 0,
+        }
+    }
+
+    /// Returns this constant as an `i64`, widening smaller integers and
+    /// fallibly narrowing larger ones.
+    ///
+    /// Covers every integer and native-int width, the boolean `True` (`1`) /
+    /// `False` (`0`) constants, and a [`ConstValue::Symbol`] that denotes an
+    /// address; everything else returns `None`.
+    ///
+    /// The symbol arm is what keeps this - and therefore
+    /// [`AddressWalk::normalize`](crate::analysis::address::AddressWalk::normalize), [`AliasKey`](crate::analysis::address::AliasKey), and every range/interval analysis built
+    /// on them - working once a host stops emitting materialised addresses as
+    /// integer constants. Without it a symbolic address would simply vanish from
+    /// the numeric analyses, which reads as "points-to got worse" rather than as
+    /// the representation change it actually is.
+    ///
+    /// # Returns
+    ///
+    /// The value as an `i64` (a symbol resolved to its address), or `None` for a
+    /// constant that has no `i64` representation.
+    #[must_use]
+    pub fn resolved_i64(&self) -> Option<i64> {
+        match self {
+            Self::Symbol(symbol) => T::symbol_address(symbol),
+            Self::I8(value) => Some(i64::from(*value)),
+            Self::I16(value) => Some(i64::from(*value)),
+            Self::I32(value) => Some(i64::from(*value)),
+            Self::I64(value) => Some(*value),
+            Self::U8(value) => Some(i64::from(*value)),
+            Self::U16(value) => Some(i64::from(*value)),
+            Self::U32(value) => Some(i64::from(*value)),
+            Self::U64(value) => i64::try_from(*value).ok(),
+            Self::NativeInt(value) => Some(*value),
+            Self::NativeUInt(value) => i64::try_from(*value).ok(),
+            Self::True => Some(1),
+            Self::False => Some(0),
+            _ => None,
+        }
+    }
+
     /// Returns the constant as an i64 if applicable.
+    ///
+    /// The value, not the bit pattern: every arm here widens exactly, so an
+    /// unsigned constant answers only while it still names the same number.
+    /// That is why `U64` and `NativeUInt` carry a guard and the narrower
+    /// unsigned widths do not - a `u32` always fits an `i64`, a `u64` above
+    /// [`i64::MAX`] never does, and reinterpreting one as a negative would hand
+    /// every caller a different number than the program has.
+    ///
+    /// The guarded arms are the mirror of the `I64(v) if *v >= 0` arm in
+    /// [`as_u64`](Self::as_u64), and they matter far past symmetry: a 64-bit
+    /// lift names most of its constants `U64`, so a missing arm here leaves the
+    /// range domain, SCCP, the threader and the algebraic recognisers reading
+    /// "unknown" for a constant that is sitting right in front of them.
     #[must_use]
     #[allow(clippy::match_same_arms)] // NativeInt is semantically different from I64
+    #[allow(clippy::cast_possible_wrap)] // Guarded by the <= i64::MAX checks
     pub const fn as_i64(&self) -> Option<i64> {
         match self {
             Self::I8(v) => Some(*v as i64),
@@ -371,7 +526,9 @@ impl<T: Target> ConstValue<T> {
             Self::U8(v) => Some(*v as i64),
             Self::U16(v) => Some(*v as i64),
             Self::U32(v) => Some(*v as i64),
+            Self::U64(v) if *v <= i64::MAX as u64 => Some(*v as i64),
             Self::NativeInt(v) => Some(*v),
+            Self::NativeUInt(v) if *v <= i64::MAX as u64 => Some(*v as i64),
             Self::True => Some(1),
             Self::False => Some(0),
             _ => None,
@@ -416,20 +573,20 @@ impl<T: Target> ConstValue<T> {
         }
     }
 
-    /// Returns the constant as an f32 if it's stored as F32.
+    /// Returns the constant as an `f32` when it is a binary32 float.
     #[must_use]
-    pub const fn as_f32(&self) -> Option<f32> {
+    pub fn as_f32(&self) -> Option<f32> {
         match self {
-            Self::F32(v) => Some(*v),
+            Self::Float(v) => f32::try_from(*v).ok(),
             _ => None,
         }
     }
 
-    /// Returns the constant as an f64 if it's stored as F64.
+    /// Returns the constant as an `f64` when it is a binary64 float.
     #[must_use]
-    pub const fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Self::F64(v) => Some(*v),
+            Self::Float(v) => f64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -447,7 +604,9 @@ impl<T: Target> ConstValue<T> {
             | Self::U8(0)
             | Self::U16(0)
             | Self::U32(0)
-            | Self::U64(0) => Some(false),
+            | Self::U64(0)
+            | Self::NativeInt(0)
+            | Self::NativeUInt(0) => Some(false),
             Self::True
             | Self::I8(_)
             | Self::I16(_)
@@ -456,7 +615,9 @@ impl<T: Target> ConstValue<T> {
             | Self::U8(_)
             | Self::U16(_)
             | Self::U32(_)
-            | Self::U64(_) => Some(true),
+            | Self::U64(_)
+            | Self::NativeInt(_)
+            | Self::NativeUInt(_) => Some(true),
             _ => None,
         }
     }
@@ -557,7 +718,7 @@ impl<T: Target> ConstValue<T> {
     ///
     /// Returns `None` when `self` is not an integer, or when `value` does not
     /// fit the target variant. Use this when a rewrite must materialise a new
-    /// constant *alongside* an existing one — a mask, a shift amount — so the
+    /// constant *alongside* an existing one - a mask, a shift amount - so the
     /// replacement keeps the width the surrounding IR declares. Hard-coding
     /// [`Self::I32`] there silently narrows the type, and mixed-width folds
     /// then sign-extend the narrowed operand rather than using the value meant.
@@ -607,175 +768,197 @@ impl<T: Target> ConstValue<T> {
             Self::U64(_) => Self::U64(0),
             Self::NativeInt(_) => Self::NativeInt(0),
             Self::NativeUInt(_) => Self::NativeUInt(0),
-            Self::F32(_) => Self::F32(0.0),
-            Self::F64(_) => Self::F64(0.0),
+            Self::Float(v) => match FloatBits::new(v.format(), 0) {
+                Some(zero) => Self::Float(zero),
+                None => Self::I32(0),
+            },
             // For non-numeric types (including I32), default to i32
             _ => Self::I32(0),
         }
     }
 
-    /// Folds a binary operation lane-wise over two equal-length vector
-    /// constants, returning `None` if the lane counts differ or any lane fails
-    /// to fold. This lifts every scalar fold method ([`Self::add`],
-    /// [`Self::mul`], …) to SIMD vector constants with no per-op code.
-    fn zip_lanes(a: &[Self], b: &[Self], f: impl Fn(&Self, &Self) -> Option<Self>) -> Option<Self> {
-        if a.len() != b.len() {
+    /// Combines the integer lanes of two vector constants of one shape by
+    /// `kind`, each lane read at its width, signed or unsigned as `signed`
+    /// says where `kind` depends on it.
+    fn integer_lanes(
+        a: &VectorConst,
+        b: &VectorConst,
+        kind: VectorBinaryKind,
+        signed: Option<bool>,
+    ) -> Option<Self> {
+        let element = VectorElement {
+            kind: VectorElementKind::Integer,
+            bits: 0,
+            scalar: false,
+            signed,
+            rounding: None,
+        };
+        a.binary(b, kind, element, None, FloatRules::default())
+            .map(Self::Vector)
+    }
+
+    /// Shifts or rotates the integer lanes of `a` by the lanes of `b`, as
+    /// [`Self::integer_lanes`] does; `None` where a shift's count is at least
+    /// its lane's width, as for a scalar.
+    fn shifted_lanes(
+        a: &VectorConst,
+        b: &VectorConst,
+        kind: VectorBinaryKind,
+        signed: Option<bool>,
+    ) -> Option<Self> {
+        let rotates = matches!(kind, VectorBinaryKind::Rol | VectorBinaryKind::Ror);
+        if !rotates
+            && b.lane_values()
+                .any(|count| count >= u128::from(a.lane_bits()))
+        {
             return None;
         }
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| f(x, y))
-            .collect::<Option<Vec<_>>>()
-            .map(|lanes| Self::Vector(lanes.into_boxed_slice()))
+        Self::integer_lanes(a, b, kind, signed)
     }
 
-    /// Folds a unary operation lane-wise over a vector constant, returning
-    /// `None` if any lane fails to fold.
-    fn map_lanes(a: &[Self], f: impl Fn(&Self) -> Option<Self>) -> Option<Self> {
-        a.iter()
-            .map(f)
-            .collect::<Option<Vec<_>>>()
-            .map(|lanes| Self::Vector(lanes.into_boxed_slice()))
+    /// The lanes a shift of this constant by `amount` works on, with the
+    /// count of each: a vector shifted by a vector, and an integer wider than
+    /// any scalar constant, held as one lane, shifted by a scalar count - a
+    /// 128-bit register's high half is a shift of the whole by 64. `None` for
+    /// a scalar shift, which the integer variants compute themselves.
+    fn lanes_and_count(
+        &self,
+        amount: &Self,
+        ptr_size: PointerSize,
+        rotates: bool,
+    ) -> Option<(VectorConst, VectorConst)> {
+        match (self, amount) {
+            (Self::Vector(a), _) if a.lanes() == 1 => {
+                let (count, _) = amount.scalar_integer_pattern(ptr_size)?;
+                let width = u128::from(a.lane_bits());
+                // Read the complete scalar count before encoding a lane. A
+                // count's high bits can affect modulo at a non-power-of-two
+                // width, and cannot turn an out-of-range shift into zero.
+                let count = if rotates {
+                    count.checked_rem(width)?
+                } else if count < width {
+                    count
+                } else {
+                    return None;
+                };
+                Some((a.clone(), VectorConst::from_lanes(a.lane_bits(), [count])?))
+            }
+            (Self::Vector(a), Self::Vector(b)) => Some((a.clone(), b.clone())),
+            _ => None,
+        }
     }
 
-    /// Attempts to negate this constant.
+    /// Returns the constant as a vector: a vector itself, an integer or float
+    /// as one lane of its width.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr_size` - Target pointer size, giving the native variants' width.
     #[must_use]
-    pub fn negate(&self, ptr_size: PointerSize) -> Option<Self> {
-        if let Self::Vector(a) = self {
-            return Self::map_lanes(a, |x| x.negate(ptr_size));
+    pub fn as_lanes(&self, ptr_size: PointerSize) -> Option<VectorConst> {
+        if self.is_wide_native(ptr_size) {
+            let (bits, width) = self.scalar_integer_pattern(ptr_size)?;
+            return VectorConst::from_lanes(width, [bits]);
         }
         match self {
-            Self::I8(v) => Some(Self::I8(v.wrapping_neg())),
-            Self::I16(v) => Some(Self::I16(v.wrapping_neg())),
-            Self::I32(v) => Some(Self::I32(v.wrapping_neg())),
-            Self::I64(v) => Some(Self::I64(v.wrapping_neg())),
-            Self::NativeInt(v) => Some(Self::NativeInt(v.wrapping_neg())),
-            Self::F32(v) => Some(Self::F32(-v)),
-            Self::F64(v) => Some(Self::F64(-v)),
-            // Unsigned negation wraps
-            Self::U8(v) => Some(Self::U8(v.wrapping_neg())),
-            Self::U16(v) => Some(Self::U16(v.wrapping_neg())),
-            Self::U32(v) => Some(Self::U32(v.wrapping_neg())),
-            Self::U64(v) => Some(Self::U64(v.wrapping_neg())),
-            Self::NativeUInt(v) => Some(Self::NativeUInt(v.wrapping_neg())),
-            _ => None,
+            Self::Vector(vector) => Some(vector.clone()),
+            Self::Float(value) => VectorConst::from_lanes(value.format().bits(), [value.bits()]),
+            _ => {
+                let (bits, width) = self.integer_extended(ptr_size)?;
+                VectorConst::from_lanes(width, [u128::from(bits)])
+            }
         }
-        .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to perform bitwise NOT on this constant.
+    /// Returns the unsigned integer `bits` wide holding `value`'s low bits, or
+    /// a one-lane vector where no integer is that wide.
     #[must_use]
-    pub fn bitwise_not(&self, ptr_size: PointerSize) -> Option<Self> {
-        if let Self::Vector(a) = self {
-            return Self::map_lanes(a, |x| x.bitwise_not(ptr_size));
+    pub fn of_lane(bits: u32, value: u128) -> Option<Self> {
+        Some(match bits {
+            8 => Self::U8(u8::try_from(value & 0xff).ok()?),
+            16 => Self::U16(u16::try_from(value & 0xffff).ok()?),
+            32 => Self::U32(u32::try_from(value & 0xffff_ffff).ok()?),
+            64 => Self::U64(u64::try_from(value & u128::from(u64::MAX)).ok()?),
+            _ => Self::Vector(VectorConst::from_lanes(bits, [value])?),
+        })
+    }
+
+    /// Returns the float a float operation reads of the constant: a float
+    /// itself, or the integer or one-lane vector whose bits are the float of
+    /// the IEEE format of its width (32, 64, 80 or 128 bits). A 16-bit
+    /// integer names no format: binary16 and bfloat16 are both that wide.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr_size` - Target pointer size, giving the native variants' width.
+    #[must_use]
+    pub fn read_float(&self, ptr_size: PointerSize) -> Option<FloatBits> {
+        if let Self::Float(value) = self {
+            return Some(*value);
         }
+        let width = match self {
+            Self::Vector(vector) => vector.bits(),
+            _ => self.scalar_integer_pattern(ptr_size)?.1,
+        };
+        if width == 16 {
+            return None;
+        }
+        self.as_float(FloatFormat::of_width(width)?, ptr_size)
+    }
+
+    /// Returns the constant as a float of `format`: a float of the format
+    /// itself, or an integer or packed register exactly as wide whose bits
+    /// are the float's - a float operation reads its operand's bits, however
+    /// the constant was typed.
+    ///
+    /// # Arguments
+    ///
+    /// * `format` - The format the operation reads.
+    /// * `ptr_size` - Target pointer size, giving the native variants' width.
+    #[must_use]
+    pub fn as_float(&self, format: FloatFormat, ptr_size: PointerSize) -> Option<FloatBits> {
+        let bits = match self {
+            Self::Float(value) => return (value.format() == format).then_some(*value),
+            Self::Vector(vector) => {
+                if vector.bits() != format.bits() {
+                    return None;
+                }
+                vector.bits_at(0, format.bits())
+            }
+            _ => {
+                let (bits, width) = self.scalar_integer_pattern(ptr_size)?;
+                if width != format.bits() {
+                    return None;
+                }
+                bits
+            }
+        };
+        FloatBits::new(format, bits)
+    }
+
+    /// Whether this is a float NaN, which no comparison orders.
+    #[must_use]
+    pub fn is_nan(&self) -> bool {
         match self {
-            Self::I8(v) => Some(Self::I8(!v)),
-            Self::I16(v) => Some(Self::I16(!v)),
-            Self::I32(v) => Some(Self::I32(!v)),
-            Self::I64(v) => Some(Self::I64(!v)),
-            Self::U8(v) => Some(Self::U8(!v)),
-            Self::U16(v) => Some(Self::U16(!v)),
-            Self::U32(v) => Some(Self::U32(!v)),
-            Self::U64(v) => Some(Self::U64(!v)),
-            Self::NativeInt(v) => Some(Self::NativeInt(!v)),
-            Self::NativeUInt(v) => Some(Self::NativeUInt(!v)),
-            _ => None,
+            Self::Float(value) => value.is_nan(),
+            _ => false,
         }
-        .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to perform bitwise AND on two constants.
-    #[must_use]
-    pub fn bitwise_and(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.bitwise_and(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a & b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a & b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a & b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a & b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a & b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a & b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a & b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a & b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a & b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::NativeUInt(a & b)),
-            // Cross-type: promote to i64 for mixed signed operations
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::I64(i64::from(*a) & b))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::U64(u64::from(*a) & b))
-            }
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Attempts to perform bitwise OR on two constants.
-    #[must_use]
-    pub fn bitwise_or(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.bitwise_or(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a | b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a | b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a | b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a | b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a | b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a | b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a | b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a | b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a | b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::NativeUInt(a | b)),
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::I64(i64::from(*a) | b))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::U64(u64::from(*a) | b))
-            }
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Attempts to perform bitwise XOR on two constants.
-    #[must_use]
-    pub fn bitwise_xor(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.bitwise_xor(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a ^ b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a ^ b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a ^ b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a ^ b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a ^ b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a ^ b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a ^ b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a ^ b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a ^ b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::NativeUInt(a ^ b)),
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::I64(i64::from(*a) ^ b))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::U64(u64::from(*a) ^ b))
-            }
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Returns this constant's bit width, for the integer arms.
+    /// Returns this constant's bit width, for the integer variants.
     ///
     /// `NativeInt`/`NativeUInt` report the target's pointer width; everything
     /// non-integral reports `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr_size` - Target pointer size, giving the native variants' width.
+    ///
+    /// # Returns
+    ///
+    /// The width in bits of an integer constant, `None` for any other variant.
     #[must_use]
-    fn integer_bits(&self, ptr_size: PointerSize) -> Option<u32> {
+    pub fn bit_width(&self, ptr_size: PointerSize) -> Option<u32> {
         Some(match self {
             Self::I8(_) | Self::U8(_) => 8,
             Self::I16(_) | Self::U16(_) => 16,
@@ -786,525 +969,427 @@ impl<T: Target> ConstValue<T> {
         })
     }
 
-    /// Returns the shift distance if it is representable and in range for a
-    /// value of `bits` width, or `None` to decline the fold.
-    ///
-    /// `SsaOp::Shl`/`Shr` document only `dest = value << amount` and define no
-    /// out-of-range behaviour, and real ISAs disagree about it — x86 masks the
-    /// count by 31 (63 with REX.W) *regardless of the destination's sub-register
-    /// width*, while AArch64 and RISC-V mask by the register width. Rust's
-    /// `wrapping_shl` masks by the value's own type, so an `I8` arm masked by 7:
-    /// `shl bl, 8` is 0 on hardware, but folding `U8(0x81) << 8` returned
-    /// `U8(0x81)` — a third semantics that matches neither.
-    ///
-    /// Declining to fold is sound under every convention, so an out-of-range or
-    /// negative count is simply not folded.
-    fn shift_distance(amount: &Self, bits: u32) -> Option<u32> {
-        let raw = amount.as_i32()?;
-        let distance = u32::try_from(raw).ok()?;
-        (distance < bits).then_some(distance)
+    /// Returns whether a native register needs more than its 64-bit payload.
+    #[inline]
+    fn is_wide_native(&self, ptr_size: PointerSize) -> bool {
+        ptr_size.bits() > 64 && matches!(self, Self::NativeInt(_) | Self::NativeUInt(_))
     }
 
-    /// Attempts to shift left.
+    /// Returns a scalar register pattern, including packed bitvectors through 128 bits.
     ///
-    /// Returns `None` when the shift distance is negative or at least the
-    /// value's own width — see `shift_distance` for why declining is the
-    /// only convention-independent answer.
-    #[must_use]
-    pub fn shl(&self, amount: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
-            return Self::zip_lanes(a, b, |x, y| x.shl(y, ptr_size));
-        }
-        let shift = Self::shift_distance(amount, self.integer_bits(ptr_size)?)?;
+    /// Bit operations inspect a register's complete bit sequence independently
+    /// of its carrier's lane geometry. Booleans carry one bit; floats and
+    /// metadata are not integer registers.
+    #[inline]
+    fn register_pattern(&self, ptr_size: PointerSize) -> Option<(u128, u32)> {
         match self {
-            Self::I8(v) => Some(Self::I8(v.wrapping_shl(shift))),
-            Self::I16(v) => Some(Self::I16(v.wrapping_shl(shift))),
-            Self::I32(v) => Some(Self::I32(v.wrapping_shl(shift))),
-            Self::I64(v) => Some(Self::I64(v.wrapping_shl(shift))),
-            Self::U8(v) => Some(Self::U8(v.wrapping_shl(shift))),
-            Self::U16(v) => Some(Self::U16(v.wrapping_shl(shift))),
-            Self::U32(v) => Some(Self::U32(v.wrapping_shl(shift))),
-            Self::U64(v) => Some(Self::U64(v.wrapping_shl(shift))),
-            Self::NativeInt(v) => Some(Self::NativeInt(v.wrapping_shl(shift))),
-            Self::NativeUInt(v) => Some(Self::NativeUInt(v.wrapping_shl(shift))),
-            _ => None,
+            Self::True => Some((1, 1)),
+            Self::False => Some((0, 1)),
+            Self::Vector(vector) if (1..=128).contains(&vector.bits()) => {
+                Some((vector.bits_at(0, vector.bits()), vector.bits()))
+            }
+            _ => self.scalar_integer_pattern(ptr_size),
         }
-        .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to shift right (arithmetic for signed, logical for unsigned).
+    /// The integer's value extended to 64 bits by its own signedness, with its
+    /// width - the shape a width- and sign-correct fold needs.
     ///
-    /// Returns `None` when the shift distance is negative or at least the
-    /// value's own width — see `shift_distance`.
+    /// A signed variant sign-extends (`I8(-1)` → `0xFFFF_FFFF_FFFF_FFFF`), an
+    /// unsigned one zero-extends (`U8(0xFF)` → `0xFF`): extending by signedness
+    /// is what makes `(int8_t)-1 & x` behave as the `0xFFFF_FFFF & x` C promotes
+    /// it to, rather than `0xFF & x`. The two accessors line up with the two
+    /// cases - `as_i64` sign-extends every signed variant, `as_u64` zero-extends
+    /// every unsigned one, and neither is asked for the sign it cannot give.
+    /// Native payloads are masked at the target width before extension.
+    /// Only the integer variants have a pattern; `True`/`False` are excluded so a
+    /// boolean never silently joins an arithmetic fold.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr_size` - Target pointer size, giving the width of the
+    ///   `NativeInt`/`NativeUInt` variants.
+    ///
+    /// # Returns
+    ///
+    /// `Some((bits, width))` - the sign/zero-extended 64-bit value and the
+    /// variant's width in bits - for an integer constant; `None` for a
+    /// non-integer variant (float, boolean, string, handle, …).
     #[must_use]
-    #[allow(clippy::cast_sign_loss)] // Shift amounts and unsigned shifts use intentional casts
-    #[allow(clippy::cast_possible_wrap)] // Wrapping is expected for logical shift operations
-    pub fn shr(&self, amount: &Self, unsigned: bool, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
-            return Self::zip_lanes(a, b, |x, y| x.shr(y, unsigned, ptr_size));
+    fn integer_extended(&self, ptr_size: PointerSize) -> Option<(u64, u32)> {
+        Some(match self {
+            Self::I8(value) => (i64::from(*value).cast_unsigned(), 8),
+            Self::U8(value) => (u64::from(*value), 8),
+            Self::I16(value) => (i64::from(*value).cast_unsigned(), 16),
+            Self::U16(value) => (u64::from(*value), 16),
+            Self::I32(value) => (i64::from(*value).cast_unsigned(), 32),
+            Self::U32(value) => (u64::from(*value), 32),
+            Self::I64(value) => (value.cast_unsigned(), 64),
+            Self::U64(value) => (*value, 64),
+            Self::NativeInt(value) => (
+                ptr_size.mask_signed(*value).cast_unsigned(),
+                ptr_size.bits(),
+            ),
+            Self::NativeUInt(value) => (ptr_size.mask_unsigned(*value), ptr_size.bits()),
+            _ => return None,
+        })
+    }
+
+    /// Rebuilds a constant of *this value's own variant* from a raw 64-bit
+    /// pattern, narrowing it to the variant's width - the reconstruction step of
+    /// a fold that has computed its result in 64 bits.
+    ///
+    /// Keying off the variant (not a width/signedness pair) is what lets a fold
+    /// preserve an operand's exact type - a `NativeUInt` stays a `NativeUInt` at
+    /// the target's pointer width, a `U32` stays a `U32` - instead of collapsing
+    /// every 64-bit result onto `I64`/`U64` and every pointer-width one onto
+    /// nothing.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits` - The raw 64-bit result pattern to narrow into this variant.
+    /// * `ptr_size` - Target pointer size, used to mask a `NativeInt`/`NativeUInt`
+    ///   result to its pointer width.
+    ///
+    /// # Returns
+    ///
+    /// `Some(constant)` of the same variant as `self` for an integer variant;
+    /// `None` when `self` is not an integer (nothing to reconstruct into).
+    #[must_use]
+    fn with_integer_bits(&self, bits: u64, ptr_size: PointerSize) -> Option<Self> {
+        Some(match self {
+            Self::I8(_) => Self::I8(bits as u8 as i8),
+            Self::U8(_) => Self::U8(bits as u8),
+            Self::I16(_) => Self::I16(bits as u16 as i16),
+            Self::U16(_) => Self::U16(bits as u16),
+            Self::I32(_) => Self::I32(bits as u32 as i32),
+            Self::U32(_) => Self::U32(bits as u32),
+            Self::I64(_) => Self::I64(bits as i64),
+            Self::U64(_) => Self::U64(bits),
+            Self::NativeInt(_) => Self::NativeInt(ptr_size.mask_signed(bits as i64)),
+            Self::NativeUInt(_) => Self::NativeUInt(ptr_size.mask_unsigned(bits)),
+            _ => return None,
+        })
+    }
+
+    /// Folds a binary operation over scalar integer constants at their common width.
+    ///
+    /// Primitive operands extend by their signedness. A primitive result keeps
+    /// the wider carrier (the left on a tie); wider registers and scalar lanes
+    /// use a complete bit pattern. Explicit vector-vector operations retain
+    /// their lane semantics before reaching this fallback.
+    ///
+    /// The shared machine evaluator normalizes attested scalar operands to
+    /// their operation width before calling these value kernels.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The right-hand operand.
+    /// * `ptr_size` - The width of native registers.
+    /// * `op` - The primitive bit operation, evaluated at up to 64 bits.
+    /// * `wide_op` - The corresponding operation on complete scalar patterns.
+    #[must_use]
+    fn fold_integer_bits(
+        &self,
+        other: &Self,
+        ptr_size: PointerSize,
+        op: impl FnOnce(u64, u64) -> u64,
+        wide_op: impl FnOnce(u128, u128) -> u128,
+    ) -> Option<Self> {
+        if let (Some((left, left_width)), Some((right, right_width))) = (
+            self.integer_extended(ptr_size),
+            other.integer_extended(ptr_size),
+        ) && left_width <= 64
+            && right_width <= 64
+        {
+            let prototype = if left_width >= right_width {
+                self
+            } else {
+                other
+            };
+            return prototype.with_integer_bits(op(left, right), ptr_size);
         }
-        let shift = Self::shift_distance(amount, self.integer_bits(ptr_size)?)?;
+        self.fold_wide_integer_bits(other, ptr_size, wide_op)
+    }
+
+    /// Folds complete scalar patterns, extending narrow primitive operands by signedness.
+    fn fold_wide_integer_bits(
+        &self,
+        other: &Self,
+        ptr_size: PointerSize,
+        op: impl FnOnce(u128, u128) -> u128,
+    ) -> Option<Self> {
+        let (_, left_width) = self.scalar_integer_pattern(ptr_size)?;
+        let (_, right_width) = other.scalar_integer_pattern(ptr_size)?;
+        let width = left_width.max(right_width);
+        let left = self.scalar_pattern_at_width(width, ptr_size)?;
+        let right = other.scalar_pattern_at_width(width, ptr_size)?;
+        Self::of_lane(width, op(left, right))
+    }
+
+    /// The two constants as the numbers they name, when both name one.
+    ///
+    /// A comparison asks which of two *numbers* is smaller, and the variant a
+    /// lift chose for each is not part of the question. One architecture's
+    /// register value arrives as `U32` and its immediate as `I32` - MIPS
+    /// `slt $t0, $t1, 4` is exactly that - so a fold that enumerates variant
+    /// pairs answers "unknown" for a comparison whose two sides are sitting
+    /// right in front of it.
+    ///
+    /// `None` when either side is not an integer (a float, a null, a vector) or
+    /// names a value with no exact `i64` reading, which is where the exact
+    /// same-variant arms above are the only sound answer.
+    fn as_signed_pair(&self, other: &Self) -> Option<(i64, i64)> {
+        Some((self.as_i64()?, other.as_i64()?))
+    }
+
+    /// The two constants as unsigned numbers, when both readings are exact.
+    ///
+    /// The unsigned counterpart of [`as_signed_pair`](Self::as_signed_pair).
+    /// It deliberately refuses a negative operand: reading one as unsigned is a
+    /// question about its *width*, which two different variants do not agree
+    /// on, and the same-variant arms above are where that is decided.
+    fn as_unsigned_pair(&self, other: &Self) -> Option<(u64, u64)> {
+        Some((self.as_u64()?, other.as_u64()?))
+    }
+
+    /// The integer constant of `ty` whose bits are the low bits of `bits`: the
+    /// type's width and signedness ([`Target::bit_width`],
+    /// [`Target::is_signed`]) pick the variant, so no host conversion hook is
+    /// needed to name a value at a width a pass computed.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits` - The value's bits, in the low bits of a 64-bit pattern.
+    /// * `ty` - An integer type 8, 16, 32 or 64 bits wide.
+    ///
+    /// # Returns
+    ///
+    /// The constant, or `None` for a type that is not such an integer.
+    #[must_use]
+    pub fn from_bits_of_type(bits: u64, ty: &T::Type) -> Option<Self> {
+        if !T::is_integer(ty) {
+            return None;
+        }
+        let signed = T::is_signed(ty);
+        Some(match (T::bit_width(ty)?, signed) {
+            (8, true) => Self::I8(bits as u8 as i8),
+            (8, false) => Self::U8(bits as u8),
+            (16, true) => Self::I16(bits as u16 as i16),
+            (16, false) => Self::U16(bits as u16),
+            (32, true) => Self::I32(bits as u32 as i32),
+            (32, false) => Self::U32(bits as u32),
+            (64, true) => Self::I64(bits.cast_signed()),
+            (64, false) => Self::U64(bits),
+            _ => return None,
+        })
+    }
+
+    /// Whether `self` and `other` are one integer at one width, whatever the
+    /// signedness each is written with ([`Self::integer_pattern`]): `I32(-1)`
+    /// and `U32(u32::MAX)`, or the `I32(0)` and `U32(0)` a compiler's two
+    /// tests of one flag compare it with.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The constant compared with.
+    /// * `ptr_size` - Target pointer size, the width of the native integers.
+    #[must_use]
+    pub fn same_integer(&self, other: &Self, ptr_size: PointerSize) -> bool {
+        matches!(
+            (self.integer_pattern(ptr_size), other.integer_pattern(ptr_size)),
+            (Some(ours), Some(theirs)) if ours == theirs
+        )
+    }
+
+    /// The constant's bits at its own width, in the low bits of a 64-bit
+    /// pattern, and that width: `None` for a constant that is not an integer
+    /// of a width (a float, a boolean, a vector).
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr_size` - Target pointer size, the width of the native integers.
+    #[must_use]
+    pub fn integer_pattern(&self, ptr_size: PointerSize) -> Option<(u64, u32)> {
+        let (bits, width) = self.integer_extended(ptr_size)?;
+        Some((BitWidth::new(width).low_bits(bits), width))
+    }
+
+    /// Returns a scalar integer's bits and width, including one wide integer lane.
+    ///
+    /// Native signed integers are sign-extended before masking to the target
+    /// width. A one-lane integer bitvector carries widths through 128 bits;
+    /// multi-lane vectors, floats, booleans and metadata handles return `None`.
+    #[must_use]
+    pub fn scalar_integer_pattern(&self, ptr_size: PointerSize) -> Option<(u128, u32)> {
+        let (raw, width) = match self {
+            Self::Vector(vector)
+                if vector.lanes() == 1 && (1..=128).contains(&vector.lane_bits()) =>
+            {
+                (vector.lane(0), vector.lane_bits())
+            }
+            Self::Vector(_) => return None,
+            _ => {
+                let width = self.bit_width(ptr_size)?;
+                let raw = if self.is_signed() {
+                    i128::from(self.as_i64()?).cast_unsigned()
+                } else {
+                    u128::from(self.as_u64()?)
+                };
+                (raw, width)
+            }
+        };
+        Some((raw & BitWidth::new(width).checked_mask_u128()?, width))
+    }
+
+    /// Reads the low value bit of a declared Boolean without interpreting its sign.
+    pub fn logical_boolean(&self, ptr_size: PointerSize) -> Option<bool> {
+        self.conversion_integer_pattern(ptr_size)
+            .map(|(bits, _)| bits & 1 != 0)
+    }
+
+    /// Returns a scalar conversion's full pattern, treating booleans as positive zero or one.
+    ///
+    /// Boolean conversion uses an eight-bit positive carrier. Integer and native
+    /// values retain their declared width; a single scalar lane retains up to
+    /// 128 bits. Floating values, explicit vectors and metadata return no pattern.
+    #[must_use]
+    pub fn conversion_integer_pattern(&self, ptr_size: PointerSize) -> Option<(u128, u32)> {
         match self {
-            Self::I8(v) => {
-                if unsigned {
-                    Some(Self::I8((*v as u8).wrapping_shr(shift) as i8))
-                } else {
-                    Some(Self::I8(v.wrapping_shr(shift)))
-                }
-            }
-            Self::I16(v) => {
-                if unsigned {
-                    Some(Self::I16((*v as u16).wrapping_shr(shift) as i16))
-                } else {
-                    Some(Self::I16(v.wrapping_shr(shift)))
-                }
-            }
-            Self::I32(v) => {
-                if unsigned {
-                    Some(Self::I32((*v as u32).wrapping_shr(shift) as i32))
-                } else {
-                    Some(Self::I32(v.wrapping_shr(shift)))
-                }
-            }
-            Self::I64(v) => {
-                if unsigned {
-                    Some(Self::I64((*v as u64).wrapping_shr(shift) as i64))
-                } else {
-                    Some(Self::I64(v.wrapping_shr(shift)))
-                }
-            }
-            Self::U8(v) => Some(Self::U8(v.wrapping_shr(shift))),
-            Self::U16(v) => Some(Self::U16(v.wrapping_shr(shift))),
-            Self::U32(v) => Some(Self::U32(v.wrapping_shr(shift))),
-            Self::U64(v) => Some(Self::U64(v.wrapping_shr(shift))),
-            Self::NativeInt(v) => {
-                if unsigned {
-                    Some(Self::NativeInt((*v as u64).wrapping_shr(shift) as i64))
-                } else {
-                    Some(Self::NativeInt(v.wrapping_shr(shift)))
-                }
-            }
-            Self::NativeUInt(v) => Some(Self::NativeUInt(v.wrapping_shr(shift))),
-            _ => None,
+            Self::True => Some((1, 8)),
+            Self::False => Some((0, 8)),
+            _ => self.scalar_integer_pattern(ptr_size),
         }
-        .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to add two constants.
-    #[must_use]
-    pub fn add(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.add(y, ptr_size));
+    /// Returns a scalar's target-width pattern, extending by its carrier's signedness.
+    pub fn scalar_pattern_at_width(&self, width: u32, ptr_size: PointerSize) -> Option<u128> {
+        if width == 0 || width > 128 {
+            return None;
         }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_add(*b))),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_add(*b))),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a.wrapping_add(*b))),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a.wrapping_add(*b))),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a.wrapping_add(*b))),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a.wrapping_add(*b))),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a.wrapping_add(*b))),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a.wrapping_add(*b))),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a.wrapping_add(*b))),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                Some(Self::NativeUInt(a.wrapping_add(*b)))
-            }
-            (Self::F32(a), Self::F32(b)) => Some(Self::F32(a + b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::F64(a + b)),
-            // Cross-type promotions
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::I64(i64::from(*a).wrapping_add(*b)))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::U64(u64::from(*a).wrapping_add(*b)))
-            }
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Attempts to subtract two constants.
-    #[must_use]
-    pub fn sub(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.sub(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_sub(*b))),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_sub(*b))),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a.wrapping_sub(*b))),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a.wrapping_sub(*b))),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a.wrapping_sub(*b))),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a.wrapping_sub(*b))),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a.wrapping_sub(*b))),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a.wrapping_sub(*b))),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a.wrapping_sub(*b))),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                Some(Self::NativeUInt(a.wrapping_sub(*b)))
-            }
-            (Self::F32(a), Self::F32(b)) => Some(Self::F32(a - b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::F64(a - b)),
-            (Self::I32(a), Self::I64(b)) => Some(Self::I64(i64::from(*a).wrapping_sub(*b))),
-            (Self::I64(a), Self::I32(b)) => Some(Self::I64(a.wrapping_sub(i64::from(*b)))),
-            (Self::U32(a), Self::U64(b)) => Some(Self::U64(u64::from(*a).wrapping_sub(*b))),
-            (Self::U64(a), Self::U32(b)) => Some(Self::U64(a.wrapping_sub(u64::from(*b)))),
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Attempts to multiply two constants.
-    #[must_use]
-    pub fn mul(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.mul(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_mul(*b))),
-            (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_mul(*b))),
-            (Self::I32(a), Self::I32(b)) => Some(Self::I32(a.wrapping_mul(*b))),
-            (Self::I64(a), Self::I64(b)) => Some(Self::I64(a.wrapping_mul(*b))),
-            (Self::U8(a), Self::U8(b)) => Some(Self::U8(a.wrapping_mul(*b))),
-            (Self::U16(a), Self::U16(b)) => Some(Self::U16(a.wrapping_mul(*b))),
-            (Self::U32(a), Self::U32(b)) => Some(Self::U32(a.wrapping_mul(*b))),
-            (Self::U64(a), Self::U64(b)) => Some(Self::U64(a.wrapping_mul(*b))),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::NativeInt(a.wrapping_mul(*b))),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                Some(Self::NativeUInt(a.wrapping_mul(*b)))
-            }
-            (Self::F32(a), Self::F32(b)) => Some(Self::F32(a * b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::F64(a * b)),
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::I64(i64::from(*a).wrapping_mul(*b)))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::U64(u64::from(*a).wrapping_mul(*b)))
-            }
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
-    }
-
-    /// Attempts to add two constants with overflow checking.
-    ///
-    /// Returns `None` if the addition would overflow.
-    /// When `unsigned` is true, operands are treated as unsigned for overflow detection.
-    #[must_use]
-    pub fn add_checked(&self, other: &Self, unsigned: bool, ptr_size: PointerSize) -> Option<Self> {
-        if unsigned {
-            // Unsigned overflow check
-            match (self, other) {
-                (Self::I32(a), Self::I32(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_add((*b).cast_unsigned())
-                    .map(|r| Self::I32(r.cast_signed())),
-                (Self::I64(a), Self::I64(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_add((*b).cast_unsigned())
-                    .map(|r| Self::I64(r.cast_signed())),
-                (Self::U8(a), Self::U8(b)) => a.checked_add(*b).map(Self::U8),
-                (Self::U16(a), Self::U16(b)) => a.checked_add(*b).map(Self::U16),
-                (Self::U32(a), Self::U32(b)) => a.checked_add(*b).map(Self::U32),
-                (Self::U64(a), Self::U64(b)) => a.checked_add(*b).map(Self::U64),
-                (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                    a.checked_add(*b).map(Self::NativeUInt)
-                }
-                _ => None,
-            }
+        let (raw, own) = self.scalar_integer_pattern(ptr_size)?;
+        let raw = if own < width && self.is_signed() {
+            let shift = 128u32.checked_sub(own)?;
+            (raw << shift)
+                .cast_signed()
+                .wrapping_shr(shift)
+                .cast_unsigned()
         } else {
-            // Signed overflow check
-            match (self, other) {
-                (Self::I8(a), Self::I8(b)) => a.checked_add(*b).map(Self::I8),
-                (Self::I16(a), Self::I16(b)) => a.checked_add(*b).map(Self::I16),
-                (Self::I32(a), Self::I32(b)) => a.checked_add(*b).map(Self::I32),
-                (Self::I64(a), Self::I64(b)) => a.checked_add(*b).map(Self::I64),
-                (Self::NativeInt(a), Self::NativeInt(b)) => a.checked_add(*b).map(Self::NativeInt),
-                _ => None,
-            }
-        }
-        .map(|v| v.mask_native(ptr_size))
+            raw
+        };
+        Some(raw & BitWidth::new(width).checked_mask_u128()?)
     }
 
-    /// Attempts to subtract two constants with overflow checking.
-    ///
-    /// Returns `None` if the subtraction would overflow.
-    /// When `unsigned` is true, operands are treated as unsigned for overflow detection.
-    #[must_use]
-    pub fn sub_checked(&self, other: &Self, unsigned: bool, ptr_size: PointerSize) -> Option<Self> {
-        if unsigned {
-            // Unsigned overflow check
-            match (self, other) {
-                (Self::I32(a), Self::I32(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_sub((*b).cast_unsigned())
-                    .map(|r| Self::I32(r.cast_signed())),
-                (Self::I64(a), Self::I64(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_sub((*b).cast_unsigned())
-                    .map(|r| Self::I64(r.cast_signed())),
-                (Self::U8(a), Self::U8(b)) => a.checked_sub(*b).map(Self::U8),
-                (Self::U16(a), Self::U16(b)) => a.checked_sub(*b).map(Self::U16),
-                (Self::U32(a), Self::U32(b)) => a.checked_sub(*b).map(Self::U32),
-                (Self::U64(a), Self::U64(b)) => a.checked_sub(*b).map(Self::U64),
-                (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                    a.checked_sub(*b).map(Self::NativeUInt)
-                }
-                _ => None,
-            }
+    /// Normalizes a scalar carrier to the operation width, extending by its own signedness.
+    pub fn scalar_integer_at_width(&self, width: u32, ptr_size: PointerSize) -> Option<Self> {
+        if width == 0 || width > 128 {
+            return None;
+        }
+        let (_, own) = self.scalar_integer_pattern(ptr_size)?;
+        if own == width {
+            return Some(self.clone().mask_native(ptr_size));
+        }
+        let raw = self.scalar_pattern_at_width(width, ptr_size)?;
+        if matches!(width, 8 | 16 | 32 | 64) && !matches!(self, Self::Vector(_)) {
+            Self::integer(width, self.is_signed(), raw as u64 as i64)
         } else {
-            // Signed overflow check
-            match (self, other) {
-                (Self::I8(a), Self::I8(b)) => a.checked_sub(*b).map(Self::I8),
-                (Self::I16(a), Self::I16(b)) => a.checked_sub(*b).map(Self::I16),
-                (Self::I32(a), Self::I32(b)) => a.checked_sub(*b).map(Self::I32),
-                (Self::I64(a), Self::I64(b)) => a.checked_sub(*b).map(Self::I64),
-                (Self::NativeInt(a), Self::NativeInt(b)) => a.checked_sub(*b).map(Self::NativeInt),
-                _ => None,
-            }
+            Self::of_lane(width, raw)
         }
-        .map(|v| v.mask_native(ptr_size))
     }
 
-    /// Attempts to multiply two constants with overflow checking.
+    /// The flag `mask` names of a constant flags value ([`SsaOp::ReadFlags`]).
     ///
-    /// Returns `None` if the multiplication would overflow.
-    /// When `unsigned` is true, operands are treated as unsigned for overflow detection.
+    /// A constant flags value holds each flag at its bit of [`FlagsMask`], as
+    /// a fold of an operation's flags states them (`fprem`'s condition codes)
+    /// and a reset leaves them (zero, every flag clear).
+    ///
+    /// # Returns
+    ///
+    /// Whether the flag is set; `None` for a mask of more or fewer than one
+    /// flag, whose read is no one truth value, or a constant that is no
+    /// integer.
+    ///
+    /// [`SsaOp::ReadFlags`]: crate::ir::ops::SsaOp::ReadFlags
     #[must_use]
-    pub fn mul_checked(&self, other: &Self, unsigned: bool, ptr_size: PointerSize) -> Option<Self> {
-        if unsigned {
-            // Unsigned overflow check
-            match (self, other) {
-                (Self::I32(a), Self::I32(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_mul((*b).cast_unsigned())
-                    .map(|r| Self::I32(r.cast_signed())),
-                (Self::I64(a), Self::I64(b)) => (*a)
-                    .cast_unsigned()
-                    .checked_mul((*b).cast_unsigned())
-                    .map(|r| Self::I64(r.cast_signed())),
-                (Self::U8(a), Self::U8(b)) => a.checked_mul(*b).map(Self::U8),
-                (Self::U16(a), Self::U16(b)) => a.checked_mul(*b).map(Self::U16),
-                (Self::U32(a), Self::U32(b)) => a.checked_mul(*b).map(Self::U32),
-                (Self::U64(a), Self::U64(b)) => a.checked_mul(*b).map(Self::U64),
-                (Self::NativeUInt(a), Self::NativeUInt(b)) => {
-                    a.checked_mul(*b).map(Self::NativeUInt)
-                }
-                _ => None,
-            }
-        } else {
-            // Signed overflow check
-            match (self, other) {
-                (Self::I8(a), Self::I8(b)) => a.checked_mul(*b).map(Self::I8),
-                (Self::I16(a), Self::I16(b)) => a.checked_mul(*b).map(Self::I16),
-                (Self::I32(a), Self::I32(b)) => a.checked_mul(*b).map(Self::I32),
-                (Self::I64(a), Self::I64(b)) => a.checked_mul(*b).map(Self::I64),
-                (Self::NativeInt(a), Self::NativeInt(b)) => a.checked_mul(*b).map(Self::NativeInt),
-                _ => None,
-            }
+    pub fn read_flag(&self, mask: FlagsMask) -> Option<bool> {
+        if !mask.is_single_bit() {
+            return None;
         }
-        .map(|v| v.mask_native(ptr_size))
+        Some(self.as_u64_bits()? & u64::from(mask.bits()) != 0)
     }
 
-    /// Attempts to divide two constants. Uses `checked_div`/`checked_rem` so
-    /// MIN/-1 overflows fold to `None` rather than wrapping silently.
+    /// The flags value of `self`'s flags outside `mask` and `update`'s
+    /// inside it ([`SsaOp::MergeFlags`]), each held at its bit of
+    /// [`FlagsMask`] ([`Self::read_flag`]); of `self`'s variant.
+    ///
+    /// [`SsaOp::MergeFlags`]: crate::ir::ops::SsaOp::MergeFlags
     #[must_use]
-    pub fn div(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.div(y, ptr_size));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => a.checked_div(*b).map(Self::I8),
-            (Self::I16(a), Self::I16(b)) => a.checked_div(*b).map(Self::I16),
-            (Self::I32(a), Self::I32(b)) => a.checked_div(*b).map(Self::I32),
-            (Self::I64(a), Self::I64(b)) => a.checked_div(*b).map(Self::I64),
-            (Self::U8(a), Self::U8(b)) => a.checked_div(*b).map(Self::U8),
-            (Self::U16(a), Self::U16(b)) => a.checked_div(*b).map(Self::U16),
-            (Self::U32(a), Self::U32(b)) => a.checked_div(*b).map(Self::U32),
-            (Self::U64(a), Self::U64(b)) => a.checked_div(*b).map(Self::U64),
-            (Self::NativeInt(a), Self::NativeInt(b)) => a.checked_div(*b).map(Self::NativeInt),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => a.checked_div(*b).map(Self::NativeUInt),
-            // Float div by zero is inf — IEEE 754 has no panic, no overflow.
-            (Self::F32(a), Self::F32(b)) => Some(Self::F32(a / b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::F64(a / b)),
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
+    pub fn merged_flags(&self, update: &Self, mask: FlagsMask) -> Option<Self> {
+        let mask = u64::from(mask.bits());
+        let merged = self.as_u64_bits()? & !mask | update.as_u64_bits()? & mask;
+        self.of_same_type_from_bits(merged, 64)
     }
 
-    /// Attempts to compute remainder (modulo) of two constants. Uses
-    /// `checked_rem` so MIN%-1 overflows fold to `None`.
+    /// The flags value `self` with the one flag `mask` names set to `bit`
+    /// ([`SsaOp::InsertFlag`]), each held at its bit of [`FlagsMask`]
+    /// ([`Self::read_flag`]); of `self`'s variant. `None` for a mask of more
+    /// or fewer than one flag.
+    ///
+    /// [`SsaOp::InsertFlag`]: crate::ir::ops::SsaOp::InsertFlag
     #[must_use]
-    pub fn rem(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.rem(y, ptr_size));
+    pub fn with_flag(&self, mask: FlagsMask, bit: bool) -> Option<Self> {
+        if !mask.is_single_bit() {
+            return None;
         }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => a.checked_rem(*b).map(Self::I8),
-            (Self::I16(a), Self::I16(b)) => a.checked_rem(*b).map(Self::I16),
-            (Self::I32(a), Self::I32(b)) => a.checked_rem(*b).map(Self::I32),
-            (Self::I64(a), Self::I64(b)) => a.checked_rem(*b).map(Self::I64),
-            (Self::U8(a), Self::U8(b)) => a.checked_rem(*b).map(Self::U8),
-            (Self::U16(a), Self::U16(b)) => a.checked_rem(*b).map(Self::U16),
-            (Self::U32(a), Self::U32(b)) => a.checked_rem(*b).map(Self::U32),
-            (Self::U64(a), Self::U64(b)) => a.checked_rem(*b).map(Self::U64),
-            (Self::NativeInt(a), Self::NativeInt(b)) => a.checked_rem(*b).map(Self::NativeInt),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => a.checked_rem(*b).map(Self::NativeUInt),
-            (Self::F32(a), Self::F32(b)) => Some(Self::F32(a % b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::F64(a % b)),
-            _ => None,
-        }
-        .map(|v| v.mask_native(ptr_size))
+        let mask = u64::from(mask.bits());
+        let flags = self.as_u64_bits()?;
+        self.of_same_type_from_bits(if bit { flags | mask } else { flags & !mask }, 64)
     }
 
-    /// Attempts to compare two constants for equality.
-    #[must_use]
-    #[allow(clippy::float_cmp)] // Exact comparison is correct for constant propagation
-    #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
-    pub fn ceq(&self, other: &Self) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.ceq(y));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a == b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a == b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::from_bool(a == b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::from_bool(a == b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::from_bool(a == b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::from_bool(a == b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::from_bool(a == b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::from_bool(a == b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::from_bool(a == b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::from_bool(a == b)),
-            (Self::F32(a), Self::F32(b)) => Some(Self::from_bool(a == b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::from_bool(a == b)),
-            (Self::Null, Self::Null) | (Self::True, Self::True) | (Self::False, Self::False) => {
-                Some(Self::True)
-            }
-            (Self::True, Self::False) | (Self::False, Self::True) => Some(Self::False),
-            // Cross-type comparisons with promotion
-            (Self::I32(a), Self::I64(b)) | (Self::I64(b), Self::I32(a)) => {
-                Some(Self::from_bool(i64::from(*a) == *b))
-            }
-            (Self::U32(a), Self::U64(b)) | (Self::U64(b), Self::U32(a)) => {
-                Some(Self::from_bool(u64::from(*a) == *b))
-            }
-            _ => None,
-        }
+    /// The `bits`-wide two's-complement integer `raw` holds, sign-extended.
+    const fn sign_extend(raw: u64, bits: u32) -> i64 {
+        let shift = 64u32.saturating_sub(bits);
+        raw.wrapping_shl(shift).cast_signed().wrapping_shr(shift)
     }
 
-    /// Attempts to compare two constants for less-than (signed).
+    /// An integer's bits, read as the unsigned integer of its width would be:
+    /// `-1` of eight bits is `0xff`; a truth value is the one bit it holds.
+    /// `None` for a constant that is neither.
     #[must_use]
-    #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
-    pub fn clt(&self, other: &Self) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.clt(y));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a < b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a < b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::from_bool(a < b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::from_bool(a < b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::from_bool(a < b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::from_bool(a < b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::from_bool(a < b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::from_bool(a < b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::from_bool(a < b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::from_bool(a < b)),
-            (Self::F32(a), Self::F32(b)) => Some(Self::from_bool(a < b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::from_bool(a < b)),
-            (Self::I32(a), Self::I64(b)) => Some(Self::from_bool(i64::from(*a) < *b)),
-            (Self::I64(a), Self::I32(b)) => Some(Self::from_bool(*a < i64::from(*b))),
-            (Self::U32(a), Self::U64(b)) => Some(Self::from_bool(u64::from(*a) < *b)),
-            (Self::U64(a), Self::U32(b)) => Some(Self::from_bool(*a < u64::from(*b))),
-            _ => None,
-        }
+    pub const fn as_u64_bits(&self) -> Option<u64> {
+        Some(match self {
+            Self::True => 1,
+            Self::False => 0,
+            Self::I8(v) => *v as u8 as u64,
+            Self::I16(v) => *v as u16 as u64,
+            Self::I32(v) => *v as u32 as u64,
+            Self::I64(v) | Self::NativeInt(v) => v.cast_unsigned(),
+            Self::U8(v) => *v as u64,
+            Self::U16(v) => *v as u64,
+            Self::U32(v) => *v as u64,
+            Self::U64(v) | Self::NativeUInt(v) => *v,
+            _ => return None,
+        })
     }
 
-    /// Attempts to compare two constants for less-than (unsigned).
-    #[must_use]
-    #[allow(clippy::cast_sign_loss)] // Unsigned comparison requires interpreting bits as unsigned
-    #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
-    pub fn clt_un(&self, other: &Self) -> Option<Self> {
-        // Treat values as unsigned for comparison
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::from_bool((*a as u8) < (*b as u8))),
-            (Self::I16(a), Self::I16(b)) => Some(Self::from_bool((*a as u16) < (*b as u16))),
-            (Self::I32(a), Self::I32(b)) => Some(Self::from_bool((*a as u32) < (*b as u32))),
-            (Self::I64(a), Self::I64(b)) => Some(Self::from_bool((*a as u64) < (*b as u64))),
-            (Self::U8(a), Self::U8(b)) => Some(Self::from_bool(a < b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::from_bool(a < b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::from_bool(a < b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::from_bool(a < b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => {
-                Some(Self::from_bool((*a as u64) < (*b as u64)))
-            }
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::from_bool(a < b)),
-            // For floats, clt.un checks for unordered (NaN) or less than
-            (Self::F32(a), Self::F32(b)) => {
-                Some(Self::from_bool(a.is_nan() || b.is_nan() || a < b))
-            }
-            (Self::F64(a), Self::F64(b)) => {
-                Some(Self::from_bool(a.is_nan() || b.is_nan() || a < b))
-            }
-            _ => None,
-        }
-    }
-
-    /// Attempts to compare two constants for greater-than (signed).
-    #[must_use]
-    #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
-    pub fn cgt(&self, other: &Self) -> Option<Self> {
-        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
-            return Self::zip_lanes(a, b, |x, y| x.cgt(y));
-        }
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a > b)),
-            (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a > b)),
-            (Self::I32(a), Self::I32(b)) => Some(Self::from_bool(a > b)),
-            (Self::I64(a), Self::I64(b)) => Some(Self::from_bool(a > b)),
-            (Self::U8(a), Self::U8(b)) => Some(Self::from_bool(a > b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::from_bool(a > b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::from_bool(a > b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::from_bool(a > b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => Some(Self::from_bool(a > b)),
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::from_bool(a > b)),
-            (Self::F32(a), Self::F32(b)) => Some(Self::from_bool(a > b)),
-            (Self::F64(a), Self::F64(b)) => Some(Self::from_bool(a > b)),
-            (Self::I32(a), Self::I64(b)) => Some(Self::from_bool(i64::from(*a) > *b)),
-            (Self::I64(a), Self::I32(b)) => Some(Self::from_bool(*a > i64::from(*b))),
-            (Self::U32(a), Self::U64(b)) => Some(Self::from_bool(u64::from(*a) > *b)),
-            (Self::U64(a), Self::U32(b)) => Some(Self::from_bool(*a > u64::from(*b))),
-            _ => None,
-        }
-    }
-
-    /// Attempts to compare two constants for greater-than (unsigned).
-    #[must_use]
-    #[allow(clippy::cast_sign_loss)] // Unsigned comparison requires interpreting bits as unsigned
-    #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
-    pub fn cgt_un(&self, other: &Self) -> Option<Self> {
-        match (self, other) {
-            (Self::I8(a), Self::I8(b)) => Some(Self::from_bool((*a as u8) > (*b as u8))),
-            (Self::I16(a), Self::I16(b)) => Some(Self::from_bool((*a as u16) > (*b as u16))),
-            (Self::I32(a), Self::I32(b)) => Some(Self::from_bool((*a as u32) > (*b as u32))),
-            (Self::I64(a), Self::I64(b)) => Some(Self::from_bool((*a as u64) > (*b as u64))),
-            (Self::U8(a), Self::U8(b)) => Some(Self::from_bool(a > b)),
-            (Self::U16(a), Self::U16(b)) => Some(Self::from_bool(a > b)),
-            (Self::U32(a), Self::U32(b)) => Some(Self::from_bool(a > b)),
-            (Self::U64(a), Self::U64(b)) => Some(Self::from_bool(a > b)),
-            (Self::NativeInt(a), Self::NativeInt(b)) => {
-                Some(Self::from_bool((*a as u64) > (*b as u64)))
-            }
-            (Self::NativeUInt(a), Self::NativeUInt(b)) => Some(Self::from_bool(a > b)),
-            // For floats, cgt.un checks for unordered (NaN) or greater than
-            (Self::F32(a), Self::F32(b)) => {
-                Some(Self::from_bool(a.is_nan() || b.is_nan() || a > b))
-            }
-            (Self::F64(a), Self::F64(b)) => {
-                Some(Self::from_bool(a.is_nan() || b.is_nan() || a > b))
-            }
-            _ => None,
-        }
+    /// A constant of `self`'s variant holding the low `bits` of `raw`.
+    fn of_same_type_from_bits(&self, raw: u64, bits: u32) -> Option<Self> {
+        let raw = BitWidth::new(bits).low_bits(raw);
+        // The bits are the value; each arm keeps the ones its type holds.
+        #[allow(clippy::cast_possible_truncation)]
+        Some(match self {
+            Self::I8(_) => Self::I8(raw as u8 as i8),
+            Self::I16(_) => Self::I16(raw as u16 as i16),
+            Self::I32(_) => Self::I32(raw as u32 as i32),
+            Self::I64(_) => Self::I64(raw.cast_signed()),
+            Self::NativeInt(_) => Self::NativeInt(Self::sign_extend(raw, bits)),
+            Self::U8(_) => Self::U8(raw as u8),
+            Self::U16(_) => Self::U16(raw as u16),
+            Self::U32(_) => Self::U32(raw as u32),
+            Self::U64(_) => Self::U64(raw),
+            Self::NativeUInt(_) => Self::NativeUInt(raw),
+            _ => return None,
+        })
     }
 
     /// Masks a `ConstValue` to the target pointer width.
@@ -1317,115 +1402,63 @@ impl<T: Target> ConstValue<T> {
         match self {
             Self::NativeInt(v) => Self::NativeInt(ptr_size.mask_signed(v)),
             Self::NativeUInt(v) => Self::NativeUInt(ptr_size.mask_unsigned(v)),
-            Self::Vector(lanes) => Self::Vector(
-                Vec::from(lanes)
-                    .into_iter()
-                    .map(|v| v.mask_native(ptr_size))
-                    .collect(),
-            ),
             other => other,
         }
     }
 
-    /// Serializes an integer constant to bytes in the given endianness.
+    /// The integer `value` as a constant of `bits` width and signedness,
+    /// wrapped to that width; `None` for a width no integer constant has.
     ///
-    /// Returns `None` for non-integer variants (floats, strings, handles,
-    /// etc.).
+    /// # Arguments
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use analyssa::{ir::value::ConstValue, target::Endianness, MockTarget, PointerSize};
-    ///
-    /// let val = ConstValue::<MockTarget>::U32(0x01020304);
-    /// let le = val.to_bytes(Endianness::Little, PointerSize::Bit64).unwrap();
-    /// let be = val.to_bytes(Endianness::Big, PointerSize::Bit64).unwrap();
-    /// assert_eq!(le, vec![0x04, 0x03, 0x02, 0x01]);
-    /// assert_eq!(be, vec![0x01, 0x02, 0x03, 0x04]);
-    ///
-    /// // A native-width value follows the target's pointer size, not `u64`.
-    /// let native = ConstValue::<MockTarget>::NativeUInt(0x0102_0304);
-    /// assert_eq!(native.to_bytes(Endianness::Little, PointerSize::Bit32).unwrap().len(), 4);
-    /// assert_eq!(native.to_bytes(Endianness::Little, PointerSize::Bit64).unwrap().len(), 8);
-    /// ```
+    /// * `bits` - 8, 16, 32 or 64.
+    /// * `signed` - Whether the constant is signed.
+    /// * `value` - The integer, as a two's-complement 64-bit value.
     #[must_use]
-    pub fn to_bytes(&self, endianness: Endianness, ptr_size: PointerSize) -> Option<Vec<u8>> {
-        match *self {
-            Self::I8(v) => Some(vec![v as u8]),
-            Self::U8(v) => Some(vec![v]),
-            Self::I16(v) => Some(endianness.bytes_of_u16(v as u16).to_vec()),
-            Self::U16(v) => Some(endianness.bytes_of_u16(v).to_vec()),
-            Self::I32(v) => Some(endianness.bytes_of_u32(v as u32).to_vec()),
-            Self::U32(v) => Some(endianness.bytes_of_u32(v).to_vec()),
-            Self::I64(v) => Some(endianness.bytes_of_u64(v as u64).to_vec()),
-            Self::U64(v) => Some(endianness.bytes_of_u64(v).to_vec()),
-            // A native int is pointer-width by definition, so emitting eight
-            // bytes on a 32-bit target writes four bytes of a neighbouring cell.
-            Self::NativeInt(v) => Some(endianness.bytes_of_ptr_sized(v as u64, ptr_size)),
-            Self::NativeUInt(v) => Some(endianness.bytes_of_ptr_sized(v, ptr_size)),
-            _ => None,
-        }
+    pub fn integer(bits: u32, signed: bool, value: i64) -> Option<Self> {
+        // Truncation to the requested width is the point.
+        #[allow(clippy::cast_possible_truncation)]
+        Some(match (bits, signed) {
+            (8, true) => Self::I8(value as i8),
+            (8, false) => Self::U8(value as u8),
+            (16, true) => Self::I16(value as i16),
+            (16, false) => Self::U16(value as u16),
+            (32, true) => Self::I32(value as i32),
+            (32, false) => Self::U32(value as u32),
+            (64, true) => Self::I64(value),
+            (64, false) => Self::U64(value.cast_unsigned()),
+            _ => return None,
+        })
     }
 
-    /// Deserializes a byte slice into an unsigned integer constant.
-    ///
-    /// The byte slice is interpreted as an unsigned integer in the given
-    /// endianness. The variant is chosen based on the slice length:
-    ///
-    /// | Length | Variant |
-    /// |--------|---------|
-    /// | 1      | `U8`    |
-    /// | 2      | `U16`   |
-    /// | 4      | `U32`   |
-    /// | 8      | `U64`   |
-    ///
-    /// Returns `None` for other slice lengths.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use analyssa::{ir::value::ConstValue, target::Endianness, MockTarget};
-    ///
-    /// let be_bytes = vec![0x01, 0x02, 0x03, 0x04];
-    /// let val = ConstValue::<MockTarget>::from_bytes(&be_bytes, Endianness::Big);
-    /// assert_eq!(val, Some(ConstValue::U32(0x01020304)));
-    /// ```
+    /// The constant of `format` whose bits are `bits`. `None` for bits wider
+    /// than the format.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8], endianness: Endianness) -> Option<Self> {
-        match bytes.len() {
-            1 => Some(Self::U8(bytes.first().copied()?)),
-            2 => Some(Self::U16(endianness.read_u16(bytes))),
-            4 => Some(Self::U32(endianness.read_u32(bytes))),
-            8 => Some(Self::U64(endianness.read_u64(bytes))),
+    pub fn float(format: FloatFormat, bits: u128) -> Option<Self> {
+        FloatBits::new(format, bits).map(Self::Float)
+    }
+
+    /// The format and bits of a float constant.
+    #[must_use]
+    pub fn float_bits(&self) -> Option<(FloatFormat, u128)> {
+        match self {
+            Self::Float(v) => Some((v.format(), v.bits())),
             _ => None,
         }
     }
 }
 
-impl<T: Target> ConstValue<T> {
-    /// Converts this constant to a different type. Forwards to
-    /// `Target::convert_const`; non-CIL hosts that don't override the hook
-    /// always observe `None`.
-    #[must_use]
-    pub fn convert_to(
-        &self,
-        target: &T::Type,
-        unsigned_source: bool,
-        ptr_bytes: u32,
-    ) -> Option<Self> {
-        T::convert_const(self, target, unsigned_source, ptr_bytes)
+/// The binary32 constant of a single.
+impl<T: Target> From<f32> for ConstValue<T> {
+    fn from(value: f32) -> Self {
+        Self::Float(FloatBits::from(value))
     }
+}
 
-    /// Converts this constant with overflow checking. Forwards to
-    /// `Target::convert_const_checked`.
-    #[must_use]
-    pub fn convert_to_checked(
-        &self,
-        target: &T::Type,
-        unsigned_source: bool,
-        ptr_bytes: u32,
-    ) -> Option<Self> {
-        T::convert_const_checked(self, target, unsigned_source, ptr_bytes)
+/// The binary64 constant of a double.
+impl<T: Target> From<f64> for ConstValue<T> {
+    fn from(value: f64) -> Self {
+        Self::Float(FloatBits::from(value))
     }
 }
 
@@ -1436,6 +1469,9 @@ where
     T::FieldRef: fmt::Display,
     T::SymbolRef: fmt::Display,
 {
+    /// Formats the constant in the IR's compact textual syntax: numeric arms
+    /// carry a type suffix (`42i8`, `10UL`, `1.5f`) while the rest use named
+    /// forms (`str@3`, `null`, `typeof(...)`, `sym(...)`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::I8(v) => write!(f, "{v}i8"),
@@ -1448,18 +1484,8 @@ where
             Self::U64(v) => write!(f, "{v}UL"),
             Self::NativeInt(v) => write!(f, "{v}n"),
             Self::NativeUInt(v) => write!(f, "{v}un"),
-            Self::F32(v) => write!(f, "{v}f"),
-            Self::F64(v) => write!(f, "{v}"),
-            Self::Vector(lanes) => {
-                write!(f, "<")?;
-                for (idx, lane) in lanes.iter().enumerate() {
-                    if idx > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{lane}")?;
-                }
-                write!(f, ">")
-            }
+            Self::Float(v) => write!(f, "{v}"),
+            Self::Vector(vector) => write!(f, "{vector}"),
             Self::String(idx) => write!(f, "str@{idx}"),
             Self::DecryptedString(s) => write!(f, "\"{}\"", s.escape_default()),
             Self::DecryptedArray(arr) => {
@@ -1485,415 +1511,405 @@ where
     }
 }
 
-/// Abstract value for dataflow analysis.
-///
-/// This represents the abstract state of an SSA variable during analysis.
-/// It forms a lattice where values can be refined as more information is gathered.
-///
-/// Generic over the host `Target` because the `Constant` variant carries a
-/// `ConstValue<T>`.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(bound(
-        serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
-                     T::FieldRef: serde::Serialize, T::SymbolRef: serde::Serialize",
-        deserialize = "T::TypeRef: serde::Deserialize<'de>, \
-                       T::MethodRef: serde::Deserialize<'de>, \
-                       T::FieldRef: serde::Deserialize<'de>, T::SymbolRef: serde::Deserialize<'de>"
-    ))
-)]
-pub enum AbstractValue<T: Target> {
-    /// No information yet (top of lattice).
-    ///
-    /// This is the initial state before any analysis.
-    #[default]
-    Top,
-
-    /// Known constant value.
-    Constant(ConstValue<T>),
-
-    /// Known to be non-null (for reference types).
-    NonNull,
-
-    /// Value in a bounded range [min, max].
-    Range {
-        /// Minimum value (inclusive).
-        min: i64,
-        /// Maximum value (inclusive).
-        max: i64,
-    },
-
-    /// Same value as another SSA variable.
-    ///
-    /// Used for copy propagation.
-    SameAs(SsaVarId),
-
-    /// Result of a specific computation (for CSE).
-    Computed(ComputedValue),
-
-    /// Multiple possible values (bottom of lattice for constants).
-    ///
-    /// This means the value cannot be determined at compile time.
-    Bottom,
-}
-
-impl<T: Target> AbstractValue<T> {
-    /// Returns `true` if this is the top element (no information).
-    #[must_use]
-    pub const fn is_top(&self) -> bool {
-        matches!(self, Self::Top)
-    }
-
-    /// Returns `true` if this is the bottom element (conflicting info).
-    #[must_use]
-    pub const fn is_bottom(&self) -> bool {
-        matches!(self, Self::Bottom)
-    }
-
-    /// Returns `true` if this is a known constant.
-    #[must_use]
-    pub const fn is_constant(&self) -> bool {
-        matches!(self, Self::Constant(_))
-    }
-
-    /// Returns the constant value if this is a constant.
-    #[must_use]
-    pub const fn as_constant(&self) -> Option<&ConstValue<T>> {
-        match self {
-            Self::Constant(c) => Some(c),
-            _ => None,
-        }
-    }
-
-    /// Returns `true` if this value is known to be non-null.
-    #[must_use]
-    pub const fn is_non_null(&self) -> bool {
-        matches!(self, Self::NonNull | Self::Constant(_))
-    }
-
-    /// Meet operation for the lattice (used at control flow joins).
-    ///
-    /// Returns the greatest lower bound of `self` and `other`.
-    #[must_use]
-    #[allow(clippy::match_same_arms)] // Arms kept separate for lattice documentation clarity
-    pub fn meet(&self, other: &Self) -> Self {
-        match (self, other) {
-            // Top meets anything yields the other
-            (Self::Top, x) | (x, Self::Top) => x.clone(),
-
-            // Bottom meets anything yields Bottom
-            (Self::Bottom, _) | (_, Self::Bottom) => Self::Bottom,
-
-            // Same constants stay constant
-            (Self::Constant(a), Self::Constant(b)) if a == b => Self::Constant(a.clone()),
-
-            // Different constants become Bottom
-            (Self::Constant(_), Self::Constant(_)) => Self::Bottom,
-
-            // NonNull meets NonNull stays NonNull
-            (Self::NonNull, Self::NonNull) => Self::NonNull,
-
-            // NonNull meets Constant stays Constant (constants are non-null if not null)
-            (Self::NonNull, Self::Constant(c)) | (Self::Constant(c), Self::NonNull) => {
-                if c.is_null() {
-                    Self::Bottom // null is not non-null
-                } else {
-                    Self::Constant(c.clone())
-                }
-            }
-
-            // Ranges can be merged
-            (
-                Self::Range {
-                    min: a_min,
-                    max: a_max,
-                },
-                Self::Range {
-                    min: b_min,
-                    max: b_max,
-                },
-            ) => {
-                let new_min = (*a_min).min(*b_min);
-                let new_max = (*a_max).max(*b_max);
-                Self::Range {
-                    min: new_min,
-                    max: new_max,
-                }
-            }
-
-            // SameAs values must match
-            (Self::SameAs(a), Self::SameAs(b)) if a == b => Self::SameAs(*a),
-
-            // Computed values must match exactly
-            (Self::Computed(a), Self::Computed(b)) if a == b => Self::Computed(a.clone()),
-
-            // Otherwise, Bottom
-            _ => Self::Bottom,
-        }
-    }
-
-    /// Join operation for the lattice.
-    ///
-    /// Returns the least upper bound of `self` and `other`.
-    #[must_use]
-    pub fn join(&self, other: &Self) -> Self {
-        match (self, other) {
-            // Bottom joins anything yields the other
-            (Self::Bottom, x) | (x, Self::Bottom) => x.clone(),
-
-            // Top joins anything yields Top
-            (Self::Top, _) | (_, Self::Top) => Self::Top,
-
-            // Same values stay the same
-            (a, b) if a == b => a.clone(),
-
-            // Otherwise, Top
-            _ => Self::Top,
-        }
-    }
-}
-
-impl<T: Target> fmt::Display for AbstractValue<T>
-where
-    T::TypeRef: fmt::Display,
-    T::MethodRef: fmt::Display,
-    T::FieldRef: fmt::Display,
-    T::SymbolRef: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Top => write!(f, "⊤"),
-            Self::Constant(c) => write!(f, "{c}"),
-            Self::NonNull => write!(f, "!null"),
-            Self::Range { min, max } => write!(f, "[{min}..{max}]"),
-            Self::SameAs(v) => write!(f, "={v}"),
-            Self::Computed(c) => write!(f, "{c}"),
-            Self::Bottom => write!(f, "⊥"),
-        }
-    }
-}
-
-/// Computed value for common subexpression elimination (CSE).
-///
-/// This represents the result of a computation, enabling recognition
-/// of equivalent expressions that can be eliminated.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ComputedValue {
-    /// The operation that produced this value.
-    pub op: ComputedOp,
-    /// The operands to the operation.
-    pub operands: Vec<SsaVarId>,
-}
-
-impl ComputedValue {
-    /// Creates a new computed value.
-    #[must_use]
-    pub fn new(op: ComputedOp, operands: Vec<SsaVarId>) -> Self {
-        Self { op, operands }
-    }
-
-    /// Creates a unary computed value.
-    #[must_use]
-    pub fn unary(op: ComputedOp, operand: SsaVarId) -> Self {
-        Self {
-            op,
-            operands: vec![operand],
-        }
-    }
-
-    /// Creates a binary computed value.
-    #[must_use]
-    pub fn binary(op: ComputedOp, left: SsaVarId, right: SsaVarId) -> Self {
-        Self {
-            op,
-            operands: vec![left, right],
-        }
-    }
-
-    /// Normalizes commutative operations for better CSE.
-    ///
-    /// For commutative ops like add/mul, orders operands consistently
-    /// so that `a + b` and `b + a` have the same computed value.
-    #[must_use]
-    pub fn normalized(self) -> Self {
-        if self.op.is_commutative() && self.operands.len() == 2 {
-            let mut ops = self.operands;
-            if let (Some(a), Some(b)) = (ops.first(), ops.get(1))
-                && a.index() > b.index()
-            {
-                ops.swap(0, 1);
-            }
-            Self {
-                op: self.op,
-                operands: ops,
-            }
-        } else {
-            self
-        }
-    }
-}
-
-impl fmt::Display for ComputedValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(", self.op)?;
-        for (i, op) in self.operands.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{op}")?;
-        }
-        write!(f, ")")
-    }
-}
-
-/// Operations that can be tracked for CSE.
-///
-/// These represent the pure operations whose results can be reused
-/// when the same operation is performed with the same operands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ComputedOp {
-    // Arithmetic
-    /// Addition
-    Add,
-    /// Subtraction
-    Sub,
-    /// Multiplication
-    Mul,
-    /// Division
-    Div,
-    /// Remainder (modulo)
-    Rem,
-    /// Negation
-    Neg,
-
-    // Bitwise
-    /// Bitwise AND
-    And,
-    /// Bitwise OR
-    Or,
-    /// Bitwise XOR
-    Xor,
-    /// Bitwise NOT
-    Not,
-    /// Shift left
-    Shl,
-    /// Shift right
-    Shr,
-
-    // Comparison
-    /// Compare equal
-    Ceq,
-    /// Compare not equal
-    Cne,
-    /// Compare less than
-    Clt,
-    /// Compare greater than
-    Cgt,
-    /// Compare less than or equal
-    Cle,
-    /// Compare greater than or equal
-    Cge,
-
-    // Conversion
-    /// Convert to int8
-    ConvI1,
-    /// Convert to int16
-    ConvI2,
-    /// Convert to int32
-    ConvI4,
-    /// Convert to int64
-    ConvI8,
-    /// Convert to uint8
-    ConvU1,
-    /// Convert to uint16
-    ConvU2,
-    /// Convert to uint32
-    ConvU4,
-    /// Convert to uint64
-    ConvU8,
-    /// Convert to float32
-    ConvR4,
-    /// Convert to float64
-    ConvR8,
-}
-
-impl ComputedOp {
-    /// Returns `true` if this operation is commutative.
-    #[must_use]
-    pub const fn is_commutative(&self) -> bool {
-        matches!(
-            self,
-            Self::Add | Self::Mul | Self::And | Self::Or | Self::Xor | Self::Ceq | Self::Cne
-        )
-    }
-
-    /// Returns `true` if this is a comparison operation.
-    #[must_use]
-    pub const fn is_comparison(&self) -> bool {
-        matches!(
-            self,
-            Self::Ceq | Self::Cne | Self::Clt | Self::Cgt | Self::Cle | Self::Cge
-        )
-    }
-}
-
-impl fmt::Display for ComputedOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Self::Add => "add",
-            Self::Sub => "sub",
-            Self::Mul => "mul",
-            Self::Div => "div",
-            Self::Rem => "rem",
-            Self::Neg => "neg",
-            Self::And => "and",
-            Self::Or => "or",
-            Self::Xor => "xor",
-            Self::Not => "not",
-            Self::Shl => "shl",
-            Self::Shr => "shr",
-            Self::Ceq => "ceq",
-            Self::Cne => "cne",
-            Self::Clt => "clt",
-            Self::Cgt => "cgt",
-            Self::Cle => "cle",
-            Self::Cge => "cge",
-            Self::ConvI1 => "conv.i1",
-            Self::ConvI2 => "conv.i2",
-            Self::ConvI4 => "conv.i4",
-            Self::ConvI8 => "conv.i8",
-            Self::ConvU1 => "conv.u1",
-            Self::ConvU2 => "conv.u2",
-            Self::ConvU4 => "conv.u4",
-            Self::ConvU8 => "conv.u8",
-            Self::ConvR4 => "conv.r4",
-            Self::ConvR8 => "conv.r8",
-        };
-        write!(f, "{s}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
 
-    use super::*;
-    use crate::testing::{MockTarget, MockType};
+    use super::{encoding::EncodedBytes, *};
+    use crate::{
+        ir::{CmpKind, variable::SsaVarId},
+        target::{Endianness, TypeLayout},
+        testing::{FactfulTarget, MockTarget, MockType},
+    };
 
     type Cv = ConstValue<MockTarget>;
     type Av = AbstractValue<MockTarget>;
+
+    /// **Two addresses of one image compare as their addresses.** `ldr r0,
+    /// =__TMC_END__; ldr r3, =__TMC_END__; cmp r3, r0` reads one address
+    /// twice: equal, as the same number twice was. Ordered unsigned they are
+    /// ordered as their addresses; signed, a load base may straddle the sign,
+    /// and nothing is decided. An import, with no address, is an opaque
+    /// identity no comparison of constants decides, itself included.
+    #[test]
+    fn two_addresses_of_one_image_compare_as_their_addresses() {
+        let ptr = PointerSize::Bit32;
+        let (low, high) = (Cv::Symbol(0x250ec), Cv::Symbol(0x25100));
+        assert_eq!(low.ceq_at(&Cv::Symbol(0x250ec), ptr), Some(Cv::True));
+        assert_eq!(low.ceq_at(&high, ptr), Some(Cv::False));
+        assert_eq!(low.relation(&high, CmpKind::Lt, true, ptr), Some(true));
+        assert_eq!(high.relation(&low, CmpKind::Ge, true, ptr), Some(true));
+        assert_eq!(low.relation(&high, CmpKind::Lt, false, ptr), None);
+        // `FactfulTarget` gives a symbol at `IMPORTED` and above no address.
+        let import = ConstValue::<FactfulTarget>::Symbol(FactfulTarget::IMPORTED);
+        assert_eq!(import.ceq_at(&import, ptr), None);
+        let local = ConstValue::<FactfulTarget>::Symbol(0x10);
+        assert_eq!(import.ceq_at(&local, ptr), None);
+    }
+
+    /// Booleans and every integer width read as an `i64`, and an
+    /// out-of-range unsigned constant does not.
+    #[test]
+    fn resolved_i64_covers_booleans_and_integers() {
+        assert_eq!(Cv::True.resolved_i64(), Some(1));
+        assert_eq!(Cv::False.resolved_i64(), Some(0));
+        assert_eq!(Cv::I32(-7).resolved_i64(), Some(-7));
+        assert_eq!(
+            Cv::U64(u64::MAX).resolved_i64(),
+            None,
+            "an out-of-range unsigned constant does not convert"
+        );
+    }
+
+    /// **A float's bytes are its IEEE 754 bits, and read back as an integer
+    /// they are that pattern.** `3.0f` is `0x40400000` and `3.0` is
+    /// `0x4008000000000000`.
+    #[test]
+    fn a_float_is_its_bit_pattern() {
+        let b64 = PointerSize::Bit64;
+        assert_eq!(
+            Cv::from(3.0f32).to_bytes(Endianness::Little, b64),
+            Some(vec![0x00, 0x00, 0x40, 0x40])
+        );
+        assert_eq!(
+            Cv::from(3.0f64).to_bytes(Endianness::Big, b64),
+            Some(vec![0x40, 0x08, 0, 0, 0, 0, 0, 0])
+        );
+        let bytes = Cv::from(3.0f32).to_bytes(Endianness::Little, b64);
+        assert_eq!(
+            bytes.and_then(|bytes| Cv::from_typed_bytes(
+                &bytes,
+                &MockType::I32,
+                Endianness::Little
+            )),
+            Some(Cv::I32(0x4040_0000))
+        );
+    }
+
+    /// **A double-width product is both halves of the exact product.** At each
+    /// width, signed and unsigned, at the extremes where a narrower product
+    /// would wrap: `u64::MAX²` is `2^128 - 2^65 + 1`, `i64::MIN²` is `2^126`,
+    /// `-1 * -1` is `1`, and the mixed widths and non-integers have no value.
+    #[test]
+    fn a_wide_product_is_both_halves_of_the_exact_product() {
+        let b64 = PointerSize::Bit64;
+        assert_eq!(
+            Cv::U64(u64::MAX).wide_mul(&Cv::U64(u64::MAX), true, b64),
+            Some((Cv::U64(1), Cv::U64(u64::MAX - 1)))
+        );
+        assert_eq!(
+            Cv::I64(i64::MIN).wide_mul(&Cv::I64(i64::MIN), false, b64),
+            Some((Cv::I64(0), Cv::I64(0x4000_0000_0000_0000)))
+        );
+        assert_eq!(
+            Cv::I64(-1).wide_mul(&Cv::I64(-1), false, b64),
+            Some((Cv::I64(1), Cv::I64(0)))
+        );
+        // The same bits read unsigned: (2^64 - 1)^2.
+        assert_eq!(
+            Cv::I64(-1).wide_mul(&Cv::I64(-1), true, b64),
+            Some((Cv::I64(1), Cv::I64(-2)))
+        );
+        assert_eq!(
+            Cv::U32(0x8000_0000).wide_mul(&Cv::U32(2), true, b64),
+            Some((Cv::U32(0), Cv::U32(1)))
+        );
+        assert_eq!(
+            Cv::I32(-3).wide_mul(&Cv::I32(5), false, b64),
+            Some((Cv::I32(-15), Cv::I32(-1)))
+        );
+        assert_eq!(
+            Cv::I8(-128).wide_mul(&Cv::I8(-128), false, b64),
+            Some((Cv::I8(0), Cv::I8(0x40)))
+        );
+        assert_eq!(
+            Cv::NativeUInt(u64::MAX).wide_mul(&Cv::NativeUInt(2), true, b64),
+            Some((Cv::NativeUInt(u64::MAX - 1), Cv::NativeUInt(1)))
+        );
+        assert_eq!(Cv::U32(1).wide_mul(&Cv::U64(1), true, b64), None);
+        assert_eq!(
+            Cv::from(1.0f64).wide_mul(&Cv::from(1.0f64), true, b64),
+            None
+        );
+    }
+
+    /// **A double-width division truncates, and traps where it has no value.**
+    /// `2^64 / 2` fills the quotient's top bit; a signed `-7 / 2` is `-3`
+    /// remainder `-1`; a quotient that does not fit, and a zero divisor, have
+    /// none.
+    #[test]
+    fn a_wide_division_truncates_and_has_no_value_where_it_traps() {
+        let b64 = PointerSize::Bit64;
+        assert_eq!(
+            Cv::U64(0).wide_div(&Cv::U64(1), &Cv::U64(2), true, b64),
+            Some((Cv::U64(0x8000_0000_0000_0000), Cv::U64(0)))
+        );
+        assert_eq!(
+            Cv::U64(7).wide_div(&Cv::U64(0), &Cv::U64(2), true, b64),
+            Some((Cv::U64(3), Cv::U64(1)))
+        );
+        assert_eq!(
+            Cv::I64(-7).wide_div(&Cv::I64(-1), &Cv::I64(2), false, b64),
+            Some((Cv::I64(-3), Cv::I64(-1)))
+        );
+        assert_eq!(
+            Cv::I32(100).wide_div(&Cv::I32(0), &Cv::I32(-7), false, b64),
+            Some((Cv::I32(-14), Cv::I32(2)))
+        );
+        // The quotient of 2^64 by 1 is 65 bits wide.
+        assert_eq!(
+            Cv::U64(0).wide_div(&Cv::U64(1), &Cv::U64(1), true, b64),
+            None
+        );
+        // i64::MIN / -1 is 2^63, one past i64::MAX.
+        assert_eq!(
+            Cv::I64(i64::MIN).wide_div(&Cv::I64(-1), &Cv::I64(-1), false, b64),
+            None
+        );
+        assert_eq!(
+            Cv::U64(1).wide_div(&Cv::U64(0), &Cv::U64(0), true, b64),
+            None
+        );
+        assert_eq!(
+            Cv::U32(1).wide_div(&Cv::U32(0), &Cv::U64(1), true, b64),
+            None
+        );
+    }
+
+    /// **A constant flags value holds each flag at its bit of `FlagsMask`**:
+    /// a read gives that bit, a merge takes the masked flags from the update
+    /// and the rest from the base, and an insertion sets or clears one flag,
+    /// each keeping the base's variant. A read or insertion of more than one
+    /// flag is no one truth value and declines, as does a constant that is no
+    /// integer.
+    #[test]
+    fn a_constant_flags_value_holds_each_flag_at_its_bit() {
+        let carry_zero = Cv::U32(u32::from(FlagsMask::CARRY.bits() | FlagsMask::ZERO.bits()));
+        assert_eq!(carry_zero.read_flag(FlagsMask::CARRY), Some(true));
+        assert_eq!(carry_zero.read_flag(FlagsMask::ZERO), Some(true));
+        assert_eq!(carry_zero.read_flag(FlagsMask::PARITY), Some(false));
+        assert_eq!(Cv::U32(0).read_flag(FlagsMask::SIGN), Some(false));
+        assert_eq!(
+            carry_zero.read_flag(FlagsMask::CARRY.union(FlagsMask::ZERO)),
+            None
+        );
+        assert_eq!(Cv::from(1.0f64).read_flag(FlagsMask::CARRY), None);
+
+        let sign = Cv::U32(u32::from(FlagsMask::SIGN.bits()));
+        assert_eq!(
+            carry_zero.merged_flags(&sign, FlagsMask::ZERO.union(FlagsMask::SIGN)),
+            Some(Cv::U32(u32::from(
+                FlagsMask::CARRY.bits() | FlagsMask::SIGN.bits()
+            )))
+        );
+        assert_eq!(
+            carry_zero.with_flag(FlagsMask::ZERO, false),
+            Some(Cv::U32(u32::from(FlagsMask::CARRY.bits())))
+        );
+        assert_eq!(
+            Cv::U8(0).with_flag(FlagsMask::CARRY, true),
+            Some(Cv::U8(
+                u8::try_from(FlagsMask::CARRY.bits()).expect("a low bit")
+            ))
+        );
+        assert_eq!(
+            carry_zero.with_flag(FlagsMask::CARRY.union(FlagsMask::ZERO), true),
+            None
+        );
+    }
+
+    /// Projected decoding keeps exact integer, floating and packed-lane semantics.
+    #[test]
+    fn projected_byte_decoding_preserves_exact_type_facts() {
+        for order in [Endianness::Little, Endianness::Big] {
+            for (ty, bytes, expected) in [
+                (MockType::I8, vec![0xff], Cv::I8(-1)),
+                (MockType::U8, vec![0xff], Cv::U8(255)),
+                (MockType::I16, vec![0xff; 2], Cv::I16(-1)),
+                (MockType::U16, vec![0xff; 2], Cv::U16(u16::MAX)),
+                (MockType::I32, vec![0xff; 4], Cv::I32(-1)),
+                (MockType::U32, vec![0xff; 4], Cv::U32(u32::MAX)),
+                (MockType::I64, vec![0xff; 8], Cv::I64(-1)),
+                (MockType::U64, vec![0xff; 8], Cv::U64(u64::MAX)),
+            ] {
+                let layout = TypeLayout::of::<MockTarget>(&ty, PointerSize::Bit64);
+                assert_eq!(Cv::from_layout_bytes(&bytes, layout, order), Some(expected));
+                assert_eq!(
+                    Cv::from_layout_bytes(&bytes[..bytes.len() - 1], layout, order),
+                    None
+                );
+            }
+            for (ty, format, bits) in [
+                (MockType::BF16, FloatFormat::BFloat16, 0x3f80u128),
+                (MockType::F64, FloatFormat::Double, 0x3ff0_0000_0000_0000),
+                (
+                    MockType::F80,
+                    FloatFormat::X87Extended,
+                    0x3fff_8000_0000_0000_0000,
+                ),
+            ] {
+                let count = usize::try_from(format.bits() / 8).unwrap();
+                let bytes = match order {
+                    Endianness::Little => bits.to_le_bytes()[..count].to_vec(),
+                    Endianness::Big => bits.to_be_bytes()[16 - count..].to_vec(),
+                };
+                let layout = TypeLayout::of::<MockTarget>(&ty, PointerSize::Bit64);
+                assert_eq!(
+                    Cv::from_layout_bytes(&bytes, layout, order),
+                    Cv::float(format, bits)
+                );
+            }
+            let layout = TypeLayout::of::<MockTarget>(&MockType::V16I4, PointerSize::Bit64);
+            assert_eq!(
+                Cv::from_layout_bytes(&[0x21; 8], layout, order),
+                VectorConst::from_lanes(4, (0..16).map(|i| if i % 2 == 0 { 1 } else { 2 }))
+                    .map(Cv::Vector)
+            );
+        }
+        for ty in [MockType::NxV4I32, MockType::NxMask4, MockType::Unknown] {
+            let layout = TypeLayout::of::<MockTarget>(&ty, PointerSize::Bit64);
+            assert_eq!(
+                Cv::from_layout_bytes(&[0; 16], layout, Endianness::Little),
+                None
+            );
+        }
+    }
+
+    /// **A float in the image reads as the float it is.** `2.0` as a double,
+    /// and a pair of doubles as a vector of them, where both used to state
+    /// nothing. The integer read of the same bytes is the control.
+    #[test]
+    fn image_bytes_read_as_the_float_their_type_names() {
+        let two = 2.0f64.to_bits().to_le_bytes();
+        assert_eq!(
+            Cv::from_typed_bytes(&two, &MockType::F64, Endianness::Little),
+            Some(Cv::from(2.0f64))
+        );
+        let pair: Vec<u8> = [2.0f64, -0.5]
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect();
+        assert_eq!(
+            Cv::from_typed_bytes(&pair, &MockType::V2F64, Endianness::Little),
+            VectorConst::from_lanes(64, [2.0f64, -0.5].map(|value| u128::from(value.to_bits())))
+                .map(Cv::Vector)
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(&two, &MockType::U64, Endianness::Little),
+            Some(Cv::U64(2.0f64.to_bits()))
+        );
+    }
+
+    /// **An integer wider than 64 bits reads from the image as the one-lane
+    /// vector the evaluator computes it as**, in either byte order: MPX's
+    /// bound pair loaded whole folds to the two bounds. Bytes too few for the
+    /// type read as nothing.
+    #[test]
+    fn a_128_bit_integer_reads_from_the_image_as_one_wide_lane() {
+        let value = 0x1000_0000_0000_0002_9000_0000_0000_0001u128;
+        let wide = Cv::of_lane(128, value);
+        assert!(wide.is_some());
+        assert_eq!(
+            Cv::from_typed_bytes(&value.to_le_bytes(), &MockType::U128, Endianness::Little),
+            wide
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(&value.to_be_bytes(), &MockType::U128, Endianness::Big),
+            wide
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(
+                &value.to_le_bytes()[..8],
+                &MockType::U128,
+                Endianness::Little
+            ),
+            None
+        );
+    }
+
+    /// **A lane wider than any one integer reads as its bits.** Two 256-bit
+    /// lanes of the bytes `0..64`: little-endian, the lowest byte the lowest
+    /// bits of its lane, so the vector read again in 64-bit lanes is the
+    /// little-endian words of the bytes; big-endian, each lane's bytes from
+    /// its last, so the first 64-bit lane holds bytes 31 down to 24. The
+    /// vector writes back as the bytes it was read from.
+    #[test]
+    fn a_lane_wider_than_an_integer_reads_as_its_bits() {
+        let bytes: Vec<u8> = (0..64u8).collect();
+        let word = |at: usize, order: Endianness| {
+            let word: [u8; 8] = bytes[at..at + 8].try_into().expect("eight bytes");
+            u128::from(match order {
+                Endianness::Little => u64::from_le_bytes(word),
+                Endianness::Big => u64::from_be_bytes(word),
+            })
+        };
+        for order in [Endianness::Little, Endianness::Big] {
+            let read = Cv::from_typed_bytes(&bytes, &MockType::V2I256, order);
+            let Some(Cv::Vector(vector)) = &read else {
+                panic!("{order:?}: {read:?}");
+            };
+            assert_eq!((vector.lane_bits(), vector.lanes()), (256, 2), "{order:?}");
+            let words: Vec<u128> = vector
+                .relaned(64)
+                .expect("eight words")
+                .lane_values()
+                .collect();
+            let expected: Vec<u128> = match order {
+                Endianness::Little => (0..8).map(|at| word(at * 8, order)).collect(),
+                Endianness::Big => [24, 16, 8, 0, 56, 48, 40, 32]
+                    .into_iter()
+                    .map(|at| word(at, order))
+                    .collect(),
+            };
+            assert_eq!(words, expected, "{order:?}");
+            assert_eq!(
+                read.as_ref()
+                    .and_then(|value| value.to_bytes(order, PointerSize::Bit64)),
+                Some(bytes.clone()),
+                "{order:?} writes back"
+            );
+        }
+        assert_eq!(
+            Cv::from_typed_bytes(&bytes[..32], &MockType::V2I256, Endianness::Little),
+            None,
+            "too few bytes"
+        );
+    }
+
+    /// **Lanes narrower than a byte pack into bytes as the register holds
+    /// them.** Sixteen nibbles `0..=15`, lane 0 lowest, are the bytes `0x10,
+    /// 0x32, ... 0xfe` read from the low end, and those bytes read back as
+    /// sixteen nibbles are the same vector; a 64-bit integer of the bytes is
+    /// the control. Bytes too few for the vector read as nothing.
+    #[test]
+    fn lanes_narrower_than_a_byte_pack_into_bytes() {
+        let nibbles = VectorConst::from_lanes(4, 0..16u128).expect("sixteen nibbles");
+        let bytes = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe];
+        assert_eq!(
+            Cv::Vector(nibbles.clone()).to_bytes(Endianness::Little, PointerSize::Bit64),
+            Some(bytes.to_vec())
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(&bytes, &MockType::V16I4, Endianness::Little),
+            Some(Cv::Vector(nibbles))
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(&bytes, &MockType::U64, Endianness::Little),
+            Some(Cv::U64(0xfedc_ba98_7654_3210))
+        );
+        assert_eq!(
+            Cv::from_typed_bytes(&bytes[..4], &MockType::V16I4, Endianness::Little),
+            None
+        );
+    }
 
     /// `ConstValue`'s `Eq`/`Hash` model structural constant identity, which is
     /// what lets GVN use an op (and therefore its constants) as a hash-map key.
     /// The float arms must compare bitwise or `Eq` would not be reflexive.
     /// Rust's `wrapping_shl` masks the distance by the *value's own* type width,
     /// so the `I8` arm masked by 7: `U8(0x81) << 8` folded to `U8(0x81)`, leaving
-    /// the value unchanged. No ISA does that — x86 masks by 31/63 regardless of
-    /// the destination sub-register, AArch64 and RISC-V by the register width —
+    /// the value unchanged. No ISA does that - x86 masks by 31/63 regardless of
+    /// the destination sub-register, AArch64 and RISC-V by the register width -
     /// and `SsaOp::Shl` defines no out-of-range behaviour at all. Declining to
     /// fold is sound under every convention.
     #[test]
@@ -1926,6 +1942,132 @@ mod tests {
         assert_eq!(Cv::I32(1).shr(&Cv::I32(-1), false, ptr), None);
     }
 
+    /// Bitwise and wrapping-arithmetic folds combine operands of *any* width and
+    /// signedness, extending each by its own signedness to a common width and
+    /// typing the result as the wider operand's exact variant. This is the path a
+    /// split constant (`movz`/`movk`, `lui`/`ori`) takes: a narrow half combined
+    /// with a wide mask or addend.
+    #[test]
+    fn mixed_width_and_sign_integer_folds_are_bit_correct() {
+        let ptr = PointerSize::Bit64;
+
+        // The AArch64 `movk` shape: a signed 64-bit field masked by an unsigned
+        // 64-bit literal, and OR-ed with a narrow half. `U32 | I64` was the pair
+        // the explicit arms missed.
+        assert_eq!(
+            Cv::I64(0x811c).bitwise_and(&Cv::U64(0xffff), ptr),
+            Some(Cv::I64(0x811c))
+        );
+        assert_eq!(
+            Cv::U32(0x9dc5).bitwise_or(&Cv::I64(0x811c_0000), ptr),
+            Some(Cv::I64(0x811c_9dc5))
+        );
+
+        // The MIPS prime shape: `U32 + I64`.
+        assert_eq!(
+            Cv::U32(0x0100_0000).add(&Cv::I64(0x193), ptr),
+            Some(Cv::I64(0x0100_0193))
+        );
+
+        // A narrow *signed* operand is promoted by sign-extension, not
+        // zero-extension: `(int8_t)-1 & (uint32_t)x` is `0xFFFF_FFFF & x`, so
+        // `I8(-1) & U32(0xABCD)` keeps every low bit of the wider operand.
+        assert_eq!(
+            Cv::I8(-1).bitwise_and(&Cv::U32(0xABCD), ptr),
+            Some(Cv::U32(0xABCD))
+        );
+        // Zero-extension would have masked it to the low 8 bits - the bug this
+        // guards against.
+        assert_ne!(
+            Cv::I8(-1).bitwise_and(&Cv::U32(0xABCD), ptr),
+            Some(Cv::U32(0x00CD))
+        );
+
+        // The result takes the wider operand's exact variant, `NativeUInt`
+        // included - it is not collapsed onto `U64`.
+        assert_eq!(
+            Cv::U32(0xF0).bitwise_or(&Cv::NativeUInt(0x0F), ptr),
+            Some(Cv::NativeUInt(0xFF))
+        );
+
+        // Wrapping multiply, mixed sign and width.
+        assert_eq!(
+            Cv::U32(0x1_0000).mul(&Cv::I64(0x1_0000), ptr),
+            Some(Cv::I64(0x1_0000_0000))
+        );
+    }
+
+    /// A native integer has a truth value like every other integer.
+    ///
+    /// Answering `None` sent a branch on a constant `native int` down whichever
+    /// arm a caller's "not known true" fallback chose.
+    #[test]
+    fn native_integers_have_a_truth_value() {
+        assert_eq!(Cv::NativeInt(0).as_bool(), Some(false));
+        assert_eq!(Cv::NativeInt(-1).as_bool(), Some(true));
+        assert_eq!(Cv::NativeUInt(0).as_bool(), Some(false));
+        assert_eq!(Cv::NativeUInt(7).as_bool(), Some(true));
+        assert_eq!(Cv::from(1.0f64).as_bool(), None);
+    }
+
+    /// Unsigned division reads both bit patterns as unsigned at their width.
+    #[test]
+    fn unsigned_division_reads_the_bit_pattern() {
+        let ptr = PointerSize::Bit64;
+        assert_eq!(
+            Cv::I32(-8).div_un(&Cv::I32(2), ptr),
+            Some(Cv::I32(0x7FFF_FFFC))
+        );
+        assert_eq!(Cv::I32(-8).div(&Cv::I32(2), ptr), Some(Cv::I32(-4)));
+        assert_eq!(Cv::I32(-1).rem_un(&Cv::I32(10), ptr), Some(Cv::I32(5)));
+        assert_eq!(Cv::I8(-1).div_un(&Cv::I8(16), ptr), Some(Cv::I8(15)));
+        assert_eq!(
+            Cv::NativeInt(-2).div_un(&Cv::NativeInt(2), PointerSize::Bit32),
+            Some(Cv::NativeInt(0x7FFF_FFFF))
+        );
+        assert_eq!(Cv::U32(7).div_un(&Cv::U32(0), ptr), None);
+        assert_eq!(Cv::I32(7).div_un(&Cv::I64(2), ptr), None, "mixed widths");
+        assert_eq!(Cv::from(1.0f64).div_un(&Cv::from(2.0f64), ptr), None);
+    }
+
+    /// A shift count held in any integer variant is honoured.
+    #[test]
+    fn a_shift_count_of_any_integer_variant_folds() {
+        let ptr = PointerSize::Bit64;
+        assert_eq!(Cv::I32(1).shl(&Cv::U32(3), ptr), Some(Cv::I32(8)));
+        assert_eq!(Cv::I64(1).shl(&Cv::I64(40), ptr), Some(Cv::I64(1 << 40)));
+        assert_eq!(
+            Cv::U32(0x80).shr(&Cv::NativeUInt(4), true, ptr),
+            Some(Cv::U32(0x8))
+        );
+        assert_eq!(Cv::I32(1).shl(&Cv::U32(32), ptr), None);
+    }
+
+    /// **An integer wider than any scalar constant shifts by a scalar count.**
+    /// A 128-bit value, one lane of its width, shifted right by 64 is its high
+    /// half and left by 64 moves its low half up; an arithmetic shift copies
+    /// the top bit and a rotate wraps. A count of the whole width declines as
+    /// a scalar's does, and a negative one never shifts.
+    #[test]
+    fn a_wide_integer_shifts_by_a_scalar_count() {
+        let ptr = PointerSize::Bit64;
+        let value = 0x8000_0000_0000_0002_0000_0000_0000_0001u128;
+        let wide = |bits: u128| Cv::of_lane(128, bits);
+        let of = wide(value).expect("a 128-bit lane");
+        assert_eq!(of.shr(&Cv::U8(64), true, ptr), wide(0x8000_0000_0000_0002));
+        assert_eq!(
+            of.shr(&Cv::U8(64), false, ptr),
+            wide(0xffff_ffff_ffff_ffff_8000_0000_0000_0002)
+        );
+        assert_eq!(of.shl(&Cv::I32(64), ptr), wide(1 << 64));
+        assert_eq!(
+            of.rotate(&Cv::U64(64), false, ptr),
+            wide(0x0000_0000_0000_0001_8000_0000_0000_0002)
+        );
+        assert_eq!(of.shl(&Cv::U32(128), ptr), None);
+        assert_eq!(of.shr(&Cv::I64(-1), true, ptr), None);
+    }
+
     /// In-range shifts must still fold, at every width.
     #[test]
     fn in_range_shifts_still_fold() {
@@ -1942,6 +2084,46 @@ mod tests {
         );
     }
 
+    /// The operation's flag decides the shift, whatever the constant's type: an
+    /// arithmetic shift of an unsigned-typed value copies its top bit down, and
+    /// a logical shift of a signed one does not.
+    #[test]
+    fn the_flag_not_the_type_decides_the_right_shift() {
+        type Cv = ConstValue<MockTarget>;
+        let ptr = PointerSize::Bit64;
+        let by = |n| Cv::I32(n);
+        assert_eq!(Cv::U8(0x80).shr(&by(4), false, ptr), Some(Cv::U8(0xf8)));
+        assert_eq!(
+            Cv::U16(0x8000).shr(&by(8), false, ptr),
+            Some(Cv::U16(0xff80))
+        );
+        assert_eq!(
+            Cv::U32(0x8000_0000).shr(&by(24), false, ptr),
+            Some(Cv::U32(0xffff_ff80))
+        );
+        assert_eq!(
+            Cv::U64(1 << 63).shr(&by(60), false, ptr),
+            Some(Cv::U64(0xffff_ffff_ffff_fff8))
+        );
+        assert_eq!(
+            Cv::NativeUInt(1 << 63).shr(&by(60), false, ptr),
+            Some(Cv::NativeUInt(0xffff_ffff_ffff_fff8))
+        );
+        assert_eq!(
+            Cv::NativeUInt(0x8000_0000).shr(&by(28), false, PointerSize::Bit32),
+            Some(Cv::NativeUInt(0xffff_fff8)),
+            "a pointer-width value's sign is its bit at the pointer width"
+        );
+        assert_eq!(Cv::I8(-128).shr(&by(4), true, ptr), Some(Cv::I8(8)));
+        assert_eq!(
+            Cv::U32(0x7fff_ffff).shr(&by(4), false, ptr),
+            Some(Cv::U32(0x07ff_ffff))
+        );
+    }
+
+    /// Structural equality keys on the arm and payload and hashes floats
+    /// bitwise, so `NaN` is reflexive and `±0.0` stay distinct, while IEEE `ceq`
+    /// semantics are left untouched.
     #[test]
     fn const_value_equality_is_structural_and_reflexive_for_floats() {
         fn hash_of(v: &Cv) -> u64 {
@@ -1950,18 +2132,18 @@ mod tests {
             h.finish()
         }
 
-        // Reflexive even for NaN — required for `Eq` to be sound.
-        assert_eq!(Cv::F64(f64::NAN), Cv::F64(f64::NAN));
-        assert_eq!(Cv::F32(f32::NAN), Cv::F32(f32::NAN));
-        assert_eq!(hash_of(&Cv::F64(f64::NAN)), hash_of(&Cv::F64(f64::NAN)));
+        // Reflexive even for NaN - required for `Eq` to be sound.
+        assert_eq!(Cv::from(f64::NAN), Cv::from(f64::NAN));
+        assert_eq!(Cv::from(f32::NAN), Cv::from(f32::NAN));
+        assert_eq!(hash_of(&Cv::from(f64::NAN)), hash_of(&Cv::from(f64::NAN)));
 
         // `+0.0` and `-0.0` are distinct constants: they are distinguishable at
         // runtime (`1.0 / x`), so value numbering must not conflate them.
-        assert_ne!(Cv::F64(0.0), Cv::F64(-0.0));
+        assert_ne!(Cv::from(0.0f64), Cv::from(-0.0f64));
 
         // Equal values hash equally (the `Hash`/`Eq` contract).
-        assert_eq!(Cv::F64(1.5), Cv::F64(1.5));
-        assert_eq!(hash_of(&Cv::F64(1.5)), hash_of(&Cv::F64(1.5)));
+        assert_eq!(Cv::from(1.5f64), Cv::from(1.5f64));
+        assert_eq!(hash_of(&Cv::from(1.5f64)), hash_of(&Cv::from(1.5f64)));
 
         // The arm is part of the identity: same number, different type.
         assert_ne!(Cv::I32(4), Cv::I64(4));
@@ -1969,12 +2151,14 @@ mod tests {
         // IEEE semantic comparison is a separate operation and is unaffected:
         // `ceq` still reports NaN as not-equal.
         assert_eq!(
-            Cv::F64(f64::NAN).ceq(&Cv::F64(f64::NAN)),
+            Cv::from(f64::NAN).ceq(&Cv::from(f64::NAN)),
             Some(Cv::False),
             "ceq keeps IEEE semantics; only structural equality is bitwise"
         );
     }
 
+    /// The `is_*` classifiers and `as_*` extractors report the expected arm and
+    /// scalar value across the integer, float, boolean, and string variants.
     #[test]
     fn const_value_classifies_and_extracts_scalars() {
         assert!(Cv::Null.is_null());
@@ -1982,7 +2166,7 @@ mod tests {
         assert!(Cv::I32(-7).is_integer());
         assert!(Cv::I64(-7).is_signed());
         assert!(Cv::U64(7).is_unsigned());
-        assert!(Cv::F64(1.5).is_float());
+        assert!(Cv::from(1.5f64).is_float());
         assert!(Cv::String(3).is_string_like());
         assert!(Cv::DecryptedString("secret".into()).is_string_like());
 
@@ -1990,8 +2174,8 @@ mod tests {
         assert_eq!(Cv::U32(9).as_i64(), Some(9));
         assert_eq!(Cv::I32(-1).as_u64(), None);
         assert_eq!(Cv::I32(7).as_u32(), Some(7));
-        assert_eq!(Cv::F32(1.25).as_f32(), Some(1.25));
-        assert_eq!(Cv::F64(2.5).as_f64(), Some(2.5));
+        assert_eq!(Cv::from(1.25f32).as_f32(), Some(1.25));
+        assert_eq!(Cv::from(2.5f64).as_f64(), Some(2.5));
         assert_eq!(Cv::False.as_bool(), Some(false));
         assert_eq!(Cv::I32(5).as_bool(), Some(true));
         assert_eq!(
@@ -2001,6 +2185,9 @@ mod tests {
         assert_eq!(Cv::String(1).as_decrypted_string(), None);
     }
 
+    /// The `is_zero`/`is_one`/`is_minus_one`/`is_all_ones` predicates and the
+    /// `zero_of_same_type`/`from_bool` constructors preserve each constant's
+    /// numeric type and meaning.
     #[test]
     fn const_value_identity_helpers_preserve_numeric_intent() {
         assert!(Cv::I32(0).is_zero());
@@ -2010,12 +2197,34 @@ mod tests {
         assert!(Cv::U32(u32::MAX).is_all_ones());
 
         assert_eq!(Cv::U16(99).zero_of_same_type(), Cv::U16(0));
-        assert_eq!(Cv::F64(99.0).zero_of_same_type(), Cv::F64(0.0));
+        assert_eq!(Cv::from(99.0f64).zero_of_same_type(), Cv::from(0.0f64));
         assert_eq!(Cv::I32(99).zero_of_same_type(), Cv::I32(0));
         assert_eq!(Cv::from_bool(true), Cv::True);
         assert_eq!(Cv::from_bool(false), Cv::False);
     }
 
+    /// The bitwise folds act on boolean constants as on one-bit values, and a
+    /// boolean against an integer declines.
+    #[test]
+    fn bitwise_operations_fold_booleans_as_one_bit_values() {
+        let ptr = PointerSize::Bit64;
+        for a in [false, true] {
+            assert_eq!(Cv::from_bool(a).bitwise_not(ptr), Some(Cv::from_bool(!a)));
+            for b in [false, true] {
+                let (l, r) = (Cv::from_bool(a), Cv::from_bool(b));
+                assert_eq!(l.bitwise_and(&r, ptr), Some(Cv::from_bool(a && b)));
+                assert_eq!(l.bitwise_or(&r, ptr), Some(Cv::from_bool(a || b)));
+                assert_eq!(l.bitwise_xor(&r, ptr), Some(Cv::from_bool(a != b)));
+            }
+        }
+        // A boolean against an integer has no common width: no fold.
+        assert_eq!(Cv::True.bitwise_and(&Cv::U8(1), ptr), None);
+        assert_eq!(Cv::U8(1).bitwise_or(&Cv::False, ptr), None);
+    }
+
+    /// The scalar arithmetic, bitwise, shift, and division folds produce the
+    /// expected results, while division by zero and a mixed int/float pair
+    /// decline to fold.
     #[test]
     fn arithmetic_and_bitwise_operations_fold_constants() {
         let ptr = PointerSize::Bit64;
@@ -2041,45 +2250,57 @@ mod tests {
         assert_eq!(Cv::I8(1).shl(&Cv::I32(3), ptr), Some(Cv::I8(8)));
         assert_eq!(Cv::I8(-8).shr(&Cv::I32(1), false, ptr), Some(Cv::I8(-4)));
         assert_eq!(Cv::I8(-8).shr(&Cv::I32(1), true, ptr), Some(Cv::I8(124)));
-        assert_eq!(Cv::I32(1).add(&Cv::F32(1.0), ptr), None);
+        assert_eq!(Cv::I32(1).add(&Cv::from(1.0f32), ptr), None);
     }
 
+    /// Vector folds apply lane by lane at the lanes' width and abort wholesale
+    /// on a shape mismatch; a whole-vector equality is one truth value and a
+    /// whole-vector order is none.
     #[test]
     fn vector_constants_fold_lane_wise() {
         let ptr = PointerSize::Bit64;
         let vec = |xs: &[i32]| {
             Cv::Vector(
-                xs.iter()
-                    .map(|&x| Cv::I32(x))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+                VectorConst::from_lanes(32, xs.iter().map(|x| u128::from(x.cast_unsigned())))
+                    .expect("a vector"),
             )
         };
 
-        // Binary ops fold element-by-element.
+        // Binary ops fold element-by-element, wrapping at the lane.
         assert_eq!(
-            vec(&[1, 2, 3]).add(&vec(&[10, 20, 30]), ptr),
-            Some(vec(&[11, 22, 33]))
+            vec(&[1, 2, i32::MAX]).add(&vec(&[10, 20, 1]), ptr),
+            Some(vec(&[11, 22, i32::MIN]))
         );
         assert_eq!(
             vec(&[0b1010, 0b1100]).bitwise_and(&vec(&[0b1100, 0b1010]), ptr),
             Some(vec(&[0b1000, 0b1000]))
         );
+        assert_eq!(vec(&[-7, 7]).div(&vec(&[2, -2]), ptr), Some(vec(&[-3, -3])));
+        assert_eq!(vec(&[1, 1]).div(&vec(&[1, 0]), ptr), None);
+        // A shift by a lane's width or more is declined, as a scalar's is.
+        assert_eq!(
+            vec(&[1, 1]).shl(&vec(&[3, 31]), ptr),
+            Some(vec(&[8, i32::MIN]))
+        );
+        assert_eq!(vec(&[1, 1]).shl(&vec(&[3, 32]), ptr), None);
+        assert_eq!(
+            vec(&[-8, 8]).shr(&vec(&[1, 1]), false, ptr),
+            Some(vec(&[-4, 4]))
+        );
         // Unary ops fold element-by-element.
         assert_eq!(vec(&[1, -2, 3]).negate(ptr), Some(vec(&[-1, 2, -3])));
+        assert_eq!(vec(&[0, -1]).bitwise_not(ptr), Some(vec(&[-1, 0])));
 
-        // Comparisons produce a per-lane boolean mask.
-        assert_eq!(
-            vec(&[1, 5]).clt(&vec(&[2, 4])),
-            Some(Cv::Vector(vec![Cv::True, Cv::False].into_boxed_slice()))
-        );
+        assert_eq!(vec(&[1, 5]).ceq(&vec(&[1, 5])), Some(Cv::True));
+        assert_eq!(vec(&[1, 5]).ceq(&vec(&[1, 4])), Some(Cv::False));
+        assert_eq!(vec(&[1, 5]).clt(&vec(&[2, 4]), ptr), None);
 
-        // Mismatched lane counts and any unfoldable lane abort the whole fold.
+        // Mismatched shapes abort the whole fold.
         assert_eq!(vec(&[1, 2]).add(&vec(&[1]), ptr), None);
-        let mixed = Cv::Vector(vec![Cv::I32(1), Cv::F32(2.0)].into_boxed_slice());
-        assert_eq!(mixed.add(&vec(&[1, 2]), ptr), None);
     }
 
+    /// The checked add/sub/mul folds return the result when it fits and `None`
+    /// on overflow, for both signed and unsigned operands.
     #[test]
     fn checked_arithmetic_reports_overflow() {
         let ptr = PointerSize::Bit64;
@@ -2101,6 +2322,8 @@ mod tests {
         assert_eq!(Cv::I16(i16::MAX).mul_checked(&Cv::I16(2), false, ptr), None);
     }
 
+    /// Native-width constants are masked to the target pointer width, both on
+    /// construction via `mask_native` and after arithmetic.
     #[test]
     fn native_values_are_masked_to_pointer_width() {
         assert_eq!(
@@ -2117,27 +2340,55 @@ mod tests {
         );
     }
 
+    /// The comparison folds respect signedness, cross-width promotion, and the
+    /// unordered (`NaN`) result of the `*_un` variants.
     #[test]
     fn comparisons_handle_signed_unsigned_and_nan_cases() {
         assert_eq!(Cv::I32(4).ceq(&Cv::I64(4)), Some(Cv::True));
-        assert_eq!(Cv::U32(4).clt(&Cv::U64(5)), Some(Cv::True));
-        assert_eq!(Cv::I8(-1).clt_un(&Cv::I8(1)), Some(Cv::False));
-        assert_eq!(Cv::I8(-1).cgt_un(&Cv::I8(1)), Some(Cv::True));
-        assert_eq!(Cv::F32(f32::NAN).clt_un(&Cv::F32(1.0)), Some(Cv::True));
-        assert_eq!(Cv::F64(f64::NAN).cgt_un(&Cv::F64(1.0)), Some(Cv::True));
+        assert_eq!(
+            Cv::U32(4).clt(&Cv::U64(5), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(
+            Cv::I8(-1).clt_un(&Cv::I8(1), PointerSize::Bit64),
+            Some(Cv::False)
+        );
+        assert_eq!(
+            Cv::I8(-1).cgt_un(&Cv::I8(1), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(
+            Cv::from(f32::NAN).clt_un(&Cv::from(1.0f32), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(
+            Cv::from(f64::NAN).cgt_un(&Cv::from(1.0f64), PointerSize::Bit64),
+            Some(Cv::True)
+        );
         assert_eq!(Cv::Null.ceq(&Cv::Null), Some(Cv::True));
         assert_eq!(Cv::True.ceq(&Cv::False), Some(Cv::False));
     }
 
+    /// Standard integer layouts share conversion semantics without host arithmetic hooks.
     #[test]
-    fn mock_target_does_not_support_const_conversions() {
-        assert_eq!(Cv::I32(1).convert_to(&MockType::I64, false, 8), None);
+    fn default_integer_conversion_hooks_keep_values_and_refuse_invalid_inputs() {
+        assert_eq!(
+            Cv::I32(1).convert_to(&MockType::I64, false, 8),
+            Some(Cv::I64(1))
+        );
         assert_eq!(
             Cv::I32(1).convert_to_checked(&MockType::I64, false, 8),
+            Some(Cv::I64(1))
+        );
+        assert_eq!(Cv::I32(1).convert_to(&MockType::Unknown, false, 8), None);
+        assert_eq!(
+            Cv::I32(256).convert_to_checked(&MockType::I8, false, 8),
             None
         );
     }
 
+    /// `Display` renders each constant, computed value, and op in its textual
+    /// form, and `normalized` orders a commutative op's operands.
     #[test]
     fn display_formats_constants_and_computed_values() {
         assert_eq!(Cv::I8(-1).to_string(), "-1i8");
@@ -2207,12 +2458,8 @@ mod tests {
         assert_eq!(Av::Range { min: 1, max: 2 }.to_string(), "[1..2]");
     }
 
-    // -----------------------------------------------------------------------
-    // ConstValue::to_bytes — all integer widths, both endianness values
-    // -----------------------------------------------------------------------
-
     /// A native int is pointer-width by definition. Emitting eight bytes on a
-    /// 32-bit target writes four bytes past the value — into a neighbouring cell
+    /// 32-bit target writes four bytes past the value - into a neighbouring cell
     /// for any caller laying out memory from these.
     #[test]
     fn native_ints_serialise_at_the_target_pointer_width() {
@@ -2245,6 +2492,7 @@ mod tests {
         );
     }
 
+    /// An `i8` serialises to a single byte in either endianness.
     #[test]
     fn to_bytes_i8_is_one_byte_regardless_of_endianness() {
         let val = Cv::I8(-1);
@@ -2256,6 +2504,7 @@ mod tests {
         }
     }
 
+    /// A `u8` serialises to a single byte in either endianness.
     #[test]
     fn to_bytes_u8_is_one_byte_regardless_of_endianness() {
         let val = Cv::U8(0xAB);
@@ -2267,6 +2516,7 @@ mod tests {
         }
     }
 
+    /// A 16-bit value's byte order follows the requested endianness.
     #[test]
     fn to_bytes_i16_depends_on_endianness() {
         let val = Cv::I16(0x0102);
@@ -2280,6 +2530,7 @@ mod tests {
         );
     }
 
+    /// A 32-bit value's byte order follows the requested endianness.
     #[test]
     fn to_bytes_u32_depends_on_endianness() {
         let val = Cv::U32(0x01020304);
@@ -2293,6 +2544,7 @@ mod tests {
         );
     }
 
+    /// A 64-bit value's byte order follows the requested endianness.
     #[test]
     fn to_bytes_i64_depends_on_endianness() {
         let val = Cv::I64(0x0102030405060708);
@@ -2306,6 +2558,7 @@ mod tests {
         );
     }
 
+    /// A native unsigned value's byte order follows the requested endianness.
     #[test]
     fn to_bytes_native_uint_depends_on_endianness() {
         let val = Cv::NativeUInt(0x0102030405060708);
@@ -2319,6 +2572,7 @@ mod tests {
         );
     }
 
+    /// A native signed value's byte order follows the requested endianness.
     #[test]
     fn to_bytes_native_int_depends_on_endianness() {
         let val = Cv::NativeInt(0x0102030405060708);
@@ -2332,15 +2586,17 @@ mod tests {
         );
     }
 
+    /// A float serialises as its IEEE 754 bits; null, booleans and strings have
+    /// no serialisation.
     #[test]
-    fn to_bytes_returns_none_for_non_integer_variants() {
+    fn to_bytes_gives_floats_their_bits_and_refuses_the_rest() {
         assert_eq!(
-            Cv::F32(1.0).to_bytes(Endianness::Little, PointerSize::Bit64),
-            None
+            Cv::from(1.0f32).to_bytes(Endianness::Little, PointerSize::Bit64),
+            Some(vec![0x00, 0x00, 0x80, 0x3F])
         );
         assert_eq!(
-            Cv::F64(1.0).to_bytes(Endianness::Little, PointerSize::Bit64),
-            None
+            Cv::from(1.0f64).to_bytes(Endianness::Big, PointerSize::Bit64),
+            Some(vec![0x3F, 0xF0, 0, 0, 0, 0, 0, 0])
         );
         assert_eq!(
             Cv::Null.to_bytes(Endianness::Little, PointerSize::Bit64),
@@ -2360,10 +2616,73 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // ConstValue::from_bytes — all supported byte lengths, both endiannesses
-    // -----------------------------------------------------------------------
+    /// Signed native encoding follows mathematical sign extension at every target width.
+    #[test]
+    fn native_serialization_matches_primitive_signed_and_unsigned_oracles() {
+        for ptr_size in [
+            PointerSize::Bit8,
+            PointerSize::Bit16,
+            PointerSize::Bit32,
+            PointerSize::Bit64,
+            PointerSize::Bit128,
+        ] {
+            let width = ptr_size.bytes();
+            for order in [Endianness::Little, Endianness::Big] {
+                for value in [
+                    i64::MIN,
+                    -257,
+                    -256,
+                    -129,
+                    -128,
+                    -1,
+                    0,
+                    1,
+                    127,
+                    128,
+                    255,
+                    256,
+                    i64::MAX,
+                ] {
+                    let extended = i128::from(value);
+                    let encoded = match order {
+                        Endianness::Little => extended.to_le_bytes(),
+                        Endianness::Big => extended.to_be_bytes(),
+                    };
+                    let expected = match order {
+                        Endianness::Little => encoded.get(..width),
+                        Endianness::Big => encoded.get(encoded.len().saturating_sub(width)..),
+                    }
+                    .map(<[u8]>::to_vec);
+                    assert_eq!(
+                        Cv::NativeInt(value).to_bytes(order, ptr_size),
+                        expected,
+                        "signed value={value} ptr={ptr_size:?} order={order:?}"
+                    );
+                }
+                for value in [0, 1, 127, 128, 255, 256, u64::MAX] {
+                    let extended = u128::from(value);
+                    let encoded = match order {
+                        Endianness::Little => extended.to_le_bytes(),
+                        Endianness::Big => extended.to_be_bytes(),
+                    };
+                    let expected = match order {
+                        Endianness::Little => encoded.get(..width),
+                        Endianness::Big => encoded.get(encoded.len().saturating_sub(width)..),
+                    }
+                    .map(<[u8]>::to_vec);
+                    assert_eq!(
+                        Cv::NativeUInt(value).to_bytes(order, ptr_size),
+                        expected,
+                        "unsigned value={value} ptr={ptr_size:?} order={order:?}"
+                    );
+                }
+            }
+        }
+    }
 
+    // ConstValue::from_bytes - all supported byte lengths, both endiannesses
+
+    /// A one-byte slice deserialises to `U8`.
     #[test]
     fn from_bytes_1_byte_produces_u8() {
         assert_eq!(
@@ -2373,6 +2692,7 @@ mod tests {
         assert_eq!(Cv::from_bytes(&[0xAB], Endianness::Big), Some(Cv::U8(0xAB)),);
     }
 
+    /// A two-byte slice deserialises to `U16` in the given endianness.
     #[test]
     fn from_bytes_2_bytes_produces_u16() {
         let le = Cv::from_bytes(&[0x02, 0x01], Endianness::Little);
@@ -2381,6 +2701,7 @@ mod tests {
         assert_eq!(be, Some(Cv::U16(0x0102)));
     }
 
+    /// A four-byte slice deserialises to `U32` in the given endianness.
     #[test]
     fn from_bytes_4_bytes_produces_u32() {
         let le = Cv::from_bytes(&[0x04, 0x03, 0x02, 0x01], Endianness::Little);
@@ -2389,6 +2710,7 @@ mod tests {
         assert_eq!(be, Some(Cv::U32(0x01020304)));
     }
 
+    /// An eight-byte slice deserialises to `U64` in the given endianness.
     #[test]
     fn from_bytes_8_bytes_produces_u64() {
         let bytes_le = [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
@@ -2403,6 +2725,7 @@ mod tests {
         );
     }
 
+    /// A slice whose length is not 1, 2, 4, or 8 does not deserialise.
     #[test]
     fn from_bytes_unsupported_length_returns_none() {
         assert_eq!(Cv::from_bytes(&[], Endianness::Little), None);
@@ -2414,6 +2737,7 @@ mod tests {
         assert_eq!(Cv::from_bytes(&[0; 16], Endianness::Little), None);
     }
 
+    /// Serialising then deserialising recovers the value as its unsigned twin.
     #[test]
     fn from_bytes_round_trips_with_to_bytes() {
         let test_values: Vec<(Cv, Cv)> = vec![
@@ -2442,6 +2766,602 @@ mod tests {
                     "round-trip failed for {original:?} with {endianness:?}",
                 );
             }
+        }
+    }
+
+    /// A 64-bit unsigned constant answers `as_i64` while it names the same
+    /// number, and refuses when it cannot.
+    ///
+    /// A 64-bit lift names most of its constants `U64`, so this arm decides
+    /// whether the range domain, SCCP and the threader can read a constant at
+    /// all - and the guard is what keeps a value above [`i64::MAX`] from being
+    /// handed back as a negative number the program never held.
+    #[test]
+    fn a_wide_unsigned_constant_reads_as_itself_or_not_at_all() {
+        type Cv = ConstValue<MockTarget>;
+        assert_eq!(Cv::U64(0).as_i64(), Some(0));
+        assert_eq!(Cv::U64(42).as_i64(), Some(42));
+        assert_eq!(
+            Cv::U64(i64::MAX as u64).as_i64(),
+            Some(i64::MAX),
+            "the largest value with a reading has one"
+        );
+        assert_eq!(
+            Cv::U64(i64::MAX as u64 + 1).as_i64(),
+            None,
+            "one past it has none, and must not wrap to a negative"
+        );
+        assert_eq!(Cv::U64(u64::MAX).as_i64(), None);
+
+        assert_eq!(Cv::NativeUInt(7).as_i64(), Some(7));
+        assert_eq!(Cv::NativeUInt(u64::MAX).as_i64(), None);
+
+        // The mirror of the arm `as_u64` already had: the pair agrees on every
+        // value both can name.
+        for value in [0u64, 1, 42, i64::MAX as u64] {
+            assert_eq!(
+                Cv::U64(value).as_i64().and_then(|v| Cv::I64(v).as_u64()),
+                Some(value)
+            );
+        }
+    }
+
+    /// A comparison of two integer constants reads each at its own width with
+    /// the comparison's signedness, whatever variants carry them.
+    ///
+    /// A lift picks a variant per operand, and one comparison's two sides need
+    /// not agree: MIPS `slt $t0, $t1, 4` arrives as `U32` against `I32`. A fold
+    /// that enumerates variant pairs answers "unknown" there, and every guard
+    /// written that way stays undecided - which is what kept the MIPS builds of
+    /// a flattened dispatcher from being threaded. Reading by the variant's
+    /// sign instead of the comparison's answers a signed compare of a `U32`
+    /// register holding a negative number as if it were positive.
+    #[test]
+    fn a_comparison_reads_both_sides_as_numbers() {
+        type Cv = ConstValue<MockTarget>;
+
+        assert_eq!(
+            Cv::U32(0).clt(&Cv::I32(4), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(
+            Cv::U32(9).clt(&Cv::I32(4), PointerSize::Bit64),
+            Some(Cv::False)
+        );
+        assert_eq!(
+            Cv::I32(4).cgt(&Cv::U32(0), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(Cv::U8(5).ceq(&Cv::I64(5)), Some(Cv::True));
+        assert_eq!(
+            Cv::I8(5).cgt(&Cv::I32(3), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+        assert_eq!(
+            Cv::U32(3).clt_un(&Cv::U64(9), PointerSize::Bit64),
+            Some(Cv::True)
+        );
+
+        // What stays unknown, and must: neither side names a number the other
+        // can be read against.
+        assert_eq!(
+            Cv::from(5.0f64).clt(&Cv::I32(9), PointerSize::Bit64),
+            None,
+            "float against integer"
+        );
+        assert_eq!(Cv::Null.ceq(&Cv::I32(0)), None, "null names no number");
+        assert_eq!(
+            Cv::U64(u64::MAX).clt(&Cv::I32(1), PointerSize::Bit64),
+            Some(Cv::True),
+            "a signed compare reads all ones as -1"
+        );
+        assert_eq!(
+            Cv::U32(0xFFFF_FFF8).clt(&Cv::U32(0), PointerSize::Bit64),
+            Some(Cv::True),
+            "a signed compare of an unsigned variant reads its sign bit"
+        );
+        assert_eq!(
+            Cv::I32(-1).clt_un(&Cv::U32(5), PointerSize::Bit64),
+            Some(Cv::False),
+            "an unsigned compare reads -1 at 32 bits as 0xFFFF_FFFF"
+        );
+        assert_eq!(
+            Cv::I8(-1).cgt_un(&Cv::U64(0x100), PointerSize::Bit64),
+            Some(Cv::False),
+            "an unsigned reading zero-extends the narrower side"
+        );
+        assert_eq!(
+            Cv::NativeUInt(0xFFFF_FFFF).clt(&Cv::I32(0), PointerSize::Bit32),
+            Some(Cv::True),
+            "a native integer is read at the pointer width"
+        );
+        assert_eq!(
+            Cv::NativeUInt(0xFFFF_FFFF).clt(&Cv::I32(0), PointerSize::Bit64),
+            Some(Cv::False)
+        );
+    }
+
+    /// A rotation takes its count modulo the value's width whatever the
+    /// count's variant, and rotates within that width: a 64-bit count is read
+    /// (an RV64 register), 65 rotates by 1, a negative count rotates the other
+    /// way, and a native integer rotates at the pointer's width.
+    #[test]
+    fn a_rotation_reads_its_count_modulo_the_width() {
+        let ptr = PointerSize::Bit64;
+        assert_eq!(
+            Cv::U64(1).rotate(&Cv::U64(63), false, ptr),
+            Some(Cv::U64(1 << 63))
+        );
+        assert_eq!(
+            Cv::U64(1).rotate(&Cv::I64(65), false, ptr),
+            Some(Cv::U64(2))
+        );
+        assert_eq!(
+            Cv::U64(1).rotate(&Cv::I32(-1), false, ptr),
+            Some(Cv::U64(1 << 63)),
+            "-1 is 63 modulo 64"
+        );
+        assert_eq!(
+            Cv::I64(1).rotate(&Cv::U64(1), true, ptr),
+            Some(Cv::I64(i64::MIN))
+        );
+        assert_eq!(
+            Cv::U8(0x81).rotate(&Cv::U64(1), false, ptr),
+            Some(Cv::U8(0x03))
+        );
+        assert_eq!(
+            Cv::I32(-1).rotate(&Cv::U64(7), true, ptr),
+            Some(Cv::I32(-1))
+        );
+        assert_eq!(
+            Cv::NativeUInt(1).rotate(&Cv::U64(1), true, PointerSize::Bit32),
+            Some(Cv::NativeUInt(0x8000_0000)),
+            "a native integer rotates at the pointer's width"
+        );
+        assert_eq!(Cv::U64(5).rotate(&Cv::U64(0), false, ptr), Some(Cv::U64(5)));
+        assert_eq!(Cv::from(1.0f64).rotate(&Cv::U64(1), false, ptr), None);
+        assert_eq!(Cv::U64(1).rotate(&Cv::from(1.0f64), false, ptr), None);
+    }
+
+    /// Signed division reads both operands as signed integers of their shared
+    /// width, whatever the variants, and refuses the one quotient that
+    /// overflows the width.
+    #[test]
+    fn a_signed_division_reads_its_operands_signed_at_their_width() {
+        let ptr = PointerSize::Bit64;
+        assert_eq!(
+            Cv::U32(0xFFFF_FFF8).div(&Cv::U32(3), ptr),
+            Some(Cv::U32(0xFFFF_FFFE)),
+            "-8 / 3 is -2"
+        );
+        assert_eq!(
+            Cv::U32(0xFFFF_FFF8).rem(&Cv::U32(3), ptr),
+            Some(Cv::U32(0xFFFF_FFFE)),
+            "-8 % 3 is -2"
+        );
+        assert_eq!(Cv::I32(-8).div(&Cv::U32(2), ptr), Some(Cv::I32(-4)));
+        assert_eq!(Cv::I64(7).div(&Cv::I64(-2), ptr), Some(Cv::I64(-3)));
+        assert_eq!(Cv::I8(i8::MIN).div(&Cv::I8(-1), ptr), None);
+        assert_eq!(Cv::U8(0x80).div(&Cv::U8(0xFF), ptr), None);
+        assert_eq!(Cv::I8(i8::MIN).rem(&Cv::I8(-1), ptr), None);
+        assert_eq!(Cv::I64(i64::MIN).div(&Cv::I64(-1), ptr), None);
+        assert_eq!(Cv::I32(5).div(&Cv::I32(0), ptr), None);
+        assert_eq!(Cv::I32(5).div(&Cv::I64(1), ptr), None, "mixed widths");
+        assert_eq!(
+            Cv::NativeUInt(0xFFFF_FFFE).div(&Cv::NativeUInt(2), PointerSize::Bit32),
+            Some(Cv::NativeUInt(0xFFFF_FFFF)),
+            "a native integer is divided at the pointer width"
+        );
+        assert_eq!(
+            Cv::from(1.0f64).div(&Cv::from(0.0f64), ptr),
+            Some(Cv::from(f64::INFINITY))
+        );
+    }
+
+    /// **A float of every format folds through one path, and a NaN result is
+    /// not folded.** Its payload is the target's: x86 makes `0.0 / 0.0` the
+    /// negative quiet NaN, RISC-V and AArch64 the positive one, so no fold of
+    /// it is right everywhere. Each format's zero is the all-zero pattern, and
+    /// `1 / 0`, an infinity, folds in each.
+    #[test]
+    fn a_nan_result_of_any_format_is_not_folded() {
+        let ptr = PointerSize::Bit64;
+        for format in [
+            FloatFormat::Half,
+            FloatFormat::BFloat16,
+            FloatFormat::Single,
+            FloatFormat::Double,
+            FloatFormat::X87Extended,
+            FloatFormat::Quad,
+        ] {
+            let zero = Cv::float(format, 0).expect("a zero");
+            assert_eq!(zero.div(&zero, ptr), None, "{format:?} 0/0");
+            assert_eq!(zero.rem(&zero, ptr), None, "{format:?} 0 rem 0");
+            let one = Cv::float(format, format.from_integer(1)).expect("a one");
+            let infinity = one.div(&zero, ptr).expect("1/0 folds");
+            assert!(!infinity.is_nan(), "{format:?} 1/0 is an infinity");
+        }
+        let nan = Cv::from(f64::NAN);
+        assert_eq!(nan.add(&Cv::from(1.0f64), ptr), None, "a NaN operand");
+        assert_eq!(Cv::from(f32::NAN).mul(&Cv::from(2.0f32), ptr), None);
+        assert_eq!(
+            Cv::from(f64::INFINITY).sub(&Cv::from(f64::INFINITY), ptr),
+            None,
+            "inf - inf"
+        );
+    }
+
+    /// **binary32 and binary64 compute as IEEE's.** The oracle is exact
+    /// arithmetic: `1.5 + 2.25` is representable, `0.1f32 * 3` is not and
+    /// rounds by the mode the program sets, which the mock target leaves
+    /// unknown, so it does not fold; `fmod` keeps the dividend's sign, and the
+    /// narrow operands of different formats do not combine.
+    #[test]
+    fn binary32_and_binary64_compute_as_ieee() {
+        let ptr = PointerSize::Bit64;
+        assert_eq!(
+            Cv::from(1.5f64).add(&Cv::from(2.25f64), ptr),
+            Some(Cv::from(3.75f64))
+        );
+        assert_eq!(Cv::from(0.1f32).mul(&Cv::from(3.0f32), ptr), None);
+        assert_eq!(
+            Cv::from(-7.5f64).rem(&Cv::from(2.0f64), ptr),
+            Some(Cv::from(-1.5f64))
+        );
+        assert_eq!(Cv::from(1.0f32).add(&Cv::from(1.0f64), ptr), None);
+        assert_eq!(Cv::from(1.0f64).as_f64(), Some(1.0));
+        assert_eq!(Cv::from(1.0f64).as_f32(), None);
+        assert_eq!(Cv::from(1.25f32).as_f32(), Some(1.25));
+        assert_eq!(Cv::from(1.5f32).to_string(), "1.5f");
+        assert_eq!(Cv::from(1.5f64).to_string(), "1.5");
+        assert_eq!(Cv::from(1e300f64).to_string(), format!("{}", 1e300f64));
+        assert_eq!(
+            format!("{:?}", Cv::from(1.5f64)),
+            "Float(Double(0x3ff8000000000000))"
+        );
+    }
+
+    /// **A 128-bit integer orders as one.** Held as one 128-bit lane, it
+    /// compares signed and unsigned by its value at that width, beside another
+    /// such integer or a narrower scalar lane the reading extends. Vectors of
+    /// more lanes have no scalar order.
+    #[test]
+    fn a_128_bit_integer_orders_as_one() {
+        let wide = |bits: u128| Cv::of_lane(128, bits).unwrap();
+        let ptr = PointerSize::Bit64;
+        let (minus_one, one, top) = (wide(u128::MAX), wide(1), wide(1 << 127));
+        assert_eq!(minus_one.clt(&one, ptr), Some(Cv::True), "-1 < 1 signed");
+        assert_eq!(
+            minus_one.clt_un(&one, ptr),
+            Some(Cv::False),
+            "2^128-1 > 1 unsigned"
+        );
+        assert_eq!(
+            top.clt(&minus_one, ptr),
+            Some(Cv::True),
+            "the minimum is least"
+        );
+        assert_eq!(top.cgt_un(&one, ptr), Some(Cv::True));
+        assert_eq!(one.cgt(&wide(0), ptr), Some(Cv::True));
+        assert_eq!(wide(1 << 100).cgt(&Cv::I64(-1), ptr), Some(Cv::True));
+        assert_eq!(wide(1 << 100).clt_un(&Cv::I64(-1), ptr), Some(Cv::False));
+        assert_eq!(Cv::I64(-1).clt(&wide(0), ptr), Some(Cv::True));
+        assert_eq!(
+            Cv::U64(u64::MAX).clt_un(&wide(1 << 64), ptr),
+            Some(Cv::True)
+        );
+        let pair = Cv::Vector(VectorConst::from_lanes(64, [1, 2]).unwrap());
+        assert_eq!(pair.clt(&pair, ptr), None);
+        assert_eq!(
+            wide(1).clt(&Cv::of_lane(96, 2).unwrap(), ptr),
+            Some(Cv::True),
+            "1 < 2 across scalar widths"
+        );
+    }
+
+    /// Every eight-bit input pair is checked against a wider mathematical oracle.
+    #[test]
+    fn checked_integer_arithmetic_exhausts_eight_bit_patterns_and_signedness() {
+        for left in 0..=255u16 {
+            for right in 0..=255u16 {
+                for unsigned in [false, true] {
+                    let (a, b, min, max) = if unsigned {
+                        (i32::from(left), i32::from(right), 0, 255)
+                    } else {
+                        (
+                            i32::from(left as u8 as i8),
+                            i32::from(right as u8 as i8),
+                            -128,
+                            127,
+                        )
+                    };
+                    for left_signed in [false, true] {
+                        for right_signed in [false, true] {
+                            let l = if left_signed {
+                                Cv::I8(left as u8 as i8)
+                            } else {
+                                Cv::U8(left as u8)
+                            };
+                            let r = if right_signed {
+                                Cv::I8(right as u8 as i8)
+                            } else {
+                                Cv::U8(right as u8)
+                            };
+                            for (actual, mathematical) in [
+                                (l.add_checked(&r, unsigned, PointerSize::Bit64), a + b),
+                                (l.sub_checked(&r, unsigned, PointerSize::Bit64), a - b),
+                                (l.mul_checked(&r, unsigned, PointerSize::Bit64), a * b),
+                            ] {
+                                let expected = (min..=max).contains(&mathematical).then_some({
+                                    if left_signed {
+                                        Cv::I8(mathematical as u8 as i8)
+                                    } else {
+                                        Cv::U8(mathematical as u8)
+                                    }
+                                });
+                                assert_eq!(
+                                    actual, expected,
+                                    "left={left} right={right} unsigned={unsigned} left_signed={left_signed} right_signed={right_signed}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Native overflow uses the target width, including sign extension into 128 bits.
+    #[test]
+    fn native_checked_arithmetic_obeys_every_target_width() {
+        for width in [
+            PointerSize::Bit8,
+            PointerSize::Bit16,
+            PointerSize::Bit32,
+            PointerSize::Bit64,
+        ] {
+            let bits = width.bits();
+            let maximum = if bits == 64 {
+                i64::MAX
+            } else {
+                (1i64 << (bits - 1)) - 1
+            };
+            let minimum = if bits == 64 {
+                i64::MIN
+            } else {
+                -1i64 << (bits - 1)
+            };
+            let unsigned_max = width.mask_unsigned(u64::MAX);
+            assert_eq!(
+                Cv::NativeInt(maximum).add_checked(&Cv::NativeInt(1), false, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeInt(minimum).sub_checked(&Cv::NativeInt(1), false, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeInt(minimum).mul_checked(&Cv::NativeInt(-1), false, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeUInt(unsigned_max).add_checked(&Cv::NativeUInt(1), true, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeUInt(0).sub_checked(&Cv::NativeUInt(1), true, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeUInt(unsigned_max).mul_checked(&Cv::NativeUInt(2), true, width),
+                None
+            );
+            assert_eq!(
+                Cv::NativeInt(maximum - 1).add_checked(&Cv::NativeInt(1), false, width),
+                Some(Cv::NativeInt(maximum))
+            );
+            assert_eq!(
+                Cv::NativeInt(-2).mul_checked(&Cv::NativeInt(2), false, width),
+                Some(Cv::NativeInt(-4))
+            );
+        }
+        let wide = |bits| Cv::of_lane(128, bits).expect("wide scalar integer");
+        let max = wide(i128::MAX.cast_unsigned());
+        let min = wide(i128::MIN.cast_unsigned());
+        assert_eq!(max.add_checked(&wide(1), false, PointerSize::Bit128), None);
+        assert_eq!(min.sub_checked(&wide(1), false, PointerSize::Bit128), None);
+        assert_eq!(
+            min.mul_checked(&wide(u128::MAX), false, PointerSize::Bit128),
+            None
+        );
+        assert_eq!(
+            wide(u128::MAX).add_checked(&wide(1), true, PointerSize::Bit128),
+            None
+        );
+        assert_eq!(
+            wide(u128::MAX).sub_checked(&wide(1), true, PointerSize::Bit128),
+            Some(wide(u128::MAX - 1))
+        );
+        assert_eq!(
+            Cv::NativeInt(-2).mul_checked(&Cv::NativeInt(2), false, PointerSize::Bit128),
+            Some(wide((-4i128).cast_unsigned()))
+        );
+        assert_eq!(
+            Cv::NativeUInt(u64::MAX).add_checked(&Cv::NativeUInt(1), true, PointerSize::Bit128),
+            Some(wide(1u128 << 64))
+        );
+        assert_eq!(
+            Cv::NativeInt(-1).scalar_integer_pattern(PointerSize::Bit128),
+            Some((u128::MAX, 128))
+        );
+    }
+
+    /// Unsupported operand shapes do not masquerade as overflow.
+    #[test]
+    fn checked_integer_layouts_reject_non_scalars_and_unequal_widths() {
+        let vector = Cv::Vector(VectorConst::from_lanes(8, [1, 2]).expect("two lanes"));
+        let too_wide = Cv::Vector(VectorConst::zeroed(256, 1).expect("noncomputing wide lane"));
+        for value in [
+            Cv::True,
+            Cv::Null,
+            Cv::float(FloatFormat::Single, 0).expect("float"),
+            vector,
+            too_wide,
+        ] {
+            assert_eq!(value.scalar_integer_pattern(PointerSize::Bit64), None);
+            assert_eq!(
+                value.add_checked(&Cv::U8(1), true, PointerSize::Bit64),
+                None
+            );
+        }
+        assert_eq!(
+            Cv::I16(1).mul_checked(&Cv::I8(1), false, PointerSize::Bit64),
+            None
+        );
+    }
+
+    /// Scalar width normalization preserves bit patterns and validates its boundaries.
+    #[test]
+    fn scalar_carriers_normalize_at_declared_widths_without_host_truncation() {
+        let wide = |width, value| Cv::of_lane(width, value).expect("scalar bitvector");
+        assert_eq!(
+            Cv::I8(-1).scalar_integer_at_width(128, PointerSize::Bit64),
+            Some(wide(128, u128::MAX))
+        );
+        assert_eq!(
+            Cv::U8(255).scalar_integer_at_width(128, PointerSize::Bit64),
+            Some(wide(128, 255))
+        );
+        assert_eq!(
+            Cv::I64(-1).scalar_integer_at_width(1, PointerSize::Bit64),
+            Some(wide(1, 1))
+        );
+        assert_eq!(
+            wide(128, u128::MAX).scalar_integer_at_width(5, PointerSize::Bit64),
+            Some(wide(5, 31))
+        );
+        assert_eq!(
+            Cv::NativeInt(255).scalar_integer_at_width(8, PointerSize::Bit8),
+            Some(Cv::NativeInt(-1))
+        );
+        assert_eq!(
+            Cv::U64(0x1_ffff_ffff).scalar_integer_at_width(32, PointerSize::Bit64),
+            Some(Cv::U32(u32::MAX))
+        );
+        for width in [0, 129, u32::MAX] {
+            assert_eq!(
+                Cv::U8(1).scalar_integer_at_width(width, PointerSize::Bit64),
+                None
+            );
+        }
+        assert_eq!(
+            Cv::True.scalar_integer_at_width(32, PointerSize::Bit64),
+            None
+        );
+    }
+
+    /// Numeric pointer sums agree with a wider integer oracle for every byte pair.
+    #[test]
+    fn pointer_sums_wrap_at_the_declared_width() {
+        for base in 0..=255u16 {
+            for index in 0..=255u16 {
+                for (stride, offset) in [(3, -17), (255, 127)] {
+                    let expected = (i64::from(base) + i64::from(index) * stride + offset)
+                        .rem_euclid(256) as u8;
+                    assert_eq!(
+                        Cv::U16(base).pointer_add(
+                            Some(&Cv::U16(index)),
+                            stride as u64,
+                            offset,
+                            PointerSize::Bit8
+                        ),
+                        Some(Cv::U8(expected))
+                    );
+                }
+            }
+        }
+        let wide = |raw| Cv::of_lane(128, raw).unwrap();
+        assert_eq!(
+            Cv::U64(8).pointer_add(
+                Some(&wide(i128::MAX.cast_unsigned())),
+                2,
+                0,
+                PointerSize::Bit128
+            ),
+            Some(wide(6))
+        );
+        assert_eq!(
+            Cv::U64(8).pointer_add(Some(&wide(u128::MAX)), 1, 1, PointerSize::Bit128),
+            Some(wide(8))
+        );
+        assert_eq!(
+            wide(u128::MAX).pointer_add(None, 0, 1, PointerSize::Bit128),
+            Some(wide(0))
+        );
+        assert_eq!(
+            Cv::I8(-1).pointer_add(None, 0, 0, PointerSize::Bit128),
+            Some(wide(u128::MAX))
+        );
+        assert_eq!(
+            Cv::U8(255).pointer_add(None, 0, 0, PointerSize::Bit128),
+            Some(wide(255))
+        );
+        assert_eq!(Cv::True.pointer_add(None, 0, 0, PointerSize::Bit64), None);
+        assert_eq!(
+            Cv::U64(8).pointer_add(Some(&Cv::False), 1, 0, PointerSize::Bit64),
+            None
+        );
+    }
+
+    /// Byte encodings use exact lane-local order, including wide and packed lanes.
+    #[test]
+    fn borrowed_encodings_cover_packed_and_wide_lanes() {
+        for (lane_bits, lanes) in [
+            (1, 24),
+            (2, 12),
+            (3, 8),
+            (4, 6),
+            (6, 4),
+            (7, 8),
+            (8, 32),
+            (16, 16),
+            (24, 8),
+            (64, 8),
+            (128, 4),
+            (256, 4),
+            (512, 2),
+            (1024, 2),
+            (2048, 1),
+        ] {
+            let count = usize::try_from(lane_bits * lanes / 8).unwrap();
+            let raw: Vec<u8> = (0..count)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let vector = VectorConst::from_lanes(8, raw.iter().copied().map(u128::from))
+                .unwrap()
+                .relaned(lane_bits)
+                .unwrap();
+            let value = Cv::Vector(vector);
+            for order in [Endianness::Little, Endianness::Big] {
+                let mut expected = raw.clone();
+                if order == Endianness::Big && lane_bits >= 8 {
+                    for lane in expected.chunks_mut(usize::try_from(lane_bits / 8).unwrap()) {
+                        lane.reverse();
+                    }
+                }
+                let mut bytes = EncodedBytes::of(&value, order, PointerSize::Bit64).unwrap();
+                assert_eq!(bytes.len(), count);
+                assert_eq!(bytes.size_hint(), (count, Some(count)));
+                assert_eq!(bytes.next(), expected.first().copied());
+                assert_eq!(bytes.len(), count - 1);
+                assert_eq!(bytes.collect::<Vec<_>>(), expected[1..]);
+                assert_eq!(value.to_bytes(order, PointerSize::Bit64), Some(expected));
+            }
+        }
+        for (lane_bits, lanes) in [(3, 3), (12, 2)] {
+            let value = Cv::Vector(VectorConst::zeroed(lane_bits, lanes).unwrap());
+            assert!(EncodedBytes::of(&value, Endianness::Little, PointerSize::Bit64).is_none());
+            assert_eq!(value.to_bytes(Endianness::Big, PointerSize::Bit64), None);
         }
     }
 }
