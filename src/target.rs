@@ -1239,20 +1239,24 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
     /// pointer-sized integers, references, and aggregates.
     fn bit_width(t: &Self::Type) -> Option<u32>;
 
-    /// The width a value of type `t` computes at as an operand of a scalar
-    /// arithmetic, logical, shift, comparison or select operation, where the
-    /// verifier requires the operands of one operation to agree
-    /// ([`crate::analysis::VerifierError::InvalidOperandWidths`]).
+    /// The width the verifier compares a value of type `t` at as an operand of
+    /// a scalar arithmetic, logical, shift, comparison or select operation,
+    /// where it requires the operands of one operation to agree
+    /// ([`crate::analysis::VerifierError::InvalidOperandWidths`]). `None` where
+    /// the width is not fixed - a pointer-sized integer, a float whose
+    /// evaluation width is the runtime's, a truth value - and such an operand is
+    /// not compared.
     ///
-    /// The default is the type's own width ([`Self::bit_width`]): a machine
-    /// target's operations read their operands at the width they are typed. A
-    /// target whose operations widen what they read answers the widened width,
-    /// so a value typed by where it is stored still computes legally: CIL's
-    /// evaluation stack holds every integer up to 32 bits as `int32`
-    /// (ECMA-335 III.1.1), so a `byte` local and an `int32` constant are one
-    /// width to `xor`. `None` where the width is not fixed - a pointer-sized
-    /// integer, a float whose evaluation width is the runtime's - and such an
-    /// operand is not compared.
+    /// The default is the type's own width ([`Self::bit_width`]), and a target
+    /// should answer no other: every analysis reads an operand at its type's
+    /// own width, and a conversion reads its operand at that width and extends
+    /// it by the conversion's signedness. A host whose operations widen what
+    /// they read - CIL's evaluation stack holds every integer up to 32 bits as
+    /// an `int32` (ECMA-335 III.1.1) - states each widening as an
+    /// [`SsaOp::IntConv`](crate::ir::ops::SsaOp::IntConv) of the narrow value.
+    /// A wider answer here only makes the verifier accept operands of mixed
+    /// widths, which the analyses then read at their own widths, not as the
+    /// host computes them.
     fn operand_width(t: &Self::Type) -> Option<u32> {
         Self::bit_width(t)
     }
