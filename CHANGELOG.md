@@ -7,11 +7,380 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+A static execution engine, an operation set that states every ISA's semantics
+exactly (no opaque native operations), and a points-to and memory model over
+the bytes of objects. The analyses take their host facts (machine, image, call
+models, budgets, interrupt) from one `AnalysisContext`, exceptions are edges of
+the one control-flow graph, and a host's facts travel inside the IR. Most
+modules below the IR are new. The breaking changes are to the IR, the analyses
+0.6.0 shipped, pass scheduling, and an API cleanup that gives every function
+its owner: a pass is its struct, an analysis that threads state is a view, and
+no forwarding or alias functions remain.
+
+### Added
+
+#### Static execution (`analysis::execution`)
+
+- Runs a function over partially known inputs, through the calls its host
+  models, and states what holds (`StaticExecution`, `StaticFacts`,
+  `ExecutionHost`, `CallModel`, `ModelCall`, `LibraryModel`).
+- Findings, never refusals (`Finding`, `FindingKind`): accesses past an
+  object's extent, use of storage whose lifetime ended, bad releases
+  (`FreeOutcome`, `ReleaseFault`) and reads of bits no write reached (`Marks`),
+  each with its evidence (`FoundObject`, `Witness`, `Decision`, `Decisions`).
+- An object model: pointer provenance, extents and their source
+  (`ExtentSource`, `ObjectExtents`, `StorageObject`), heap lifetimes
+  (`Lifetime`), allocation sites (`Memory::locate`), allocator families and
+  heaps (`AllocatorFamily`, `Allocator`). Stack writes are proved only inside a
+  frame the host attests (`ExecutionHost::stack_extent`,
+  `realigned_stack_extent`, `RealignedExtent`).
+- Library models, serializable under `serde`: allocation, reallocation,
+  duplication, deallocation, page protection, heap creation and destruction,
+  identity routines, and routines that write data but no code
+  (`LibraryModel::WritesData`, `DataWrites`, `ArgumentSet`, `printf_writes`),
+  with the conditions a call must meet and the failure values it may deliver
+  (`Conditions`, `Delivery`, `Pages`, `AllocatedProtection`).
+- C++ exceptions run as an Itanium personality routine runs them (`Throw`,
+  `Rethrow`, `Resume`, `BeginCatch`, `EndCatch`, `Exceptions`, `Thrown`,
+  `SsaExceptionHandler::selector`); a call stated never to return runs the
+  host's model of how it leaves.
+- Code a run writes: a later entry into changed bytes switches into the code
+  lifted from them (`InstructionSources::record_change`, `EnteredCode`,
+  `Resumption`, `CodeRefusal`). Returns by their contract (`ReturnContract`,
+  `EnteredReturn`, `UnknownReturn`) and through the return word
+  (`ReturnTransfer`), with the registers a host names at each resume, handover
+  or entry (`MachineStates`, `MachinePoint`, `StatedRegister`, `Widening`).
+- Exception handlers, conditional traps, block and string operations, vector
+  masked, gathered, faulting and segment accesses, lane-controlled computations
+  (`ir::ops::controlled`: `LaneExecution`, `LaneOperand`) and atomics over
+  private storage.
+- Path refinement by each fork's condition (`Equality`, `IntegerBits::bounded`,
+  `ExecutionUsage::infeasible_paths`); per-byte budgets
+  (`Budget::ExecutionSteps`, `ExecutionBlockBytes`, `ExecutionDepth`);
+  `ArgumentBytes::bound` and `complete`; `SsaFunction::release_execution_operands`.
+- Protection a program changes itself, per page and per path
+  (`InstructionSources::permissions_over` and `protection_changed`,
+  `CodeMemory::instruction_permissions_over`, `protection_changed` and
+  `image_unwritten`): a write is admitted where a change made the bytes
+  writable, and image bytes a change covered are served or proven from the
+  image only while no write reached them. A kernel's protection call returns
+  zero or a negated `errno` at the pointer width
+  (`ProtectionResult::ZeroOrNegatedErrno`, `returned`, `kind`;
+  `ModelValue::Offset`).
+- A store into storage the image or the write guard says may not be written
+  faults its path, as the machine faults it (`FindingKind::ReadOnlyWrite`): the
+  path ends at the store, the finding records the bytes it reached, it counts
+  among the run's traps, and a handler that may catch it receives the raise. A
+  write that may not happen (a lane an unknown mask may leave alone, a direction
+  a block may not take) and a model's write refuse the root.
+
+#### Operations, constants and evaluation
+
+- The operations every ISA needs, stated typed: contractions
+  (`SsaOp::Contract`), computations over a `Kernel` (`SsaOp::Compute`), float
+  raises, rounding environments as operands, typed atomics (`AtomicCmpXchg`,
+  `AtomicPairCmpXchg`, `AtomicLockRmw`, `AtomicCondRmw`, `AtomicPairRmw`,
+  `AtomicCheckedRmw`), directed block operations (`CompareBlk`, `ScanBlk`,
+  `LoadBlk`, `MoveBlk`), variadic arguments (`ArgNext`, `ArgStep`), CIL's typed
+  references and `MemoryOp::Write`. `SsaOp::stated_type` and
+  `SsaOp::folds_results` ask an operation what it states.
+- Every float format as a constant (`FloatFormat`, `FloatBits`,
+  `ConstValue::Float`), folded exactly through `rustc_apfloat` under the
+  target's `FloatRules`, subnormal flushing included; vector constants of any
+  width up to 16384 bits (`VectorConst`) with every lane operation folded.
+- Constant folding of AES, SHA-1, SHA-2, SHA-512, SM3, SM4, GHASH, GF(2^8),
+  CRC-32, carry-less products, bit deposit and extract and decimal adjusts,
+  each tested against its standard's known answers.
+- `analysis::Machine` (pointer width, byte order, float rules, division
+  outcomes `ir::division`, misaligned access) with `Machine::evaluate` and
+  `evaluate_results` as the one constant evaluator; `ir::evaluation`
+  (`Evaluation`, `ArithmeticTrap`), so a fold keeps a trap that still executes;
+  operand layouts for a host that evaluates operations itself (`OperandLayout`,
+  `Destination`).
+- `ir::integer`: 1- to 128-bit integer types with exact checked conversions
+  (`IntegerType`), their known bits (`IntegerBits`) and `BitWidth`, which owns
+  a width's low-bit masks. `ConstValue::same_integer` and `relation`;
+  `ValueRange::window` and `read_bounded`.
+- `ConstValue::native` (a signed integer at a pointer width) and
+  `ConstValue::symbol_relation`, which decides a comparison of two symbols as
+  the addresses `Target::symbol_address` gives them; `SsaFunction::symbol_of`,
+  the symbol a value holds through the conversions that keep its bits.
+- `ir::content`: an operation's and a constant's semantic content as a
+  versioned canonical byte stream (`write_content`, `ContentSink`);
+  `target::layout` (`TypeLayout`, `StorageLayout`, `BooleanStorage`).
+
+#### Memory, points-to and the image
+
+- Points-to over the bytes of objects (`pointsto::Object`: frame, caller,
+  image, allocation), with escape, call models and call effects, kept with the
+  function (`SsaFunction::solved_points_to`). Call effects on every call
+  (`CallEffects`, `CallMemory`, `CallAccess`, `CallLocation`, `Capture`).
+- Memory SSA footprints (`pointsto::Footprint`) and regions (`MemoryRegion`,
+  `MemoryRegion::is_apart_from`, `MemoryDefSite::Image`);
+  `MemorySsaStats::call_count`; `PointeeExtent::at_call`;
+  `FunctionAnalyses::call_escape`.
+- `analysis::image` (`ImageData`, `Mutability`, `ReadOnlyExtents`,
+  `ReadOnlyOverlay`): loads of read-only image data fold to their bytes, and a
+  read of storage the loader maps cannot fault. `analysis::frame`
+  (`FrameAnchors`, `CellKey`, `FrameEscape`) and `analysis::reach`
+  (`for_each_reach`, `Reach`, `LoadedValues`, `address_origins`).
+- `FunctionAnalyses::memory_ssa` (`Analysis::MemorySsa`): a function's memory
+  SSA, built once over the points-to relation the analyses keep.
+  `MemorySsa::build_with_cfg` takes that relation as a closure, asked only
+  where a footprint can set two locations apart, and
+  `passes::memory::unread_loads` and `dead_frame_stores` read the function's
+  `MemorySsa`.
+
+#### Analyses
+
+- `analysis::context` (`AnalysisContext`: machine, image, call models, budget,
+  interrupt), `analysis::budget` (`Budget`, `WorkBudget`, `Exhaustion`,
+  `EventKind::BudgetExhausted`) and `interrupt` (`Interrupt`,
+  `NeverInterrupted`, `Latch`, `PipelineReport::interrupted`).
+- `analysis::guards` (`GuardFacts`, `GuardReader`, `Question`, `Definitions`,
+  `GuardFacts::phi_on_way`), `bindingtime`, `demand` (the inputs and effects an
+  observation depends on, by role), `bits` (known bits, `Reader`,
+  `DemandedBits`), `congruence`, `doubleword`, `distribute`, `mba`, `rotate`,
+  `byteswap`, `select`, `reshape`, `flags`, `records` (`RecordLayouts`),
+  `folding` (`FoldForest`), `webs` and `copies::ParallelCopy`.
+- `analysis::symbolic::SymbolicInstance`, so symbolic expressions never equate
+  two runs that could differ; `analysis::dataflow::solve_sparse_dense`;
+  `Classes`, a disjoint-set forest over small integers.
+- `Congruence::step` (how far apart the values of a set lie, so a host can tell
+  accesses at `i`, `i + 1`, ..., `i + 7` interleave), `Doubleword::regroup`
+  (`Regrouping`, `Composed`), whose algebraic fold reads a double-width sum of a
+  value's two halves as the value, and
+  `DominatorTree::nearest_common_dominator`.
+
+#### Passes, pipelines and the IR
+
+- New passes: `moot`, `unthread` (`DuplicateMergingPass`), `arms`
+  (`ArmMergingPass`), `rejoin` (`LoopRejoiningPass`), `demand`
+  (`DemandedBitsPass`), `passthrough` (`UnreadPassthroughPass`), `residual`,
+  `calltarget` (`ConstantCallTargetPass`), `switchbounds`
+  (`SwitchBoundsPass`), `equalities` (`EqualityPropagationPass`) and `idle`
+  (`IdleLoopPass`).
+- Pass pipelines: `FunctionPass`, `ModulePass`, `PassEnv` (`record`,
+  `exhausted`, `ranges`), `FunctionPipeline`, `PipelineSpec`, `PipelineReport`,
+  `scheduling::presets`, `PassScheduler::run_once` and `FailurePolicy`;
+  `EventBuilder::new`; one round for a host driving its own fixpoint
+  (`DeadCodeEliminationPass::run_iteration`,
+  `ControlFlowSimplificationPass::run_iteration`,
+  `CopyPropagationPass::{propagate, run_iteration}`, `WorkBudget::rounds`);
+  `passes::deadcode::live_values`; `SsaFunction::refutations`.
+- SSA construction for front ends (`SsaFunction::construct_ssa`,
+  `finish_construction`, `SsaConstructOptions`, `ConstructionReport`,
+  `BoundaryRecorder`); host facts carried in the IR (`Target::VariableFacts`,
+  `InstructionFacts`, `FunctionFacts`); instruction identity (`InstrId`); block
+  provenance per edge (`BlockProvenance`).
+- Calls that return several values: `CallData::results` (`CallResult`,
+  `CallData::with_result`) and `SsaOp::Return::results`
+  (`SsaOp::returns_results`), each under the key naming where the callee leaves
+  it, as a callee leaving an integer in `eax` and a character in `edx` returns
+  both. Static execution binds each to what the callee's return handed back
+  under its key (`State::hand_back`, `State::take_handed`); points-to reads a
+  modelled call's as pointing anywhere. A call or return with results encodes
+  under a tag of its own, so one returning a single value keeps its digest.
+- The exception value model: phi operands per edge kind (`PhiEdge`),
+  runtime-supplied values (`SsaOp::RuntimeValue`), `finally` flow
+  (`FinallyFlow`) and exceptional webs.
+- Editing: `SsaEditor::replace_uses_within`, `constant_at_exit` and `unrotate`;
+  `CheckedReplaceResult::took`.
+- Structure recovery: `switch` from comparison trees, fall-through cases, guard
+  clauses, join and loop splitting, edge blocks, polar conditions and repeated
+  tests (`StructureOptions`, `Structured::repeats`,
+  `Structured::drop_onward_gotos`), and the region tree's own
+  operations (`Region::sequence`, `gotos`, `statements_in_conditions`,
+  `Predicate::statements`, `CaseTest::decides`).
+- `VarMap`, `VarSet` and `RenameGroups` for far variable ids;
+  `graph::Adjacency`; `BlockLiveness`; `SsaFunction::shrink_to_fit`;
+  `AnalysisCache::bounded`; the traversal iterators are exported
+  (`DfsIterator`, `BfsIterator`, `DominatorIterator`).
+
+### Changed
+
+#### IR (breaking)
+
+- `SsaOp::Call(Box<CallData>)` replaces `Call`, `CallVirt` and
+  `CallIndirect`, with a `Callee` (`Direct`, `Virtual`, `Constrained`,
+  `Indirect`), stated effects, tail calls and staged stack values.
+- Every memory operation carries `AccessQualifiers` (address space,
+  permission, locality, volatility, alignment); the CIL prefix operations are
+  gone.
+- `ConstValue::Float(FloatBits)` replaces `F32` and `F64`;
+  `ConstValue::Vector` holds a `VectorConst`. Vector operations state their
+  lanes, and float operations their format and rounding; an inexact result
+  folds only under a rounding something states.
+- `SsaOp::Return` carries `state` (a boxed slice), `transfer` and `results`
+  (`returns` and `returns_with` are no longer `const`); `LocalAlloc` carries `zeroed`,
+  `FpClassify` a `FloatClassLayout`, and `CopyBlk` and `InitBlk` a direction.
+- An address's base is an `AddressBase`; `AbsoluteUse` is `AddressUse<u64>`.
+- One control-flow graph (`SsaCfg`) carries normal and exceptional edges;
+  `EhCfg` is gone.
+- `SsaFunction::rebuild_ssa` is gone: front ends construct with
+  `construct_ssa`, and passes that edit edges repair with `reconstruct_values`
+  and declare it (`SsaEditor::declare_repaired`); `modification_scope` has no
+  default.
+- The verifier rejects more malformed IR at `VerifyLevel::Quick`;
+  `SsaFunction::validate_indices` runs the bounds scan alone.
+- `SsaFunction::purity` reports `MethodPurity::MayThrow`; `LoadArg` is a
+  memory read. `Rewiring::inherit_rename_group` takes whether the substitution
+  took. `SsaEditor::route_through` takes `via`.
+- `analysis::loop_analyzer` is `analysis::loopanalyzer`; every item is `pub`
+  in a private module and re-exported where needed; public hash containers are
+  `FxHashMap` and `FxHashSet`.
+
+#### Context, analyses and scheduling (breaking)
+
+- `AnalysisContext::new` takes a `Machine`; a pass host states one context
+  (`SsaPassHost::context`), `PassEnv::new` takes it, and `FunctionAnalyses`
+  keeps it.
+- `MemorySsa::build` and the memory pass take the context;
+  `pointsto::solve` and `analyze_function` take a `WorkBudget` and the call
+  models, and `analyze_function` returns an `Arc<PointsTo>` (an exhausted solve
+  answers "anywhere"); `evaluate_const_op` is `Machine::evaluate`; `structure`
+  takes its `StructureOptions` outright, and `StructureOptions` has a
+  `statements` field, the statements each block prints (`StructureOptions::bare`
+  leaves it empty); `structure_ssa` counts each block's rows.
+- Every fixpoint bound is a `WorkBudget` kind; the per-pass iteration fields
+  of `PipelineConfig`, `TaintConfig::max_iterations` and the
+  `DEFAULT_MAX_ITERATIONS` constants are gone, and the bounded passes are unit
+  structs.
+- `MemoryLocation` gains `Escaped`, `CallLocation` gains `Frame`, and
+  `MemoryOp::Call` models a stated call. `CallEscape` shares an
+  `Arc<PointsTo>` and has no lifetime.
+- Value ranges are cached per function state (`RangeFacts`, `PassEnv::ranges`);
+  `ranges::analyze` returns `Result<ValueRanges, Exhaustion>`; `range_at` is a
+  method of `GuardedRanges`.
+- `interproc::solve` returns a `SolveOutcome` and supports bidirectional
+  transfers (`SummaryFlow`).
+- `PassScheduler` requires `SsaFunction<T>: Send`, commits parallel results in
+  method order, and passes declare their guarantees through `Declared` and
+  `Target::capability`.
+
+#### Functions and their owners (breaking)
+
+A function that works on one thing is that thing's method, state threaded
+through several helpers is a view, and a pass is its struct:
+
+| Before | Now |
+|---|---|
+| `passes::<pass>::run(...)` | `<Pass>.run(&mut ssa, &PassEnv::new(&method, &events, context))` |
+| `address::normalize_address`, `compare_addresses`, `alias_keys_for_function`, ... | `AddressWalk::new(ir, ptr_size)`: `normalize`, `compare`, `alias_keys`, ... |
+| `address::const_i64`, `const_u64`, `const_value_i64` | `SsaFunction::const_i64`, `const_u64`, `ConstValue::resolved_i64` |
+| `bits::known_bits`, `known_constant`, `redundant_mask`, ... | `bits::Reader::new(ssa, constants)` methods |
+| `doubleword::{fold, store_pair, wide_load, one_value}` | `Doubleword::new(ssa, constants, machine)` methods |
+| `MemorySsa::classify_memory_operation` | `MemoryLocator::new(ssa, ptr_size).classify` |
+| `GuardFacts::equalities`, `Question::is_boolean`, `GuardFacts::of_reading` | `GuardReader::equalities`, `Definitions::is_boolean`, `GuardFacts::of(.., memory)` |
+| `RecordLayout::field_of(&layouts, ..)` | `RecordLayouts::new(&layouts).field_of(..)` |
+| `execution::Value::constant_bytes` | `ConstValue::payload_bytes` |
+| `Machine::evaluates_results(op)` | `op.folds_results()` |
+| `ResidualSize::measure(function, budget)` | `ResidualSize::measure(function, budget, cancelled)` |
+| `algebraic::narrow_phis(ssa, method, events, ptr_size, ..)` | `algebraic::narrow_phis(ssa, env, reads_narrow)` |
+
+#### Behaviour
+
+- Range propagation models conversions, bitwise operations and wrapping,
+  refines through every branch kind, bounds a value through the copies,
+  conversions and offsets a guard compares, and decides by congruence modulo
+  64. Every conditional-branch kind is decided by the range, predicate,
+  threading and control-flow passes.
+- Two symbols compare as the addresses `Target::symbol_address` gives them, in
+  constant folding, the range analysis and `passes::decide`: one address loaded
+  twice is equal to itself, the difference of two is the distance between them,
+  and a branch or flag test over the two is decided. A signed ordering of two
+  addresses, and a symbol the target gives no address, stay undecided.
+- The memory pass forwards across stated calls, composes values stored in
+  parts, and removes frame-exit, unread and stack-probe stores; the predicate
+  pass decides guards, selects and null checks of placed symbols;
+  `algebraic` joins a phi whose operands all name one place.
+- `unthread` merges blocks a compiler copied or threaded back, un-rotates
+  rotated loops, and routes a loop's break through the test after it; structure
+  recovery places shared code, tails, loop exits and nested conditions without
+  gotos and follows a loop to where its ways out meet. On dash, each step
+  removed gotos and added none to any function.
+- `unthread` merges the alike tests a compiler copied into a loop's two ways
+  in, so the loop is entered at one test, and a copy that jumps past a test
+  reading a phi none of the copied rows reads. `structure` leaves out each
+  `goto` that only runs on to a `goto` to the same block, and weighs code it
+  places more than once against the gotos it saves, at 16 statements a goto: on
+  RISC-V dash, `readtoken1` prints `parsesub`'s stack push once instead of
+  twenty times, in 1,181 lines instead of 1,986, for 22 more gotos.
+- A pipeline run stops once every pass has seen the function as it stands, and
+  asks its interrupt before and after every pass.
+- Performance: `moot` makes about half the states and holds far less (the
+  largest Windows system-library searches from 4.5-6.5 GB to 1.4-3.3 GB);
+  `demand` shares one dependency table per body (414 s to 195 s of CPU on a
+  system library); Memory SSA interns its locations; the verifier reads a
+  function in one walk; the range pass joins phi operands once (a 900 s
+  timeout now 54 s); `structure` decides the code ending the function once per
+  recovery (a 2000-deep nest recovers in a third of the time); internal tables
+  use `rustc-hash`.
+
+### Removed
+
+- The free pass functions (`passes::<pass>::run`, `controlflow::run_iteration`,
+  `copying::run_iteration`, `deadcode::{run_iteration, run_global}`,
+  `calltarget::direct_constant_calls`, `switchbounds::prune_switch_cases`): see
+  the table above.
+- Forwarders and second names: `symbolic::expr::evaluate_unary_typed` and
+  `evaluate_binary_typed` (use `NumericOp::evaluate_unary` and
+  `evaluate_binary`), `consts::scalar::convert_integer` (`IntegerType::convert`),
+  `SsaEvaluator::set_symbolic_expr` (`set`), `PassTransaction::run_one`
+  (`run_group`) and `PhiAnalyzer::find_phi_defining`
+  (`SsaFunction::find_phi_defining`).
+- The opaque and redundant operations: `SsaOp::NativeOpaque`, `FlagAdjust`,
+  `ComputeFlags`, the per-family vector, mask, predicate and tile operations
+  `Contract` and `Compute` replace, `BlockString`, and the untyped atomics
+  (`CmpXchg`, `AtomicRmw`, `WideCompareExchange`).
+- `SsaFunction::{mark_preserved_dispatch_var, is_preserved_dispatch_var,
+  has_preserved_dispatch_vars}`, which no pass honoured;
+  `pointsto::SYNTHETIC_LOC_BASE` and `copying::protect_sole_local_defs` (now
+  private); `analysis::symbolic::ops` (use `NumericOp`), `GraphError` (use
+  `Error`), `memory::MAX_MEMORY_SSA_CELLS`,
+  `FunctionRoots::exception_entry_values`, `TaintAnalysis::forward_only` and
+  `bidirectional`.
+
+### Fixed
+
+- Range analysis: a select's arms are read where each is chosen (`min(n, 8191)`
+  is `[0, 8191]`); an unsigned order bounds below as well as above; `<=` and
+  `>=` were read as the wrong arm, after which threading deleted live blocks; a
+  63-bit window was read through `i64::MIN`; a zero-bit width no longer
+  overflows a mask shift (`BitWidth`).
+- The opaque-predicate pass reads an operand's constant through copies in
+  every probe, never through a width conversion; it no longer reads an order
+  through a wrapping subtraction or decides `x < x` for a NaN.
+- Reconstruction gave a throw the value its block ends with, reset loop
+  variables to their pre-loop value, and kept a location's first write of two;
+  edges were rerouted into exception regions, and handlers reached from a
+  second clause, finally flow and handler-entry phis were mishandled.
+- A load of a slot whose address escaped was resolved to the slot's value;
+  `CallEscape` let addresses stored to memory escape no call; the evaluator
+  kept fields across calls; Memory SSA and points-to read a constant-counted
+  reach (`memcpy(dst, src, 208)`) as unbounded; machine queries counted as
+  memory reads.
+- Constant folding of `div.un`/`rem.un`, shifts by wide counts, rotates,
+  booleans and binary32/binary64 NaNs; `simplify_op` folded away division traps.
+  `SsaEvaluator`, SCCP, backward dataflow and loop analysis mishandled NaN,
+  handler reachability, unsigned comparisons and fused branches.
+- Address normalization overflowed the stack on long constant chains and lost
+  scaled-index bases; malformed IR is reported instead of panicking or
+  allocating gigabytes.
+- `SsaEditor::merge_duplicate` dropped the facts of the copy's rows;
+  `set_op_preserving_type` and `remap_variables_preserving_type` replaced an
+  instruction's recorded type with the host's answer for the new operation.
+- Phi narrowing and the predicate pass's restating of a join read a definition
+  site without confirming the variable is defined there; both now use the
+  guarded lookups (`find_phi_defining`, `recorded_definition`).
+- `StructureMetrics::gotos` and `Structured::labels` missed a `break` or
+  `continue` C can only write as a goto; both are now `Region::jumps`.
+
 ## [0.6.0] - 2026-09-04
 
 Structured control-flow recovery arrives: any control-flow graph becomes a tree
 of statements, total by construction, with the exception model rebuilt
-underneath it — a clause is now three typed block ranges instead of five loose
+underneath it - a clause is now three typed block ranges instead of five loose
 indices, and one exception-aware flow view replaces five hand-written copies of
 the same loop. An address becomes a value the IR can carry, so a function,
 global or import stays distinguishable from the integer it lowers to. And the
@@ -27,7 +396,7 @@ set sized for the current CFG.
 
 ### Added
 
-- **`analysis::structure`** — structured control-flow recovery: loops classified
+- **`analysis::structure`** - structured control-flow recovery: loops classified
   by where they test, multi-way branches, protected regions with their handlers,
   and conditions spanning several blocks (`Predicate`), which is what turns two
   nested branches back into `a && b`. Total by construction, with `Region::Goto`
@@ -35,19 +404,19 @@ set sized for the current CFG.
   (`StructureMetrics::resized_inputs` and `depth_limited`) rather than a
   precondition.
 
-- **`analysis::structure::BlockSet` and `StructureOptions::max_depth`** — the two
+- **`analysis::structure::BlockSet` and `StructureOptions::max_depth`** - the two
   types that make the recovery total. `BlockSet` carries the index domain it was
   built for, so `contains` is total over every `NodeId`; `max_depth` (with
   `DEFAULT_MAX_DEPTH`) bounds the recovery's stack *and* every later traversal of
   the result, the derived `Drop` and `Clone` included, and caps how many blocks
   one condition may fold. Reaching either costs quality, never correctness.
 
-- **`ProtectedHandlerKind` and `HandlerFilter`** — the input side of a handler,
+- **`ProtectedHandlerKind` and `HandlerFilter`** - the input side of a handler,
   split from `HandlerKind`, which now describes only a recovered one. A filter
   expression rides `ProtectedHandlerKind::Filter`, so a filter without an
   expression and an expression on a `finally` are unrepresentable.
 
-- **`analysis::recovery`** — the bridge from an `SsaFunction` to that recovery.
+- **`analysis::recovery`** - the bridge from an `SsaFunction` to that recovery.
   `structure_ssa` reads the exception table into `ProtectedRegions`, derives
   condition-only blocks from instructions, and returns `Recovered`: the tree
   *and* the clauses it could not convert (`RejectedClause`, `ClauseRejection`).
@@ -55,7 +424,7 @@ set sized for the current CFG.
   `try/catch(A)/catch(B)` does not lose a catch.
 
 - **`compute_post_dominators`, `control_dependences` and `ReverseGraph`** in
-  `graph::algorithms`, with `PostDominatorTree` and `ControlDependences` — the
+  `graph::algorithms`, with `PostDominatorTree` and `ControlDependences` - the
   results are indexed by the original nodes, over a reversed graph rooted at a
   virtual exit so a function with several returns, or none, still has one.
   `immediate_post_dominator` is the single bounds guard, and `strict_controllers`
@@ -64,15 +433,15 @@ set sized for the current CFG.
   as a parent chain does not terminate. `DominatorTree::is_reachable` exposes
   reachability the tree already knew, instead of a second BFS.
 
-- **`analysis::exceptions`** — one exception-aware flow view, replacing five
+- **`analysis::exceptions`** - one exception-aware flow view, replacing five
   hand-written copies of one loop over the exception table: `FunctionRoots`
   (where control can enter), `EhCfg` (the graph in which those are reachable) and
   `EhDominance`. The last keeps apart three questions that were one answer used
-  for all of them — `definition_reaches`, which knows a throw can interrupt a
+  for all of them - `definition_reaches`, which knows a throw can interrupt a
   guard part-way, `dominates_block`, and the verifier's floor
   `definition_is_well_formed`.
 
-- **`ExceptionBlocks` and `SsaFunction::exception_blocks`** — the block roles an
+- **`ExceptionBlocks` and `SsaFunction::exception_blocks`** - the block roles an
   exception table assigns (`is_runtime_entry`, `is_region_start`,
   `is_region_end`), indexed once instead of re-derived from five loose
   `Option<usize>` fields at eleven reader sites. It borrows the function, because
@@ -88,18 +457,18 @@ set sized for the current CFG.
   an `ExceptionTableError`. `ClausePart` names which part a range belongs to,
   and `BlockRange::to_bitset` is the crate's only interval-to-set expansion.
 
-- **`ir::exception::HandlerKind` and `Target::handler_kind`** — one handler
+- **`ir::exception::HandlerKind` and `Target::handler_kind`** - one handler
   taxonomy and one classifier, re-exported from `analysis::structure` so the enum
   the recovery reports and the enum the IR classifies are the same enum.
 
 - **`ExceptionTableError` and `SsaVerifier::check_exception_table`, at
-  `VerifyLevel::Quick`** — reports `VerifierError::MalformedExceptionClause` for
+  `VerifyLevel::Quick`** - reports `VerifierError::MalformedExceptionClause` for
   a clause whose parts run past the last block, claim each other's blocks, or
   disagree about being a filter. `EmptyBlockRange` is the deserialization-side
   refusal of a pair covering no block, the one path no constructor guards.
 
 - **`ConstValue::Symbol(T::SymbolRef)`, with `Target::SymbolRef` and
-  `Target::symbol_address`** — a located or named entity used as a value. It
+  `Target::symbol_address`** - a located or named entity used as a value. It
   folds exactly as the other reference constants do, which is to say not at all:
   address arithmetic stays the address model's job. `SymbolRef` is distinct from
   `MethodRef`, which names a *callable*, and `symbol_address` defaults to `None`,
@@ -107,7 +476,7 @@ set sized for the current CFG.
 
 - **`passes::algebraic` collapses redundant integer conversion chains.** A lift
   emits one conversion per width change, so a value narrowed, widened and
-  narrowed again arrives as `(uint16_t)(uint64_t)(uint32_t)x` — 40.8% of `x86_64`
+  narrowed again arrives as `(uint16_t)(uint64_t)(uint32_t)x` - 40.8% of `x86_64`
   conversions took another conversion as their operand. An intermediate is
   unobservable when the result is no wider than it *and* no wider than the
   source; where the result is wider, the two are interchangeable exactly when
@@ -115,14 +484,14 @@ set sized for the current CFG.
   Over the committed fixtures, `x86_64` integer conversions fell 26.7% and
   `arm_64` 15.8%; three-deep casts in rendered source fell 64%.
 
-- **`analysis::convert::collapse_conversion_chain`** — that rule as a documented,
+- **`analysis::convert::collapse_conversion_chain`** - that rule as a documented,
   testable analysis instead of a fast path buried in a pass, with an oracle
   matrix over all 2048 three-link shapes the mock target can express.
   `testing::MockConvLink` and `MockConversionChain` build a chain of any depth
   over any mock integer width, laid out so a test can damage one def site
   deliberately.
 
-- **`SsaFunction::recorded_definition` and `RecordedDefinition`** — the crate's
+- **`SsaFunction::recorded_definition` and `RecordedDefinition`** - the crate's
   one guarded, scan-free def-site dereference. A def site is variable *metadata*:
   an edit that does not restate it leaves it naming whatever instruction now sits
   at that index, so dereferencing it unchecked answers with a foreign operation
@@ -130,7 +499,7 @@ set sized for the current CFG.
   `try_constant_value` are built on it.
 
 - **`analysis::cache::FunctionAnalyses`, `scheduling::AnalysisCache` and
-  `CacheStats`** — the derived analyses of one function, each computed at most
+  `CacheStats`** - the derived analyses of one function, each computed at most
   once and only if asked for, and a per-method cache of those that outlives the
   visit which built it. The handle borrows the function and hands that borrow
   back through `ir()`, so pairing two functions' results by mistake fails to
@@ -148,29 +517,29 @@ set sized for the current CFG.
   now public, since "does this touch memory, and where" is a question a consumer
   can have without wanting the versioning built on top of it.
 
-- **A payload on every many-to-one system kind** — `CacheMaintenanceOp` (13
+- **A payload on every many-to-one system kind** - `CacheMaintenanceOp` (13
   instructions), `TlbMaintenanceOp` (13), `BarrierOp` (3), `HypervisorOp` (32),
   `HardwareEngineOp` (12), `InterruptReturnOp` (13), `BreakpointOp` (17),
   `TrapOp` (16) and `SysRegOp` (72), carried by the matching `SystemOpKind`
   variants, by the new `SystemOpKind::ControlRegister`, and by `SsaOp::Break`.
   Five of these classes had been rendering a *representative* member's mnemonic
-  for the whole class, so `clflush` read as `invd` and `xend` as `serialize` —
+  for the whole class, so `clflush` read as `invd` and `xend` as `serialize` -
   worse than a generic label, because it looks correct. `SsaOp::Break` and
   `SystemOpKind::Trap` now distinguish `ud2` from a breakpoint trap and
   `int 0x80` from `int 0x2d`, and `SsaBlockBuilder::break_` takes the
   `BreakpointOp` as a required argument.
 
 - **`MachineStateOp` and `SystemOpKind::MachineState`**, replacing
-  `SystemOpKind::Privileged` — one variant per operation across 138 instructions,
+  `SystemOpKind::Privileged` - one variant per operation across 138 instructions,
   from descriptor tables and port I/O through the CET shadow stack and key locker
   to the ARM, AArch64 and MIPS machine-state operations. `mnemonic`, `kind_str`,
   `effects` and `writes_destination_operand` are all per-operation, and there is
   no catch-all arm to fall into.
 
-- **Eleven `FlagAdjustKind` variants for the x86 flag writers** — the clear/set
+- **Eleven `FlagAdjustKind` variants for the x86 flag writers** - the clear/set
   pairs for carry, direction, alignment check and interrupt, plus
   `LoadStatusFromReg` (`sahf`), `StoreStatusToReg` (`lahf`) and
-  `SetRegFromCarry` (`salc`) — with `FlagAdjustResult` and
+  `SetRegFromCarry` (`salc`) - with `FlagAdjustResult` and
   `FlagAdjustKind::{result, output_arity, effects, effects_for_outputs,
   kind_str, mnemonic}`. `flags_written` names the bits each writes and
   `defines_register` marks the two whose result is a register, so a caller can
@@ -186,13 +555,13 @@ set sized for the current CFG.
   `is_valid` its complement, and `Display` a loop over it, so a bit added to the
   table becomes valid, printable and checkable in one edit.
 
-- **`SsaVerifier::check_flag_masks`, at `VerifyLevel::Standard`** — reports
+- **`SsaVerifier::check_flag_masks`, at `VerifyLevel::Standard`** - reports
   `InvalidNativeOperation` for an `SsaOp::ReadFlags` naming a bit no flag
   defines, and for an `SsaOp::FlagAdjust` whose output count differs from
   `FlagAdjustKind::output_arity`. `SsaBlockBuilder::read_flags` refuses the same
   mask at construction; the verifier's copy is for persisted blobs.
 
-- **Identity for the remaining native kinds** — eight `SysRegOp` variants with
+- **Identity for the remaining native kinds** - eight `SysRegOp` variants with
   `effects` (model-specific, extended-control, control and debug registers, read
   and written); `SystemOpKind::Hint(HintOp)`, the carrier that makes `endbr64`
   distinguishable from padding, whose effects keep a lifted `nop` non-removable
@@ -202,7 +571,7 @@ set sized for the current CFG.
   and eight `FpuControlKind` variants for the SSE control word and the `xsave`
   family.
 
-- **`ir::ops::table`, `OpKindTable` and `OpKindIter`** — the contract every
+- **`ir::ops::table`, `OpKindTable` and `OpKindIter`** - the contract every
   operation-kind enum shares: a pinned `COUNT`, an index-to-variant `from_index`,
   an injective `kind_str`, an optional `mnemonic`, and an `all` iterator. Sixteen
   enums implement it, and one registry drives the count, spelling and cross-table
@@ -228,13 +597,13 @@ set sized for the current CFG.
   it holds two definitions without allocating.
 
 - **The operand policy of the forty-five boxed-payload operations is written
-  once** — `outputs` are definitions, `inputs` are uses, definitions come first,
+  once** - `outputs` are definitions, `inputs` are uses, definitions come first,
   and the stack effect is `(inputs.len(), outputs.len())`, in one blanket
   implementation no payload type can override. A payload struct that grows a
   field no longer compiles until someone decides whether it is an operand.
 
 - **Breaking.** **`Display` for seventeen operations separates operands with `, `
-  instead of a space** — the vector operations with boxed payloads plus
+  instead of a space** - the vector operations with boxed payloads plus
   `FpTranscendental` and `FpuControl`. Two spellings of one list were maintained
   across forty-five render arms; the rendering is now one helper.
   `VectorSegmentLoad` renders its destinations the way every other operation
@@ -242,7 +611,7 @@ set sized for the current CFG.
 
 - **Breaking.** **`analysis::structure`'s caller-supplied block sets are
   `BlockSet` rather than `BitSet`, and `StructureOptions` gained a required
-  `max_depth`** — every struct literal must be rewritten. `StructureOptions` also
+  `max_depth`** - every struct literal must be rewritten. `StructureOptions` also
   gains `Debug`, `Clone`, `PartialEq` and `Eq`.
 
 - **Two shapes recover one level flatter.** `Structured::labels` is now exactly
@@ -250,7 +619,7 @@ set sized for the current CFG.
   region owned it is reached by falling into it rather than by jumping to it. And
   a conditional whose first arm cannot fall through returns the other arm as the
   resume point instead of nesting it as an `else`, so `if (c) return; ..` stays
-  one level deep however often it repeats — which keeps the early-return spine,
+  one level deep however often it repeats - which keeps the early-return spine,
   ordinary in decompiled input, off the depth bound.
 
 - **The conversion-chain collapse moved out of `passes::algebraic` into
@@ -269,7 +638,7 @@ set sized for the current CFG.
 - **Breaking.** **`VerifierError::PhiInEntryBlock` becomes
   `PhiWithoutPredecessors`.** A phi operand names the terminator edge it arrived
   along, so the rule is about having no incoming edges rather than about being
-  block 0 — a handler entry the runtime dispatches to has none either, and a
+  block 0 - a handler entry the runtime dispatches to has none either, and a
   zero-operand phi there, previously reported nowhere, is now an error. The
   rebuild runs `demote_runtime_entry_phis` before each trivial-phi elimination,
   so the crate cannot emit IR its own verifier rejects.
@@ -307,8 +676,8 @@ set sized for the current CFG.
 
 - **Breaking.** **`analysis::SsaCfg` no longer draws an edge from a protected
   region to its handler**, so a block's successor count is its terminator's
-  arity. The synthetic edge was the wrong *edge* — control reaches a handler from
-  wherever it threw, not from the region's first block — it fired for 1 of 29
+  arity. The synthetic edge was the wrong *edge* - control reaches a handler from
+  wherever it threw, not from the region's first block - it fired for 1 of 29
   clauses on the corpus's one exception-carrying fixture, and it broke arity for
   every other consumer. A consumer needing handler reachability reads
   `SsaFunction::exception_handlers`.
@@ -319,7 +688,7 @@ set sized for the current CFG.
   shape, so a host persisting the serde form must migrate. `filter_offset` is
   gated on `SsaExceptionHandler::kind`, so `class_token_or_filter` is read as an
   IL offset only where it is one, and `remap_block_indices` maps each part by its
-  members — exact for the order-preserving remap compaction performs, and a
+  members - exact for the order-preserving remap compaction performs, and a
   superset otherwise, which is the conservative direction.
 
 - **Breaking.** **`Target::handler_kind` replaces `Target::is_filter_handler`.**
@@ -340,14 +709,14 @@ set sized for the current CFG.
 - **The edit-scope boundary now leaves both the def sites and the use index
   exact, for every scope.** `repair_ssa` and `rebuild_ssa` rewrite instructions
   and variables without restoring the index, so an edit above `UsesOnly` finished
-  with an index that no longer described the function — and that index is the
+  with an index that no longer described the function - and that index is the
   candidate list `replace_uses_checked_indexed` iterates, so the next pass's
   rewrites were being chosen from it.
 
 - **Breaking.** **Post-dominance seeds one virtual-exit edge per exit-less
   region, not per stranded node**, and `compute_post_dominators` /
   `control_dependences` return the two new result types. The old seeding
-  established a *forward* property — "this node reaches no sink" — with a walk
+  established a *forward* property - "this node reaches no sink" - with a walk
   that only moved backwards. On `0 -> 1 -> 2 -> 1` the virtual exit gained edges
   to both 0 and 1, so node 1 stopped post-dominating node 0 although it is node
   0's only successor, and node 1 was reported control dependent on a block with
@@ -364,7 +733,7 @@ set sized for the current CFG.
   rooted at handler and filter entries.** Handler blocks were unreachable in the
   terminator-only CFG, so phi placement and renaming skipped them: a store inside
   a handler reached the rejoin block with no merge point, and `passes::memory`
-  forwarded the try-path store into a load there — the wrong value on every path
+  forwarded the try-path store into a load there - the wrong value on every path
   that actually threw. A depth-1 handler still got its phi by accident, because
   `compute_dominance_frontiers` inserts before it notices the unreachable-node
   sentinel, which is why the suite was green.
@@ -377,7 +746,7 @@ set sized for the current CFG.
 
 - **Breaking.** **`SsaOp::FlagAdjust` effects and identity are derived from
   `FlagAdjustKind`.** The operation sat in a shared "pure value-producing
-  compute" arm that never inspected the kind — right while the enum held only
+  compute" arm that never inspected the kind - right while the enum held only
   NZCV producers, but `cld`, `std`, `clac` and `stac` write control flags no SSA
   operand models, so `removable_when_unused()` said yes and dead-code elimination
   silently removed the SMAP window around a user-pointer access. Purity now
@@ -391,7 +760,7 @@ set sized for the current CFG.
   live, which folds a `b.vs` against a flag `setf8` had overwritten.
 
 - **Breaking.** **The system and compute taxonomies have one representation per
-  instruction, so several `kind_str` fingerprints move** — `rdmsr` is
+  instruction, so several `kind_str` fingerprints move** - `rdmsr` is
   `"system.sysreg.msr.read"`, `rdtscp` is `"system.timestamp.aux"`, every
   `PacKind` reads `"compute.pac.*"`, and `HintOp` is spelled `"system.hint.*"`.
   These keys are checked injective over the union of every table plus both
@@ -418,8 +787,8 @@ set sized for the current CFG.
 
 ### Removed
 
-- **`SsaOp::set_dest`.** Nothing called it — not this crate, its tests, its
-  benches or its fuzz targets — and SSA renaming rewrites definitions through
+- **`SsaOp::set_dest`.** Nothing called it - not this crate, its tests, its
+  benches or its fuzz targets - and SSA renaming rewrites definitions through
   `SsaOp::replace_def`, which handles secondary outputs too. It also disagreed
   with the operand walk about `Call`, `CallVirt` and `CallIndirect`, where it
   *created* a destination the walk reports nothing for.
@@ -462,7 +831,7 @@ set sized for the current CFG.
 
 - **`NativeExceptionKind`, `native_is_filter_handler` and
   `Target::is_filter_handler`.** A second copy of the handler taxonomy, variant
-  for variant, plus a boolean where the question has four answers — so a catch, a
+  for variant, plus a boolean where the question has four answers - so a catch, a
   finally and a fault could not be told apart and structured recovery could not
   name what a handler does. `HandlerKind` is the one home and
   `Target::handler_kind` the one classifier, required and total.
@@ -480,7 +849,7 @@ set sized for the current CFG.
   carried its own copy of `get_definition`'s fast path, minus the check that the
   instruction found actually defines the variable asked for, so a def site stale
   by one index handed the walk an unrelated conversion whose widths then decided
-  whether to rewrite — silent wrong code, where a refusal would have cost only
+  whether to rewrite - silent wrong code, where a refusal would have cost only
   the optimization. Every link now resolves through `recorded_definition`.
 
   Five other sites had made the same unguarded copy. `try_constant_value` yields
@@ -493,7 +862,7 @@ set sized for the current CFG.
 - **A cyclic def-use chain made the collapse walk spin forever.** Malformed IR
   can present exact def sites that lead in a circle, and the walk had no bound
   and no visited set. It now refuses once it has taken more steps than
-  `SsaFunction::var_id_bound` — exact by pigeonhole, with no allocation and no
+  `SsaFunction::var_id_bound` - exact by pigeonhole, with no allocation and no
   arbitrary constant.
 
 - **GVN forwarded a redundant computation to a leader that did not reach it.**
@@ -502,13 +871,13 @@ set sized for the current CFG.
   and rewrote the other's uses to a definition that does not dominate them. A
   leader is now only a leader where it is available, and availability is
   dominance. On the MIPS fixture this was `DominanceViolation { def_block: 1,
-  use_block: 7 }` — the last remaining reason a debug and a release build lifted
+  use_block: 7 }` - the last remaining reason a debug and a release build lifted
   the same bytes differently.
 
 - **Loop canonicalization rewrote every header phi to one value.**
   `insert_preheader` and `unify_latches` keyed their phi maps on
   `VariableOrigin`, but `VariableOrigin::Phi` is a unit variant, so every phi
-  merging earlier phis — the ordinary shape in lifted native code — shares it.
+  merging earlier phis - the ordinary shape in lifted native code - shares it.
   One inserted phi stood for all of them, a dominance violation for all but one.
   Both now key on the header phi's result.
 
@@ -519,8 +888,8 @@ set sized for the current CFG.
   unwinding into `guard_pass`, which rolled the pass back and left the function
   unoptimised with nothing upstream the wiser. Such an index now answers "not in
   this loop". Dead-code elimination had the same defect from the other metadata
-  source — `handler_start_block` and `filter_start_block` can name a block the
-  current function does not have — and now reads them with the checked accessors
+  source - `handler_start_block` and `filter_start_block` can name a block the
+  current function does not have - and now reads them with the checked accessors
   the verifier already used.
 
 - **A load could resolve to a different value on consecutive runs.** More than
@@ -544,16 +913,16 @@ set sized for the current CFG.
 
 - **Protected regions were lost or printed unprotected.** Two regions sharing a
   try start kept only one, because the entry-to-region map held a single index
-  per block — so the ordinary `try { try {} catch {} } finally {}` encoding
+  per block - so the ordinary `try { try {} catch {} } finally {}` encoding
   dropped a clause; the map now holds every region starting at a block, outermost
-  last. And a region whose entry is unreachable — nothing says a `try` is
-  reached, since the runtime takes the edge into the handler — left its handler
+  last. And a region whose entry is unreachable - nothing says a `try` is
+  reached, since the runtime takes the edge into the handler - left its handler
   blocks to the orphan pass, which emitted them outside any `Region::Try`; such
   regions are now drained and opened at top level.
 
 - **Three defects in how a conditional's blocks are placed.** A join folded into
   the predicate stayed the conditional's resume point, becoming a `Region::Goto`
-  to a block with no statement position — on exactly the shape merging exists to
+  to a block with no statement position - on exactly the shape merging exists to
   remove. A handler's joins were bounded by a loop the handler is not inside,
   since the runtime enters a handler where the enclosing loop's back edge does
   not, so a handler-internal diamond degraded to an over-wide arm plus a goto;
@@ -565,7 +934,7 @@ set sized for the current CFG.
 - **An exception clause could be mapped half-way, by specification.**
   `remap_block_indices` was documented to advance a removed exclusive end to the
   next surviving block anywhere in the function, and to clear a start without
-  touching its end — so a region that began somewhere and ended nowhere, and a
+  touching its end - so a region that began somewhere and ended nowhere, and a
   handler whose end had crossed into the filter block, were states the IR could
   hold and no check could refuse. The range type deletes both.
 
@@ -579,7 +948,7 @@ set sized for the current CFG.
 - **`structure` and `structure_protected` declared every block condition-only
   without saying so.** Both are generic over the graph traits `SsaCfg`
   implements, so the obvious call on the crate's own CFG type asserted that every
-  SSA block — stores, calls, everything — computes nothing but its own branch
+  SSA block - stores, calls, everything - computes nothing but its own branch
   condition. The claim is now in both `///` blocks, and `condition_only_blocks`
   answers it from block contents. A tree recovered through `structure_ssa`
   therefore has fewer merged conditions and more gotos, which is the sound
@@ -604,7 +973,7 @@ rows) while landing 4% more rewrites (94,257 to 98,467), because rejected work i
 no longer discarded wholesale.
 
 Every defect below shares a shape: a value substitution or a definition record
-that was *stated* rather than *established* — a chain composed without resolving
+that was *stated* rather than *established* - a chain composed without resolving
 to a surviving target, a label asserting a definition that did not exist, or a
 repair applied on one path and not its sibling.
 
@@ -613,16 +982,16 @@ repair applied on one path and not its sibling.
 - **A pass group no longer trusts a pass's own "changed" return.**
   `SsaFunction` now tracks whether a checked edit mutated it, and
   `PassTransaction::run_group` treats a mutated function as changed regardless of
-  what the pass reported. The precondition that made this necessary — a pass
+  what the pass reported. The precondition that made this necessary - a pass
   editing under `SsaRollbackPolicy::Never` must report the change when the edit
-  fails, or the group skips both verification and rollback — was unstated,
+  fails, or the group skips both verification and rollback - was unstated,
   unenforced, and had been got wrong by eight passes. It is now structural
   rather than a convention: a pass that mutates and then claims otherwise is
   still verified and still rolled back.
 
 ### Added
 
-- **`SsaFunction::take_edit_dirty`** — reports whether a checked edit mutated the
+- **`SsaFunction::take_edit_dirty`** - reports whether a checked edit mutated the
   function, clearing the flag. For consumers driving their own pass groups, who
   need the same guarantee `PassTransaction` now provides.
 
@@ -639,7 +1008,7 @@ repair applied on one path and not its sibling.
   only through entries already inserted, so for `[(p2, x), (p1, p2)]` it records
   `p1 -> p2` while `p2` is retired in the same round. Uses of `p1` were rewritten
   to a phi deleted moments later. Each chain is now walked to a target that is
-  not itself being replaced, with a cycle guard — the repair path had always done
+  not itself being replaced, with a cycle guard - the repair path had always done
   this. The 0.4.1 change remains correct as a performance fix; only its
   composition order was wrong.
 
@@ -653,7 +1022,7 @@ repair applied on one path and not its sibling.
 - **`pre_clean_unreachable` inlined trivial phis without resolving chains.** Its
   replacement map was applied entry by entry, so a phi inlined to a value that
   was itself another phi being inlined in the same pass left the intermediate in
-  place — a use naming a phi the same loop had already removed. Because the map
+  place - a use naming a phi the same loop had already removed. Because the map
   is a `BTreeMap`, whether the chain resolved depended on key order, which made
   the failure rare and order-dependent rather than reliably reproducible.
 
@@ -664,7 +1033,7 @@ repair applied on one path and not its sibling.
 
 - **Entry replacements were labelled as phi-defined.** The stand-in
   `repair_same_block_future_uses` fabricates for a use with no prior definition
-  is undefined by construction — it represents the value incoming to the
+  is undefined by construction - it represents the value incoming to the
   function. Copying the source variable's origin labelled it `Phi`, asserting
   that a phi defined it. It now carries `EntryLiveIn`, whose contract is exactly
   that the caller supplies it.
@@ -684,7 +1053,7 @@ repair applied on one path and not its sibling.
 - **`expand_phi_predecessor` could leave two operands on one edge.** A
   predecessor reaching a block both directly and through the block being bypassed
   had an operand added for an edge it already named. Duplicate operands have no
-  defined meaning and consumers disagree — `PhiNode::operand_from` returns the
+  defined meaning and consumers disagree - `PhiNode::operand_from` returns the
   first, SCCP meets them all and yields Bottom. The replaced edge is now dropped
   and operands are added only for predecessors the phi does not already name.
 
@@ -692,7 +1061,7 @@ repair applied on one path and not its sibling.
   defaults to `SsaRollbackPolicy::Never`, so a failed edit or boundary repair
   leaves the edits applied. Returning `false`/`0` then tells the pass-group
   transaction nothing changed, and its `Unchanged` arm returns *without verifying
-  and without rolling back* — so damaged IR was kept, and kept unchecked. On a
+  and without rolling back* - so damaged IR was kept, and kept unchecked. On a
   125 MB reference binary seven edit sessions failed this way and produced zero
   rollbacks, meaning seven functions carried mutated, unverified IR.
   `algebraic`, `ranges`, `reassociate`, `strength` and `threading` now report the
@@ -702,28 +1071,28 @@ repair applied on one path and not its sibling.
   The mixed policy across passes is deliberate and unchanged: passes that verify
   inside their own edit session (`copying`, `predicates`, `licm`) need
   `OnFailure` for that verification to mean anything, while passes that delegate
-  to the transaction use `Never` to avoid a second snapshot — the transaction
+  to the transaction use `Never` to avoid a second snapshot - the transaction
   already clones once per pass, where `OnFailure` clones per edit session. What
   was missing was the unstated precondition that a `Never` pass must report the
   change on failure.
 
 - **`gvn` reported "unchanged" only correctly in debug builds.** Its rollback
   policy is `OnFailure` under `debug_assertions` and `Never` otherwise, so
-  `return 0` on failure was true under test and false in release — the one
+  `return 0` on failure was true under test and false in release - the one
   configuration where the damaged IR would ship. The return now depends on which
   policy actually ran.
 
 - **`controlflow` and `blockmerge` reported "unchanged" after applying edits.**
   Under `SsaRollbackPolicy::Never` a failed boundary repair leaves the edits in
   place. Reporting zero told the caller nothing had changed, and a pass-group
-  transaction treats "unchanged" as "nothing to verify" — so damaged IR was kept,
+  transaction treats "unchanged" as "nothing to verify" - so damaged IR was kept,
   and kept unchecked. Both now report the applied edits, which lets the
   transaction verify the function and roll it back.
 
 ### Ownership
 
 - Recorded ATRAPS LLC as copyright holder and added a `NOTICE` file. The Apache-2.0
-  appendix was never filled in — it still carried the literal
+  appendix was never filled in - it still carried the literal
   `[yyyy] [name of copyright owner]` placeholder, so nothing in this repo stated
   who owned it.
 - Added a `repository` field. The manifest declared `documentation` but no
@@ -734,8 +1103,8 @@ repair applied on one path and not its sibling.
 ## [0.4.1] - 2026-07-26
 
 Speculative evaluation for `SsaEvaluator`. Consumers that explore alternative
-executions — a symbolic executor taking both arms of a branch, a control-flow
-deobfuscator tracing every path through a dispatcher — previously had to clone
+executions - a symbolic executor taking both arms of a branch, a control-flow
+deobfuscator tracing every path through a dispatcher - previously had to clone
 the evaluator per fork, paying for everything learned so far on every fork. A
 checkpoint costs nothing to take and one journal entry per mutation to undo, so
 the cost tracks the speculation rather than the accumulated state.
@@ -743,7 +1112,7 @@ the cost tracks the speculation rather than the accumulated state.
 ### Added
 
 - **`SsaEvaluator::checkpoint` and `SsaEvaluator::rollback`**, with the
-  `EvaluatorMark` token they exchange (re-exported from `analysis`) — mark a
+  `EvaluatorMark` token they exchange (re-exported from `analysis`) - mark a
   state, evaluate speculatively, and restore exactly what was marked. Marks
   nest, and rolling back to an outer mark subsumes any inner ones, so an
   abandoned branch is discarded in one step rather than unwound level by level.
@@ -758,7 +1127,7 @@ the cost tracks the speculation rather than the accumulated state.
 - **Trivial-phi elimination in rebuild mode is no longer quadratic.** The
   rebuild path substituted each trivial phi one at a time, scanning the whole
   function per substitution, and a rebuild produces trivial phis in proportion
-  to the function — so every fixpoint round scaled with the square of the
+  to the function - so every fixpoint round scaled with the square of the
   function. The substitutions are now composed into a single map (back-to-front,
   which reproduces the order-sensitive sequential result exactly) and applied in
   one pass. The repair path had already been corrected for this in 0.4.0; this
@@ -768,7 +1137,7 @@ the cost tracks the speculation rather than the accumulated state.
 
 Memory optimization arrives: a Memory SSA-backed pass doing store-to-load
 forwarding, redundant load elimination, and dead store elimination, together
-with the alias machinery it needs — points-to and address analyses, address
+with the alias machinery it needs - points-to and address analyses, address
 spaces on indirect accesses, and a rewritten `MemoryLocation::Indirect` that
 keys on the decoded address rather than the SSA value holding it. Alongside it:
 an interprocedural summary framework, a transactional pass-group primitive
@@ -779,53 +1148,53 @@ Normalization is substantially faster on large functions. Profiling a real
 17,284-function binary found nearly all of its lift time in one 27,384-block
 function, spent on work that scaled with the function rather than with the
 change being made. Fixing that takes the binary's lift from **1014.5 s to
-34.6 s**. Separately, trivial-phi elimination went from cubic to quadratic —
+34.6 s**. Separately, trivial-phi elimination went from cubic to quadratic -
 **26 s to 48 ms** on a 1,600-phi chain.
 
 ### Added
 
-- **Memory optimization pass** (`passes::memory`, `MemoryOptimizationPass`) —
+- **Memory optimization pass** (`passes::memory`, `MemoryOptimizationPass`) -
   store-to-load forwarding, redundant load elimination, and block-local dead
   store elimination, every rewrite gated on an alias proof rather than a
   syntactic shape. Calls, fences, atomics, volatile prefixes, and opaque native
   operations are barriers.
 - **Points-to and address analyses** (`analysis::pointsto`, `analysis::address`)
-  — an inclusion-based (Andersen) constraint solver with a field-sensitive
+  - an inclusion-based (Andersen) constraint solver with a field-sensitive
   intraprocedural extractor, and a normalized `base + index*stride + offset`
   address model with a cell-identity `AliasKey` projection.
-- **`Target::field_member_index`** — optional host accessor giving field-sensitive
+- **`Target::field_member_index`** - optional host accessor giving field-sensitive
   points-to a stable per-field cell identity.
 - **Address spaces on indirect accesses.** `SsaOp::{LoadIndirect, StoreIndirect}`
   carry `address_space: Option<u16>`, and alias analysis treats distinct spaces
-  as disjoint — covering x86 `FS:`/`GS:`.
-- **Interprocedural summary framework** (`interproc`) — `CallGraph` over an
+  as disjoint - covering x86 `FS:`/`GS:`.
+- **Interprocedural summary framework** (`interproc`) - `CallGraph` over an
   opaque method key plus `solve`, driving a caller-supplied `SummaryTransfer`
   over the call graph's SCCs, callees before callers, with a bounded fixpoint on
   recursive components.
-- **Transactional pass execution** (`scheduling::PassTransaction`) — runs a pass
+- **Transactional pass execution** (`scheduling::PassTransaction`) - runs a pass
   group against one reusable snapshot, verifies once, and rolls back on verifier
   rejection or panic, re-running the group pass-by-pass to isolate the culprit.
   Offered to hosts driving their own pass loop; `PassScheduler` snapshots per
   pass under `verify_hard` and does not use it.
 - **`EventKind::LoadForwarded` and `EventKind::DeadStoreRemoved`**, with matching
   event-builder support.
-- **`DataFlowAnalysis::widen`** — a widening hook the solver applies between
+- **`DataFlowAnalysis::widen`** - a widening hook the solver applies between
   iterations, giving infinite-height domains a termination argument.
 - **`ValueRange` implements `MeetSemiLattice` and `JoinSemiLattice`**, so range
   domains compose with the generic solver.
-- **`VariableOrigin::EntryLiveIn`** — a value the caller supplies whose position
+- **`VariableOrigin::EntryLiveIn`** - a value the caller supplies whose position
   in the signature is not known. The other four variants describe a CIL method,
   which has a declared signature and local table; a machine-code front end has
   neither, so a register read before the body ever writes it is neither an
   argument at a known index nor a declared local. Front ends previously had to
   stamp such a value `Argument(0)`, which asserted a signature position the
-  lifter has not recovered — and, at `rebuild`'s origin-keyed grouping, collapsed
+  lifter has not recovered - and, at `rebuild`'s origin-keyed grouping, collapsed
   every live-in of a function into argument group 0. `is_entry_defined` accepts
   the new variant, so a read of one needs no definition in the body; `Phi` stays
   rejected, so a variable whose definition was destroyed still cannot masquerade
   as an entry value. ABI recovery may later reclassify one as a real
   `Argument(n)`.
-- **`VariableOrigin::is_entry_live_in` and `is_caller_supplied`** — the latter
+- **`VariableOrigin::is_entry_live_in` and `is_caller_supplied`** - the latter
   covers `Argument` and `EntryLiveIn` together, which is the predicate consumers
   actually want when asking "does the body have to define this?".
 - **The entry-defined origin set is now a tested public contract**
@@ -839,7 +1208,7 @@ change being made. Fixing that takes the binary's lift from **1014.5 s to
 - **`VariableOrigin` gained a fifth variant** (`EntryLiveIn`, see **Added**). The
   enum is not `#[non_exhaustive]`, so any exhaustive `match` on it downstream
   needs a new arm; a `_` arm compiles unchanged, but check whether it should
-  instead join the `Argument` arm — the question to ask is whether the site cares
+  instead join the `Argument` arm - the question to ask is whether the site cares
   about *caller-supplied* (use `is_caller_supplied`) or about a *signature
   index*. All in-crate matches were audited: `rebuild`'s group derivation and
   version-stack seeding treat `EntryLiveIn` as naming no argument/local slot, and
@@ -847,7 +1216,7 @@ change being made. Fixing that takes the binary's lift from **1014.5 s to
   machine-code front end emits neither op. Serde encoding is additive but not
   backward compatible in the reading direction: a 0.3.0 deserializer rejects a
   payload containing the new variant.
-- **Removed the block-duplication methods on `SsaFunction<T>`** —
+- **Removed the block-duplication methods on `SsaFunction<T>`** -
   `allocate_fresh_variables_for_block`, `clone_block_with_remap`,
   `duplicate_block`, `remap_block_targets`. Shipped in 0.2.0 with no caller in
   this crate or any consumer, and never executed by a test. Adding tests showed
@@ -859,8 +1228,8 @@ change being made. Fixing that takes the binary's lift from **1014.5 s to
   `alias_keys_for_function`, `MemorySsa::build`, and `passes::memory::run` take a
   `PointerSize`, and `IndirectLocation` carries one. Address arithmetic wraps at
   the pointer width, and without it a sign-extended `-8` and a zero-extended
-  `0xFFFF_FFF8` — the two lowerings a 32-bit frontend emits for one displacement
-  — decoded 4 GiB apart, so `may_alias` proved two accesses to *one cell*
+  `0xFFFF_FFF8` - the two lowerings a 32-bit frontend emits for one displacement
+  - decoded 4 GiB apart, so `may_alias` proved two accesses to *one cell*
   disjoint. Pass `SsaPassHost::ptr_size()`; `PointerSize::Bit64` reproduces the
   previous behaviour exactly.
 - **`SsaPassHost::events()` now returns `&dyn EventListener<T>`** instead of
@@ -879,7 +1248,7 @@ change being made. Fixing that takes the binary's lift from **1014.5 s to
 - **`MemoryLocation::Indirect` now carries an `IndirectLocation`** (decoded
   base/index/stride/offset plus access width and address space) instead of a bare
   `SsaVarId`. See **Fixed**.
-- **`World::methods_reverse_topological` now returns `Vec<Vec<T::MethodRef>>`** —
+- **`World::methods_reverse_topological` now returns `Vec<Vec<T::MethodRef>>`** -
   the call graph's SCCs in reverse topological order rather than a flat list. The
   grouping is load-bearing: a non-recursive component converges in one visit
   while a recursive one needs a bounded fixpoint, and a flat list cannot express
@@ -901,7 +1270,7 @@ builds, on shapes that are ordinary for lifted native code:
   two-definition op through a single-`dest` view and `value_key()` omits `flags`,
   so GVN deleted an instruction whose flags a later `BranchFlags` still read.
   Strength reduction and reassociation built replacements with `flags: None`.
-  All three now check *liveness* of the flags definition — a dead one still
+  All three now check *liveness* of the flags definition - a dead one still
   optimizes, a live one declines the rewrite.
 - **Memory SSA versioned only the location a definition named**, so a barrier or
   an overlapping store left a may-aliasing cell's version untouched and the
@@ -926,7 +1295,7 @@ builds, on shapes that are ordinary for lifted native code:
 - **Constraint reasoning read "cannot compare" as "proved"** (`is_none_or` where
   `is_some_and` was meant), and recorded signed constraints on the false edge of
   unsigned comparisons.
-- **LICM hoisted uses above their definitions** — the trampoline filter ran after
+- **LICM hoisted uses above their definitions** - the trampoline filter ran after
   the operand-availability fixpoint; both now run to a joint fixpoint.
 - **Block merging destroyed exception-region boundaries** that its own coalescing
   path protects, and treated `Leave` as a plain forwarding jump.
@@ -945,7 +1314,7 @@ binaries, and these shapes abort the process rather than being reported:
   LICM. All now use the bounds-tolerant accessors. The last four were found by
   the new fuzz targets, not by inspection.
 - **`VarSet` now grows rather than dropping an out-of-range variable id**, which
-  previously made the variable read back as absent — "dead", for a liveness set.
+  previously made the variable read back as absent - "dead", for a liveness set.
 - **Symbolic expressions are bounded by node count, not only depth.** `x op x`
   doubles the node count while adding one to the depth, so the depth cap could
   not fire before memory was exhausted.
@@ -966,7 +1335,7 @@ binaries, and these shapes abort the process rather than being reported:
   handler receives from the runtime, identified by the `Pop` at the handler's
   entry. `SsaRebuilder` already carved out that shape, and without the matching
   carve-out here the verifier rejected the IR the rebuilder is built to produce
-  — failing every method with a handler as soon as a CFG-modifying pass
+  - failing every method with a handler as soon as a CFG-modifying pass
   triggered a rebuild.
 - **A non-dense variables table** is now reported as `VariableTableNotDense`.
   `SsaFunction::variable(id)` is a raw index, so a dropped row silently redirects
@@ -986,14 +1355,14 @@ numeric analyses:
 
 - **Value-range propagation could prove a loop guard that is not true.** The
   analysis is optimistic, so its conclusions are sound only *at* the fixpoint,
-  but it terminated on an iteration cap — and a truncated run leaves ranges too
+  but it terminated on an iteration cap - and a truncated run leaves ranges too
   narrow, which proves comparisons that are not provable. On `i = 0; while i < 10
   { i += 1 }` the guard folded to constant `true` below a budget of 32, and the
   next pipeline iteration deleted the loop exit. Convergence is now load-bearing
   (`RangeResult` answers `None` to every query unless the fixpoint was reached)
   and widening provides the termination argument in place of the cap.
 - **Range arithmetic ignored the destination width**, so a wrapping 32-bit `add`
-  read as positive in `i64` and folded `sum < 0` to `false` — the opposite of the
+  read as positive in `i64` and folded `sum < 0` to `false` - the opposite of the
   truth. Results escaping the declared width now yield no information. `Neg`,
   `Shl`, `Or`, and `Xor` transfer functions were added at the same time.
 - **Memory SSA renaming leaked versions across sibling dominator subtrees.** The
@@ -1002,7 +1371,7 @@ numeric analyses:
   restores scope.
 - **`MemoryLocation::Indirect` keyed on the address SSA value, not the address.**
   Accesses at different offsets off one base were unrelated rather than provably
-  disjoint, and — the unsound direction — two `Indirect` locations with different
+  disjoint, and - the unsound direction - two `Indirect` locations with different
   address values were reported `NoAlias`, though two SSA pointers can hold one
   address. Identity was also unstable under GVN and LICM.
 - **Array-element locations never used a constant index.**
@@ -1016,8 +1385,8 @@ numeric analyses:
 spent on work that scaled with the function rather than with the change being
 made. Six fixes, in descending order of impact:
 
-- LICM opened an edit scope — a whole-function snapshot, repair, and verification
-  — *per loop*, and that function has 3,633 loops. It now processes the whole
+- LICM opened an edit scope - a whole-function snapshot, repair, and verification
+  - *per loop*, and that function has 3,633 loops. It now processes the whole
   loop forest in one scope.
 - `replace_uses_checked_with` scanned every instruction to find one variable's
   uses, once per redundant pair in GVN. The editor now maintains the use index
@@ -1026,7 +1395,7 @@ made. Six fixes, in descending order of impact:
   pass sites called it purely to size a bitset. The new O(1) `var_id_bound`
   replaces it for sizing.
 - `SsaVarId::PLACEHOLDER` encodes `u32::MAX - 1`, and `var_id_capacity` folded it
-  in like a real id — so a function holding an unrenamed phi reported ~4.29
+  in like a real id - so a function holding an unrenamed phi reported ~4.29
   billion and callers allocated 512 MB bitsets. Now excluded.
 - The verifier keyed four `HashMap`s on `SsaVarId` (SipHash on a dense integer)
   and allocated one per block.
@@ -1045,14 +1414,14 @@ discards that invocation's hoists rather than one loop's.
   fixpoint ran once per phi. Phi operands are now collapsed in the same round:
   **200 phis 42 ms → 0.66 ms, 800 phis 3.0 s → 10 ms, 1600 phis 26 s → 48 ms**.
 - `SsaCfg::from_ssa` deduped synthetic handler edges with a scan of the whole
-  edge list per handler — O(H·E) on an attacker-controlled handler table, on a
+  edge list per handler - O(H·E) on an attacker-controlled handler table, on a
   structure most passes rebuild.
 - The scheduler built the call graph twice per pass batch, inside its own
   fixpoint.
 - Dominance frontiers allocated a dense n×n bitmatrix per call; rows are now
   allocated on first write (`BitSet::lazy`).
 - `trace_to_phi` recursed into both operands of every binary op with no
-  memoization — 2²⁰ traversals under its depth cap.
+  memoization - 2²⁰ traversals under its depth cap.
 - `IndexedGraph::find_any_cycle` restarted a DFS from every node, O(V·(V+E)); it
   is now one Tarjan pass.
 - Per-iteration rebuilds removed from block merging, control-flow simplification,
@@ -1076,15 +1445,15 @@ placeholder is not a variable so it cannot be forgotten at a call site; and
 **`SsaFunction::var_id_bound`**, the O(1) sizing bound above.
 
 `benches/ssa_repair.rs` measures these costs directly, including a size sweep
-putting `rebuild_ssa` at 20–30× a whole-function snapshot — stable across two
-decades of function size — and `PassTransaction` group execution at 1.6–1.8×
-faster than per-pass snapshotting, rising to 20–28× on the terminating fixpoint
+putting `rebuild_ssa` at 20-30× a whole-function snapshot - stable across two
+decades of function size - and `PassTransaction` group execution at 1.6-1.8×
+faster than per-pass snapshotting, rising to 20-28× on the terminating fixpoint
 iteration.
 
 ## [0.3.0] - 2026-07-16
 
-Native operation coverage for modern lifters — x87/FPU, SVE/SME, AMX tiles,
-vector crypto, system/compute intrinsics, PAC — plus a domain-typed conversion
+Native operation coverage for modern lifters - x87/FPU, SVE/SME, AMX tiles,
+vector crypto, system/compute intrinsics, PAC - plus a domain-typed conversion
 family replacing the single `Conv` op. Several effect-classification and
 value-numbering correctness fixes ship alongside; see **Fixed**.
 
@@ -1095,7 +1464,7 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
 
   | Old | New | Notes |
   |-----|-----|-------|
-  | `Conv` (int → int) | `IntConv` | Identical field set — mechanical rename. |
+  | `Conv` (int → int) | `IntConv` | Identical field set - mechanical rename. |
   | `Conv` (int → ptr) | `IntToPtr` | No `overflow_check`/`unsigned`. |
   | `Conv` (ptr → int) | `PtrToInt` | No `overflow_check`/`unsigned`. |
   | `Conv` (int → float) | `IntToFloat` | Keeps `overflow_check`/`unsigned`. |
@@ -1116,7 +1485,7 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
   distinguishable at runtime via `1.0 / x`). IEEE-754 *semantic* comparison is
   unchanged and still lives in `ceq` and the `c*_un` family.
 - **`SsaOp` and its operand payloads are now `Eq + Hash`.** No `Target` change is
-  required — the trait already demanded `Eq + Hash` on its associated types.
+  required - the trait already demanded `Eq + Hash` on its associated types.
 
 ### Fixed
 
@@ -1133,7 +1502,7 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
 - **GVN could merge `CallClobber` markers**, aliasing the fresh undefined values
   of two different calls' caller-saved registers (all of its operands are
   definitions, which the key normalizes to a sentinel). It is no longer
-  value-numbered. `Phi` is likewise excluded — it is block-relative, and the key
+  value-numbered. `Phi` is likewise excluded - it is block-relative, and the key
   does not encode the defining block.
 - **`SsaEditor::nop_instruction` left the removed value's `result_type` stamped
   on the `Nop`.** `set_op_preserving_type` now clears the type when the new op
@@ -1143,7 +1512,7 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
   Memory SSA emits a `MemoryOp::Barrier` and the verifier's fence invariant
   applies.
 - **`setffr`/`wrffr` were deletable by DCE.** They write the SVE first-fault
-  register, which is not an SSA operand, and their `outputs` may be empty — pure
+  register, which is not an SSA operand, and their `outputs` may be empty - pure
   plus zero definitions meant DCE removed them, dropping the FFR initialization a
   following first-faulting load depends on. They now report `Opaque` effects.
 - **Pointer conversions sign-extended when folded.** `IntToPtr`/`PtrToInt`
@@ -1152,8 +1521,8 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
   zero-extend. (Latent: no in-tree `Target` implements `convert_const`.)
 
 - **LICM did not converge on functions with deep loop-invariant dependency
-  chains.** The hoist phase moved only one dependency "wave" per invocation —
-  leaving dependent invariants for a later call — so deeply-chained invariants in
+  chains.** The hoist phase moved only one dependency "wave" per invocation -
+  leaving dependent invariants for a later call - so deeply-chained invariants in
   large loops needed O(chain-depth) expensive invocations and routinely exhausted
   the driving fixpoint's iteration cap with work still pending. It now hoists a
   loop's entire invariant chain in one pass, inserting in topological order so a
@@ -1161,7 +1530,7 @@ value-numbering correctness fixes ship alongside; see **Fixed**.
 - **Loop canonicalization oscillated against CFG simplification.** `controlflow`
   (jump threading) and `blockmerge` (trampoline elimination) now preserve
   canonical loop preheaders and unified latches instead of removing them as empty
-  forwarding blocks — which `loopcanon` immediately re-inserted, so the
+  forwarding blocks - which `loopcanon` immediately re-inserted, so the
   normalization fixpoint never settled. Loop-simplify form is now stable (the
   same trade-off LLVM's `simplifycfg` makes).
 
@@ -1200,7 +1569,7 @@ spent super-linear time per call. Output is unchanged.
   `FpuControl`), and pointer authentication (`PacKind`).
 - SVE/SME and AMX operations: predicate/first-fault ops, SVE compute, SME
   outer-product and ZA-tile ops, matrix multiply-accumulate, tile operations.
-- **`serde` feature** (off by default): serializes the IR data model — the
+- **`serde` feature** (off by default): serializes the IR data model - the
   operation-kind taxonomy, the native descriptors, and the SSA graph itself
   (`SsaFunction` and everything reachable from it: blocks, instructions, ops,
   phis, variables, constants, exception handlers).
@@ -1219,11 +1588,11 @@ spent super-linear time per call. Output is unchanged.
     format that requires string keys, JSON included.
 
   Not covered: borrowed views (`SsaDefs<'a>`, `MemoryEffect<'a, T>`), transient
-  pass machinery (builders, editors, edit reports), and `SsaFeatureToken` — its
+  pass machinery (builders, editors, edit reports), and `SsaFeatureToken` - its
   `&'static str` opcode can serialize but cannot deserialize, so a derive there
   would be a one-way trap.
 - `num_enum::{IntoPrimitive, TryFromPrimitive}` on seven kind enums. **Note:**
-  this pins those enums' numeric discriminants as public API — inserting a
+  this pins those enums' numeric discriminants as public API - inserting a
   variant mid-enum silently remaps any value a host persisted by discriminant.
   The `serde` derives encode by variant *name* and are not affected.
 - New public helpers: `SsaVarId::as_u32`, `SsaInstruction::set_op_preserving_type`,
@@ -1231,11 +1600,11 @@ spent super-linear time per call. Output is unchanged.
   arith_signedness, compare_kind, memory_effect}`, and a `fp_classify` builder.
 - `ConstValue` scalar folds recurse lane-wise into `Vector` operands (previously
   returned `None`).
-- `SsaEditor::replace_uses_checked_with` — replace instruction uses against a
+- `SsaEditor::replace_uses_checked_with` - replace instruction uses against a
   caller-supplied dominator tree, letting a pass that rewrites many variables
   (e.g. GVN) build the tree once and reuse it across the whole batch instead of
   per replacement.
-- `BitSet::{contains_checked, insert_checked}` — bounds-tolerant accessors that
+- `BitSet::{contains_checked, insert_checked}` - bounds-tolerant accessors that
   treat an out-of-range index as unset rather than panicking, for callers whose
   index comes from data that may legitimately name a position outside the set
   (e.g. a terminator referencing a block that was never recovered).
@@ -1285,7 +1654,7 @@ A few IR enum shapes changed (see **Changed**).
 
 ### Performance & memory
 
-- Shrunk core IR types ~3–4×: `SsaOp` 168→40 B, `SsaInstruction` 176→48 B,
+- Shrunk core IR types ~3-4×: `SsaOp` 168→40 B, `SsaInstruction` 176→48 B,
   `Option<SsaVarId>` 16→4 B (niche-encoded `SsaVarId`), `ConstValue` 40→24 B,
   `PhiOperand` 16→8 B; guarded by a `size_of` regression test.
 - Removed hot-loop allocations (`uses()`/`successors()` purge, word-skipping
