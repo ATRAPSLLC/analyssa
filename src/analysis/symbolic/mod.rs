@@ -13,14 +13,13 @@
 //! SSA Operations -> SymbolicEvaluator -> SymbolicExpr tree -> Host Solver -> Solutions
 //! ```
 //!
-//! Rassa intentionally carries no solver dependency (Z3, etc.). Host crates
-//! wire their own solver against `SymbolicExpr`/`SymbolicOp`.
+//! `analyssa` intentionally carries no solver dependency (Z3, etc.). Host crates
+//! wire their own solver against `SymbolicExpr`/`NumericOp`.
 //!
 //! # Module Structure
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`ops`] | Operation types (`SymbolicOp`: add, xor, comparison, etc.) |
 //! | [`expr`] | Expression tree representation (`SymbolicExpr`) with simplification |
 //! | [`evaluator`] | Builds expressions from SSA operations (`SymbolicEvaluator`) |
 //!
@@ -45,16 +44,10 @@
 //!
 //! ## Expression Simplification
 //!
-//! The [`SymbolicExpr::simplify`] method performs constant folding and applies
-//! algebraic identities:
-//!
-//! - Constant folding: `5 + 3` → `8`
-//! - Identity removal: `x + 0` → `x`, `x * 1` → `x`
-//! - Zero absorption: `x * 0` → `0`
-//! - Self-cancellation: `x ^ x = 0`, `x - x = 0`, `x | x = x`
-//! - Double negation: `--x` → `x`, `~~x` → `x`
-//! - XOR constant cancellation: `(x ^ c) ^ c` → `x`
-//! - Sign/ones operations: `x & -1` → `x`, `x | -1` → `-1`, `x ^ -1` → `~x`
+//! The [`SymbolicExpr::simplify`] method folds constant subexpressions using
+//! their carrier widths. An unbound leaf does not establish an integer domain
+//! or guarantee that its computation returns a value, so symbolic identities
+//! retain their operands until those requirements can be established.
 //!
 //! ## Constraint Satisfaction
 //!
@@ -67,15 +60,16 @@
 //!
 //! ```rust
 //! use analyssa::{
-//!     analysis::symbolic::{SymbolicExpr, SymbolicOp},
+//!     analysis::symbolic::SymbolicExpr,
+//!     ir::evaluation::NumericOp,
 //!     testing::MockTarget,
 //!     PointerSize,
 //! };
 //!
 //! // Build expression: (state XOR 0x12345678) %u 13
 //! let state = SymbolicExpr::<MockTarget>::named("state");
-//! let xored = SymbolicExpr::binary(SymbolicOp::Xor, state, SymbolicExpr::constant_i64(0x12345678));
-//! let result = SymbolicExpr::binary(SymbolicOp::RemU, xored, SymbolicExpr::constant_i64(13));
+//! let xored = SymbolicExpr::binary(NumericOp::Xor, state, SymbolicExpr::constant_i64(0x12345678));
+//! let result = SymbolicExpr::binary(NumericOp::RemU, xored, SymbolicExpr::constant_i64(13));
 //!
 //! // The expression stays symbolic in `state` until it is bound.
 //! assert_eq!(result.as_i64(), None);
@@ -83,7 +77,9 @@
 //!
 //! // Hand `result` to a host-side solver to find states that produce a given
 //! // case index; binding `state` directly evaluates the dispatch.
-//! let case = result.substitute_named("state", 5, PointerSize::Bit64);
+//! let case = result
+//!     .substitute_named("state", &SymbolicExpr::constant_i64(5))
+//!     .simplify(PointerSize::Bit64);
 //! assert_eq!(case.as_i64(), Some((5 ^ 0x12345678) % 13));
 //! ```
 //!
@@ -92,14 +88,13 @@
 //! Keep host-side solver instances reusable for repeated queries. `analyssa`
 //! intentionally carries no solver dependency.
 
+mod concrete;
 pub mod evaluator;
 pub mod expr;
-pub mod ops;
+mod instance;
 
 // Z3-based solvers live in host crates behind their own feature flags because
 // analyssa intentionally carries no Z3 dependency.
-// Hosts wire their own solver against `SymbolicExpr`/`SymbolicOp`.
+// Hosts wire their own solver against `SymbolicExpr`/`NumericOp`.
 
-pub use evaluator::SymbolicEvaluator;
-pub use expr::SymbolicExpr;
-pub use ops::SymbolicOp;
+pub use self::{evaluator::SymbolicEvaluator, expr::SymbolicExpr, instance::SymbolicInstance};

@@ -1,10 +1,10 @@
-//! Data flow analysis framework — direction, analysis trait, results.
+//! Data flow analysis framework - direction, analysis trait, results.
 //!
 //! Defines the core abstractions for data flow analysis:
 //!
 //! - [`DataFlowCfg`]: Trait for control flow graphs usable with the solver.
-//!   Abstracts over CFG implementations so the solver can run on SSA-level
-//!   [`EhCfg`] and host-provided CFG types.
+//!   Abstracts over CFG implementations so the solver can run on the SSA-level
+//!   [`SsaCfg`] and host-provided CFG types.
 //! - [`Direction`]: Forward (entry-to-exit) or backward (exit-to-entry).
 //!   Determines how information propagates and which combining operation is used.
 //! - [`DataFlowAnalysis`]: Trait for a specific analysis. Implementations supply
@@ -17,7 +17,7 @@
 use std::fmt::Debug;
 
 use crate::{
-    analysis::{dataflow::lattice::MeetSemiLattice, exceptions::EhCfg},
+    analysis::{cfg::SsaCfg, dataflow::lattice::MeetSemiLattice},
     graph::{
         NodeId, Predecessors, RootedGraph, Successors,
         algorithms::{postorder, reverse_postorder},
@@ -29,7 +29,7 @@ use crate::{
 /// Trait for control flow graphs usable with the dataflow solver.
 ///
 /// Abstracts over CFG implementations so the solver can run on the crate's
-/// exception-aware [`EhCfg`] and on host-provided CFG types.
+/// [`SsaCfg`] and on host-provided CFG types.
 pub trait DataFlowCfg: Predecessors + Successors {
     /// Returns the entry node of the CFG.
     fn entry(&self) -> NodeId;
@@ -104,8 +104,8 @@ pub trait DataFlowAnalysis<T: Target> {
     /// been revisited enough times to look loop-carried.
     ///
     /// The solver has no iteration cap: it drains its worklist and relies on
-    /// the lattice having finite height. A lattice of unbounded height — an
-    /// interval domain, most obviously — does not, and would iterate once per
+    /// the lattice having finite height. A lattice of unbounded height - an
+    /// interval domain, most obviously - does not, and would iterate once per
     /// loop trip. Widening trades precision on the unstable bound for
     /// termination in a bounded number of steps.
     ///
@@ -184,7 +184,7 @@ impl<L: Clone> AnalysisResults<L> {
 // conservative, never incorrect. Phi pruning in the rebuilder needs that
 // widening, since liveness over terminator edges alone would prune a phi the
 // exception-aware frontier legitimately demands.
-impl<T: Target> DataFlowCfg for EhCfg<'_, T> {
+impl<T: Target> DataFlowCfg for SsaCfg<'_, T> {
     fn entry(&self) -> NodeId {
         RootedGraph::entry(self)
     }

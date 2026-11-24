@@ -52,6 +52,12 @@ use crate::BitSet;
 /// * `successors` - CFG successors for each block index
 /// * `block_count` - Total number of blocks in the CFG
 ///
+/// The caller's `defs` and `uses` sets are read tolerantly: a block index at or
+/// past `block_count` names no block of this CFG, so a use there makes nothing
+/// live and a def there satisfies nothing. Sizing them differently from the
+/// graph is a caller defect, but one that belongs to the verifier rather than
+/// to a panic here.
+///
 /// # Returns
 /// For each group ID, the set of blocks where the variable is live-in.
 pub fn compute_live_in_blocks(
@@ -93,9 +99,9 @@ pub fn compute_live_in_blocks(
         // it's only live-in if the use comes before the def. Since we don't track
         // instruction ordering here, we conservatively mark use-only blocks as live-in
         // and blocks that both use and define as live-in (slightly over-approximate
-        // but safe — may place a few extra phis that trivial phi elimination removes).
+        // but safe - may place a few extra phis that trivial phi elimination removes).
         for use_block in use_blocks.iter() {
-            if live_in_set.insert(use_block) {
+            if use_block < block_count && live_in_set.insert(use_block) {
                 worklist.push(use_block);
             }
         }
@@ -111,7 +117,7 @@ pub fn compute_live_in_blocks(
                 // If predecessor defines the variable, liveness doesn't propagate further
                 // (the definition satisfies the use). But the predecessor itself is NOT
                 // live-in for this variable (the def originates here).
-                if def_blocks.contains(pred) {
+                if def_blocks.contains_checked(pred) {
                     continue;
                 }
                 if live_in_set.insert(pred) {

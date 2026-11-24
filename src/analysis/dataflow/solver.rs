@@ -17,8 +17,10 @@
 //! **Iteration**:
 //! 1. Pop a block from the worklist (deduplicated via `in_worklist` flag)
 //! 2. Compute the input/output by meeting lattice values from all
-//!    predecessors (forward) or successors (backward)
-//! 3. Preserve boundary values for entry/exit blocks
+//!    predecessors (forward) or successors (backward); a backward analysis
+//!    also meets the handlers a throw from inside a protected block reaches
+//! 3. Meet the boundary value into the entry (forward) or every exit
+//!    (backward)
 //! 4. Apply the transfer function to compute the output/input
 //! 5. If the result changed, add affected adjacent blocks
 //!    (successors for forward, predecessors for backward) to the worklist
@@ -38,9 +40,12 @@
 use std::{cmp::Reverse, collections::BinaryHeap, marker::PhantomData};
 
 use crate::{
-    analysis::dataflow::{
-        framework::{AnalysisResults, DataFlowAnalysis, DataFlowCfg, Direction},
-        lattice::MeetSemiLattice,
+    analysis::{
+        dataflow::{
+            framework::{AnalysisResults, DataFlowAnalysis, DataFlowCfg, Direction},
+            lattice::MeetSemiLattice,
+        },
+        exceptions::FunctionRoots,
     },
     bitset::BitSet,
     graph::NodeId,
@@ -58,15 +63,15 @@ use crate::{
 /// ```rust
 /// use analyssa::{
 ///     analysis::{
+///         SsaCfg,
 ///         dataflow::{DataFlowSolver, ReachingDefinitions},
-///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing,
 /// };
 ///
 /// let ssa = testing::diamond_phi_fixture();
-/// let graph = EhCfg::from_ssa(&ssa);
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = ReachingDefinitions::new(&ssa);
 /// let solver = DataFlowSolver::new(analysis);
@@ -101,6 +106,22 @@ pub struct DataFlowSolver<T: Target, A: DataFlowAnalysis<T>> {
     /// Exit blocks, precomputed once per solve for O(1) membership in the
     /// backward solver hot loop (avoids re-allocating `cfg.exits()` per visit).
     exit_blocks: BitSet,
+    /// The backward boundary value, which every exit block's out-state starts
+    /// from. `None` for a forward analysis.
+    boundary: Option<A::Lattice>,
+    /// The function's exception entry points, for a backward analysis of a
+    /// function that has any.
+    ///
+    /// A block inside a protected region can leave through a throw from any of
+    /// its instructions, so its out-state also meets the in-states of the
+    /// handlers that throw reaches ([`FunctionRoots::exceptional_successors`]).
+    /// The graph's own exceptional edge runs from the region's guard only,
+    /// which is what dominance needs but not what a backward fact needs: a
+    /// value the handler reads is live at every block that can throw into it.
+    roots: Option<FunctionRoots>,
+    /// Per handler root, the blocks whose out-state meets its in-state, so a
+    /// change to the handler re-enqueues them.
+    exceptional_predecessors: Vec<Vec<usize>>,
     /// Number of iterations performed.
     iterations: usize,
     _phantom: PhantomData<T>,
@@ -119,6 +140,9 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
             visits: Vec::new(),
             order_priority: Vec::new(),
             exit_blocks: BitSet::new(0),
+            boundary: None,
+            roots: None,
+            exceptional_predecessors: Vec::new(),
             iterations: 0,
             _phantom: PhantomData,
         }
@@ -126,8 +150,23 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
 
     /// Solves the data flow analysis to a fixpoint.
     ///
-    /// Returns the analysis results containing input and output states
-    /// for each basic block.
+    /// Seeds every block with the analysis's initial value, stamps the boundary
+    /// value onto the entry (forward) or exit blocks (backward), then drains a
+    /// priority worklist until no block's state changes. There is no iteration
+    /// cap: termination rests on the lattice having finite height, or on
+    /// [`DataFlowAnalysis::widen`] forcing convergence for an unbounded one. A
+    /// function with no blocks short-circuits to empty results, since the state
+    /// vectors would otherwise be indexed by a block that does not exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose blocks and variables the analysis reads.
+    /// * `cfg` - The control flow graph supplying entry, exits, traversal order,
+    ///   and the predecessor/successor edges the fixpoint propagates along.
+    ///
+    /// # Returns
+    ///
+    /// Per-block input and output states at the fixpoint.
     pub fn solve<C: DataFlowCfg>(
         mut self,
         ssa: &SsaFunction<T>,
@@ -160,7 +199,24 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         self.iterations
     }
 
-    /// Initializes the solver state.
+    /// Initializes the solver state before the fixpoint loop.
+    ///
+    /// Fills the in/out state vectors with the analysis's `initial()` value, then
+    /// overwrites the boundary: forward analyses stamp `boundary()` onto the entry
+    /// block's in-state, backward analyses onto every exit block's out-state. The
+    /// exit set is cached in a [`BitSet`] here so the backward hot loop can test
+    /// membership without rebuilding `cfg.exits()` on each visit, and a backward
+    /// analysis of a function with exception handlers records which blocks each
+    /// handler is an exceptional successor of. Finally it
+    /// assigns each block a traversal priority - its position in reverse postorder
+    /// (forward) or postorder (backward) - and seeds the priority worklist with
+    /// every block, so the first sweep visits blocks in the order that minimizes
+    /// re-visits on reducible CFGs.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function; supplies the block count and initial/boundary values.
+    /// * `cfg` - The control flow graph; supplies entry, exits, and traversal order.
     fn initialize<C: DataFlowCfg>(&mut self, ssa: &SsaFunction<T>, cfg: &C)
     where
         A::Lattice: Clone,
@@ -197,6 +253,20 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
                     }
                 }
                 self.exit_blocks = exit_blocks;
+                self.boundary = Some(boundary);
+
+                let roots = FunctionRoots::of(ssa);
+                self.exceptional_predecessors = vec![Vec::new(); num_blocks];
+                if roots.has_flow_roots() {
+                    for block in 0..num_blocks {
+                        for &handler in roots.exceptional_successors(block) {
+                            if let Some(preds) = self.exceptional_predecessors.get_mut(handler) {
+                                preds.push(block);
+                            }
+                        }
+                    }
+                    self.roots = Some(roots);
+                }
             }
         }
 
@@ -224,7 +294,20 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         }
     }
 
-    /// Main iteration loop.
+    /// Drains the worklist, processing one block per pop until the fixpoint.
+    ///
+    /// Popping the min-priority entry clears the block's `in_worklist` flag before
+    /// processing, so the block can legitimately be re-enqueued if a later change
+    /// affects it. Each pop dispatches on direction and, whenever the block's
+    /// state changed, re-enqueues the blocks that depend on it (successors for
+    /// forward, predecessors for backward). The loop ends when the worklist empties,
+    /// which - because a block is only ever re-added after an actual state change -
+    /// coincides with the fixpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function passed through to the transfer function.
+    /// * `cfg` - The control flow graph supplying the edges to propagate along.
     fn iterate<C: DataFlowCfg>(&mut self, ssa: &SsaFunction<T>, cfg: &C)
     where
         A::Lattice: Clone,
@@ -247,9 +330,27 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         }
     }
 
-    /// Processes a block in forward direction.
+    /// Processes a block in the forward direction.
     ///
-    /// Returns `true` if the output state changed.
+    /// Recomputes the block's in-state as the meet of every predecessor's
+    /// out-state, folding predecessors in place so the whole join costs one clone
+    /// rather than one per edge, then applies the transfer function and widens the
+    /// result against the block's previous out-state. A block with no predecessors
+    /// keeps its seeded in-state, and the entry block meets its predecessors (if
+    /// any) into the boundary value set in [`Self::initialize`], so the boundary
+    /// survives without hiding a loop through the entry. The change flag reports whether
+    /// the out-state actually moved, which is what tells [`Self::iterate`] whether
+    /// to re-enqueue successors.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Index of the block to process.
+    /// * `ssa` - The SSA function, source of the block and its instructions.
+    /// * `cfg` - The control flow graph, source of predecessor edges.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the block's output state changed.
     fn process_forward<C: DataFlowCfg>(
         &mut self,
         block_idx: usize,
@@ -264,30 +365,31 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         let Some(current_in) = self.in_states.get(block_idx).cloned() else {
             return false;
         };
-        let mut input = if cfg.predecessors(node).next().is_none() {
-            // Entry block or unreachable - keep current in_state
-            current_in.clone()
-        } else {
-            // Meet all predecessor outputs. The accumulator is seeded from the
-            // first predecessor and the rest are folded in place, so the whole
-            // fold costs one clone rather than one per predecessor.
-            let mut result: Option<A::Lattice> = None;
-            for pred in cfg.predecessors(node) {
-                let Some(pred_out) = self.out_states.get(pred.index()) else {
-                    continue;
-                };
-                match result.as_mut() {
-                    None => result = Some(pred_out.clone()),
-                    Some(acc) => acc.meet_into(pred_out),
-                }
+        // Meet all predecessor outputs. The accumulator is seeded once and the
+        // rest are folded in place, so the whole fold costs one clone rather
+        // than one per predecessor.
+        //
+        // The entry block starts from its boundary value and meets its
+        // predecessors into it. A well-formed function gives the entry none
+        // (the verifier's `EntryHasPredecessors`), so this is the boundary
+        // alone; one that does not still gets its loop's state instead of
+        // having it silently replaced by the boundary. Meeting into the
+        // previous in-state is exact because the boundary is where it started
+        // and meet is idempotent.
+        let is_entry = node == cfg.entry();
+        let mut result: Option<A::Lattice> = is_entry.then(|| current_in.clone());
+        for pred in cfg.predecessors(node) {
+            let Some(pred_out) = self.out_states.get(pred.index()) else {
+                continue;
+            };
+            match result.as_mut() {
+                None => result = Some(pred_out.clone()),
+                Some(acc) => acc.meet_into(pred_out),
             }
-            result.unwrap_or_else(|| current_in.clone())
-        };
-
-        // Special case: entry block keeps its boundary value
-        if node == cfg.entry() {
-            input = current_in.clone();
         }
+        // A block with no predecessors (the entry, or an unreachable block)
+        // keeps its current in-state.
+        let input = result.unwrap_or_else(|| current_in.clone());
 
         if let Some(slot) = self.in_states.get_mut(block_idx) {
             *slot = input.clone();
@@ -320,9 +422,28 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         *slot
     }
 
-    /// Processes a block in backward direction.
+    /// Processes a block in the backward direction.
     ///
-    /// Returns `true` if the input state changed.
+    /// Mirror image of [`Self::process_forward`]: recomputes the block's out-state
+    /// as the meet of every successor's in-state and every exceptional
+    /// successor's (the handlers a throw from inside the block reaches), applies
+    /// the transfer function to obtain the new in-state, and widens it against
+    /// the previous one. An exit block (looked up in the cached `exit_blocks`
+    /// set) meets those into the boundary value, so a `Return` inside a
+    /// protected region still sees what its handler needs; a block with no
+    /// successor of either kind keeps its current out-state. The change flag
+    /// reports whether the in-state moved, which tells [`Self::iterate`] whether
+    /// to re-enqueue predecessors.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Index of the block to process.
+    /// * `ssa` - The SSA function, source of the block and its instructions.
+    /// * `cfg` - The control flow graph, source of successor edges.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the block's input state changed.
     fn process_backward<C: DataFlowCfg>(
         &mut self,
         block_idx: usize,
@@ -332,33 +453,34 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
     where
         A::Lattice: Clone,
     {
-        // Compute output by meeting all successor inputs
         let node = NodeId::new(block_idx);
-        let Some(current_out) = self.out_states.get(block_idx).cloned() else {
+        // An exit starts from the boundary; any other block from its first
+        // successor. The rest are folded in place, so the whole meet costs one
+        // clone rather than one per edge.
+        let mut result: Option<A::Lattice> = if self.exit_blocks.contains_checked(block_idx) {
+            self.boundary.clone()
+        } else {
+            None
+        };
+        let handlers = self
+            .roots
+            .as_ref()
+            .map_or(&[][..], |roots| roots.exceptional_successors(block_idx));
+        let successors = cfg.successors(node).map(NodeId::index);
+        for succ in successors.chain(handlers.iter().copied()) {
+            let Some(succ_in) = self.in_states.get(succ) else {
+                continue;
+            };
+            match result.as_mut() {
+                None => result = Some(succ_in.clone()),
+                Some(acc) => acc.meet_into(succ_in),
+            }
+        }
+        // A dead end (no successor of either kind, not an exit) keeps its
+        // current out-state.
+        let Some(output) = result.or_else(|| self.out_states.get(block_idx).cloned()) else {
             return false;
         };
-        let mut output = if cfg.successors(node).next().is_none() {
-            // Exit block or dead end - keep current out_state
-            current_out.clone()
-        } else {
-            // Meet all successor inputs
-            let mut result: Option<A::Lattice> = None;
-            for succ in cfg.successors(node) {
-                let Some(succ_in) = self.in_states.get(succ.index()) else {
-                    continue;
-                };
-                result = Some(match result {
-                    None => succ_in.clone(),
-                    Some(acc) => acc.meet(succ_in),
-                });
-            }
-            result.unwrap_or_else(|| current_out.clone())
-        };
-
-        // Special case: exit blocks keep their boundary value
-        if self.exit_blocks.contains(node.index()) {
-            output = current_out.clone();
-        }
 
         if let Some(slot) = self.out_states.get_mut(block_idx) {
             *slot = output.clone();
@@ -382,7 +504,18 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         changed
     }
 
-    /// Adds affected blocks to the worklist after a change.
+    /// Re-enqueues the blocks whose states depend on a block that just changed.
+    ///
+    /// When `block_idx`'s state moves, only its dataflow neighbours can be
+    /// affected: successors for a forward analysis, predecessors (including the
+    /// blocks that can throw into it) for a backward one. Each is pushed at its precomputed traversal priority, and the
+    /// `in_worklist` flag guards against enqueuing a block that is already pending,
+    /// keeping the heap free of duplicates.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The block whose state just changed.
+    /// * `cfg` - The control flow graph supplying the neighbour edges.
     fn add_affected_to_worklist<C: DataFlowCfg>(&mut self, block_idx: usize, cfg: &C) {
         let node = NodeId::new(block_idx);
 
@@ -406,9 +539,14 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
                 }
             }
             Direction::Backward => {
-                // Backward: predecessors are affected
+                // Backward: predecessors are affected, and so is every block
+                // that can throw into this one.
                 for pred in cfg.predecessors(node) {
                     enqueue(pred.index(), &mut self.in_worklist, &mut self.worklist);
+                }
+                let thrower_lists = self.exceptional_predecessors.get(block_idx);
+                for &pred in thrower_lists.map_or(&[][..], Vec::as_slice) {
+                    enqueue(pred, &mut self.in_worklist, &mut self.worklist);
                 }
             }
         }

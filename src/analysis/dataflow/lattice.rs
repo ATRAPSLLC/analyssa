@@ -10,9 +10,9 @@
 //! For data flow analysis, lattices model the abstract values of program state:
 //!
 //! - **Partial Order**: Elements can be compared (≤)
-//! - **Meet (∧)**: Greatest lower bound — combines information from multiple
+//! - **Meet (∧)**: Greatest lower bound - combines information from multiple
 //!   paths (intersection for must-analysis, union for may-analysis)
-//! - **Join (∨)**: Least upper bound — merges information conservatively
+//! - **Join (∨)**: Least upper bound - merges information conservatively
 //! - **Top (⊤)**: Greatest element ("no information" / "unknown")
 //! - **Bottom (⊥)**: Least element ("conflict" / "all information")
 //!
@@ -108,7 +108,7 @@ pub trait MeetSemiLattice: Clone + Debug + PartialEq {
     /// Meets `other` into `self` in place.
     ///
     /// Defaults to `*self = self.meet(other)`, so implementing it is optional.
-    /// Override it where the meet can be done without allocating — a `BitSet`
+    /// Override it where the meet can be done without allocating - a `BitSet`
     /// union, for example. The solver folds the meet over every predecessor of
     /// every block on every visit, so the default's per-predecessor temporary is
     /// the dominant allocation in a dense CFG.
@@ -184,7 +184,7 @@ impl MeetSemiLattice for BitSet {
         result
     }
 
-    /// Union in place — no temporary set per predecessor.
+    /// Union in place - no temporary set per predecessor.
     fn meet_into(&mut self, other: &Self) {
         self.union_with(other);
     }
@@ -213,15 +213,10 @@ mod tests {
     use super::*;
     use crate::analysis::dataflow::{JoinSemiLattice, Lattice, MeetSemiLattice};
 
-    /// The lattice traits must stay reachable from `analysis::dataflow` directly,
-    /// like every other trait the module's header advertises — not only via the
-    /// longer `dataflow::lattice::` path, which would make the documented import
-    /// fail to compile. Importing through the short path here pins the
-    /// re-export.
     /// A two-point lattice, the smallest thing that can implement [`Lattice`].
     ///
-    /// No type in the crate implements the full [`Lattice`] trait — `BitSet`
-    /// provides only the two halves — so this also serves as the proof that the
+    /// No type in the crate implements the full [`Lattice`] trait - `BitSet`
+    /// provides only the two halves - so this also serves as the proof that the
     /// trait is implementable as declared.
     #[derive(Clone, Debug, PartialEq)]
     enum TwoPoint {
@@ -267,11 +262,6 @@ mod tests {
         }
     }
 
-    /// The lattice traits must stay reachable from `analysis::dataflow` directly,
-    /// like every other trait the module header advertises — not only via the
-    /// longer `dataflow::lattice::` path, which would make the documented import
-    /// fail to compile. Naming them through the short path here pins the
-    /// re-export.
     /// `meet_into` is an optimisation of `meet`, so an override that disagrees
     /// with it would silently corrupt every analysis built on the lattice. The
     /// solver calls it once per predecessor per visit, so a divergence would be
@@ -306,6 +296,12 @@ mod tests {
         check(&TwoPoint::Top, &TwoPoint::Top);
     }
 
+    /// The lattice traits must stay reachable from `analysis::dataflow` directly,
+    /// like every other trait the module header advertises - not only via the
+    /// longer `dataflow::lattice::` path, which would make the documented import
+    /// fail to compile. Naming them through the short path here pins the
+    /// re-export, and the closing assertions check the absorption law that
+    /// [`Lattice`] documents but cannot enforce at the type level.
     #[test]
     fn lattice_traits_are_re_exported_from_dataflow() {
         fn assert_meet<T: MeetSemiLattice>() {}
@@ -322,6 +318,7 @@ mod tests {
         assert_eq!(top.join(&top.meet(&bottom)), top);
     }
 
+    /// `BitSet` meet is set union, so both operands' members survive.
     #[test]
     fn test_bitset_meet_union() {
         let mut a = BitSet::new(10);
@@ -342,6 +339,7 @@ mod tests {
         assert!(!result.contains(4));
     }
 
+    /// Pins the idempotence law `x.meet(x) == x` for `BitSet`.
     #[test]
     fn test_bitset_meet_idempotent() {
         let mut a = BitSet::new(10);
@@ -354,6 +352,7 @@ mod tests {
         assert_eq!(a, result);
     }
 
+    /// Pins the commutativity law `x.meet(y) == y.meet(x)` for `BitSet`.
     #[test]
     fn test_bitset_meet_commutative() {
         let mut a = BitSet::new(10);
@@ -368,6 +367,7 @@ mod tests {
         assert_eq!(a.meet(&b), b.meet(&a));
     }
 
+    /// Pins the associativity law `x.meet(y.meet(z)) == (x.meet(y)).meet(z)` for `BitSet`.
     #[test]
     fn test_bitset_meet_associative() {
         let mut a = BitSet::new(10);
@@ -385,6 +385,7 @@ mod tests {
         assert_eq!(left, right);
     }
 
+    /// `BitSet` join is set intersection, so only shared members survive.
     #[test]
     fn test_bitset_join_intersection() {
         let mut a = BitSet::new(10);
@@ -406,6 +407,7 @@ mod tests {
         assert!(!result.contains(4));
     }
 
+    /// Pins the idempotence law `x.join(x) == x` for `BitSet`.
     #[test]
     fn test_bitset_join_idempotent() {
         let mut a = BitSet::new(10);
@@ -418,6 +420,7 @@ mod tests {
         assert_eq!(a, result);
     }
 
+    /// Pins the commutativity law `x.join(y) == y.join(x)` for `BitSet`.
     #[test]
     fn test_bitset_join_commutative() {
         let mut a = BitSet::new(10);
@@ -432,6 +435,7 @@ mod tests {
         assert_eq!(a.join(&b), b.join(&a));
     }
 
+    /// The empty `BitSet` is top; any non-empty set is not.
     #[test]
     fn test_bitset_is_top_empty() {
         let empty = BitSet::new(10);
@@ -442,6 +446,7 @@ mod tests {
         assert!(!non_empty.is_top());
     }
 
+    /// The full `BitSet` is bottom; a partial set is not.
     #[test]
     fn test_bitset_is_bottom_full() {
         let full = BitSet::full(10);
@@ -452,6 +457,7 @@ mod tests {
         assert!(!partial.is_bottom());
     }
 
+    /// Meeting with the empty set (top) leaves the other operand unchanged.
     #[test]
     fn test_bitset_meet_with_empty() {
         let empty = BitSet::new(10);
@@ -467,6 +473,7 @@ mod tests {
         assert_eq!(result.count(), 2);
     }
 
+    /// Joining with the empty set (top) collapses the result to empty.
     #[test]
     fn test_bitset_join_with_empty() {
         let empty = BitSet::new(10);

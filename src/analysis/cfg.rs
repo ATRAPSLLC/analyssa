@@ -1,38 +1,56 @@
 //! Control flow graph view of SSA functions.
 //!
 //! This module provides [`SsaCfg`], a lightweight CFG view constructed directly
-//! from an [`SsaFunction`] by extracting control flow edges from block terminators.
+//! from an [`SsaFunction`]: one graph carrying both relations control actually
+//! has, so a consumer picks a question rather than a graph type.
 //!
-//! # What the edges are, and are not
+//! # The two relations
 //!
-//! An edge is a transfer some block's terminator names, and nothing else. A
-//! block's successor count is therefore exactly its terminator's arity, which
-//! is what lets a consumer read one from the other.
+//! Control leaves a block two ways. Its terminator names a transfer, and a
+//! throw anywhere inside it transfers to whichever handler or filter entry
+//! covers it - dispatched by the runtime, named by no terminator.
 //!
-//! Exceptional control flow is **not** here. Control reaches a handler because
-//! the runtime dispatched to it, from wherever the throw happened — not from
-//! any block's terminator — so an edge for it would be an edge no terminator
-//! takes, and every consumer reading arity from successor count would see a
-//! conditional branch that does not exist. A consumer that needs handlers
-//! connected wants [`EhCfg`](crate::analysis::exceptions::EhCfg), which adds
-//! those edges deliberately and says where they came from.
+//! The **complete** relation holds both, and is what the plain accessors
+//! ([`block_successors`](SsaCfg::block_successors),
+//! [`block_predecessors`](SsaCfg::block_predecessors)) return. It is the
+//! default because it is the one that is true: a handler is reachable in it,
+//! so a dominator tree, a liveness solve or a reachability prune built on it
+//! accounts for the values a throw carries into a handler instead of treating
+//! the handler as dead code.
+//!
+//! The **terminator** relation holds only the transfers terminators name, and
+//! is reached through [`terminator_successors`](SsaCfg::terminator_successors),
+//! [`terminator_predecessors`](SsaCfg::terminator_predecessors) or, for an
+//! algorithm that wants it as a graph, [`terminator_view`](SsaCfg::terminator_view).
+//! A consumer wants it when an edge must correspond to something a block
+//! *chooses*: a block's successor count is its terminator's arity there, which
+//! is what structure recovery reads, and a phi's normal operands stand one per
+//! such edge.
+//!
+//! Which edges are exceptional is never guesswork:
+//! [`exceptional_successors`](SsaCfg::exceptional_successors),
+//! [`exceptional_predecessors`](SsaCfg::exceptional_predecessors) and
+//! [`is_exception_edge`](SsaCfg::is_exception_edge) name them, and
+//! [`roots`](SsaCfg::roots) says where control can enter at all.
 //!
 //! # Design
 //!
-//! `SsaCfg` holds a reference to the SSA function (zero-copy) and caches
-//! predecessor/successor lists. It implements the standard graph traits:
+//! `SsaCfg` holds a reference to the SSA function (zero-copy) and caches both
+//! relations' successor and predecessor lists. It implements the standard graph
+//! traits over the complete relation:
 //! - [`GraphBase`] - Node count and iteration
-//! - [`Successors`] - Forward edge traversal (from terminators)
-//! - [`Predecessors`] - Backward edge traversal (computed from successors)
+//! - [`Successors`] - Forward edge traversal
+//! - [`Predecessors`] - Backward edge traversal
+//! - [`RootedGraph`] - Entry plus every handler and filter entry
 //!
 //! This bridges the gap between passes (which receive `SsaFunction`, not the
 //! original CIL CFG) and dataflow analyses that require a CFG.
 //!
 //! # Complexity
 //!
-//! Construction: O(V + E) time and memory, where E is the number of
-//! terminator-derived edges. All queries are O(1) or O(k), where k is the
-//! number of adjacent nodes.
+//! Construction: O(V + E) time and memory, where E counts both relations'
+//! edges. All queries are O(1) or O(k), where k is the number of adjacent
+//! nodes.
 //!
 //! # Construction
 //!
@@ -43,15 +61,17 @@
 //!
 //! let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
 //! let mut block = SsaBlock::new(0);
-//! block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+//! block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
 //! ssa.add_block(block);
 //! let cfg = SsaCfg::from_ssa(&ssa);
 //! assert_eq!(cfg.block_count(), 1);
 //! ```
 
 use crate::{
-    graph::{GraphBase, NodeId, Predecessors, Successors},
-    ir::function::SsaFunction,
+    BitSet,
+    analysis::exceptions::{FinallyFlow, FunctionRoots},
+    graph::{Adjacency, GraphBase, NodeId, Predecessors, RootedGraph, Successors},
+    ir::{function::SsaFunction, ops::SsaOp},
     target::Target,
 };
 
@@ -77,20 +97,21 @@ use crate::{
 pub struct SsaCfg<'a, T: Target> {
     /// Reference to the SSA function.
     ssa: &'a SsaFunction<T>,
-    /// Precomputed successor lists for each block, flattened: block `b` owns
-    /// `successor_values[successor_offsets[b]..successor_offsets[b + 1]]`.
+    /// The blocks each block's terminator transfers to.
     ///
-    /// Flattened rather than `Vec<Vec<usize>>` because a CFG view is rebuilt
+    /// Compressed rather than `Vec<Vec<usize>>` because a CFG view is rebuilt
     /// repeatedly (dominators, loop analysis, and most passes construct one),
-    /// and a vector per block cost two allocations per block every time. The
-    /// flattened form is a fixed handful of buffers regardless of block count.
-    successor_offsets: Vec<u32>,
-    /// Concatenated per-block successor lists; see [`Self::successor_offsets`].
-    successor_values: Vec<usize>,
-    /// Precomputed predecessor lists, flattened; see [`Self::successor_offsets`].
-    predecessor_offsets: Vec<u32>,
-    /// Concatenated per-block predecessor lists; see [`Self::predecessor_offsets`].
-    predecessor_values: Vec<usize>,
+    /// and a vector per block cost two allocations per block every time.
+    successors: Adjacency,
+    /// The exact inverse of [`Self::successors`].
+    predecessors: Adjacency,
+    /// Where control can enter the function, and which blocks a throw in can
+    /// reach which handler.
+    roots: FunctionRoots,
+    /// The successors including the transfers a throw makes.
+    flow_successors: Adjacency,
+    /// The exact inverse of [`Self::flow_successors`].
+    flow_predecessors: Adjacency,
 }
 
 impl<'a, T: Target> SsaCfg<'a, T> {
@@ -115,7 +136,7 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     ///
     /// let mut ssa_function = SsaFunction::<MockTarget>::new(0, 0);
     /// let mut block = SsaBlock::new(0);
-    /// block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    /// block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     /// ssa_function.add_block(block);
     ///
     /// let cfg = SsaCfg::from_ssa(&ssa_function);
@@ -123,93 +144,55 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     /// ```
     #[must_use]
     pub fn from_ssa(ssa: &'a SsaFunction<T>) -> Self {
-        let block_count = ssa.block_count();
-
-        // Successors go straight into CSR. The terminator loop visits blocks in
-        // ascending order and a block's successors are contiguous, so the rows
-        // are already grouped by source and no intermediate edge list or
-        // scatter cursor is needed on this side.
-        let mut successor_offsets: Vec<u32> = vec![0; block_count.saturating_add(1)];
-        let mut successor_values: Vec<usize> = Vec::with_capacity(block_count.saturating_mul(2));
-
-        for block_idx in 0..block_count {
-            if let Some(block) = ssa.block(block_idx) {
-                // One definition of "the terminator", shared with `SsaBlock` and
-                // the two target mutators: the last instruction, when it
-                // transfers control.
-                if let Some(op) = block.control_terminator() {
-                    op.for_each_successor(|succ| {
-                        // An out-of-range successor contributes no edge at all.
-                        if succ < block_count {
-                            successor_values.push(succ);
-                        }
-                    });
-                }
-            }
-            if let Some(slot) = block_idx
-                .checked_add(1)
-                .and_then(|next| successor_offsets.get_mut(next))
-            {
-                *slot = u32::try_from(successor_values.len()).unwrap_or(u32::MAX);
-            }
-        }
-
-        // Predecessors are the inverse, counted and scattered from the finished
-        // successor rows. Walking those rows in ascending block order gives each
-        // predecessor row its sources in ascending order too, so the relation is
-        // the exact inverse of the successor relation, multiplicity included.
-        let mut predecessor_offsets: Vec<u32> = vec![0; block_count.saturating_add(1)];
-        for to in &successor_values {
-            if let Some(slot) = to
-                .checked_add(1)
-                .and_then(|next| predecessor_offsets.get_mut(next))
-            {
-                *slot = slot.saturating_add(1);
-            }
-        }
-        let mut running_pred: u32 = 0;
-        for slot in &mut predecessor_offsets {
-            running_pred = running_pred.saturating_add(*slot);
-            *slot = running_pred;
-        }
-
-        let mut predecessor_values: Vec<usize> = vec![0; running_pred as usize];
-        let mut pred_cursors: Vec<u32> = predecessor_offsets.clone();
-        for block_idx in 0..block_count {
-            let row = Self::csr_row(&successor_offsets, &successor_values, block_idx);
-            for to in row {
-                if let Some(cursor) = pred_cursors.get_mut(*to) {
-                    if let Some(slot) = predecessor_values.get_mut(*cursor as usize) {
-                        *slot = block_idx;
+        let n = ssa.block_count();
+        let finally_flow = FinallyFlow::of(ssa);
+        let successors = Adjacency::from_rows(n, |index, row| {
+            let Some(block) = ssa.block(index) else {
+                return;
+            };
+            match block.control_terminator() {
+                Some(SsaOp::Leave { .. }) if finally_flow.diverted_target(index).is_some() => {
+                    if let Some(entry) = finally_flow.diverted_target(index)
+                        && entry < n
+                    {
+                        row.push(entry);
                     }
-                    *cursor = cursor.saturating_add(1);
+                }
+                Some(SsaOp::EndFinally) => {
+                    for resume in finally_flow.resume_targets(index) {
+                        if *resume < n {
+                            row.push(*resume);
+                        }
+                    }
+                }
+                Some(op) => op.for_each_successor(|successor| {
+                    if successor < n {
+                        row.push(successor);
+                    }
+                }),
+                None => {}
+            }
+        });
+        let roots = FunctionRoots::of(ssa);
+        let flow_successors = Adjacency::from_rows(n, |index, row| {
+            let terminator = successors.row(index);
+            row.extend_from_slice(terminator);
+            for root in roots.exceptional_successors(index) {
+                if *root < n && !terminator.contains(root) {
+                    row.push(*root);
                 }
             }
-        }
-
+        });
+        let predecessors = successors.inverse();
+        let flow_predecessors = flow_successors.inverse();
         Self {
             ssa,
-            successor_offsets,
-            successor_values,
-            predecessor_offsets,
-            predecessor_values,
+            successors,
+            predecessors,
+            roots,
+            flow_successors,
+            flow_predecessors,
         }
-    }
-
-    /// Returns one block's slice out of a CSR pair, or an empty slice when the
-    /// block does not exist.
-    fn csr_row<'s>(offsets: &[u32], values: &'s [usize], block: usize) -> &'s [usize] {
-        let Some(start) = offsets.get(block).map(|offset| *offset as usize) else {
-            return &[];
-        };
-        let Some(end) = block
-            .checked_add(1)
-            .and_then(|next| offsets.get(next))
-            .map(|offset| *offset as usize)
-        else {
-            return &[];
-        };
-        values.get(start..end).unwrap_or(&[])
     }
 
     /// Returns the underlying SSA function.
@@ -233,14 +216,12 @@ impl<'a, T: Target> SsaCfg<'a, T> {
         self.ssa.is_empty()
     }
 
-    /// Returns the successor block indices for a given block.
+    /// Returns the blocks this block's terminator transfers to.
     ///
-    /// One entry per transfer the block's terminator names, in the terminator's
-    /// own operand order — so `Branch c, 1, 1` yields `[1, 1]`, and the slice
-    /// length is the terminator's arity.
-    ///
-    /// Reach for [`Self::predecessor_blocks`] when the question is *which
-    /// blocks*, rather than how many edges.
+    /// One entry per transfer the terminator names, in its own operand order -
+    /// so `Branch c, 1, 1` yields `[1, 1]`, and the slice length is the
+    /// terminator's arity. A throw is not a transfer the terminator names, so
+    /// it is not here; [`Self::block_successors`] is the complete relation.
     ///
     /// # Arguments
     ///
@@ -251,13 +232,32 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     /// A slice of successor block indices. Empty if the block has no
     /// successors (e.g., return, throw) or doesn't exist.
     #[must_use]
-    pub fn block_successors(&self, block_idx: usize) -> &[usize] {
-        Self::csr_row(&self.successor_offsets, &self.successor_values, block_idx)
+    pub fn terminator_successors(&self, block_idx: usize) -> &[usize] {
+        self.successors.row(block_idx)
     }
 
-    /// Returns the predecessor block indices for a given block.
+    /// Returns every block control can reach from this one.
     ///
-    /// The exact inverse of [`Self::block_successors`], **multiplicity
+    /// The terminator's transfers, plus the handler or filter a throw in this
+    /// block dispatches to. This is the relation a question about reachability,
+    /// dominance, liveness or where values merge is about, and it is the one
+    /// the graph traits expose.
+    ///
+    /// [`Self::terminator_successors`] is the narrower question - *what does
+    /// this block's terminator name* - which arity, trampoline and
+    /// edge-rewriting decisions ask instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The block index to query.
+    #[must_use]
+    pub fn block_successors(&self, block_idx: usize) -> &[usize] {
+        self.flow_successors.row(block_idx)
+    }
+
+    /// Returns the blocks whose terminator transfers to this one.
+    ///
+    /// The exact inverse of [`Self::terminator_successors`], **multiplicity
     /// included**: a block reached twice from one predecessor lists that
     /// predecessor twice, and the entries ascend by source block.
     ///
@@ -278,12 +278,111 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     ///
     /// A slice of predecessor block indices.
     #[must_use]
+    pub fn terminator_predecessors(&self, block_idx: usize) -> &[usize] {
+        self.predecessors.row(block_idx)
+    }
+
+    /// Returns every block control can reach this one from.
+    ///
+    /// The inverse of [`Self::block_successors`]: the blocks whose terminator
+    /// transfers here, plus - for a handler or filter entry - every block a
+    /// throw in which dispatches here.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The block index to query.
+    #[must_use]
     pub fn block_predecessors(&self, block_idx: usize) -> &[usize] {
-        Self::csr_row(
-            &self.predecessor_offsets,
-            &self.predecessor_values,
-            block_idx,
-        )
+        self.flow_predecessors.row(block_idx)
+    }
+
+    /// Returns where control can enter the function, and which blocks can
+    /// throw to which handler.
+    #[must_use]
+    pub const fn roots(&self) -> &FunctionRoots {
+        &self.roots
+    }
+
+    /// Returns the handlers and filters a throw in this block can reach.
+    ///
+    /// The exceptional half of [`Self::block_successors`].
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The block a throw would leave.
+    #[must_use]
+    pub fn exceptional_successors(&self, block_idx: usize) -> &[usize] {
+        self.roots.exceptional_successors(block_idx)
+    }
+
+    /// Returns the blocks a throw in which dispatches to this one.
+    ///
+    /// The exceptional half of [`Self::block_predecessors`].
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - A handler or filter entry.
+    #[must_use]
+    pub fn exceptional_predecessors(&self, block_idx: usize) -> &[usize] {
+        self.roots.exceptional_predecessors(block_idx)
+    }
+
+    /// Returns the blocks an exceptional edge leaves.
+    ///
+    /// A definition in one of these may not have run when the throw happened,
+    /// which is what [`EhDominance::definition_reaches`] refines.
+    ///
+    /// [`EhDominance::definition_reaches`]: crate::analysis::exceptions::EhDominance::definition_reaches
+    #[must_use]
+    pub fn edge_sources(&self) -> BitSet {
+        let mut sources = BitSet::new(self.ssa.block_count().max(1));
+        for block in 0..self.ssa.block_count() {
+            if !self.exceptional_successors(block).is_empty() {
+                sources.insert_checked(block);
+            }
+        }
+        sources
+    }
+
+    /// Returns a view of this graph restricted to terminator edges.
+    ///
+    /// The same object read the narrow way, for the questions that are about
+    /// what terminators name rather than about where control can go: branch
+    /// arity, trampolines, and the dominance a value has along ordinary
+    /// control flow.
+    #[must_use]
+    pub const fn terminator_view(&self) -> TerminatorView<'_, 'a, T> {
+        TerminatorView { cfg: self }
+    }
+
+    /// Returns whether a throw in `from` can take control to `to`.
+    ///
+    /// Not the opposite of a terminator edge: one edge can be both. A protected
+    /// block that leaves to its own `finally` gets there two ways - by running
+    /// to the `leave`, and by throwing part-way through - and a phi at that
+    /// handler has to account for each, with a normal operand for the first and
+    /// exceptional operands for the second. Ask
+    /// [`terminator_successors`](Self::terminator_successors) for the other
+    /// half rather than inferring it from this answer.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - The block control leaves.
+    /// * `to` - The block it arrives at.
+    #[must_use]
+    pub fn is_exception_edge(&self, from: usize, to: usize) -> bool {
+        self.exceptional_successors(from).contains(&to)
+    }
+
+    /// Returns the successors of every block, as an owned snapshot.
+    ///
+    /// For the callers that mutate the function afterwards and so cannot hold
+    /// this view's borrow. Row `b` is [`Self::block_successors`] for `b`.
+    #[must_use]
+    pub fn to_successor_lists(&self) -> Vec<Vec<usize>> {
+        (0..self.ssa.block_count())
+            .map(|block| self.block_successors(block).to_vec())
+            .collect()
     }
 
     /// Returns each distinct block that transfers to `block_idx`, ascending.
@@ -321,8 +420,10 @@ impl<'a, T: Target> SsaCfg<'a, T> {
 
     /// Returns the exit nodes of the CFG.
     ///
-    /// Exit nodes are blocks with no successors (blocks that end in return,
-    /// throw, or other terminating instructions).
+    /// A block whose terminator transfers nowhere: control leaves the function
+    /// there. Read from the terminator relation deliberately - a `Return`
+    /// inside a protected region still ends the function, even though a throw
+    /// earlier in the same block would have gone to the handler.
     ///
     /// # Returns
     ///
@@ -331,7 +432,7 @@ impl<'a, T: Target> SsaCfg<'a, T> {
     pub fn exits(&self) -> Vec<NodeId> {
         let mut exits = Vec::new();
         for idx in 0..self.ssa.block_count() {
-            if self.block_successors(idx).is_empty() {
+            if self.terminator_successors(idx).is_empty() {
                 exits.push(NodeId::new(idx));
             }
         }
@@ -358,6 +459,59 @@ impl<T: Target> Successors for SsaCfg<'_, T> {
     }
 }
 
+/// A [`SsaCfg`] read as its terminator edges alone.
+///
+/// Produced by [`SsaCfg::terminator_view`]. It borrows the graph rather than
+/// rebuilding one, so asking both questions of one function costs one
+/// construction.
+#[derive(Debug)]
+pub struct TerminatorView<'c, 'a, T: Target> {
+    /// The graph being read narrowly.
+    cfg: &'c SsaCfg<'a, T>,
+}
+
+impl<T: Target> GraphBase for TerminatorView<'_, '_, T> {
+    fn node_count(&self) -> usize {
+        self.cfg.node_count()
+    }
+
+    fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+        self.cfg.node_ids()
+    }
+}
+
+impl<T: Target> Successors for TerminatorView<'_, '_, T> {
+    fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+        self.cfg
+            .terminator_successors(node.index())
+            .iter()
+            .copied()
+            .map(NodeId::new)
+    }
+}
+
+impl<T: Target> Predecessors for TerminatorView<'_, '_, T> {
+    fn predecessors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+        self.cfg
+            .terminator_predecessors(node.index())
+            .iter()
+            .copied()
+            .map(NodeId::new)
+    }
+}
+
+impl<T: Target> RootedGraph for TerminatorView<'_, '_, T> {
+    fn entry(&self) -> NodeId {
+        NodeId::new(0)
+    }
+}
+
+impl<T: Target> RootedGraph for SsaCfg<'_, T> {
+    fn entry(&self) -> NodeId {
+        NodeId::new(0)
+    }
+}
+
 impl<T: Target> Predecessors for SsaCfg<'_, T> {
     fn predecessors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
         self.block_predecessors(node.index())
@@ -374,6 +528,7 @@ mod tests {
         analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
         graph::{GraphBase, Predecessors, Successors},
         ir::{
+            SsaVarId,
             block::SsaBlock,
             exception::{BlockRange, SsaExceptionHandler},
             instruction::SsaInstruction,
@@ -390,23 +545,23 @@ mod tests {
 
     /// The predecessor relation is the exact inverse of the successor one.
     ///
-    /// This is the invariant that lets `dominators::precompute_predecessors`
+    /// This invariant lets canonical predecessor inversion
     /// remain a separate derivation: it inverts the same `Successors` impl in
     /// the same node order, so it cannot disagree with this CSR.
     #[test]
     fn predecessor_relation_is_the_exact_inverse_of_the_successor_relation() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         ssa.add_block(block(
             0,
             SsaOp::Branch {
-                condition: crate::ir::SsaVarId::from_index(0),
+                condition: SsaVarId::from_index(0),
                 true_target: 1,
                 false_target: 2,
             },
         ));
         ssa.add_block(block(1, SsaOp::Jump { target: 3 }));
         ssa.add_block(block(2, SsaOp::Jump { target: 3 }));
-        ssa.add_block(block(3, SsaOp::Return { value: None }));
+        ssa.add_block(block(3, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
 
@@ -433,16 +588,16 @@ mod tests {
     /// wants the edges, and "which blocks flow in" wants the block.
     #[test]
     fn a_doubled_branch_arm_is_two_edges_and_one_predecessor_block() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         ssa.add_block(block(
             0,
             SsaOp::Branch {
-                condition: crate::ir::SsaVarId::from_index(0),
+                condition: SsaVarId::from_index(0),
                 true_target: 1,
                 false_target: 1,
             },
         ));
-        ssa.add_block(block(1, SsaOp::Return { value: None }));
+        ssa.add_block(block(1, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
 
@@ -459,17 +614,17 @@ mod tests {
     /// A self-loop is recorded, because a terminator really does name it.
     #[test]
     fn a_self_loop_is_an_edge_like_any_other() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         ssa.add_block(block(0, SsaOp::Jump { target: 1 }));
         ssa.add_block(block(
             1,
             SsaOp::Branch {
-                condition: crate::ir::SsaVarId::from_index(0),
+                condition: SsaVarId::from_index(0),
                 true_target: 1,
                 false_target: 2,
             },
         ));
-        ssa.add_block(block(2, SsaOp::Return { value: None }));
+        ssa.add_block(block(2, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
         assert_eq!(cfg.block_predecessors(1), &[0, 1]);
@@ -484,12 +639,12 @@ mod tests {
     /// verifier must name the defect.
     #[test]
     fn a_block_whose_last_instruction_is_not_a_terminator_has_no_edges() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         let mut stray = SsaBlock::new(0);
         stray.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
         stray.add_instruction(SsaInstruction::synthetic(SsaOp::Nop));
         ssa.add_block(stray);
-        ssa.add_block(block(1, SsaOp::Return { value: None }));
+        ssa.add_block(block(1, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
         assert!(
@@ -507,20 +662,23 @@ mod tests {
         );
     }
 
+    /// End-to-end check that a small diamond CFG exposes the successors,
+    /// predecessors, exits, and graph-trait iterators derived from its
+    /// terminators, and that out-of-range block queries return empty.
     #[test]
     fn cfg_extracts_successors_and_predecessors_from_terminators() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         ssa.add_block(block(
             0,
             SsaOp::Branch {
-                condition: crate::ir::SsaVarId::from_index(0),
+                condition: SsaVarId::from_index(0),
                 true_target: 1,
                 false_target: 2,
             },
         ));
         ssa.add_block(block(1, SsaOp::Jump { target: 3 }));
-        ssa.add_block(block(2, SsaOp::Return { value: None }));
-        ssa.add_block(block(3, SsaOp::Return { value: None }));
+        ssa.add_block(block(2, SsaOp::returns(None)));
+        ssa.add_block(block(3, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
 
@@ -548,22 +706,24 @@ mod tests {
             cfg.predecessors(NodeId::new(3)).collect::<Vec<_>>(),
             vec![NodeId::new(1)]
         );
-        assert_eq!(cfg.block_successors(99), &[]);
-        assert_eq!(cfg.block_predecessors(99), &[]);
+        let none: &[usize] = &[];
+        assert_eq!(cfg.block_successors(99), none);
+        assert_eq!(cfg.block_predecessors(99), none);
     }
 
-    /// A protected region contributes no edge, so a terminator's arity is what
-    /// its successor count says.
+    /// A protected region contributes an edge to the complete relation and
+    /// none to the terminator one, which is what keeps arity readable.
     ///
     /// Block 0 begins a protected region and ends in an unconditional `Jump`.
-    /// It has exactly one successor, so a consumer reading successor count as
-    /// branch arity sees the unconditional transfer that is really there.
+    /// A consumer reading arity asks the terminator relation and sees the one
+    /// transfer that is really named; a consumer asking where control can go
+    /// sees the handler too, because a throw really does go there.
     #[test]
-    fn a_protected_region_adds_no_edge() {
-        let mut ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+    fn a_protected_region_adds_an_edge_only_to_the_complete_relation() {
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
         ssa.add_block(block(0, SsaOp::Jump { target: 1 }));
-        ssa.add_block(block(1, SsaOp::Return { value: None }));
-        ssa.add_block(block(2, SsaOp::Return { value: None }));
+        ssa.add_block(block(1, SsaOp::returns(None)));
+        ssa.add_block(block(2, SsaOp::returns(None)));
         ssa.set_exception_handlers(vec![SsaExceptionHandler {
             flags: 0,
             try_offset: 0,
@@ -574,33 +734,105 @@ mod tests {
             protected_range: BlockRange::new(0, 1),
             handler_range: BlockRange::new(2, 3),
             filter_range: None,
+            selector: None,
         }]);
 
         let cfg = SsaCfg::from_ssa(&ssa);
 
         assert_eq!(
-            cfg.block_successors(0),
+            cfg.terminator_successors(0),
             &[1],
-            "an unconditional jump has one successor, inside a try region or not"
+            "an unconditional jump names one transfer, inside a try region or not"
+        );
+        assert_eq!(
+            cfg.block_successors(0),
+            &[1, 2],
+            "and a throw in it reaches the handler"
         );
         assert!(
-            cfg.block_predecessors(2).is_empty(),
-            "the runtime enters a handler; no terminator does"
+            cfg.terminator_predecessors(2).is_empty(),
+            "no terminator transfers to a handler"
         );
+        assert_eq!(
+            cfg.block_predecessors(2),
+            &[0],
+            "but a throw in the protected block gets there"
+        );
+        assert!(cfg.is_exception_edge(0, 2));
+        assert!(!cfg.is_exception_edge(0, 1));
         // The region itself is untouched, so a consumer that needs it still
         // has it.
         assert_eq!(ssa.exception_handlers().len(), 1);
     }
 
+    /// A CFG over a function with no blocks answers every query without
+    /// panicking: it is empty, has no exits, and iterates no nodes.
     #[test]
     fn an_empty_cfg_answers_without_panicking() {
-        let ssa = crate::ir::SsaFunction::<MockTarget>::new(0, 0);
+        let ssa = SsaFunction::<MockTarget>::new(0, 0);
         let cfg = SsaCfg::from_ssa(&ssa);
 
         assert!(cfg.is_empty());
         assert!(cfg.exits().is_empty());
-        // Traversal order is a rooted question, and this graph has no root of
-        // its own -- `EhCfg` is what carries one.
         assert_eq!(cfg.node_ids().count(), 0);
+    }
+    /// A nested finally chain with an unrelated preservation-only block.
+    fn admission_fixture() -> SsaFunction<MockTarget> {
+        let mut ssa = SsaFunction::new(0, 0);
+        for (id, op) in [
+            SsaOp::Jump { target: 1 },
+            SsaOp::Leave { target: 8 },
+            SsaOp::Jump { target: 3 },
+            SsaOp::EndFinally,
+            SsaOp::Leave { target: 8 },
+            SsaOp::Jump { target: 6 },
+            SsaOp::EndFinally,
+            SsaOp::Rethrow,
+            SsaOp::returns(None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ssa.add_block(block(id, op));
+        }
+        ssa.set_exception_handlers(
+            [(1, 2, 2, 4), (0, 5, 5, 7)]
+                .into_iter()
+                .map(
+                    |(start, end, handler_start, handler_end)| SsaExceptionHandler {
+                        flags: 2,
+                        try_offset: 0,
+                        try_length: 0,
+                        handler_offset: 0,
+                        handler_length: 0,
+                        class_token_or_filter: 0,
+                        protected_range: BlockRange::new(start, end),
+                        handler_range: BlockRange::new(handler_start, handler_end),
+                        filter_range: None,
+                        selector: None,
+                    },
+                )
+                .collect(),
+        );
+        ssa
+    }
+
+    /// Construction preserves exact normal, finally, exceptional and inverse relations.
+    #[test]
+    fn cfg_preserves_nested_finally_and_exception_edges() {
+        let ssa = admission_fixture();
+        let cfg = SsaCfg::from_ssa(&ssa);
+        let expected: [&[usize]; 9] = [&[1], &[2], &[3], &[5], &[5], &[6], &[8], &[], &[]];
+        let complete: [&[usize]; 9] = [&[1, 5], &[2, 5], &[3, 5], &[5], &[5], &[6], &[8], &[], &[]];
+        for node in 0..9 {
+            assert_eq!(cfg.terminator_successors(node), expected[node]);
+            assert_eq!(cfg.block_successors(node), complete[node]);
+        }
+        assert_eq!(cfg.terminator_predecessors(5), [3, 4]);
+        assert_eq!(cfg.block_predecessors(5), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            cfg.roots().preservation_roots().collect::<Vec<_>>(),
+            [3, 6, 7]
+        );
     }
 }

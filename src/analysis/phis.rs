@@ -47,7 +47,7 @@
 //! use analyssa::{
 //!     analysis::{ConstEvaluator, PhiAnalyzer},
 //!     ir::{value::ConstValue, SsaVarId},
-//!     testing, PointerSize,
+//!     testing,
 //! };
 //!
 //! // Diamond CFG whose merge block holds `v3 = phi([1] v1, [2] v2)`,
@@ -62,7 +62,7 @@
 //!     // Two distinct sources: neither trivial nor a uniform constant.
 //!     assert!(analyzer.is_trivial(phi).is_none());
 //!
-//!     let mut evaluator = ConstEvaluator::new(&ssa, PointerSize::Bit64);
+//!     let mut evaluator = ConstEvaluator::new(&ssa, testing::MACHINE);
 //!     assert!(analyzer.uniform_constant(phi, &mut evaluator).is_none());
 //! }
 //!
@@ -76,7 +76,7 @@
 //! assert_eq!(analyzer.is_trivial(phi), Some(left));
 //!
 //! // ...and every operand resolves to the same constant.
-//! let mut evaluator = ConstEvaluator::new(&ssa, PointerSize::Bit64);
+//! let mut evaluator = ConstEvaluator::new(&ssa, testing::MACHINE);
 //! assert_eq!(
 //!     analyzer.uniform_constant(phi, &mut evaluator),
 //!     Some(ConstValue::I32(10))
@@ -275,13 +275,13 @@ impl<'a, T: Target> PhiAnalyzer<'a, T> {
                         // dominate the phi's uses; replacing the phi with it would
                         // create a use-before-def (`IntraBlockCycle`). This arises
                         // for a loop-carried phi that looks trivial once an
-                        // unreachable predecessor operand is dropped — its lone
+                        // unreachable predecessor operand is dropped - its lone
                         // remaining operand is the loop-body (back-edge) value.
                         // Skip such phis: leaving the phi in place is always sound.
                         let same_block_instr_def = match replacement {
                             Some(source) => self.ssa.variable(source).is_some_and(|var| {
                                 let site = var.def_site();
-                                site.block == block_idx && site.instruction.is_some()
+                                site.block() == block_idx && site.index().is_some()
                             }),
                             None => false,
                         };
@@ -396,24 +396,6 @@ impl<'a, T: Target> PhiAnalyzer<'a, T> {
 
         Some(first_value)
     }
-
-    /// Finds the PHI node that defines a variable.
-    ///
-    /// This delegates to [`SsaFunction::find_phi_defining`] for the actual lookup,
-    /// which uses O(1) lookup via the variable's definition site when available.
-    ///
-    /// # Arguments
-    ///
-    /// * `var` - The SSA variable ID to find the defining PHI for.
-    ///
-    /// # Returns
-    ///
-    /// `Some((block_idx, &PhiNode))` if the variable is defined by a PHI node,
-    /// `None` if the variable is not defined by a PHI or doesn't exist.
-    #[must_use]
-    pub fn find_phi_defining(&self, var: SsaVarId) -> Option<(usize, &PhiNode)> {
-        self.ssa.find_phi_defining(var)
-    }
 }
 
 /// Callback type for resolving Leave targets in exception handler blocks.
@@ -445,6 +427,13 @@ pub struct PhiPlacementConfig<'a, T: Target> {
 ///
 /// Data structures are keyed by `u32` group IDs. The `group_to_origin` mapping
 /// translates group IDs to `VariableOrigin` values for the created phi nodes.
+///
+/// # Arguments
+///
+/// * `blocks` - The function's blocks; placed phi nodes are inserted into these
+///   in place.
+/// * `config` - Definition/live-in/frontier sets and the group callbacks that
+///   drive placement; see [`PhiPlacementConfig`].
 ///
 /// # Returns
 ///
@@ -550,6 +539,7 @@ mod tests {
         testing::{MockTarget, MockType},
     };
 
+    /// A phi with a single non-self operand is trivial and reports that operand.
     #[test]
     fn trivial_phi_single_operand() {
         let ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
@@ -561,6 +551,8 @@ mod tests {
         assert_eq!(analyzer.is_trivial(&phi), Some(v0));
     }
 
+    /// Multiple operands that all name the same source collapse to one trivial
+    /// source.
     #[test]
     fn trivial_phi_all_same_operands() {
         let ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
@@ -574,9 +566,11 @@ mod tests {
         assert_eq!(analyzer.is_trivial(&phi), Some(v0));
     }
 
+    /// Self-referential operands are excluded, so a phi with one other source is
+    /// still trivial.
     #[test]
     fn trivial_phi_with_self_references() {
-        // phi(self, v0, self) — self-references ignored, v0 is the trivial source.
+        // phi(self, v0, self) - self-references ignored, v0 is the trivial source.
         let ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let analyzer = PhiAnalyzer::new(&ssa);
         let result = SsaVarId::from_index(0);
@@ -588,6 +582,7 @@ mod tests {
         assert_eq!(analyzer.is_trivial(&phi), Some(v0));
     }
 
+    /// Two distinct non-self sources leave the phi non-trivial.
     #[test]
     fn non_trivial_phi_different_operands() {
         let ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
@@ -623,9 +618,7 @@ mod tests {
             let mut phi = PhiNode::new(phi_res, VariableOrigin::Local(0));
             phi.add_operand(PhiOperand::new(v_src, 0));
             b0.add_phi(phi);
-            b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-                value: Some(phi_res),
-            }));
+            b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(phi_res))));
             ssa.add_block(b0);
             ssa.recompute_uses();
             ssa
@@ -651,6 +644,8 @@ mod tests {
         );
     }
 
+    /// A wholly self-referential phi is not trivial via `is_trivial`, but
+    /// `analyze_trivial` classifies it as removable (`Some(None)`).
     #[test]
     fn trivial_phi_all_self_references() {
         // phi(self, self) → undefined / unreachable; reported via analyze_trivial as Some(None).

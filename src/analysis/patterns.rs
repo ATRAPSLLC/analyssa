@@ -57,9 +57,9 @@
 //!
 //! ```rust
 //! use analyssa::{
-//!     analysis::PatternDetector,
+//!     analysis::{Machine, PatternDetector},
 //!     ir::function::{SsaDefSpec, SsaFunctionBuilder},
-//!     testing::{MockTarget, MockType},
+//!     testing::{MACHINE, MockTarget, MockType},
 //!     PointerSize,
 //! };
 //!
@@ -95,7 +95,11 @@
 //! builder.add_phi_operand(1, state, 2, next).unwrap();
 //! let ssa = builder.finish().unwrap();
 //!
-//! let detector = PatternDetector::new(&ssa, PointerSize::Bit32);
+//! let machine = Machine {
+//!     ptr_size: PointerSize::Bit32,
+//!     ..MACHINE
+//! };
+//! let detector = PatternDetector::new(&ssa, machine);
 //!
 //! // Find dispatcher patterns
 //! let dispatchers = detector.find_dispatchers();
@@ -114,11 +118,13 @@
 //! assert_eq!(blocks, vec![0, 2]);
 //! ```
 
-use std::collections::HashMap;
+use std::iter;
+
+use rustc_hash::FxHashMap;
 
 use crate::{
-    BitSet, PointerSize,
-    analysis::{cfg::SsaCfg, evaluator::SsaEvaluator, symbolic::SymbolicExpr},
+    BitSet,
+    analysis::{cfg::SsaCfg, consts::Machine, evaluator::SsaEvaluator, symbolic::SymbolicExpr},
     ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
     target::Target,
 };
@@ -135,15 +141,15 @@ use crate::{
 pub struct PatternDetector<'a, T: Target> {
     /// Reference to the SSA function being analyzed for patterns.
     ssa: &'a SsaFunction<T>,
-    /// Target pointer size for native int/uint constant evaluation.
-    pointer_size: PointerSize,
+    /// The machine the function computes on.
+    machine: Machine,
 }
 
 impl<'a, T: Target> PatternDetector<'a, T> {
-    /// Creates a new pattern detector for the given SSA function.
+    /// Creates a pattern detector for `ssa`, which computes as `machine` does.
     #[must_use]
-    pub fn new(ssa: &'a SsaFunction<T>, pointer_size: PointerSize) -> Self {
-        Self { ssa, pointer_size }
+    pub fn new(ssa: &'a SsaFunction<T>, machine: Machine) -> Self {
+        Self { ssa, machine }
     }
 
     /// Returns the underlying SSA function.
@@ -176,7 +182,26 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         dispatchers
     }
 
-    /// Analyzes a block to determine if it's a dispatcher.
+    /// Analyzes a block to determine whether it is a control-flow-flattening
+    /// dispatcher.
+    ///
+    /// A block qualifies only if its terminator is a `Switch` with at least two
+    /// targets and at least one target (or the default) can reach the block
+    /// again, i.e. the switch sits on a loop. The single reverse-reachability
+    /// set from `blocks_reaching` answers that loop-back test for every target
+    /// in one traversal. When the shape matches, the dispatch expression is
+    /// recovered and the variables it references become the pattern's
+    /// `state_vars`.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Index of the candidate dispatcher block.
+    /// * `predecessors` - Predecessor sets for the whole function, reused
+    ///   across candidates for the reachability query.
+    ///
+    /// # Returns
+    ///
+    /// The [`DispatcherPattern`] if the block is a dispatcher, otherwise `None`.
     fn analyze_potential_dispatcher(
         &self,
         block_idx: usize,
@@ -202,14 +227,14 @@ impl<'a, T: Target> PatternDetector<'a, T> {
 
         // Check if any target loops back to this block.
         //
-        // Asked as one *reverse* traversal — "which blocks can reach this
-        // dispatcher?" — rather than a forward BFS per target, which would be
+        // Asked as one *reverse* traversal - "which blocks can reach this
+        // dispatcher?" - rather than a forward BFS per target, which would be
         // O(targets x (B + E)) with a fresh `BitSet` per target. A flattened
         // dispatcher has as many targets as it has states.
         let reaching = self.blocks_reaching(block_idx, predecessors);
         let has_loopback = targets
             .iter()
-            .chain(std::iter::once(&default))
+            .chain(iter::once(&default))
             .any(|&target| reaching.contains_checked(target));
 
         if !has_loopback {
@@ -245,16 +270,22 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         })
     }
 
-    /// Checks if there's a path from `from_block` that reaches `target_block`.
-    ///
-    /// Uses BFS with a depth limit to avoid infinite loops.
     /// Returns every block from which `target_block` is reachable.
     ///
     /// A single reverse breadth-first walk over the predecessor relation, so the
     /// caller can answer "does any of these N blocks reach me?" in one traversal
-    /// instead of N. The `visited` set bounds it, so unlike the forward walk this
-    /// replaced there is no arbitrary depth cap to truncate a long chain — the
-    /// answer is exact.
+    /// instead of N. The visited set bounds it, so there is no depth cap to
+    /// truncate a long chain - the answer is exact.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_block` - The block whose reverse-reachability set is computed.
+    /// * `predecessors` - Predecessor sets for the whole function.
+    ///
+    /// # Returns
+    ///
+    /// A [`BitSet`] with a bit set for every block that can reach
+    /// `target_block` (the target itself only if it lies on a cycle).
     fn blocks_reaching(&self, target_block: usize, predecessors: &[Vec<usize>]) -> BitSet {
         let block_count = self.ssa.block_count().max(1);
         let mut reaching = BitSet::new(block_count);
@@ -274,30 +305,40 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         reaching
     }
 
-    /// Gets the successor blocks of a given block.
-    fn block_successors(&self, block_idx: usize) -> Option<Vec<usize>> {
-        let block = self.ssa.block(block_idx)?;
-        block.control_terminator()?;
-        Some(block.successors())
-    }
-
-    /// Builds a symbolic expression for how the switch index is computed.
+    /// Recovers a symbolic expression for how the dispatcher's switch index is
+    /// computed from its state.
+    ///
+    /// Seeds every phi result in the block as a symbolic variable (bound to the
+    /// SSA variable itself, not an opaque name, so `for_each_variable` can later
+    /// recover the state variables), symbolically evaluates the block's
+    /// instructions, and reads back the switch variable's resulting expression -
+    /// typically something of the form `(state ^ const) % num_cases`.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The dispatcher block to evaluate.
+    /// * `switch_var` - The SSA variable driving the switch.
+    ///
+    /// # Returns
+    ///
+    /// The symbolic dispatch expression, or `None` if the switch value did not
+    /// resolve.
     fn build_dispatch_expression(
         &self,
         block_idx: usize,
         switch_var: SsaVarId,
     ) -> Option<SymbolicExpr<T>> {
-        let mut eval = SsaEvaluator::new(self.ssa, self.pointer_size);
+        let mut eval = SsaEvaluator::new(self.ssa, self.machine);
 
         // Mark all phi results as symbolic (they come from different paths)
         if let Some(block) = self.ssa.block(block_idx) {
             for phi in block.phi_nodes() {
                 // Seeded as the SSA variable itself, not as an opaque name.
                 // `set_symbolic` builds a `SymbolicExpr::NamedVar`, which
-                // `for_each_variable` skips by design — so a dispatch expression
+                // `for_each_variable` skips by design - so a dispatch expression
                 // built from named seeds references no variables at all and
                 // `DispatcherPattern::state_vars` could never be populated.
-                eval.set_symbolic_expr(phi.result(), SymbolicExpr::Variable(phi.result()));
+                eval.set(phi.result(), SymbolicExpr::Variable(phi.result()));
             }
         }
 
@@ -336,36 +377,54 @@ impl<'a, T: Target> PatternDetector<'a, T> {
     }
 
     /// Finds all blocks that can reach the dispatcher block.
+    ///
+    /// Builds the reverse CFG (predecessor lists) from every block's successors
+    /// and walks it breadth-first from the dispatcher. Unlike `blocks_reaching`,
+    /// the returned set includes the dispatcher block itself; `find_sources`
+    /// filters it back out.
+    ///
+    /// # Arguments
+    ///
+    /// * `dispatcher_block` - The block every returned block must be able to
+    ///   reach.
+    ///
+    /// # Returns
+    ///
+    /// A [`BitSet`] of every block that can reach `dispatcher_block`, including
+    /// the dispatcher block.
     fn find_reaching_blocks(&self, dispatcher_block: usize) -> BitSet {
         let block_count = self.ssa.block_count().max(1);
         let mut reaching = BitSet::new(block_count);
 
-        // Build reverse CFG (predecessors)
-        let mut predecessors: HashMap<usize, Vec<usize>> = HashMap::new();
-        for block_idx in 0..self.ssa.block_count() {
-            if let Some(succs) = self.block_successors(block_idx) {
-                for succ in succs {
-                    predecessors.entry(succ).or_default().push(block_idx);
-                }
-            }
-        }
-
-        // BFS backwards from dispatcher
+        let cfg = SsaCfg::from_ssa(self.ssa);
         let mut queue = vec![dispatcher_block];
         while let Some(block_idx) = queue.pop() {
             if block_idx >= block_count || !reaching.insert(block_idx) {
                 continue;
             }
-
-            if let Some(preds) = predecessors.get(&block_idx) {
-                queue.extend(preds.iter().copied());
-            }
+            queue.extend_from_slice(cfg.terminator_predecessors(block_idx));
         }
 
         reaching
     }
 
-    /// Analyzes a block to determine if it's a source for the dispatcher.
+    /// Analyzes a block to determine whether it feeds state into the
+    /// dispatcher.
+    ///
+    /// Requires the block's terminator to jump or branch directly to the
+    /// dispatcher; otherwise the block is not a direct source. When it does, the
+    /// state value the block contributes to the dispatcher's state phi is
+    /// computed and mapped to the switch case it selects.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The candidate source block.
+    /// * `dispatcher` - The dispatcher these sources feed.
+    ///
+    /// # Returns
+    ///
+    /// A [`SourceBlock`] describing the state value and target case, or `None`
+    /// if the block does not lead to the dispatcher.
     fn analyze_source_block(
         &self,
         block_idx: usize,
@@ -406,23 +465,38 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         })
     }
 
-    /// Computes the state value set by a block.
+    /// Computes the state value a source block contributes to the dispatcher.
+    ///
+    /// Symbolically evaluates the block (with its phi results seeded as symbolic
+    /// variables), locates the dispatcher's state phi, and returns the evaluated
+    /// value of the operand that phi takes from this block. Only the dispatcher's
+    /// first state variable is considered.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The source block to evaluate.
+    /// * `dispatcher` - The dispatcher whose state phi is inspected.
+    ///
+    /// # Returns
+    ///
+    /// The symbolic state value this block feeds to the dispatcher, or `None`
+    /// if it could not be determined.
     fn compute_state_value(
         &self,
         block_idx: usize,
         dispatcher: &DispatcherPattern<T>,
     ) -> Option<SymbolicExpr<T>> {
-        let mut eval = SsaEvaluator::new(self.ssa, self.pointer_size);
+        let mut eval = SsaEvaluator::new(self.ssa, self.machine);
 
         // Set phi nodes in this block as symbolic
         if let Some(block) = self.ssa.block(block_idx) {
             for phi in block.phi_nodes() {
                 // Seeded as the SSA variable itself, not as an opaque name.
                 // `set_symbolic` builds a `SymbolicExpr::NamedVar`, which
-                // `for_each_variable` skips by design — so a dispatch expression
+                // `for_each_variable` skips by design - so a dispatch expression
                 // built from named seeds references no variables at all and
                 // `DispatcherPattern::state_vars` could never be populated.
-                eval.set_symbolic_expr(phi.result(), SymbolicExpr::Variable(phi.result()));
+                eval.set(phi.result(), SymbolicExpr::Variable(phi.result()));
             }
         }
 
@@ -451,7 +525,22 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         None
     }
 
-    /// Computes which case a state value leads to.
+    /// Computes which switch case a concrete state value selects.
+    ///
+    /// Requires both a concrete state value and a recovered dispatch expression.
+    /// Binds the dispatcher's state variables (and a generic `state` name) to
+    /// the constant, evaluates the dispatch expression, and returns the case
+    /// index. Out-of-range results yield `None`, modelling a fall-through to the
+    /// default case.
+    ///
+    /// # Arguments
+    ///
+    /// * `state_value` - The source block's state value, if known.
+    /// * `dispatcher` - The dispatcher supplying the dispatch expression.
+    ///
+    /// # Returns
+    ///
+    /// The in-range target case index, or `None` if unknown or out of bounds.
     fn compute_target_case(
         &self,
         state_value: Option<&SymbolicExpr<T>>,
@@ -470,7 +559,7 @@ impl<'a, T: Target> PatternDetector<'a, T> {
             .map(|v| format!("phi_{}", v.index()))
             .collect();
 
-        let mut bindings: HashMap<&str, ConstValue<T>> = HashMap::new();
+        let mut bindings: FxHashMap<&str, ConstValue<T>> = FxHashMap::default();
         for name in &state_var_names {
             bindings.insert(name.as_str(), concrete_state.clone());
         }
@@ -479,7 +568,7 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         bindings.insert("state", concrete_state.clone());
 
         // Evaluate the dispatch expression
-        let case_idx = dispatch_expr.evaluate_named(&bindings, self.pointer_size)?;
+        let case_idx = dispatch_expr.evaluate_named(&bindings, self.machine.ptr_size)?;
 
         // Convert to usize and check bounds
         let idx = case_idx.as_i64().and_then(|v| usize::try_from(v).ok())?;
@@ -496,6 +585,11 @@ impl<'a, T: Target> PatternDetector<'a, T> {
     ///
     /// An opaque predicate is a conditional branch where the condition
     /// can be statically determined to always be true or always false.
+    ///
+    /// # Returns
+    ///
+    /// One pattern per block whose branch resolves to `AlwaysTrue` or
+    /// `AlwaysFalse`; branches that stay symbolic or unknown are omitted.
     #[must_use]
     pub fn find_opaque_predicates(&self) -> Vec<OpaquePredicatePattern<T>> {
         (0..self.ssa.block_count())
@@ -503,7 +597,22 @@ impl<'a, T: Target> PatternDetector<'a, T> {
             .collect()
     }
 
-    /// Analyzes a block to see if it contains an opaque predicate.
+    /// Analyzes a block to see whether its branch is an opaque predicate.
+    ///
+    /// Only `Branch` terminators are considered. The block is symbolically
+    /// evaluated with its phi results seeded as symbolic variables, and the
+    /// condition variable's resulting value classifies the branch as
+    /// `AlwaysTrue`, `AlwaysFalse`, `Symbolic`, or `Unknown`. Only the two
+    /// statically determined cases are reported as opaque predicates.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - The candidate branch block.
+    ///
+    /// # Returns
+    ///
+    /// An [`OpaquePredicatePattern`] when the branch always resolves the same
+    /// way, otherwise `None`.
     fn analyze_opaque_predicate(&self, block_idx: usize) -> Option<OpaquePredicatePattern<T>> {
         let block = self.ssa.block(block_idx)?;
 
@@ -519,13 +628,13 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         };
 
         // Evaluate the block to see if condition is determinable
-        let mut eval = SsaEvaluator::new(self.ssa, self.pointer_size);
+        let mut eval = SsaEvaluator::new(self.ssa, self.machine);
 
-        // Set phi nodes as symbolic — as the SSA variable itself, so the
+        // Set phi nodes as symbolic - as the SSA variable itself, so the
         // resulting expression stays linked to the IR (see the seeding in
         // `build_dispatch_expression`).
         for phi in block.phi_nodes() {
-            eval.set_symbolic_expr(phi.result(), SymbolicExpr::Variable(phi.result()));
+            eval.set(phi.result(), SymbolicExpr::Variable(phi.result()));
         }
 
         eval.evaluate_block_instructions(block_idx);
@@ -699,7 +808,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{MACHINE, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -732,7 +841,7 @@ mod tests {
         let zero = mk(&mut ssa, 0, 0, 0);
         let next = mk(&mut ssa, 2, 2, 0);
         // The mask is materialised inside the dispatcher block, as a lifter
-        // emits it — the analysis evaluates only that block's instructions.
+        // emits it - the analysis evaluates only that block's instructions.
         let mask = mk(&mut ssa, 1, 1, 0);
         let sel = mk(&mut ssa, 3, 1, 1);
         let state =
@@ -782,7 +891,7 @@ mod tests {
         ssa.add_block(b3);
 
         let mut b4 = SsaBlock::new(4);
-        b4.add_instruction(instr(SsaOp::Return { value: None }));
+        b4.add_instruction(instr(SsaOp::returns(None)));
         ssa.add_block(b4);
         ssa.recompute_uses();
         ssa
@@ -790,14 +899,14 @@ mod tests {
 
     /// The detector seeds the block's phi results symbolically and then
     /// evaluates the block. Routing that through `evaluate_block` erased the
-    /// seeds first — `evaluate_phis` removes a phi's value when no predecessor
-    /// is set — so every value derived from the state phi came back Unknown and
+    /// seeds first - `evaluate_phis` removes a phi's value when no predecessor
+    /// is set - so every value derived from the state phi came back Unknown and
     /// `dispatch_expr` was always `None`. The whole dispatcher analysis was
     /// inert, and `state_vars` (derived from `dispatch_expr`) was always empty.
     #[test]
     fn a_dispatcher_recovers_its_dispatch_expression() {
         let ssa = flattened_dispatcher();
-        let detector = PatternDetector::new(&ssa, PointerSize::Bit64);
+        let detector = PatternDetector::new(&ssa, MACHINE);
 
         let dispatchers = detector.find_dispatchers();
         assert_eq!(

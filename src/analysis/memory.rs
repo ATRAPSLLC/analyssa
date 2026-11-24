@@ -37,13 +37,18 @@
 //! 4. Add new phi blocks to the worklist (they're also definitions)
 //! 5. Repeat until fixed point
 //!
-//! **Phase 3: Renaming** (O(B * L)):
+//! **Phase 3: Renaming and instruction indexing**:
 //! Traverse the dominator tree in preorder, maintaining a version stack per location:
 //! 1. Record entry version for each location at block entry
 //! 2. Push new versions for phi nodes and store definitions
 //! 3. Process all instructions (loads read top of stack, stores create new versions)
 //! 4. Record exit versions for each location at block exit
 //! 5. Fill in phi operands for successor blocks with current version stacks
+//!
+//! Instruction-point queries index existing definitions on first use. The
+//! location/version traversal already orders each block's records, so the
+//! bounded index needs no sort. Subsequent queries allocate nothing and use
+//! binary search; block-boundary consumers build no instruction index.
 //!
 //! # Memory Location Hierarchy
 //!
@@ -76,13 +81,39 @@
 //! | StaticField | InstanceField/ArrayElement | false | false |
 //! | InstanceField | ArrayElement | false | false |
 //!
-//! An `Indirect` location is a *decoded* address — `base + index*stride +
-//! offset` plus the access width — not the SSA id of the address operand. Two
+//! An `Indirect` location is a *decoded* address - `base + index*stride +
+//! offset` plus the access width - not the SSA id of the address operand. Two
 //! of them off a common base compare by overlapping bit extent, so `[rbp-8]`
 //! and `[rbp-16]` are provably disjoint; different bases conservatively
-//! may-alias, since two SSA pointers can hold one address. See
+//! may-alias, since two SSA pointers can hold one address - except where
+//! both bases are storage of their own: two different frame slots, and a
+//! frame slot against a *stated* absolute address, which is a link-time or
+//! program-stated address and so names no slot of the function being
+//! analysed. An address the
+//! program states as a number has the absolute base, so two image cells
+//! compare by extent too, however their addresses were materialised. See
 //! [`IndirectLocation`] for the full rationale, including why keying on the
 //! address value id is both imprecise and unstable under GVN.
+//!
+//! # Regions
+//!
+//! A location lies in a [`MemoryRegion`]: the image's read-only data, its
+//! writable data, the function's own frame, or anywhere else. The region is
+//! what decides what a location holds when the function is entered, and one
+//! rule decides everything built on it:
+//!
+//! > A load folds to a constant only if its region is provably unwritten on
+//! > every path reaching it.
+//!
+//! A [read-only image](MemoryRegion::ImageReadOnly) cell gives that for free: a
+//! write to it faults, so no execution continues past one, and nothing the
+//! function does can have changed it. Such a location is never versioned by a
+//! store or a barrier, and its one version is defined by
+//! [`MemoryDefSite::Image`] - the image's bytes. Every other region's entry
+//! version is [`MemoryDefSite::Entry`], which says nothing about what an
+//! earlier function wrote. The regions come from the host through
+//! [`AnalysisContext`]; without an image every location is
+//! [`MemoryRegion::Unknown`] and nothing is read.
 //!
 //! # Usage
 //!
@@ -90,17 +121,17 @@
 //! use analyssa::{
 //!     analysis::{
 //!         memory::{MemoryLocation, MemorySsa},
-//!         SsaCfg,
+//!         AnalysisContext, SsaCfg,
 //!     },
 //!     ir::SsaVarId,
-//!     testing, PointerSize,
+//!     testing,
 //! };
 //!
-//! // Fixture that stores to `object.field1`, loads it back, then performs
+//! // A function that stores to `object.field1`, loads it back, then performs
 //! // an indirect store and an atomic exchange.
 //! let ssa = testing::memory_effect_fixture();
 //! let cfg = SsaCfg::from_ssa(&ssa);
-//! let mem_ssa = MemorySsa::build(&ssa, PointerSize::Bit64);
+//! let mem_ssa = MemorySsa::build(&ssa, &AnalysisContext::new(testing::MACHINE));
 //!
 //! // The store and the load are attributed to the same memory location.
 //! let object = SsaVarId::from_index(0);
@@ -109,7 +140,7 @@
 //!
 //! // Query the memory version entering and leaving a block. Every operation
 //! // that may alias this location bumps its version, not just the ones naming
-//! // it: the fixture's indirect store and atomic exchange both classify to
+//! // it: the function's indirect store and atomic exchange both classify to
 //! // `Unknown`, which may-aliases everything, so the field's version advances
 //! // past them too. That is what makes a version comparison a valid test for
 //! // "is the value I read here still intact".
@@ -129,32 +160,37 @@
 //! - Chow et al., "Effective Representation of Aliases and Indirect Memory
 //!   Operations in SSA Form", CC 1996
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::{
+    borrow::Borrow, cmp::Reverse, collections::VecDeque, num::NonZeroU16, ops::Range, rc::Rc,
+    sync::OnceLock,
+};
 
-/// Maximum `locations × blocks` product [`MemorySsa::build`] will construct.
-///
-/// Renaming records an entry and an exit version per location per block, so the
-/// retained allocation is quadratic when the location count scales with the
-/// block count — which it does for a "function" that is really data misread as
-/// code, where each distinct `base + offset` mints its own `Indirect` location.
-/// At 4000 blocks × 4000 locations that is ~16M map entries, several GB.
-///
-/// 4M cells is far above any real function (a 2000-block function touching 200
-/// distinct cells is 400k) and bounds the structure at tens of MB.
-const MAX_MEMORY_SSA_CELLS: usize = 4_000_000;
+use log::warn;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     analysis::{
-        address::{const_i64, normalize_address},
-        exceptions::EhCfg,
+        address::{AddressBase, AddressWalk},
+        budget::{Budget, Exhaustion},
+        cells::MemoryCells,
+        cfg::SsaCfg,
+        context::AnalysisContext,
+        frame::{FrameAnchors, FrameEscape},
+        image::{ImageData, Mutability},
+        pointsto::{self, Footprint, PointsTo},
     },
+    bitset::BitSet,
     graph::{
         GraphBase, NodeId, RootedGraph, Successors,
-        algorithms::{compute_dominance_frontiers, compute_dominators},
+        algorithms::{DominatorTree, compute_dominance_frontiers, compute_dominators},
     },
     ir::{
         function::SsaFunction,
-        ops::{MemoryEffectLocation, SsaEffectKind, SsaEffects, SsaOp},
+        ops::{
+            AccessMode, CallAccess, CallLocation, FrameOrigin, MemoryEffectLocation, PointeeExtent,
+            SsaEffectKind, SsaEffects, SsaOp, SystemOpKind,
+        },
+        value::ConstValue,
         variable::SsaVarId,
     },
     pointer::PointerSize,
@@ -192,7 +228,7 @@ pub enum MemoryLocation<T: Target> {
     /// Indirect memory access through a pointer: `*(base + index*stride + offset)`
     ///
     /// Decoded from the address expression rather than keyed on the address
-    /// value id — see [`IndirectLocation`] for why that distinction is
+    /// value id - see [`IndirectLocation`] for why that distinction is
     /// load-bearing.
     Indirect(IndirectLocation),
 
@@ -201,33 +237,129 @@ pub enum MemoryLocation<T: Target> {
     /// Used when we can't determine the exact location (e.g., after a call
     /// that may modify memory, or for volatile accesses).
     Unknown,
+
+    /// Any memory the program has let escape: every location but the
+    /// function's own frame cells whose address it kept to itself.
+    ///
+    /// What a call that touches memory only through what it was handed, and
+    /// carries its stack arguments as operands, reaches
+    /// ([`CallLocation::Escaped`]). It
+    /// may alias every location [`Self::Unknown`] does, except a frame cell
+    /// whose address never left the function.
+    Escaped,
 }
 
 impl<T: Target> MemoryLocation<T> {
+    /// Returns the region this location lies in.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The host's facts, for its image.
+    /// * `entry_stack_pointer` - The value the host declared the stack pointer
+    ///   at entry, when it declared one.
+    #[must_use]
+    pub fn region(
+        &self,
+        context: &AnalysisContext<'_>,
+        entry_stack_pointer: Option<SsaVarId>,
+    ) -> MemoryRegion {
+        let Self::Indirect(cell) = self else {
+            return MemoryRegion::Unknown;
+        };
+        if cell.base.is_slot() {
+            return MemoryRegion::Frame;
+        }
+        if entry_stack_pointer.is_some_and(|sp| cell.base == AddressBase::Value(sp))
+            && cell.index.is_none()
+            && cell.address_space.is_none()
+        {
+            return MemoryRegion::Frame;
+        }
+        let Some(image) = context.image() else {
+            return MemoryRegion::Unknown;
+        };
+        let Some((address, len)) = cell.image_extent(image, None) else {
+            return MemoryRegion::Unknown;
+        };
+        match image.region(address) {
+            Some(region) if region.covers(address, len) => match region.mutability {
+                Mutability::ReadOnly => MemoryRegion::ImageReadOnly,
+                Mutability::Writable => MemoryRegion::ImageWritable,
+            },
+            _ => MemoryRegion::Unknown,
+        }
+    }
+
+    /// Returns the memory an access to this location may touch, as
+    /// `relation` places it ([`Footprint`]): escaped memory for
+    /// [`Escaped`](Self::Escaped), an indirect cell's
+    /// ([`IndirectLocation::footprint`]), and anywhere for the rest.
+    ///
+    /// # Arguments
+    ///
+    /// * `relation` - The function's points-to relation.
+    /// * `image` - The host's image, which places a stated address in it.
+    #[must_use]
+    pub fn footprint(&self, relation: &PointsTo, image: Option<&dyn ImageData>) -> Footprint {
+        match self {
+            Self::Escaped => Footprint::ESCAPED,
+            Self::Indirect(cell) => cell.footprint(relation, image),
+            Self::InstanceField(..)
+            | Self::StaticField(_)
+            | Self::ArrayElement(..)
+            | Self::Unknown => Footprint::Anywhere,
+        }
+    }
+
     /// Returns the base object variable, if any.
     ///
-    /// For instance fields and arrays, this is the object/array variable.
-    /// For static fields and unknown locations, returns `None`.
+    /// For instance fields and arrays, this is the object/array variable, and
+    /// for an indirect access its base value. For static fields, unknown
+    /// locations and absolute addresses, returns `None`.
     #[must_use]
     pub fn base_object(&self) -> Option<SsaVarId> {
         match self {
             Self::InstanceField(obj, _) => Some(*obj),
             Self::ArrayElement(arr, _) => Some(*arr),
-            Self::Indirect(indirect) => Some(indirect.base),
-            Self::StaticField(_) | Self::Unknown => None,
+            Self::Indirect(indirect) => indirect.base.value(),
+            Self::StaticField(_) | Self::Unknown | Self::Escaped => None,
         }
     }
 
     /// Returns `true` if this location may alias the other location.
     ///
-    /// This is a conservative analysis - if we can't prove non-aliasing,
-    /// we assume aliasing is possible.
+    /// Conservative by design: when non-aliasing cannot be proven the answer is
+    /// `true`. This predicate drives the *invalidation* half of the memory pass -
+    /// a store or barrier bumps the version of every location it may-alias - so a
+    /// false negative here would let a stale value survive a clobbering write.
+    /// Distinct SSA ids for the same object or array are therefore treated as
+    /// possibly equal; only [`must_alias`](Self::must_alias) insists on identical
+    /// ids. `Unknown` aliases everything, and an `Indirect` cell conservatively
+    /// aliases every concrete managed location.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The location to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the two locations may refer to overlapping memory.
     #[must_use]
     pub fn may_alias(&self, other: &Self) -> bool {
         match (self, other) {
-            // Unknown aliases everything; Indirect may alias any concrete location
-            (Self::Unknown, _)
-            | (_, Self::Unknown)
+            // A slot of the function's own frame is not a static field.
+            (Self::Indirect(cell), Self::StaticField(_))
+            | (Self::StaticField(_), Self::Indirect(cell))
+                if cell.base.is_slot() =>
+            {
+                false
+            }
+            // Unknown aliases everything; Indirect may alias any concrete location.
+            // Escaped memory leaves out only frame cells whose address never left
+            // the function, which this predicate cannot tell apart, so it aliases
+            // everything too; the memory pass, which knows the frame, narrows it.
+            (Self::Unknown | Self::Escaped, _)
+            | (_, Self::Unknown | Self::Escaped)
             | (
                 Self::Indirect(_),
                 Self::InstanceField(..) | Self::ArrayElement(..) | Self::StaticField(_),
@@ -253,7 +385,7 @@ impl<T: Target> MemoryLocation<T> {
             // two un-GVN'd loads of one slot, two arguments, or a value and a phi
             // of it all name one object through distinct ids. Treating distinct
             // ids as disjoint would be a false NoAlias, which is unsound in the
-            // direction that matters — `may_alias` drives the invalidation half
+            // direction that matters - `may_alias` drives the invalidation half
             // of the memory pass, so a false NoAlias lets a stale value survive a
             // store to the same cell. This mirrors `Indirect`, which is already
             // may-alias across distinct bases for exactly this reason.
@@ -278,8 +410,20 @@ impl<T: Target> MemoryLocation<T> {
 
     /// Returns `true` if this location must alias the other location.
     ///
-    /// This is a more precise analysis - returns `true` only if we can
-    /// prove the locations definitely refer to the same memory.
+    /// The precise counterpart to [`may_alias`](Self::may_alias): it returns
+    /// `true` only when the two descriptions provably denote one cell, requiring
+    /// identical object/array ids together with identical field tokens or
+    /// constant indices. `Unknown` never must-aliases, not even itself. This
+    /// drives the *forwarding* half of the memory pass, where a false positive
+    /// would be unsound, so it never guesses.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The location to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the two locations provably refer to the same memory cell.
     #[must_use]
     pub fn must_alias(&self, other: &Self) -> bool {
         match (self, other) {
@@ -305,6 +449,47 @@ impl<T: Target> MemoryLocation<T> {
     }
 }
 
+/// Which part of the program's memory a location lies in.
+///
+/// Decides what the location holds when the function is entered; see the
+/// module documentation for the rule a fold rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryRegion {
+    /// Image data the host reports read-only: the file's bytes, in every
+    /// function, always.
+    ImageReadOnly,
+    /// Image data the program may write: the file's bytes only until
+    /// something writes them, which can happen before this function runs.
+    ImageWritable,
+    /// The function's own frame, addressed from the stack pointer it was
+    /// entered with.
+    Frame,
+    /// Anywhere else, or somewhere the analysis cannot place: memory reached
+    /// through a pointer, the heap, an address the host does not serve.
+    Unknown,
+}
+
+impl MemoryRegion {
+    /// Whether this region and `other` cannot be the same memory.
+    ///
+    /// The frame is the stack the function was entered on; the image's two
+    /// regions are the bytes the host serves at the addresses it states. No two
+    /// of those three overlap. [`MemoryRegion::Unknown`] is the answer for memory
+    /// reached through a pointer, so it overlaps everything, itself included.
+    #[must_use]
+    pub const fn is_apart_from(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => false,
+            (Self::Frame, Self::Frame)
+            | (Self::ImageReadOnly, Self::ImageReadOnly)
+            | (Self::ImageWritable, Self::ImageWritable) => false,
+            (Self::Frame, Self::ImageReadOnly | Self::ImageWritable)
+            | (Self::ImageReadOnly, Self::Frame | Self::ImageWritable)
+            | (Self::ImageWritable, Self::Frame | Self::ImageReadOnly) => true,
+        }
+    }
+}
+
 /// A pointer dereference decoded into `base + index*stride + offset`, together
 /// with the width of the access.
 ///
@@ -314,13 +499,13 @@ impl<T: Target> MemoryLocation<T> {
 /// That is wrong for native code in both directions:
 ///
 /// - It is **imprecise**: `[rbp-8]` and `[rbp-16]` compute two different
-///   address values, so nothing relates them — even though they provably do not
+///   address values, so nothing relates them - even though they provably do not
 ///   overlap. Every stack slot looks unrelated to every other.
 /// - It is **unstable**: the address is produced by a [`SsaOp::PtrAdd`], which
 ///   is a pure op, so GVN and LICM freely re-number and hoist it. The identity
 ///   of a memory cell would then depend on which optimization ran.
 ///
-/// Decoding the address (via [`crate::analysis::address::normalize_address`])
+/// Decoding the address (via [`AddressWalk::normalize`](crate::analysis::address::AddressWalk::normalize))
 /// fixes both: the cell is named by what it *is*, not by which instruction computed
 /// it, and two accesses off a common base become comparable by offset.
 ///
@@ -330,18 +515,25 @@ impl<T: Target> MemoryLocation<T> {
 /// pointers can hold the same address, so nothing in the address expression
 /// alone can rule that out; separating them requires a points-to oracle, which
 /// is not available to a pure function on locations (see
-/// [`pointsto`](crate::analysis::pointsto)). This is deliberately weaker than
+/// [`pointsto`]). This is deliberately weaker than
 /// the managed-code variants above, which key on object identity.
+///
+/// The absolute bases are the exception, and they are one because they are not
+/// values: two addresses in one absolute space are numbers, so their extents
+/// are directly comparable. An absolute address against a value base may alias,
+/// since the value may hold that number, and the [`Symbol`](AddressBase::Symbol)
+/// and [`Number`](AddressBase::Number) spaces may alias each other, since the
+/// host's symbol space and the program's need not agree.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct IndirectLocation {
-    /// Root value the address is measured from.
-    pub base: SsaVarId,
+    /// What the address is measured from.
+    pub base: AddressBase,
     /// Scaled index term, when the address carries one.
     pub index: Option<SsaVarId>,
     /// Stride applied to [`Self::index`], in bytes.
     ///
     /// Meaningless without an index, and therefore held at `0` whenever
-    /// [`Self::index`] is `None` — see [`IndirectLocation::new`]. Keeping that
+    /// [`Self::index`] is `None` - see [`IndirectLocation::new`]. Keeping that
     /// invariant is what lets the derived `Eq`/`Hash` agree with
     /// [`must_alias`](Self::must_alias): otherwise two locations denoting the
     /// same cell could differ in a field neither alias rule consults, and be
@@ -353,13 +545,13 @@ pub struct IndirectLocation {
     pub size_bits: Option<u32>,
     /// Address space the access is qualified by, or `None` for the target's
     /// default (flat) space. Distinct spaces never alias.
-    pub address_space: Option<u16>,
+    pub address_space: Option<NonZeroU16>,
     /// Target pointer width this address was decoded against.
     ///
     /// Address arithmetic wraps here, so the width is part of what the offset
     /// *means*: `+4294967288` and `-8` are one displacement on a 32-bit target
     /// and two distinct ones on a 64-bit target.
-    /// [`normalize_address`]
+    /// [`AddressWalk::normalize`](crate::analysis::address::AddressWalk::normalize)
     /// canonicalises every folded displacement into it, and
     /// `extents_overlap` needs it to notice an access
     /// that runs off the top of the address space and wraps to the bottom.
@@ -374,16 +566,16 @@ impl IndirectLocation {
     /// no index (see [`Self::stride_bytes`]).
     #[must_use]
     pub fn new(
-        base: SsaVarId,
+        base: impl Into<AddressBase>,
         index: Option<SsaVarId>,
         stride_bytes: u64,
         offset_bits: i64,
         size_bits: Option<u32>,
-        address_space: Option<u16>,
+        address_space: Option<NonZeroU16>,
         ptr_size: PointerSize,
     ) -> Self {
         Self {
-            base,
+            base: base.into(),
             index,
             stride_bytes: if index.is_some() { stride_bytes } else { 0 },
             offset_bits,
@@ -393,13 +585,222 @@ impl IndirectLocation {
         }
     }
 
+    /// Returns the memory this access may touch, as `relation` places it
+    /// ([`PointsTo::footprint`]): through a value, the bytes of what the
+    /// value points into; at a stated address, those bytes of the image
+    /// where `image` places them, and otherwise memory the function lets go
+    /// of, which holds no byte of its own frame or allocations.
+    ///
+    /// Anywhere for an access in a qualified address space, one that wraps
+    /// the address space, and one off a slot base, which the relation does
+    /// not place.
+    ///
+    /// # Arguments
+    ///
+    /// * `relation` - The function's points-to relation.
+    /// * `image` - The host's image.
+    #[must_use]
+    pub fn footprint(&self, relation: &PointsTo, image: Option<&dyn ImageData>) -> Footprint {
+        if self.address_space.is_some() || self.crosses_wrap_boundary() {
+            return Footprint::Anywhere;
+        }
+        // Its first byte from its base, and the byte past its last where no
+        // index moves it.
+        let first = self.offset_bits.div_euclid(8);
+        let end = self
+            .index
+            .is_none()
+            .then_some(self.size_bits)
+            .flatten()
+            .and_then(|size| {
+                let end_bits = self.offset_bits.checked_add(i64::from(size))?;
+                end_bits
+                    .div_euclid(8)
+                    .checked_add(i64::from(end_bits.rem_euclid(8) != 0))
+            });
+        match self.base {
+            AddressBase::Value(pointer) => relation.footprint(pointer, first, end, self.ptr_size),
+            AddressBase::Symbol | AddressBase::Number => {
+                match image.and_then(|image| self.image_extent(image, None)) {
+                    Some((address, len)) => Footprint::image(
+                        i64::try_from(address).ok().zip(
+                            address
+                                .checked_add(len)
+                                .and_then(|end| i64::try_from(end).ok()),
+                        ),
+                    ),
+                    None => Footprint::ESCAPED,
+                }
+            }
+            AddressBase::Local(_) | AddressBase::Argument(_) => Footprint::Anywhere,
+        }
+    }
+
+    /// Returns where in `image` this access reads, as `(address, bytes)` in the
+    /// host's symbol space, when it names a whole-byte extent of the image:
+    /// for an indexed access, every byte an index from `index`'s least to
+    /// its greatest value may move it over, a table read at a guarded index
+    /// spanning the table.
+    ///
+    /// `None` for an access through a value, an indexed one `index` does not
+    /// bound, one in a qualified address space, one of unknown or sub-byte
+    /// width, one that wraps the address space, and a
+    /// [`Number`](AddressBase::Number) address when the host cannot relate
+    /// the program's integers to its symbols.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - The host's image, which also says how the two absolute
+    ///   spaces relate.
+    /// * `index` - The least and greatest value of [`Self::index`] where the
+    ///   access is made; read only for an indexed access.
+    #[must_use]
+    pub fn image_extent(
+        &self,
+        image: &dyn ImageData,
+        index: Option<(i64, i64)>,
+    ) -> Option<(u64, u64)> {
+        if self.address_space.is_some() || self.crosses_wrap_boundary() {
+            return None;
+        }
+        let size_bits = self.size_bits?;
+        if size_bits == 0 || size_bits % 8 != 0 || self.offset_bits % 8 != 0 {
+            return None;
+        }
+        let bytes = self.offset_bits / 8;
+        let (first, last) = match self.index {
+            None => (bytes, bytes),
+            Some(_) => {
+                let (low, high) = index?;
+                let stride = i64::try_from(self.stride_bytes).ok()?;
+                (
+                    bytes.checked_add(low.checked_mul(stride)?)?,
+                    bytes.checked_add(high.checked_mul(stride)?)?,
+                )
+            }
+        };
+        let in_symbol_space = |offset: i64| match self.base {
+            AddressBase::Symbol => Some(offset),
+            AddressBase::Number => offset.checked_add(image.number_offset()?),
+            AddressBase::Value(_) | AddressBase::Local(_) | AddressBase::Argument(_) => None,
+        };
+        let (first, last) = (in_symbol_space(first)?, in_symbol_space(last)?);
+        let len = u64::try_from(last.checked_sub(first)?)
+            .ok()?
+            .checked_add(u64::from(size_bits / 8))?;
+        let address = self.ptr_size.mask_unsigned(first.cast_unsigned());
+        // An index moving the access across the top of the address space
+        // reads at both ends of it, which no one extent says.
+        let top = u128::from(self.ptr_size.mask_unsigned(u64::MAX)).saturating_add(1);
+        (u128::from(address).saturating_add(u128::from(len)) <= top).then_some((address, len))
+    }
+
+    /// Returns where in `image` this access reads, as [`Self::image_extent`]
+    /// does, where the image maps the whole of it ([`ImageData::mapped`]):
+    /// storage the loader mapped, which no read of it faults on.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - The host's image.
+    /// * `index` - The least and greatest value of [`Self::index`] where the
+    ///   access is made; read only for an indexed access.
+    #[must_use]
+    pub fn placed_in_image(
+        &self,
+        image: &dyn ImageData,
+        index: Option<(i64, i64)>,
+    ) -> Option<(u64, u64)> {
+        self.image_extent(image, index)
+            .filter(|(address, extent)| image.mapped(*address, *extent))
+    }
+
+    /// Whether this access reads the first word of a symbol the host proves
+    /// bound ([`Target::symbol_bound`]): storage the loader mapped before the
+    /// function ran, at an address no read of a word there faults on.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The function the access is in, whose facts the host reads.
+    /// * `word_bits` - The target's word, in bits.
+    #[must_use]
+    pub fn bound_first_word<T: Target>(&self, ssa: &SsaFunction<T>, word_bits: i64) -> bool {
+        let AddressBase::Value(base) = self.base else {
+            return false;
+        };
+        self.index.is_none()
+            && self.offset_bits == 0
+            && self
+                .size_bits
+                .is_some_and(|bits| i64::from(bits) <= word_bits)
+            && matches!(
+                ssa.get_definition(base),
+                Some(SsaOp::Const {
+                    value: ConstValue::Symbol(symbol),
+                    ..
+                }) if T::symbol_bound(ssa.facts(), symbol)
+            )
+    }
+
+    /// Whether no read of this access can fault: the first word of a bound
+    /// symbol ([`Self::bound_first_word`]), or an unindexed access the image
+    /// maps whole ([`Self::placed_in_image`]) - or, with no image at hand, one
+    /// the function's facts hold mapped ([`Target::address_mapped`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The function the access is in.
+    /// * `image` - The host's image, where it has one.
+    /// * `word_bits` - The target's word, in bits.
+    #[must_use]
+    pub fn reads_mapped<T: Target>(
+        &self,
+        ssa: &SsaFunction<T>,
+        image: Option<&dyn ImageData>,
+        word_bits: i64,
+    ) -> bool {
+        if self.bound_first_word(ssa, word_bits) {
+            return true;
+        }
+        if self.index.is_some() {
+            return false;
+        }
+        match image {
+            Some(image) => self.placed_in_image(image, None).is_some(),
+            None => self
+                .symbol_extent()
+                .is_some_and(|(address, len)| T::address_mapped(ssa.facts(), address, len)),
+        }
+    }
+
+    /// Returns where this unindexed access reads in the host's symbol space,
+    /// as `(address, bytes)`, where its address is a symbol's: what
+    /// [`Self::image_extent`] says of it without an image.
+    #[must_use]
+    pub fn symbol_extent(&self) -> Option<(u64, u64)> {
+        if self.base != AddressBase::Symbol
+            || self.index.is_some()
+            || self.address_space.is_some()
+            || self.crosses_wrap_boundary()
+        {
+            return None;
+        }
+        let size_bits = self.size_bits?;
+        if size_bits == 0 || size_bits % 8 != 0 || self.offset_bits % 8 != 0 {
+            return None;
+        }
+        let address = self
+            .ptr_size
+            .mask_unsigned((self.offset_bits / 8).cast_unsigned());
+        Some((address, u64::from(size_bits / 8)))
+    }
+
     /// Returns `true` when this access runs past the top of the address space.
     ///
     /// Displacements are canonicalised into the signed pointer-width range, so
-    /// an access whose *end* exceeds that range wraps around to the bottom — and
+    /// an access whose *end* exceeds that range wraps around to the bottom - and
     /// can then overlap a low-offset access that the linear extent comparison
     /// calls disjoint.
-    fn crosses_wrap_boundary(&self) -> bool {
+    pub fn crosses_wrap_boundary(&self) -> bool {
         let Some(size) = self.size_bits else {
             return false;
         };
@@ -418,6 +819,22 @@ impl IndirectLocation {
     }
 
     /// Returns `true` if the two accesses may touch overlapping memory.
+    ///
+    /// Tries three cheap disjointness proofs before the last-resort extent
+    /// comparison: different address spaces never alias; different bases always
+    /// may-alias (two SSA pointers can hold one address, and a value can hold an
+    /// absolute one); and an index term that
+    /// cannot be equated defeats offset reasoning, since the indices could take
+    /// the same value. Only when space, base, and index all line up does it
+    /// compare the `[offset, offset + size)` bit extents.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The other decoded access to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` unless the two accesses are provably disjoint.
     #[must_use]
     pub fn may_alias(&self, other: &Self) -> bool {
         // Distinct address spaces are disjoint by construction: a segmented
@@ -426,12 +843,23 @@ impl IndirectLocation {
         if self.address_space != other.address_space {
             return false;
         }
-        // Different roots: two distinct SSA pointers can hold the same address.
+        // Different roots: two distinct SSA pointers can hold the same
+        // address, so they may alias. Two bases that are each storage of
+        // their own cannot - which is both slots, and a slot against a
+        // *stated* absolute address: the displacement of a symbol or a bare
+        // integer is a link-time or program-stated address, and no such
+        // address names a frame slot of the function being analysed
+        // ([`AddressBase::Local`]). An address a *value* holds is not stated,
+        // so it keeps aliasing the frame.
         if self.base != other.base {
-            return true;
+            let slot_against_absolute =
+                |a: AddressBase, b: AddressBase| a.is_slot() && b.is_absolute();
+            return !((self.base.is_slot() && other.base.is_slot())
+                || slot_against_absolute(self.base, other.base)
+                || slot_against_absolute(other.base, self.base));
         }
         // A scaled index term whose contribution we cannot equate defeats any
-        // offset reasoning — the indices could take the same value.
+        // offset reasoning - the indices could take the same value.
         if !self.index_matches(other) {
             return true;
         }
@@ -439,6 +867,19 @@ impl IndirectLocation {
     }
 
     /// Returns `true` if the two accesses provably name exactly one cell.
+    ///
+    /// Requires everything the extent comparison relies on to be known and equal:
+    /// same address space, same base, matching index contribution, equal offset,
+    /// and equal known widths. An unknown width can never prove equal extent, so
+    /// a width-less access never must-aliases, not even against itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The other decoded access to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when both accesses provably denote the same memory cell.
     #[must_use]
     pub fn must_alias(&self, other: &Self) -> bool {
         self.address_space == other.address_space
@@ -457,8 +898,8 @@ impl IndirectLocation {
     /// contribution, so their constant offsets are directly comparable.
     ///
     /// Equal index *value ids* with equal strides contribute equally whatever
-    /// the runtime value. Anything else — different index values, different
-    /// strides, or an index on only one side (it could be zero) — is not
+    /// the runtime value. Anything else - different index values, different
+    /// strides, or an index on only one side (it could be zero) - is not
     /// comparable.
     fn index_matches(&self, other: &Self) -> bool {
         match (self.index, other.index) {
@@ -508,6 +949,17 @@ pub enum ArrayIndex {
 
 impl ArrayIndex {
     /// Returns `true` if these indices may refer to the same element.
+    ///
+    /// A variable or unknown index may take any runtime value, so it overlaps
+    /// anything; two constants overlap only when equal.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The index to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` unless both indices are constants with different values.
     #[must_use]
     pub fn may_overlap(&self, other: &Self) -> bool {
         match (self, other) {
@@ -519,6 +971,18 @@ impl ArrayIndex {
     }
 
     /// Returns `true` if these indices must refer to the same element.
+    ///
+    /// Provable only for two equal constants or two identical index variables;
+    /// any other pairing, including a variable against a constant, is not equal
+    /// enough to prove.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The index to test against.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when the indices provably select the same element.
     #[must_use]
     pub fn must_equal(&self, other: &Self) -> bool {
         match (self, other) {
@@ -554,11 +1018,56 @@ pub enum MemoryOp<T: Target> {
         /// Instruction index within the block.
         instr: usize,
     },
+    /// A read of a location that defines no value the location holds: a load
+    /// whose result is computed from the bytes it reads (a broadcast of one
+    /// element, a deinterleaving of segments, a masked read).
+    Read {
+        /// The memory location read.
+        location: MemoryLocation<T>,
+        /// Block containing this operation.
+        block: usize,
+        /// Instruction index within the block.
+        instr: usize,
+    },
     /// A memory operation that both reads and writes, or whose value operand is implicit.
     ReadWrite {
         /// The memory location being read and written.
         location: MemoryLocation<T>,
         /// Effect summary attached to this operation.
+        effects: SsaEffects,
+        /// Block containing this operation.
+        block: usize,
+        /// Instruction index within the block.
+        instr: usize,
+    },
+    /// A write of a location that stores no value an operand holds and reads
+    /// nothing ([`SsaEffectKind::Write`]): a coprocessor register stored to
+    /// memory, a move into a special register whose memory effect is not
+    /// modelled. What the location holds is unknown after it, and no store
+    /// before it is observed by it.
+    Write {
+        /// The memory location written.
+        location: MemoryLocation<T>,
+        /// Effect summary attached to this operation.
+        effects: SsaEffects,
+        /// Block containing this operation.
+        block: usize,
+        /// Instruction index within the block.
+        instr: usize,
+    },
+    /// A call whose host stated its effects: it reads and may write exactly
+    /// these locations ([`CallEffects`](crate::ir::ops::CallEffects)), and no
+    /// other memory. A call nobody described is a [`Self::Barrier`].
+    Call {
+        /// Each location the call touches, and how.
+        accesses: Vec<(MemoryLocation<T>, AccessMode)>,
+        /// The frame bytes the callee owns for the duration of the call
+        /// ([`CallLocation::Frame`]), and
+        /// how it treats them. What it does to them is this, whatever escaped
+        /// memory it reaches otherwise: no object of the caller lies where a
+        /// callee's parameters do.
+        owned: Vec<(MemoryLocation<T>, AccessMode)>,
+        /// Effect summary attached to this call.
         effects: SsaEffects,
         /// Block containing this operation.
         block: usize,
@@ -579,15 +1088,107 @@ pub enum MemoryOp<T: Target> {
 }
 
 impl<T: Target> MemoryOp<T> {
-    /// Returns the memory location accessed by this operation.
+    /// This operation as a volatile access makes it, with `effects`: a
+    /// [`Self::ReadWrite`] of its location. A volatile access may be observed
+    /// (an earlier store to its cell stays live) and may change what the cell
+    /// holds (a device register's read), so no value is forwarded through it
+    /// and it is no store a later one makes dead. A call or barrier stays as
+    /// it is.
     #[must_use]
-    pub fn location(&self) -> &MemoryLocation<T> {
+    pub fn made_volatile(self, effects: SsaEffects) -> Self {
+        match self {
+            Self::Load {
+                location,
+                block,
+                instr,
+                ..
+            }
+            | Self::Store {
+                location,
+                block,
+                instr,
+                ..
+            }
+            | Self::Read {
+                location,
+                block,
+                instr,
+            } => Self::ReadWrite {
+                location,
+                effects,
+                block,
+                instr,
+            },
+            other => other,
+        }
+    }
+
+    /// Returns the one memory location this operation accesses, or `None` for
+    /// a [`Self::Call`], which may access several ([`Self::accessed_locations`]).
+    #[must_use]
+    pub fn location(&self) -> Option<&MemoryLocation<T>> {
         match self {
             Self::Load { location, .. }
             | Self::Store { location, .. }
+            | Self::Read { location, .. }
             | Self::ReadWrite { location, .. }
-            | Self::Barrier { location, .. } => location,
+            | Self::Write { location, .. }
+            | Self::Barrier { location, .. } => Some(location),
+            Self::Call { .. } => None,
         }
+    }
+
+    /// Returns every location this operation reads or writes.
+    pub fn accessed_locations(&self) -> impl Iterator<Item = &MemoryLocation<T>> {
+        self.location()
+            .into_iter()
+            .chain(self.call_accesses().map(|(location, _)| location))
+    }
+
+    /// Returns the locations this operation may write: each one gets a new
+    /// version here, as does every location it may alias.
+    pub fn defined_locations(&self) -> impl Iterator<Item = &MemoryLocation<T>> {
+        let single = match self {
+            Self::Store { location, .. }
+            | Self::ReadWrite { location, .. }
+            | Self::Write { location, .. }
+            | Self::Barrier { location, .. } => Some(location),
+            Self::Load { .. } | Self::Read { .. } | Self::Call { .. } => None,
+        };
+        single.into_iter().chain(
+            self.call_accesses()
+                .filter(|(_, access)| access.writes())
+                .map(|(location, _)| location),
+        )
+    }
+
+    /// Returns the locations this operation may read, so that a store to any
+    /// location that may alias one of them is observed here.
+    pub fn read_locations(&self) -> impl Iterator<Item = &MemoryLocation<T>> {
+        let single = match self {
+            Self::Load { location, .. }
+            | Self::Read { location, .. }
+            | Self::ReadWrite { location, .. }
+            | Self::Barrier { location, .. } => Some(location),
+            Self::Store { .. } | Self::Write { .. } | Self::Call { .. } => None,
+        };
+        single.into_iter().chain(
+            self.call_accesses()
+                .filter(|(_, access)| access.reads())
+                .map(|(location, _)| location),
+        )
+    }
+
+    /// Returns every location a described call touches, owned bytes
+    /// included, and how; nothing for any other operation.
+    fn call_accesses(&self) -> impl Iterator<Item = &(MemoryLocation<T>, AccessMode)> {
+        let (accesses, owned) = match self {
+            Self::Call {
+                accesses, owned, ..
+            } => (accesses.as_slice(), owned.as_slice()),
+            _ => (&[][..], &[][..]),
+        };
+        accesses.iter().chain(owned)
     }
 
     /// Returns the block index containing this operation.
@@ -596,7 +1197,10 @@ impl<T: Target> MemoryOp<T> {
         match self {
             Self::Load { block, .. }
             | Self::Store { block, .. }
+            | Self::Read { block, .. }
             | Self::ReadWrite { block, .. }
+            | Self::Write { block, .. }
+            | Self::Call { block, .. }
             | Self::Barrier { block, .. } => *block,
         }
     }
@@ -607,7 +1211,10 @@ impl<T: Target> MemoryOp<T> {
         match self {
             Self::Load { instr, .. }
             | Self::Store { instr, .. }
+            | Self::Read { instr, .. }
             | Self::ReadWrite { instr, .. }
+            | Self::Write { instr, .. }
+            | Self::Call { instr, .. }
             | Self::Barrier { instr, .. } => *instr,
         }
     }
@@ -621,10 +1228,7 @@ impl<T: Target> MemoryOp<T> {
     /// Returns `true` if this operation defines a new memory version.
     #[must_use]
     pub fn defines_memory(&self) -> bool {
-        matches!(
-            self,
-            Self::Store { .. } | Self::ReadWrite { .. } | Self::Barrier { .. }
-        )
+        self.defined_locations().next().is_some()
     }
 
     /// Returns `true` if this is a load operation.
@@ -637,8 +1241,11 @@ impl<T: Target> MemoryOp<T> {
     #[must_use]
     pub fn effects(&self) -> Option<SsaEffects> {
         match self {
-            Self::ReadWrite { effects, .. } | Self::Barrier { effects, .. } => Some(*effects),
-            Self::Load { .. } | Self::Store { .. } => None,
+            Self::ReadWrite { effects, .. }
+            | Self::Write { effects, .. }
+            | Self::Barrier { effects, .. }
+            | Self::Call { effects, .. } => Some(*effects),
+            Self::Load { .. } | Self::Store { .. } | Self::Read { .. } => None,
         }
     }
 }
@@ -721,7 +1328,17 @@ impl<T: Target> MemoryVersion<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryDefSite {
     /// Defined at function entry (initial version before any stores).
+    ///
+    /// Says nothing about the contents: an earlier function may have written
+    /// the location, and a caller may have handed any value in.
     Entry,
+    /// Defined by the image: the location lies in a region the host reports
+    /// read-only, so its contents are the image's bytes and nothing the
+    /// function does changes them.
+    ///
+    /// The one version such a location has. Unlike [`Self::Entry`] it states
+    /// the contents, which is what lets a load of it fold to a constant.
+    Image,
     /// Defined by a store instruction at a specific block and instruction index.
     Store {
         /// The block containing the store.
@@ -754,56 +1371,787 @@ pub enum MemoryDefSite {
 ///
 /// The walk is an explicit-stack DFS rather than recursion, so the scope
 /// restore that recursion would get for free is modelled as its own step.
-enum RenameStep<T: Target> {
+enum RenameStep {
     /// Rename this block, then descend into its dominator-tree children.
     Enter(usize),
     /// Leaving a block's dominator subtree: pop one version for each location
-    /// listed, restoring the rename state that block's siblings must observe.
-    Exit(Vec<MemoryLocation<T>>),
+    /// listed (by interned id), restoring the rename state that block's
+    /// siblings must observe.
+    Exit(Vec<usize>),
+}
+
+/// The live version of every interned location while the dominator tree is
+/// walked: a stack per location, the top being the version that reaches the
+/// block being renamed.
+#[derive(Debug, Default)]
+struct VersionStacks {
+    /// One stack per interned location id.
+    stacks: Vec<Vec<u32>>,
+}
+
+impl VersionStacks {
+    /// Creates empty stacks for `locations` interned locations.
+    fn new(locations: usize) -> Self {
+        Self {
+            stacks: vec![Vec::new(); locations],
+        }
+    }
+
+    /// Makes `version` the live version of `location`.
+    fn push(&mut self, location: usize, version: u32) {
+        if let Some(stack) = self.stacks.get_mut(location) {
+            stack.push(version);
+        }
+    }
+
+    /// Restores the version that was live before the last [`Self::push`] of
+    /// `location`.
+    fn pop(&mut self, location: usize) {
+        if let Some(stack) = self.stacks.get_mut(location) {
+            stack.pop();
+        }
+    }
+
+    /// The version of `location` that reaches the block being renamed.
+    fn live(&self, location: usize) -> Option<u32> {
+        self.stacks.get(location)?.last().copied()
+    }
+}
+
+/// A dense table of memory versions, one cell per `(block, location)`.
+///
+/// Renaming records the version of every location at every block's entry and
+/// exit, so the table holds `blocks x locations` cells by construction. Cells
+/// are addressed by an interned location id, not by the location: the lookup
+/// is a multiply and an add, where keying a map by location hashes a ~48 byte
+/// value for every one of those cells.
+#[derive(Debug, Default)]
+struct VersionTable {
+    /// Locations per row; a row holds one block.
+    width: usize,
+    /// Row-major cells, [`Self::ABSENT`] where the location had no version.
+    cells: Vec<u32>,
+}
+
+impl VersionTable {
+    /// The cell value of a location that has no live version in the block.
+    const ABSENT: u32 = u32::MAX;
+
+    /// Creates a table with every cell absent.
+    fn new(blocks: usize, locations: usize) -> Self {
+        Self {
+            width: locations,
+            cells: vec![Self::ABSENT; blocks.saturating_mul(locations)],
+        }
+    }
+
+    /// The version `location` had in `block`, when it had one.
+    fn get(&self, block: usize, location: usize) -> Option<u32> {
+        if location >= self.width {
+            return None;
+        }
+        let cell = block.checked_mul(self.width)?.checked_add(location)?;
+        self.cells.get(cell).copied().filter(|&v| v != Self::ABSENT)
+    }
+
+    /// Records, for `block`, the live version of every location that has one.
+    fn record(&mut self, block: usize, live: &VersionStacks) {
+        let start = block.saturating_mul(self.width);
+        let Some(row) = self.cells.get_mut(start..start.saturating_add(self.width)) else {
+            return;
+        };
+        for (cell, stack) in row.iter_mut().zip(&live.stacks) {
+            if let Some(&version) = stack.last() {
+                *cell = version;
+            }
+        }
+    }
+}
+
+/// A location's new version immediately after one instruction completes.
+#[derive(Debug)]
+struct VersionWrite {
+    /// Interned location whose state changes.
+    location: usize,
+    /// Instruction making the change within its block.
+    instruction: usize,
+    /// Version defined by that instruction.
+    version: usize,
+}
+
+/// A block's instruction extent and classified memory-operation range.
+#[derive(Debug)]
+struct MemoryBlock {
+    /// One past the final instruction, also the block-exit query position.
+    instructions: usize,
+    /// Classified operations in the shared operation vector.
+    operations: Range<usize>,
 }
 
 /// Memory SSA representation.
 ///
 /// This structure tracks versioned memory locations throughout a function,
 /// enabling precise tracking of memory state for analysis.
+///
+/// Every location is interned to its index in the first-appearance order while
+/// the operations are identified. Everything keyed by location afterwards (the
+/// definitions, the live versions during renaming, the entry and exit versions)
+/// is a dense vector indexed by that id, and only the public lookups by
+/// [`MemoryLocation`] hash one, once per call.
 #[derive(Debug)]
 pub struct MemorySsa<T: Target> {
-    /// Next version number for each memory location.
-    next_version: HashMap<MemoryLocation<T>, u32>,
+    /// Memory phi nodes at each block, indexed by block.
+    memory_phis: Vec<Vec<MemoryPhi<T>>>,
 
-    /// Memory phi nodes at each block.
-    /// Key is block index, value is list of memory phi nodes.
-    memory_phis: BTreeMap<usize, Vec<MemoryPhi<T>>>,
-
-    /// Definition sites for each memory version.
-    definitions: HashMap<MemoryVersion<T>, MemoryDefSite>,
-
-    /// Memory version at block entry, keyed by `(interned location id, block)`.
+    /// The interned location id of each phi in [`Self::memory_phis`], in the
+    /// same order, so renaming never looks a phi's location up.
     ///
-    /// Keyed by an interned id rather than a cloned [`MemoryLocation`]: the map
-    /// holds up to `blocks × locations` entries, and an `Indirect` location is
-    /// ~48 bytes to clone and hash for every one of them.
-    entry_versions: HashMap<(u32, usize), u32>,
+    /// Phis are placed one location at a time in id order, at most one per
+    /// block and location, so each block's row ascends strictly and
+    /// [`Self::memory_phi`] finds a location's phi by binary search.
+    phi_locations: Vec<Vec<usize>>,
 
-    /// Memory version at block exit, keyed by `(interned location id, block)`.
-    exit_versions: HashMap<(u32, usize), u32>,
+    /// Definition site of each memory version, indexed by interned location id
+    /// and then by version number. A location's versions are numbered in the
+    /// order they are defined, so the position in its row is the number.
+    definitions: Vec<Vec<MemoryDefSite>>,
+
+    /// Memory version at block entry.
+    entry_versions: VersionTable,
+
+    /// Memory version at block exit.
+    exit_versions: VersionTable,
+
+    /// Instruction-local versions, derived only when an observation requests them.
+    write_versions: OnceLock<Vec<Vec<VersionWrite>>>,
 
     /// Interning table: location to its index in [`Self::ordered_locations`].
-    location_ids: HashMap<MemoryLocation<T>, u32>,
+    location_ids: FxHashMap<MemoryLocation<T>, usize>,
 
-    /// All identified memory operations.
+    /// All identified memory operations, in instruction order.
     operations: Vec<MemoryOp<T>>,
 
+    /// The operations and instruction extent of each block.
+    block_operations: Vec<MemoryBlock>,
+
     /// All unique memory locations in the function.
-    locations: HashSet<MemoryLocation<T>>,
+    locations: FxHashSet<MemoryLocation<T>>,
     /// The same locations in first-appearance order.
     ///
-    /// `locations` is a `HashSet`, so iterating it is nondeterministic across
-    /// runs. Version numbers and the order availability is seeded both derive
-    /// from that iteration, and the downstream similarity pipeline is
-    /// content-addressed — it requires byte-identical optimized IR. This list is
-    /// built from `operations`, which is instruction order.
+    /// `locations` is a hash set, so its iteration order follows the hasher
+    /// rather than the function. Version numbers and the order availability is
+    /// seeded both derive from this list instead, and the downstream similarity
+    /// pipeline is content-addressed - it requires byte-identical optimized IR.
+    /// This list is built from `operations`, which is instruction order.
     ordered_locations: Vec<MemoryLocation<T>>,
+
+    /// Interned ids of the locations in [`MemoryRegion::ImageReadOnly`]: never
+    /// versioned by a store or a barrier, and defined by
+    /// [`MemoryDefSite::Image`].
+    immutable: BitSet,
+
+    /// The region each interned location lies in, by its id - the same answer
+    /// [`MemoryLocation::region`] gives, kept because the invalidation half
+    /// asks it of every (candidate, defined) pair and the host's context is
+    /// not in hand there.
+    regions: Vec<MemoryRegion>,
+
+    /// The anchors of the function's own frame, when no address of it leaves
+    /// the function ([`FrameEscape`]) and some operation touches escaped
+    /// memory: its cells are then none of the memory the program let escape
+    /// ([`Self::may_alias`]).
+    private_frame: Option<FrameAnchors>,
+
+    /// The memory each interned location may touch
+    /// ([`MemoryLocation::footprint`]), by id; empty where no footprint can
+    /// set two locations apart ([`Self::footprints_may_separate`]), which
+    /// places nothing apart.
+    footprints: Vec<Footprint>,
+
+    /// The budget the build ran out of, when it did. Such a structure is empty.
+    exhaustion: Option<Exhaustion>,
+}
+
+/// Where the memory operations of one function at one pointer width read and
+/// write: each classified into the location it touches ([`Self::classify`]),
+/// the one [`MemorySsa`] versions.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryLocator<'a, T: Target> {
+    /// The function.
+    ssa: &'a SsaFunction<T>,
+    /// The target pointer width addresses are read at.
+    ptr_size: PointerSize,
+}
+
+impl<'a, T: Target> MemoryLocator<'a, T> {
+    /// Locates the memory operations of `ssa` at `ptr_size`.
+    #[must_use]
+    pub const fn new(ssa: &'a SsaFunction<T>, ptr_size: PointerSize) -> Self {
+        Self { ssa, ptr_size }
+    }
+
+    /// Classifies an SSA operation as a memory operation, if applicable.
+    ///
+    /// Public because the classification - not the versioning built on top of
+    /// it - is what a consumer needs to ask "does this operation touch memory,
+    /// and which cell". Everything whose effect is not modelled classifies to a
+    /// [`MemoryOp::Barrier`], [`MemoryOp::ReadWrite`] or [`MemoryOp::Write`] over
+    /// [`MemoryLocation::Unknown`], which may-aliases every location, so a
+    /// consumer that consults [`MemoryLocation::may_alias`] is conservative by
+    /// construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - The operation to classify.
+    /// * `block` / `instr` - Position recorded on the returned [`MemoryOp`].
+    ///
+    /// # Returns
+    ///
+    /// The classified memory operation, or `None` when the operation touches no
+    /// memory. A volatile access classifies as [`MemoryOp::made_volatile`]
+    /// makes it.
+    #[must_use]
+    pub fn classify(&self, op: &SsaOp<T>, block: usize, instr: usize) -> Option<MemoryOp<T>> {
+        let classified = if let SsaOp::Call(call) = op
+            && let Some(stated) = &call.effects
+        {
+            let args = &call.args;
+            let effects = op.effects();
+            // Its memory unknown, or running code that may touch any:
+            // the barrier every undescribed call is.
+            let Some(accesses) = stated.accesses() else {
+                return Some(MemoryOp::Barrier {
+                    location: MemoryLocation::Unknown,
+                    effects,
+                    block,
+                    instr,
+                });
+            };
+            if accesses.is_empty() {
+                return None;
+            }
+            let (owned, accesses) = accesses.iter().partition::<Vec<_>, _>(|access| {
+                matches!(access.location, CallLocation::Frame { .. })
+            });
+            let located = |accesses: Vec<&CallAccess<T>>| {
+                accesses
+                    .into_iter()
+                    .map(|access| (self.call_location(access, args), access.access))
+                    .collect()
+            };
+            Some(MemoryOp::Call {
+                accesses: located(accesses),
+                owned: located(owned),
+                effects,
+                block,
+                instr,
+            })
+        } else {
+            match op {
+                SsaOp::LoadField {
+                    dest,
+                    object,
+                    field,
+                    ..
+                } => {
+                    let location = MemoryLocation::InstanceField(*object, field.clone());
+                    Some(MemoryOp::Load {
+                        location,
+                        dest: *dest,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::StoreField {
+                    object,
+                    field,
+                    value,
+                    ..
+                } => {
+                    let location = MemoryLocation::InstanceField(*object, field.clone());
+                    Some(MemoryOp::Store {
+                        location,
+                        value: *value,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::LoadStaticField { dest, field, .. } => {
+                    let location = MemoryLocation::StaticField(field.clone());
+                    Some(MemoryOp::Load {
+                        location,
+                        dest: *dest,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::StoreStaticField { field, value, .. } => {
+                    let location = MemoryLocation::StaticField(field.clone());
+                    Some(MemoryOp::Store {
+                        location,
+                        value: *value,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::LoadElement {
+                    dest, array, index, ..
+                } => {
+                    let idx = self.resolve_array_index(*index);
+                    let location = MemoryLocation::ArrayElement(*array, idx);
+                    Some(MemoryOp::Load {
+                        location,
+                        dest: *dest,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::StoreElement {
+                    array,
+                    index,
+                    value,
+                    ..
+                } => {
+                    let idx = self.resolve_array_index(*index);
+                    let location = MemoryLocation::ArrayElement(*array, idx);
+                    Some(MemoryOp::Store {
+                        location,
+                        value: *value,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::LoadIndirect {
+                    dest,
+                    addr,
+                    value_type,
+                    access: space,
+                } => {
+                    let location = self.indirect_location(*addr, value_type, space.address_space);
+                    Some(MemoryOp::Load {
+                        location,
+                        dest: *dest,
+                        block,
+                        instr,
+                    })
+                }
+                SsaOp::StoreIndirect {
+                    addr,
+                    value,
+                    value_type,
+                    access: space,
+                } => {
+                    let location = self.indirect_location(*addr, value_type, space.address_space);
+                    Some(MemoryOp::Store {
+                        location,
+                        value: *value,
+                        block,
+                        instr,
+                    })
+                }
+                // A whole vector moves as a value of its type does.
+                SsaOp::VectorLoad {
+                    dest,
+                    addr,
+                    vector_type,
+                    access: space,
+                } => Some(MemoryOp::Load {
+                    location: self.indirect_location(*addr, vector_type, space.address_space),
+                    dest: *dest,
+                    block,
+                    instr,
+                }),
+                SsaOp::VectorStore {
+                    addr,
+                    value,
+                    vector_type,
+                    access: space,
+                } => Some(MemoryOp::Store {
+                    location: self.indirect_location(*addr, vector_type, space.address_space),
+                    value: *value,
+                    block,
+                    instr,
+                }),
+                // The bytes a vector read computes its lanes from, and a vector
+                // write that writes them in a layout of its own or only where its
+                // mask says.
+                SsaOp::VectorBroadcastLoad {
+                    addr,
+                    vector_type,
+                    access: space,
+                    ..
+                } => Some(MemoryOp::Read {
+                    location: self.indirect_extent(
+                        *addr,
+                        T::vector_shape(vector_type).map(|shape| shape.lane_bits),
+                        space.address_space,
+                    ),
+                    block,
+                    instr,
+                }),
+                // One segment is the vector it loads.
+                SsaOp::VectorSegmentLoad {
+                    dests,
+                    base,
+                    mask: None,
+                    vector_type,
+                    segments: 1,
+                    access: space,
+                    ..
+                } if dests.len() == 1 => Some(MemoryOp::Load {
+                    location: self.indirect_location(*base, vector_type, space.address_space),
+                    dest: dests.first().copied()?,
+                    block,
+                    instr,
+                }),
+                SsaOp::VectorSegmentLoad {
+                    base,
+                    vector_type,
+                    segments,
+                    access: space,
+                    ..
+                } => Some(MemoryOp::Read {
+                    location: self.indirect_extent(
+                        *base,
+                        T::bit_width(vector_type).and_then(|bits| bits.checked_mul(*segments)),
+                        space.address_space,
+                    ),
+                    block,
+                    instr,
+                }),
+                // A masked read, and an expanding one, which reads the elements
+                // its mask enables one after another, read within the vector's
+                // extent at the address.
+                SsaOp::VectorMaskedLoad {
+                    addr,
+                    vector_type,
+                    access: space,
+                    ..
+                }
+                | SsaOp::VectorPackLoad {
+                    addr,
+                    vector_type,
+                    access: space,
+                    ..
+                } => Some(MemoryOp::Read {
+                    location: self.indirect_location(*addr, vector_type, space.address_space),
+                    block,
+                    instr,
+                }),
+                // One segment is the vector it stores.
+                SsaOp::VectorSegmentStore {
+                    base,
+                    values,
+                    mask: None,
+                    vector_type,
+                    segments: 1,
+                    access: space,
+                    ..
+                } if values.len() == 1 => Some(MemoryOp::Store {
+                    location: self.indirect_location(*base, vector_type, space.address_space),
+                    value: values.first().copied()?,
+                    block,
+                    instr,
+                }),
+                SsaOp::VectorSegmentStore {
+                    base,
+                    vector_type,
+                    segments,
+                    access: space,
+                    ..
+                } => Some(MemoryOp::ReadWrite {
+                    location: self.indirect_extent(
+                        *base,
+                        T::bit_width(vector_type).and_then(|bits| bits.checked_mul(*segments)),
+                        space.address_space,
+                    ),
+                    effects: op.effects(),
+                    block,
+                    instr,
+                }),
+                // So do a masked write and a compressing one.
+                SsaOp::VectorMaskedStore {
+                    addr,
+                    vector_type,
+                    access: space,
+                    ..
+                }
+                | SsaOp::VectorPackStore {
+                    addr,
+                    vector_type,
+                    access: space,
+                    ..
+                } => Some(MemoryOp::ReadWrite {
+                    location: self.indirect_location(*addr, vector_type, space.address_space),
+                    effects: op.effects(),
+                    block,
+                    instr,
+                }),
+                // A cache operation on one line reads the line its address names,
+                // or writes it where it zeroes or discards the line: the bytes at
+                // and around the address, in a size the implementation fixes and
+                // no operand states. A width left unknown overlaps every access
+                // through the same base, below the address as well as above it.
+                // Read as memory nothing can place, `clflush [rdi+32]` kept every
+                // register save of its function alive.
+                SsaOp::SystemOp(data)
+                    if matches!(
+                        data.kind,
+                        SystemOpKind::CacheMaintenance(line) if line.names_a_line()
+                    ) && !data.inputs.is_empty() =>
+                {
+                    let effects = op.effects();
+                    let address = data.inputs.first().copied()?;
+                    let location = self.indirect_extent(address, None, None);
+                    Some(match effects.kind {
+                        SsaEffectKind::Read => MemoryOp::Read {
+                            location,
+                            block,
+                            instr,
+                        },
+                        _ => MemoryOp::ReadWrite {
+                            location,
+                            effects,
+                            block,
+                            instr,
+                        },
+                    })
+                }
+                // A move to or from a register the machine holds reads no memory.
+                // One that writes the register may decide what memory holds at an
+                // address (a translation base), which is a write nothing places:
+                // `msr basepri, r3` read as a read of every cell kept each register
+                // save of a Cortex-M critical section alive.
+                SsaOp::SystemOp(data)
+                    if matches!(
+                        data.kind,
+                        SystemOpKind::ControlRegister(register) if !register.moves_memory()
+                    ) =>
+                {
+                    let effects = op.effects();
+                    match effects.kind {
+                        SsaEffectKind::Write | SsaEffectKind::ReadWrite => Some(MemoryOp::Write {
+                            location: MemoryLocation::Unknown,
+                            effects,
+                            block,
+                            instr,
+                        }),
+                        _ => None,
+                    }
+                }
+                _ => {
+                    let effects = op.effects();
+                    match effects.kind {
+                        SsaEffectKind::ReadWrite | SsaEffectKind::Atomic => {
+                            Some(MemoryOp::ReadWrite {
+                                location: MemoryLocation::Unknown,
+                                effects,
+                                block,
+                                instr,
+                            })
+                        }
+                        SsaEffectKind::Fence | SsaEffectKind::Call if !effects.is_pure() => {
+                            Some(MemoryOp::Barrier {
+                                location: MemoryLocation::Unknown,
+                                effects,
+                                block,
+                                instr,
+                            })
+                        }
+                        SsaEffectKind::Opaque
+                            if !effects.is_pure()
+                                && !matches!(effects.memory, MemoryEffectLocation::None) =>
+                        {
+                            Some(MemoryOp::Barrier {
+                                location: MemoryLocation::Unknown,
+                                effects,
+                                block,
+                                instr,
+                            })
+                        }
+                        // A read without a result (a cache clean or flush) still
+                        // observes the memory it reads.
+                        SsaEffectKind::Read => Some(op.dest().map_or(
+                            MemoryOp::Read {
+                                location: MemoryLocation::Unknown,
+                                block,
+                                instr,
+                            },
+                            |dest| MemoryOp::Load {
+                                location: MemoryLocation::Unknown,
+                                dest,
+                                block,
+                                instr,
+                            },
+                        )),
+                        SsaEffectKind::Write => Some(MemoryOp::Write {
+                            location: MemoryLocation::Unknown,
+                            effects,
+                            block,
+                            instr,
+                        }),
+                        SsaEffectKind::Pure
+                        | SsaEffectKind::RuntimeDefined
+                        | SsaEffectKind::Fence
+                        | SsaEffectKind::Call
+                        | SsaEffectKind::Opaque => None,
+                    }
+                }
+            }
+        };
+        if op.is_volatile() {
+            classified.map(|classified| classified.made_volatile(op.effects()))
+        } else {
+            classified
+        }
+    }
+
+    /// The memory location a call's stated access names.
+    ///
+    /// A named field is that static field; escaped memory is
+    /// [`MemoryLocation::Escaped`]; frame bytes are the cells an access through
+    /// the entry stack pointer names; memory an argument points to is what that
+    /// address names, as a load or store through it would see it
+    /// ([`MemoryLocator::pointee_location`]).
+    fn call_location(&self, access: &CallAccess<T>, args: &[SsaVarId]) -> MemoryLocation<T> {
+        match &access.location {
+            CallLocation::Field(field) => MemoryLocation::StaticField(field.clone()),
+            CallLocation::Escaped => MemoryLocation::Escaped,
+            // The bytes an indirect access through the value they are measured
+            // from would name at that offset: the entry stack pointer, or the
+            // one alignment's result. With neither to measure from, no frame is
+            // placed and they may be anywhere.
+            CallLocation::Frame {
+                origin,
+                offset,
+                bytes,
+            } => self
+                .ssa
+                .entry_stack_pointer()
+                .and_then(|entry| match origin {
+                    FrameOrigin::Entry => Some(entry),
+                    FrameOrigin::Alignment => AddressWalk::new(self.ssa, self.ptr_size)
+                        .frame_anchor(entry)
+                        .map(|(anchor, _)| anchor),
+                })
+                .zip(offset.checked_mul(8))
+                .zip(
+                    bytes
+                        .checked_mul(8)
+                        .and_then(|bits| u32::try_from(bits).ok()),
+                )
+                .map_or(
+                    MemoryLocation::Unknown,
+                    |((base, offset_bits), size_bits)| {
+                        MemoryLocation::Indirect(IndirectLocation::new(
+                            base,
+                            None,
+                            0,
+                            offset_bits,
+                            Some(size_bits),
+                            None,
+                            self.ptr_size,
+                        ))
+                    },
+                ),
+            CallLocation::Pointee { extent, .. } => {
+                access
+                    .pointer_argument(args)
+                    .map_or(MemoryLocation::Unknown, |addr| {
+                        let extent = extent.at_call(args, |count| self.ssa.const_u64(count));
+                        self.pointee_location(addr, extent)
+                    })
+            }
+        }
+    }
+
+    /// The memory an address names, `extent` wide.
+    ///
+    /// An address taken of a field names that field: a by-reference argument
+    /// built with `LoadStaticFieldAddr` is the static field itself. Any other
+    /// address is decoded as an indirect access through it would be, with the
+    /// extent's width when it states one and no width - overlapping whatever
+    /// lies from the address on - when it does not.
+    fn pointee_location(&self, addr: SsaVarId, extent: PointeeExtent) -> MemoryLocation<T> {
+        match self.ssa.get_definition(addr) {
+            Some(SsaOp::LoadStaticFieldAddr { field, .. }) => {
+                return MemoryLocation::StaticField(field.clone());
+            }
+            Some(SsaOp::LoadFieldAddr { object, field, .. }) => {
+                return MemoryLocation::InstanceField(*object, field.clone());
+            }
+            _ => {}
+        }
+        let size_bits = match extent {
+            PointeeExtent::Bytes(bytes) => bytes
+                .checked_mul(8)
+                .and_then(|bits| u32::try_from(bits).ok()),
+            PointeeExtent::InArgument(_) | PointeeExtent::Unbounded => None,
+        };
+        let address = AddressWalk::new(self.ssa, self.ptr_size).normalize(addr);
+        MemoryLocation::Indirect(IndirectLocation::new(
+            address.base,
+            address.index,
+            address.stride_bytes,
+            address.offset_bits,
+            size_bits,
+            None,
+            self.ptr_size,
+        ))
+    }
+
+    /// Decodes an indirect access into an offset-aware memory location.
+    ///
+    /// The address is normalized to `base + index*stride + offset` rather than
+    /// keyed on `addr` itself, so the resulting cell identity survives the
+    /// address computation being re-numbered or hoisted. See
+    /// [`IndirectLocation`].
+    fn indirect_location(
+        &self,
+        addr: SsaVarId,
+        value_type: &T::Type,
+        address_space: Option<NonZeroU16>,
+    ) -> MemoryLocation<T> {
+        let address = AddressWalk::new(self.ssa, self.ptr_size).normalize(addr);
+        MemoryLocation::Indirect(IndirectLocation::new(
+            address.base,
+            address.index,
+            address.stride_bytes,
+            address.offset_bits,
+            T::bit_width(value_type),
+            address_space,
+            self.ptr_size,
+        ))
+    }
+
+    /// The `bits` from `addr` in `address_space`: the extent a vector access
+    /// touches, whatever value its lanes make of it.
+    fn indirect_extent(
+        &self,
+        addr: SsaVarId,
+        bits: Option<u32>,
+        address_space: Option<NonZeroU16>,
+    ) -> MemoryLocation<T> {
+        let address = AddressWalk::new(self.ssa, self.ptr_size).normalize(addr);
+        MemoryLocation::Indirect(IndirectLocation::new(
+            address.base,
+            address.index,
+            address.stride_bytes,
+            address.offset_bits,
+            bits,
+            address_space,
+            self.ptr_size,
+        ))
+    }
+
+    /// Resolves an array index to an [`ArrayIndex`] abstraction, folding a
+    /// constant index so that distinct constant elements stop may-aliasing.
+    fn resolve_array_index(&self, index_var: SsaVarId) -> ArrayIndex {
+        match self.ssa.const_i64(index_var) {
+            Some(index) => ArrayIndex::Constant(index),
+            None => ArrayIndex::Variable(index_var),
+        }
+    }
 }
 
 impl<T: Target> MemorySsa<T> {
@@ -811,41 +2159,80 @@ impl<T: Target> MemorySsa<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            next_version: HashMap::new(),
-            memory_phis: BTreeMap::new(),
-            definitions: HashMap::new(),
-            entry_versions: HashMap::new(),
-            exit_versions: HashMap::new(),
-            location_ids: HashMap::new(),
+            memory_phis: Vec::new(),
+            phi_locations: Vec::new(),
+            definitions: Vec::new(),
+            entry_versions: VersionTable::default(),
+            exit_versions: VersionTable::default(),
+            write_versions: OnceLock::new(),
+            location_ids: FxHashMap::default(),
             operations: Vec::new(),
-            locations: HashSet::new(),
+            block_operations: Vec::new(),
+            locations: FxHashSet::default(),
             ordered_locations: Vec::new(),
+            immutable: BitSet::new(0),
+            regions: Vec::new(),
+            private_frame: None,
+            footprints: Vec::new(),
+            exhaustion: None,
         }
     }
 
-    /// Builds Memory SSA from an SSA function.
+    /// Builds Memory SSA from an SSA function, with the host's facts: its
+    /// pointer width, which canonicalises folded address displacements; its
+    /// image, which places locations in their [`MemoryRegion`]; and its work
+    /// budget.
     ///
-    /// This performs the full Memory SSA construction:
-    /// 1. Identify all memory operations
-    /// 2. Place memory phi nodes at dominance frontiers
-    /// 3. Rename memory versions using dominator tree traversal
+    /// This performs the full Memory SSA construction: it identifies every
+    /// memory operation, places memory phi nodes at dominance frontiers, and
+    /// renames memory versions by a dominator tree traversal. Address
+    /// arithmetic wraps at the pointer width, and the model cannot tell a
+    /// sign-extended `-8` from a zero-extended `0xFFFF_FFF8` without it
+    /// ([`AddressWalk::normalize`](crate::analysis::address::AddressWalk::normalize)).
+    ///
+    /// A location in [`MemoryRegion::ImageReadOnly`] is never versioned by a
+    /// store or a barrier and its one version is [`MemoryDefSite::Image`] (see
+    /// the module documentation). Past the
+    /// [`MemorySsaCells`](Budget::MemorySsaCells) budget for block/location cells
+    /// plus may-alias instruction definitions, the structure is empty
+    /// and records the [`Exhaustion`]: every alias query then falls back to the
+    /// conservative answer and a consumer finds nothing to do.
     ///
     /// # Arguments
     ///
     /// * `ssa` - The SSA function to analyze.
-    /// * `cfg` - The control flow graph of the function.
-    /// * `ptr_size` - Target pointer width, used to canonicalise folded address
-    ///   displacements. Address arithmetic wraps at this width, and the model
-    ///   cannot tell a sign-extended `-8` from a zero-extended `0xFFFF_FFF8`
-    ///   without it — see
-    ///   [`normalize_address`].
+    /// * `context` - The host's machine, image and budget.
     ///
     /// # Returns
     ///
-    /// A complete Memory SSA representation.
+    /// A complete Memory SSA representation, or an empty one that says why.
     #[must_use]
-    pub fn build(ssa: &SsaFunction<T>, ptr_size: PointerSize) -> Self {
-        let eh = EhCfg::from_ssa(ssa);
+    pub fn build(ssa: &SsaFunction<T>, context: &AnalysisContext<'_>) -> Self {
+        let eh = SsaCfg::from_ssa(ssa);
+        Self::build_with_cfg(&eh, context, None, || {
+            pointsto::analyze_function(ssa, context.budget(), context.models())
+        })
+    }
+
+    /// Builds canonical memory state while reusing the caller's CFG and optional dominance.
+    ///
+    /// The function is borrowed from the CFG, so its block coordinates cannot
+    /// name a different body. Ordinary construction computes dominance only
+    /// after checking the configured retained-cell limit. Dependency analysis
+    /// supplies its existing tree.
+    ///
+    /// `points_to` gives the function's points-to relation under `context`,
+    /// asked only where a footprint can set two locations apart: solved for
+    /// the build, or the one a function's analyses hold
+    /// ([`FunctionAnalyses::memory_ssa`](crate::analysis::cache::FunctionAnalyses::memory_ssa)).
+    pub fn build_with_cfg<R: Borrow<PointsTo>>(
+        eh: &SsaCfg<'_, T>,
+        context: &AnalysisContext<'_>,
+        dominators: Option<&DominatorTree>,
+        points_to: impl FnOnce() -> R,
+    ) -> Self {
+        let ssa = eh.ssa();
+        let ptr_size = context.machine().ptr_size;
         let mut mem_ssa = Self::new();
 
         // Phase 1: Identify all memory operations
@@ -857,37 +2244,224 @@ impl<T: Target> MemorySsa<T> {
         // location per distinct `base + offset`, so the location count scales
         // with the block count and the product is quadratic.
         //
-        // Past the budget, drop the analysis rather than the process: an empty
-        // `MemorySsa` reports no locations, every alias query falls back to the
-        // conservative answer, and the memory pass simply finds nothing to do.
-        let budget = MAX_MEMORY_SSA_CELLS;
+        // Past the budget, drop the analysis rather than the process.
         let cells = mem_ssa
             .ordered_locations
             .len()
             .saturating_mul(ssa.block_count());
-        if cells > budget {
-            log::warn!(
-                "memory SSA exceeded its size budget ({} locations x {} blocks = {cells} cells, \
-                 bound {budget}); skipping memory analysis for this function",
+        if let Some(exhaustion) = context.budget().check(Budget::MemorySsaCells, cells) {
+            warn!(
+                "memory SSA exceeded its size budget ({} locations x {} blocks); {exhaustion}; \
+                 skipping memory analysis for this function",
                 mem_ssa.ordered_locations.len(),
                 ssa.block_count(),
             );
-            return Self::new();
+            return Self::refused(exhaustion);
+        }
+
+        // No location needs versioning or a dominance frontier.
+        if mem_ssa.ordered_locations.is_empty() {
+            return mem_ssa;
+        }
+
+        // Which locations the image says nothing can write.
+        let entry_stack_pointer = ssa.entry_stack_pointer();
+        let mut immutable = BitSet::new(mem_ssa.ordered_locations.len());
+        let mut regions = Vec::with_capacity(mem_ssa.ordered_locations.len());
+        for (id, location) in mem_ssa.ordered_locations.iter().enumerate() {
+            let region = location.region(context, entry_stack_pointer);
+            if region == MemoryRegion::ImageReadOnly {
+                immutable.insert_checked(id);
+            }
+            regions.push(region);
+        }
+        mem_ssa.immutable = immutable;
+        mem_ssa.regions = regions;
+        // What each location may touch, where a footprint can set two apart:
+        // the relation is over the function's values, its objects' bytes and
+        // what escapes, with the host's call models.
+        if mem_ssa.footprints_may_separate() {
+            let relation = points_to();
+            mem_ssa.footprints = mem_ssa
+                .ordered_locations
+                .iter()
+                .map(|location| location.footprint(relation.borrow(), context.image()))
+                .collect();
+        }
+        // Escaped memory leaves out the frame's own cells while no address of
+        // the frame leaves; worked out only where something touches it.
+        let touches_escaped = mem_ssa.operations.iter().any(|operation| {
+            operation
+                .defined_locations()
+                .chain(operation.read_locations())
+                .any(|location| matches!(location, MemoryLocation::Escaped))
+        });
+        mem_ssa.private_frame = entry_stack_pointer
+            .filter(|_| touches_escaped)
+            .filter(|&pointer| !FrameEscape::of(ssa, pointer).escapes())
+            .map(|pointer| FrameAnchors::of(ssa, pointer, ptr_size));
+
+        // Both phases walk the same dominator tree, and both version what each
+        // defining operation clobbers, which is asked of every location once.
+        let computed_dominators;
+        let dom_tree = match dominators {
+            Some(tree) => tree,
+            None => {
+                computed_dominators = compute_dominators(eh, eh.entry());
+                &computed_dominators
+            }
+        };
+        // Admit each changed-location cell before retaining it. Both temporary
+        // clobber lists and canonical definitions obey the combined allowance;
+        // a rejected long block must not first allocate its complete write set.
+        let mut clobbers: Vec<Rc<[usize]>> = Vec::with_capacity(mem_ssa.operations.len());
+        let mut demand = cells;
+        // Operations defining the same locations clobber the same ones: each
+        // such set is worked out once, and held once.
+        let mut shared: FxHashMap<Vec<usize>, Rc<[usize]>> = FxHashMap::default();
+        let none: Rc<[usize]> = Rc::from(Vec::new());
+        for operation in &mem_ssa.operations {
+            if !operation.defines_memory() {
+                clobbers.push(Rc::clone(&none));
+                continue;
+            }
+            let defined: Vec<usize> = operation
+                .defined_locations()
+                .filter_map(|location| mem_ssa.location_ids.get(location).copied())
+                .collect();
+            let row = match shared.get(&defined) {
+                Some(row) => Rc::clone(row),
+                None => {
+                    let row: Rc<[usize]> =
+                        Rc::from(mem_ssa.clobbered_by(operation).collect::<Vec<usize>>());
+                    shared.insert(defined, Rc::clone(&row));
+                    row
+                }
+            };
+            let Some(next) = demand.checked_add(row.len()) else {
+                return Self::refused(Exhaustion {
+                    budget: Budget::MemorySsaCells,
+                    limit: context.budget().limit(Budget::MemorySsaCells),
+                    demand: usize::MAX,
+                });
+            };
+            if let Some(exhaustion) = context.budget().check(Budget::MemorySsaCells, next) {
+                warn!(
+                    "memory SSA exceeded its definition budget; {exhaustion}; skipping memory analysis for this function"
+                );
+                return Self::refused(exhaustion);
+            }
+            demand = next;
+            clobbers.push(row);
         }
 
         // Phase 2: Place memory phi nodes
-        mem_ssa.place_memory_phis(&eh);
+        mem_ssa.place_memory_phis(eh, dom_tree, &clobbers);
 
         // Phase 3: Rename memory versions
-        mem_ssa.rename_memory_versions(ssa, &eh, ptr_size);
+        mem_ssa.rename_memory_versions(eh, dom_tree, &clobbers);
 
         mem_ssa
+    }
+
+    /// Withholds partial structures when the configured cell limit or index range is exceeded.
+    fn refused(exhaustion: Exhaustion) -> Self {
+        let mut empty = Self::new();
+        empty.exhaustion = Some(exhaustion);
+        empty
+    }
+
+    /// Returns whether an access to `one` may touch `other`: whether the two
+    /// may alias ([`MemoryLocation::may_alias`]), except that escaped memory
+    /// is no cell of the function's own frame ([`FrameAnchors::cell`]) where
+    /// no address of that frame leaves the function ([`FrameEscape`]), and
+    /// that two locations whose footprints do not overlap
+    /// ([`Footprint::overlaps`]) touch no byte in common: a pointer into one
+    /// object against one into another, or memory the function lets go of
+    /// against a frame cell below its least escaped local.
+    ///
+    /// A call that states it reaches escaped memory touches what it was
+    /// handed and what the program let escape, and carries its stack
+    /// arguments as operands: a spill kept across it in a frame whose
+    /// address it never saw holds what was stored there.
+    ///
+    /// # Arguments
+    ///
+    /// * `one` - One accessed location.
+    /// * `other` - The other.
+    #[must_use]
+    pub fn may_alias(&self, one: &MemoryLocation<T>, other: &MemoryLocation<T>) -> bool {
+        self.may_alias_interned(
+            one,
+            self.location_ids.get(one).copied(),
+            other,
+            self.location_ids.get(other).copied(),
+        )
+    }
+
+    /// [`Self::may_alias`] of two locations whose interned ids, where they
+    /// have one, are `one_id` and `other_id`.
+    fn may_alias_interned(
+        &self,
+        one: &MemoryLocation<T>,
+        one_id: Option<usize>,
+        other: &MemoryLocation<T>,
+        other_id: Option<usize>,
+    ) -> bool {
+        let own = |location: &MemoryLocation<T>| {
+            self.private_frame
+                .as_ref()
+                .is_some_and(|anchors| anchors.cell(location).is_some())
+        };
+        let placed = |id: Option<usize>| id.and_then(|id| self.footprints.get(id));
+        one.may_alias(other)
+            && !(matches!(one, MemoryLocation::Escaped) && own(other))
+            && !(matches!(other, MemoryLocation::Escaped) && own(one))
+            && placed(one_id)
+                .zip(placed(other_id))
+                .is_none_or(|(one, other)| one.overlaps(other))
+    }
+
+    /// Returns `true` when `location` lies in read-only image data: its
+    /// contents are the image's bytes wherever the function reads them.
+    #[must_use]
+    pub fn is_immutable(&self, location: &MemoryLocation<T>) -> bool {
+        self.location_ids
+            .get(location)
+            .is_some_and(|&id| self.is_immutable_id(id))
+    }
+
+    /// Tests a canonical interned cell without hashing host metadata again.
+    pub fn is_immutable_id(&self, id: usize) -> bool {
+        self.immutable.contains_checked(id)
+    }
+
+    /// Returns the budget the build ran out of, when it did.
+    #[must_use]
+    pub const fn exhaustion(&self) -> Option<Exhaustion> {
+        self.exhaustion
     }
 
     /// Returns the memory phi nodes at a block.
     #[must_use]
     pub fn memory_phis(&self, block: usize) -> &[MemoryPhi<T>] {
-        self.memory_phis.get(&block).map_or(&[], Vec::as_slice)
+        self.memory_phis.get(block).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the memory phi that merges the location interned as `location`
+    /// at `block`, if the block merges it.
+    ///
+    /// The phi a [`MemoryDefSite::Phi`] names, found without hashing a
+    /// location: a walk back through a cell's merges asks this once per phi it
+    /// passes.
+    #[must_use]
+    pub fn memory_phi(&self, block: usize, location: usize) -> Option<&MemoryPhi<T>> {
+        let at = self
+            .phi_locations
+            .get(block)?
+            .binary_search(&location)
+            .ok()?;
+        self.memory_phis.get(block)?.get(at)
     }
 
     /// Returns all memory operations.
@@ -898,341 +2472,491 @@ impl<T: Target> MemorySsa<T> {
 
     /// Returns all unique memory locations.
     #[must_use]
-    pub fn locations(&self) -> &HashSet<MemoryLocation<T>> {
+    pub fn locations(&self) -> &FxHashSet<MemoryLocation<T>> {
         &self.locations
     }
 
     /// Returns the memory version at block entry for a location.
+    ///
+    /// The version every instruction in the block before the first write to the
+    /// location reads. Where the block merges the location, that is its memory
+    /// phi's version: the phi defines it at the block's entry.
     #[must_use]
     pub fn version_at_entry(&self, location: &MemoryLocation<T>, block: usize) -> Option<u32> {
         let id = *self.location_ids.get(location)?;
-        self.entry_versions.get(&(id, block)).copied()
+        self.entry_versions.get(block, id)
     }
 
     /// Returns the memory version at block exit for a location.
     #[must_use]
     pub fn version_at_exit(&self, location: &MemoryLocation<T>, block: usize) -> Option<u32> {
         let id = *self.location_ids.get(location)?;
-        self.exit_versions.get(&(id, block)).copied()
+        self.exit_versions.get(block, id)
+    }
+
+    /// Returns the version reaching a position immediately before an instruction.
+    ///
+    /// The instruction at `instruction` has not executed. A position equal to
+    /// the block's instruction count denotes its normal exit. Earlier
+    /// may-alias stores, calls and barriers contribute their versions, and
+    /// block-entry phis and exception-entry unknowns retain their identities.
+    /// The first interior mutable-state query derives a bounded index from
+    /// existing definitions in one linear pass. Later queries allocate nothing
+    /// and binary-search a location/position row. Entry and exit use the
+    /// canonical boundary tables directly. A cell unchanged within its block
+    /// uses the entry version, including read-only image cells. Block-boundary
+    /// consumers build no such index.
+    ///
+    /// # Arguments
+    ///
+    /// * `location` - The memory cell whose state is requested.
+    /// * `block` - The block containing the observation.
+    /// * `instruction` - The position before which state is observed.
+    ///
+    /// # Returns
+    ///
+    /// The reaching version, or `None` for an unknown cell, unreachable block,
+    /// invalid position, unrepresentable version or exhausted analysis. A
+    /// version identifies state; it does not prove that the state's bytes are known.
+    #[must_use]
+    pub fn version_before(
+        &self,
+        location: &MemoryLocation<T>,
+        block: usize,
+        instruction: usize,
+    ) -> Option<u32> {
+        let id = self.location_ids.get(location).copied()?;
+        self.version_before_id(id, block, instruction)
+    }
+
+    /// Queries one canonical cell by its analysis-local identity.
+    ///
+    /// Entry and exit boundaries use the canonical tables. Interior queries
+    /// initialize a shared instruction-point index on first use.
+    pub fn version_before_id(&self, id: usize, block: usize, instruction: usize) -> Option<u32> {
+        let row = self.block_operations.get(block)?;
+        if instruction > row.instructions {
+            return None;
+        }
+        let entry = self.entry_versions.get(block, id)?;
+        let exit = self.exit_versions.get(block, id);
+        if instruction == 0 || exit == Some(entry) {
+            return Some(entry);
+        }
+        if instruction == row.instructions {
+            return exit;
+        }
+        let writes = self.instruction_versions().get(block)?;
+        let mut low = 0usize;
+        let mut high = writes.len();
+        while low < high {
+            let middle = low.saturating_add(high.saturating_sub(low) / 2);
+            let write = writes.get(middle)?;
+            if (write.location, write.instruction) < (id, instruction) {
+                low = middle.saturating_add(1);
+            } else {
+                high = middle;
+            }
+        }
+        if let Some(write) = low.checked_sub(1).and_then(|last| writes.get(last))
+            && write.location == id
+        {
+            return u32::try_from(write.version).ok();
+        }
+        Some(entry)
+    }
+
+    /// Indexes writes by location and instruction position on first use.
+    ///
+    /// Existing definition order already sorts each block's writes. The index
+    /// borrows the same immutable body and needs no second memory representation.
+    fn instruction_versions(&self) -> &[Vec<VersionWrite>] {
+        if let Some(index) = self.write_versions.get() {
+            return index;
+        }
+        let mut blocks: Vec<Vec<VersionWrite>> = (0..self.block_operations.len())
+            .map(|_| Vec::new())
+            .collect();
+        for (location, definitions) in self.definitions.iter().enumerate() {
+            for (version, definition) in definitions.iter().enumerate() {
+                if let MemoryDefSite::Store { block, instr } = definition
+                    && let Some(writes) = blocks.get_mut(*block)
+                {
+                    writes.push(VersionWrite {
+                        location,
+                        instruction: *instr,
+                        version,
+                    });
+                }
+            }
+        }
+
+        self.write_versions.get_or_init(|| blocks)
+    }
+
+    /// Returns every location with the definition site of the version that
+    /// enters `block`, in the order the locations first appear in the function.
+    ///
+    /// The batch form of [`Self::version_at_entry`] followed by
+    /// [`Self::definition`] for each location: it never hashes a location. A
+    /// location with no version at the block's entry, as in a block the
+    /// function's entry does not reach, is left out.
+    pub fn entry_definitions(
+        &self,
+        block: usize,
+    ) -> impl Iterator<Item = (&MemoryLocation<T>, MemoryDefSite)> {
+        self.ordered_locations
+            .iter()
+            .enumerate()
+            .filter_map(move |(id, location)| {
+                let version = self.entry_versions.get(block, id)?;
+                Some((location, self.defined_at(id, version)?))
+            })
     }
 
     /// Returns the definition site for a memory version.
     #[must_use]
     pub fn definition(&self, version: &MemoryVersion<T>) -> Option<MemoryDefSite> {
-        self.definitions.get(version).copied()
+        self.definition_of(&version.location, version.version)
     }
 
-    /// Returns the next version number for a location (and increments it).
-    fn allocate_version(&mut self, location: &MemoryLocation<T>) -> u32 {
-        let version = self.next_version.entry(location.clone()).or_insert(0);
-        let result = *version;
-        *version = version.saturating_add(1);
-        result
+    /// Returns the definition of a borrowed cell's analysis-local version.
+    ///
+    /// Avoids cloning target field metadata when walking memory dependencies.
+    #[must_use]
+    pub fn definition_of(
+        &self,
+        location: &MemoryLocation<T>,
+        version: u32,
+    ) -> Option<MemoryDefSite> {
+        self.defined_at(*self.location_ids.get(location)?, version)
+    }
+
+    /// Returns the canonical classified memory operation at an instruction.
+    ///
+    /// Uses block-local binary search. Unclassified instructions and invalid
+    /// positions return `None`.
+    #[must_use]
+    pub fn operation_at(&self, block: usize, instruction: usize) -> Option<&MemoryOp<T>> {
+        let row = self
+            .operations
+            .get(self.block_operations.get(block)?.operations.clone())?;
+        let index = row
+            .binary_search_by_key(&instruction, MemoryOp::instr)
+            .ok()?;
+        row.get(index)
+    }
+
+    /// Resolves a borrowed cell to this analysis's interned identity.
+    pub fn location_id(&self, location: &MemoryLocation<T>) -> Option<usize> {
+        self.location_ids.get(location).copied()
+    }
+
+    /// Borrows a canonical cell without copying host metadata.
+    pub fn location_by_id(&self, id: usize) -> Option<&MemoryLocation<T>> {
+        self.ordered_locations.get(id)
+    }
+
+    /// The values the load at `instruction` of `block` of `ssa` may read:
+    /// what each store to its location that may reach it wrote, through the
+    /// memory phis that merge them, each once, in value order.
+    ///
+    /// `None` where anything else may define what it reads: the function's
+    /// entry or the image, a write that only may be to the location (a call,
+    /// a store through an address the alias relation cannot tell from the
+    /// location's), an exception handler's entry, which the protected region
+    /// may have left at any point, or a store of more than one value; and
+    /// where the instruction is no load of one location.
+    #[must_use]
+    pub fn stored_values(
+        &self,
+        ssa: &SsaFunction<T>,
+        block: usize,
+        instruction: usize,
+    ) -> Option<Vec<SsaVarId>> {
+        let load = self
+            .operation_at(block, instruction)
+            .filter(|operation| operation.is_load())?;
+        let location = self.location_id(load.location()?)?;
+        let mut pending = vec![self.version_before_id(location, block, instruction)?];
+        let mut seen = FxHashSet::default();
+        let mut stored = Vec::new();
+        while let Some(version) = pending.pop() {
+            if !seen.insert(version) {
+                continue;
+            }
+            match self.defined_at(location, version)? {
+                MemoryDefSite::Store { block, instr } => {
+                    let store = self
+                        .operation_at(block, instr)
+                        .filter(|operation| operation.is_store())?;
+                    if self.location_id(store.location()?)? != location {
+                        return None;
+                    }
+                    let mut written = Vec::new();
+                    ssa.block(block)?
+                        .instructions()
+                        .get(instr)?
+                        .op()
+                        .for_each_addressed_access(|access| {
+                            if access.writes {
+                                written.push(access.value);
+                            }
+                        });
+                    let [Some(value)] = written[..] else {
+                        return None;
+                    };
+                    stored.push(value);
+                }
+                MemoryDefSite::Phi { block } => pending.extend(
+                    self.memory_phi(block, location)?
+                        .operands
+                        .iter()
+                        .map(|operand| operand.version),
+                ),
+                MemoryDefSite::Entry
+                | MemoryDefSite::Image
+                | MemoryDefSite::ExceptionEntry { .. } => return None,
+            }
+        }
+        stored.sort_unstable();
+        stored.dedup();
+        Some(stored)
+    }
+
+    /// Returns the definition site of `version` of the location interned as
+    /// `location`.
+    pub fn defined_at(&self, location: usize, version: u32) -> Option<MemoryDefSite> {
+        let version = usize::try_from(version).ok()?;
+        self.definitions.get(location)?.get(version).copied()
+    }
+
+    /// Defines the next version of the location interned as `location` at
+    /// `site`, and returns its number.
+    ///
+    /// A location's versions are numbered from zero in the order they are
+    /// defined, which is the position of their site in its row of
+    /// [`Self::definitions`].
+    fn define(&mut self, location: usize, site: MemoryDefSite) -> u32 {
+        let Some(versions) = self.definitions.get_mut(location) else {
+            return 0;
+        };
+        let version = u32::try_from(versions.len()).unwrap_or(u32::MAX);
+        versions.push(site);
+        version
+    }
+
+    /// The interned ids of the locations `op` invalidates, in location order:
+    /// each location it defines and every location those may alias, except the
+    /// read-only image cells, which nothing can write.
+    fn clobbered_by<'a>(&'a self, op: &'a MemoryOp<T>) -> impl Iterator<Item = usize> + 'a {
+        // Each defined location's region, found once: a hash per candidate is
+        // what this loop would otherwise spend most of its time on.
+        let defined: Vec<(&MemoryLocation<T>, Option<usize>, Option<MemoryRegion>)> = op
+            .defined_locations()
+            .map(|location| {
+                let id = self.location_ids.get(location).copied();
+                let region = id.and_then(|id| self.regions.get(id).copied());
+                (location, id, region)
+            })
+            .collect();
+        self.ordered_locations
+            .iter()
+            .enumerate()
+            .filter(move |&(id, candidate)| {
+                !self.immutable.contains_checked(id)
+                    && defined.iter().any(|&(location, defined_id, region)| {
+                        !self.regions_are_disjoint(id, region)
+                            && self.may_alias_interned(candidate, Some(id), location, defined_id)
+                    })
+            })
+            .map(|(id, _)| id)
+    }
+
+    /// Whether footprints ([`MemoryLocation::footprint`]) can set two of the
+    /// locations apart that their addresses leave may-aliasing: only two of
+    /// different bases do, escaped memory counting as one, where one of them
+    /// is reached through a value, which only the points-to relation places.
+    /// Every other location's footprint is any memory.
+    fn footprints_may_separate(&self) -> bool {
+        let mut through_value = false;
+        let mut bases: Vec<Option<AddressBase>> = Vec::new();
+        for location in &self.ordered_locations {
+            let base = match location {
+                MemoryLocation::Indirect(cell) => Some(cell.base),
+                MemoryLocation::Escaped => None,
+                MemoryLocation::InstanceField(..)
+                | MemoryLocation::StaticField(_)
+                | MemoryLocation::ArrayElement(..)
+                | MemoryLocation::Unknown => continue,
+            };
+            through_value |= matches!(base, Some(AddressBase::Value(_)));
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
+            if through_value && bases.len() > 1 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the location interned as `id` and a location in the region
+    /// `defined` (`None` for one the analysis has no region for) lie in regions
+    /// that cannot be the same memory.
+    ///
+    /// The address expressions alone cannot say that a stack cell and an image
+    /// cell are apart: the frame is addressed from a value and the image cell
+    /// from a stated address, which [`IndirectLocation::may_alias`] must call
+    /// a may-alias because a value can hold any address. Their *regions* say
+    /// it - the frame is the stack the function was entered on and the image's
+    /// cells are at addresses the host serves, and no frame of a running
+    /// function lies in the image it was loaded from. This is where that is
+    /// worth saying: a store to one otherwise defines a version of every
+    /// location in the other, which is most of them.
+    ///
+    /// [`MemoryRegion::Unknown`] is disjoint from nothing - it is the answer
+    /// for memory reached through a pointer, which may reach anywhere - so a
+    /// location the analysis cannot place keeps clobbering everything.
+    fn regions_are_disjoint(&self, id: usize, defined: Option<MemoryRegion>) -> bool {
+        match (self.regions.get(id), defined) {
+            (Some(&candidate), Some(other)) => candidate.is_apart_from(other),
+            _ => false,
+        }
     }
 
     /// Phase 1: Identify all memory operations in the SSA function.
     fn identify_memory_operations(&mut self, ssa: &SsaFunction<T>, ptr_size: PointerSize) {
+        self.block_operations = ssa
+            .blocks()
+            .iter()
+            .map(|block| MemoryBlock {
+                instructions: block.instructions().len(),
+                operations: 0..0,
+            })
+            .collect();
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
             if let Some(mem_op) =
-                Self::classify_memory_operation(ssa, instr.op(), block_idx, instr_idx, ptr_size)
+                MemoryLocator::new(ssa, ptr_size).classify(instr.op(), block_idx, instr_idx)
             {
-                if self.locations.insert(mem_op.location().clone()) {
-                    let id = u32::try_from(self.ordered_locations.len()).unwrap_or(u32::MAX);
-                    self.location_ids.insert(mem_op.location().clone(), id);
-                    self.ordered_locations.push(mem_op.location().clone());
+                for location in mem_op.accessed_locations() {
+                    if self.locations.insert(location.clone()) {
+                        self.location_ids
+                            .insert(location.clone(), self.ordered_locations.len());
+                        self.ordered_locations.push(location.clone());
+                        self.definitions.push(Vec::new());
+                    }
+                }
+                // Instructions are visited block by block, so a block's
+                // operations are adjacent.
+                let index = self.operations.len();
+                if let Some(block) = self.block_operations.get_mut(block_idx) {
+                    let range = &mut block.operations;
+                    if range.start == range.end {
+                        range.start = index;
+                    }
+                    range.end = index.saturating_add(1);
                 }
                 self.operations.push(mem_op);
             }
         }
     }
 
-    /// Classifies an SSA operation as a memory operation, if applicable.
+    /// Phase 2: Place memory phi nodes at dominance frontiers.
     ///
-    /// Public because the classification — not the versioning built on top of
-    /// it — is what a consumer needs to ask "does this operation touch memory,
-    /// and which cell". Everything whose effect is not modelled classifies to a
-    /// [`MemoryOp::Barrier`] or [`MemoryOp::ReadWrite`] over
-    /// [`MemoryLocation::Unknown`], which may-aliases every location, so a
-    /// consumer that consults [`MemoryLocation::may_alias`] is conservative by
-    /// construction.
+    /// Standard iterated-dominance-frontier placement, with the twist specific to
+    /// memory: a store to `L` is also a definition of every location that
+    /// may-alias `L`, so each defining op seeds the definition-block set of all
+    /// its may-aliases, not just its own location. Without that, an overlapping
+    /// cell or a barrier's `Unknown` would receive no merge point and its version
+    /// could survive a clobber. Locations are processed in `ordered_locations`
+    /// order so version numbering does not depend on `HashMap` iteration order.
     ///
     /// # Arguments
     ///
-    /// * `ssa` — The function, for resolving address expressions and constant
-    ///   array indices.
-    /// * `op` — The operation to classify.
-    /// * `block` / `instr` — Position recorded on the returned [`MemoryOp`].
-    /// * `ptr_size` — Pointer width, for normalizing indirect addresses.
-    ///
-    /// # Returns
-    ///
-    /// The classified memory operation, or `None` when the operation touches no
-    /// memory.
-    #[must_use]
-    pub fn classify_memory_operation(
-        ssa: &SsaFunction<T>,
-        op: &SsaOp<T>,
-        block: usize,
-        instr: usize,
-        ptr_size: PointerSize,
-    ) -> Option<MemoryOp<T>> {
-        match op {
-            SsaOp::LoadField {
-                dest,
-                object,
-                field,
-            } => {
-                let location = MemoryLocation::InstanceField(*object, field.clone());
-                Some(MemoryOp::Load {
-                    location,
-                    dest: *dest,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::StoreField {
-                object,
-                field,
-                value,
-            } => {
-                let location = MemoryLocation::InstanceField(*object, field.clone());
-                Some(MemoryOp::Store {
-                    location,
-                    value: *value,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::LoadStaticField { dest, field } => {
-                let location = MemoryLocation::StaticField(field.clone());
-                Some(MemoryOp::Load {
-                    location,
-                    dest: *dest,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::StoreStaticField { field, value } => {
-                let location = MemoryLocation::StaticField(field.clone());
-                Some(MemoryOp::Store {
-                    location,
-                    value: *value,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::LoadElement {
-                dest, array, index, ..
-            } => {
-                let idx = Self::resolve_array_index(ssa, *index);
-                let location = MemoryLocation::ArrayElement(*array, idx);
-                Some(MemoryOp::Load {
-                    location,
-                    dest: *dest,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::StoreElement {
-                array,
-                index,
-                value,
-                ..
-            } => {
-                let idx = Self::resolve_array_index(ssa, *index);
-                let location = MemoryLocation::ArrayElement(*array, idx);
-                Some(MemoryOp::Store {
-                    location,
-                    value: *value,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::LoadIndirect {
-                dest,
-                addr,
-                value_type,
-                address_space,
-            } => {
-                let location =
-                    Self::indirect_location(ssa, *addr, value_type, *address_space, ptr_size);
-                Some(MemoryOp::Load {
-                    location,
-                    dest: *dest,
-                    block,
-                    instr,
-                })
-            }
-            SsaOp::StoreIndirect {
-                addr,
-                value,
-                value_type,
-                address_space,
-            } => {
-                let location =
-                    Self::indirect_location(ssa, *addr, value_type, *address_space, ptr_size);
-                Some(MemoryOp::Store {
-                    location,
-                    value: *value,
-                    block,
-                    instr,
-                })
-            }
-            _ => {
-                let effects = op.effects();
-                match effects.kind {
-                    SsaEffectKind::ReadWrite | SsaEffectKind::Atomic => Some(MemoryOp::ReadWrite {
-                        location: MemoryLocation::Unknown,
-                        effects,
-                        block,
-                        instr,
-                    }),
-                    SsaEffectKind::Fence | SsaEffectKind::Call if !effects.is_pure() => {
-                        Some(MemoryOp::Barrier {
-                            location: MemoryLocation::Unknown,
-                            effects,
-                            block,
-                            instr,
-                        })
-                    }
-                    SsaEffectKind::Opaque
-                        if !effects.is_pure()
-                            && !matches!(effects.memory, MemoryEffectLocation::None) =>
-                    {
-                        Some(MemoryOp::Barrier {
-                            location: MemoryLocation::Unknown,
-                            effects,
-                            block,
-                            instr,
-                        })
-                    }
-                    SsaEffectKind::Read => op.dest().map(|dest| MemoryOp::Load {
-                        location: MemoryLocation::Unknown,
-                        dest,
-                        block,
-                        instr,
-                    }),
-                    SsaEffectKind::Write => Some(MemoryOp::ReadWrite {
-                        location: MemoryLocation::Unknown,
-                        effects,
-                        block,
-                        instr,
-                    }),
-                    SsaEffectKind::Pure
-                    | SsaEffectKind::Fence
-                    | SsaEffectKind::Call
-                    | SsaEffectKind::Opaque => None,
-                }
-            }
-        }
-    }
-
-    /// Decodes an indirect access into an offset-aware memory location.
-    ///
-    /// The address is normalized to `base + index*stride + offset` rather than
-    /// keyed on `addr` itself, so the resulting cell identity survives the
-    /// address computation being re-numbered or hoisted. See
-    /// [`IndirectLocation`].
-    fn indirect_location(
-        ssa: &SsaFunction<T>,
-        addr: SsaVarId,
-        value_type: &T::Type,
-        address_space: Option<u16>,
-        ptr_size: PointerSize,
-    ) -> MemoryLocation<T> {
-        let address = normalize_address(ssa, addr, ptr_size);
-        MemoryLocation::Indirect(IndirectLocation::new(
-            address.base,
-            address.index,
-            address.stride_bytes,
-            address.offset_bits,
-            T::bit_width(value_type),
-            address_space,
-            ptr_size,
-        ))
-    }
-
-    /// Resolves an array index to an [`ArrayIndex`] abstraction, folding a
-    /// constant index so that distinct constant elements stop may-aliasing.
-    fn resolve_array_index(ssa: &SsaFunction<T>, index_var: SsaVarId) -> ArrayIndex {
-        match const_i64(ssa, index_var) {
-            Some(index) => ArrayIndex::Constant(index),
-            None => ArrayIndex::Variable(index_var),
-        }
-    }
-
-    /// Phase 2: Place memory phi nodes at dominance frontiers.
-    fn place_memory_phis(&mut self, eh: &EhCfg<'_, T>) {
+    /// * `eh` - Exception-aware CFG, source of the dominance frontiers.
+    /// * `dom_tree` - The dominator tree of `eh`.
+    fn place_memory_phis(
+        &mut self,
+        eh: &SsaCfg<'_, T>,
+        dom_tree: &DominatorTree,
+        clobbers: &[Rc<[usize]>],
+    ) {
         let block_count = eh.node_count();
         if block_count == 0 {
             return;
         }
 
-        // Compute dominators and dominance frontiers
-        let dom_tree = compute_dominators(eh, eh.entry());
-        let frontiers = compute_dominance_frontiers(eh, &dom_tree);
+        let frontiers = compute_dominance_frontiers(eh, dom_tree);
+        self.memory_phis = vec![Vec::new(); block_count];
+        self.phi_locations = vec![Vec::new(); block_count];
 
         // A definition of `L` is also a definition of every location it may
         // alias. Memory versions are per-location, so without this a store to
         // `*(p+16)` bumps only its own version and a barrier bumps only
-        // `Unknown` — leaving the version of a may-aliasing cell unchanged and
+        // `Unknown` - leaving the version of a may-aliasing cell unchanged and
         // therefore still looking forwardable across a block boundary.
-        let mut def_blocks: HashMap<MemoryLocation<T>, BTreeSet<usize>> = HashMap::new();
-        for op in &self.operations {
-            if !op.defines_memory() {
-                continue;
-            }
-            let defined = op.location();
-            for location in &self.ordered_locations {
-                if location.may_alias(defined) {
-                    def_blocks
-                        .entry(location.clone())
-                        .or_default()
-                        .insert(op.block());
+        let mut def_blocks: Vec<Vec<usize>> = vec![Vec::new(); self.ordered_locations.len()];
+        for (op, clobbered) in self.operations.iter().zip(clobbers) {
+            for &id in clobbered.iter() {
+                if let Some(blocks) = def_blocks.get_mut(id) {
+                    blocks.push(op.block());
                 }
             }
         }
 
         // Standard phi placement algorithm (iterated dominance frontier).
         // Iterated in `ordered_locations` order so version numbering does not
-        // depend on `HashMap` iteration order.
-        let ordered = self.ordered_locations.clone();
-        for location in ordered {
-            let Some(defs) = def_blocks.get(&location).cloned() else {
+        // depend on `HashMap` iteration order, each location's worklist from
+        // its defining blocks in ascending order. Which blocks a location has
+        // a phi at, and which it has processed, are stamped with the location:
+        // one array of each serves every location, with no set to allocate
+        // per location.
+        let mut phi_at = vec![usize::MAX; block_count];
+        let mut processed_at = vec![usize::MAX; block_count];
+        for (id, defs) in def_blocks.iter_mut().enumerate() {
+            if defs.is_empty() {
+                continue;
+            }
+            defs.sort_unstable();
+            defs.dedup();
+            let Some(location) = self.ordered_locations.get(id).cloned() else {
                 continue;
             };
-            let mut phi_blocks: BTreeSet<usize> = BTreeSet::new();
             let mut worklist: VecDeque<usize> = defs.iter().copied().collect();
-            let mut processed: BTreeSet<usize> = BTreeSet::new();
 
             while let Some(block) = worklist.pop_front() {
-                if !processed.insert(block) {
-                    continue;
+                match processed_at.get_mut(block) {
+                    Some(stamp) if *stamp != id => *stamp = id,
+                    _ => continue,
                 }
 
-                let node_id = NodeId::new(block);
-                if node_id.index() >= frontiers.len() {
-                    continue;
-                }
-
-                let Some(frontier_set) = frontiers.get(node_id.index()) else {
+                let Some(frontier_set) = frontiers.get(block) else {
                     continue;
                 };
                 for frontier_block in frontier_set.iter() {
-                    if phi_blocks.insert(frontier_block) {
+                    let fresh = match phi_at.get_mut(frontier_block) {
+                        Some(stamp) if *stamp != id => {
+                            *stamp = id;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if fresh {
                         // Add phi at frontier
-                        let version = self.allocate_version(&location);
-                        let phi = MemoryPhi::new(location.clone(), version);
-                        self.memory_phis
-                            .entry(frontier_block)
-                            .or_default()
-                            .push(phi);
-                        self.definitions.insert(
-                            MemoryVersion::new(location.clone(), version),
+                        let version = self.define(
+                            id,
                             MemoryDefSite::Phi {
                                 block: frontier_block,
                             },
                         );
+                        if let (Some(phis), Some(locations)) = (
+                            self.memory_phis.get_mut(frontier_block),
+                            self.phi_locations.get_mut(frontier_block),
+                        ) {
+                            phis.push(MemoryPhi::new(location.clone(), version));
+                            locations.push(id);
+                        }
                         worklist.push_back(frontier_block);
                     }
                 }
@@ -1249,43 +2973,47 @@ impl<T: Target> MemorySsa<T> {
     ///
     /// The walk is an explicit-stack DFS rather than recursion: dominator trees
     /// on real functions reach thousands of blocks deep, and this crate denies
-    /// panics — a blown call stack is not a recoverable error.
+    /// panics - a blown call stack is not a recoverable error.
     ///
     /// Version *numbering* is an opaque identity, not an ordering: phi versions
     /// are allocated during phi placement (phase 2), so a location carrying phis
     /// receives its entry version here with a number above them. Consumers that
     /// need to recognise the entry version match [`MemoryDefSite::Entry`] via
     /// [`MemorySsa::definition`] rather than comparing against zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `eh` - Exception-aware CFG the walk follows.
+    /// * `dom_tree` - The dominator tree of `eh`, in whose preorder blocks are
+    ///   renamed.
     fn rename_memory_versions(
         &mut self,
-        ssa: &SsaFunction<T>,
-        eh: &EhCfg<'_, T>,
-        ptr_size: PointerSize,
+        eh: &SsaCfg<'_, T>,
+        dom_tree: &DominatorTree,
+        clobbers: &[Rc<[usize]>],
     ) {
         let block_count = eh.node_count();
         if block_count == 0 {
             return;
         }
 
-        // Compute dominators for traversal order
-        let dom_tree = compute_dominators(eh, eh.entry());
+        let locations = self.ordered_locations.len();
+        self.entry_versions = VersionTable::new(block_count, locations);
+        self.exit_versions = VersionTable::new(block_count, locations);
 
         // Live version stack per location; the top is the version reaching the
-        // block currently being renamed.
-        let mut version_stacks: HashMap<MemoryLocation<T>, Vec<u32>> = HashMap::new();
-
-        // Seed every location with its function-entry version.
-        let locations = self.ordered_locations.clone();
-        for location in locations {
-            let entry_version = self.allocate_version(&location);
-            version_stacks
-                .entry(location.clone())
-                .or_default()
-                .push(entry_version);
-            self.definitions.insert(
-                MemoryVersion::new(location, entry_version),
-                MemoryDefSite::Entry,
-            );
+        // block currently being renamed. Every location is seeded with its
+        // function-entry version - the image's bytes for a location nothing can
+        // write.
+        let mut live = VersionStacks::new(locations);
+        for id in 0..locations {
+            let site = if self.immutable.contains_checked(id) {
+                MemoryDefSite::Image
+            } else {
+                MemoryDefSite::Entry
+            };
+            let entry_version = self.define(id, site);
+            live.push(id, entry_version);
         }
 
         // Rename in dominator-tree preorder, restoring scope on the way out.
@@ -1303,8 +3031,7 @@ impl<T: Target> MemorySsa<T> {
                         *slot = true;
                     }
 
-                    let pushed =
-                        self.rename_block(block_idx, ssa, eh, &mut version_stacks, ptr_size);
+                    let pushed = self.rename_block(block_idx, eh, &mut live, clobbers);
 
                     // Pushed before the children so it pops after all of them:
                     // the subtree runs with this block's definitions live.
@@ -1317,9 +3044,7 @@ impl<T: Target> MemorySsa<T> {
                 }
                 RenameStep::Exit(pushed) => {
                     for location in pushed {
-                        if let Some(stack) = version_stacks.get_mut(&location) {
-                            stack.pop();
-                        }
+                        live.pop(location);
                     }
                 }
             }
@@ -1343,52 +3068,44 @@ impl<T: Target> MemorySsa<T> {
     fn kill_at_exception_root(
         &mut self,
         block_idx: usize,
-        eh: &EhCfg<'_, T>,
-        version_stacks: &mut HashMap<MemoryLocation<T>, Vec<u32>>,
-    ) -> Vec<MemoryLocation<T>> {
+        eh: &SsaCfg<'_, T>,
+        live: &mut VersionStacks,
+    ) -> Vec<usize> {
         let region = eh.roots().region_of(block_idx);
-        let mut killed: Vec<MemoryLocation<T>> = Vec::new();
+        let mut killed: Vec<usize> = Vec::new();
 
-        for location in &self.ordered_locations {
-            let live = version_stacks
-                .get(location)
-                .and_then(|stack| stack.last().copied());
-            let Some(live) = live else {
+        for id in 0..self.ordered_locations.len() {
+            // Nothing the region did can have written the image's read-only
+            // bytes, interrupted or not.
+            if self.immutable.contains_checked(id) {
+                continue;
+            }
+            let Some(current) = live.live(id) else {
                 continue;
             };
-            let defined_in_region = match self
-                .definitions
-                .get(&MemoryVersion::new(location.clone(), live))
-            {
+            let defined_in_region = match self.defined_at(id, current) {
                 // An unknown extent could have written anything.
                 None => true,
-                Some(MemoryDefSite::Store { block, .. }) => {
-                    region.as_ref().is_none_or(|range| range.contains(block))
-                }
-                Some(MemoryDefSite::Phi { block }) => {
-                    region.as_ref().is_none_or(|range| range.contains(block))
+                Some(MemoryDefSite::Store { block, .. } | MemoryDefSite::Phi { block }) => {
+                    region.as_ref().is_none_or(|range| range.contains(&block))
                 }
                 // Already unknown, or the function-entry state, which the
                 // region cannot have disturbed without a store.
-                Some(MemoryDefSite::ExceptionEntry { .. }) => false,
-                Some(MemoryDefSite::Entry) => false,
+                Some(
+                    MemoryDefSite::ExceptionEntry { .. }
+                    | MemoryDefSite::Entry
+                    | MemoryDefSite::Image,
+                ) => false,
             };
             if !defined_in_region {
                 continue;
             }
-            killed.push(location.clone());
+            killed.push(id);
         }
 
-        for location in &killed {
-            let version = self.allocate_version(location);
-            version_stacks
-                .entry(location.clone())
-                .or_default()
-                .push(version);
-            self.definitions.insert(
-                MemoryVersion::new(location.clone(), version),
-                MemoryDefSite::ExceptionEntry { block: block_idx },
-            );
+        for &id in &killed {
+            let version = self.define(id, MemoryDefSite::ExceptionEntry { block: block_idx });
+            live.push(id, version);
         }
 
         killed
@@ -1396,107 +3113,96 @@ impl<T: Target> MemorySsa<T> {
 
     /// Renames memory versions within a single block.
     ///
-    /// Returns one entry per version pushed onto [`version_stacks`], which the
-    /// caller pops when leaving this block's dominator subtree. A block that
-    /// stores twice to the same location pushes twice and so appears twice.
-    ///
-    /// [`version_stacks`]: MemorySsa::rename_memory_versions
+    /// Returns one entry per version pushed onto `live`, which the caller pops
+    /// when leaving this block's dominator subtree. A block that stores twice to
+    /// the same location pushes twice and so appears twice.
     fn rename_block(
         &mut self,
         block_idx: usize,
-        ssa: &SsaFunction<T>,
-        eh: &EhCfg<'_, T>,
-        version_stacks: &mut HashMap<MemoryLocation<T>, Vec<u32>>,
-        ptr_size: PointerSize,
-    ) -> Vec<MemoryLocation<T>> {
-        let mut pushed: Vec<MemoryLocation<T>> = Vec::new();
+        eh: &SsaCfg<'_, T>,
+        live: &mut VersionStacks,
+        clobbers: &[Rc<[usize]>],
+    ) -> Vec<usize> {
+        let mut pushed: Vec<usize> = Vec::new();
 
         // Entering a handler or filter: the region it protects was interrupted
         // part-way, so any store the region made is not known to have run.
         // Those locations get a fresh version standing for "unknown".
         if eh.roots().is_flow_root(block_idx) {
-            pushed.extend(self.kill_at_exception_root(block_idx, eh, version_stacks));
+            pushed.extend(self.kill_at_exception_root(block_idx, eh, live));
         }
 
-        // Record entry versions. Every location was seeded with a stack, so
-        // iterating the stacks covers `self.locations` without cloning it.
-        for (location, stack) in version_stacks.iter() {
-            if let Some((&version, &id)) = stack.last().zip(self.location_ids.get(location)) {
-                self.entry_versions.insert((id, block_idx), version);
+        // Memory phis define their versions at the block's entry, before
+        // anything in it runs.
+        let phis = self
+            .memory_phis
+            .get(block_idx)
+            .map_or(&[][..], Vec::as_slice);
+        let phi_locations = self
+            .phi_locations
+            .get(block_idx)
+            .map_or(&[][..], Vec::as_slice);
+        for (phi, &location) in phis.iter().zip(phi_locations) {
+            live.push(location, phi.result_version);
+            pushed.push(location);
+        }
+
+        // Record entry versions, the phis' included: a location merged here
+        // enters on the merge.
+        self.entry_versions.record(block_idx, live);
+
+        // The block's operations were classified once, when they were
+        // identified, and the function has not changed since.
+        for index in self
+            .block_operations
+            .get(block_idx)
+            .map(|block| block.operations.clone())
+            .unwrap_or_default()
+        {
+            let Some(mem_op) = self.operations.get(index) else {
+                continue;
+            };
+            if !mem_op.defines_memory() {
+                continue;
             }
-        }
-
-        // Process memory phi nodes - they define new versions
-        if let Some(phis) = self.memory_phis.get(&block_idx).cloned() {
-            for phi in phis {
-                version_stacks
-                    .entry(phi.location.clone())
-                    .or_default()
-                    .push(phi.result_version);
-                pushed.push(phi.location);
-            }
-        }
-
-        // Process instructions in the block
-        let Some(block) = ssa.block(block_idx) else {
-            return pushed;
-        };
-
-        for (instr_idx, instr) in block.instructions().iter().enumerate() {
-            // Handle stores - create new version
-            if let Some(mem_op) =
-                Self::classify_memory_operation(ssa, instr.op(), block_idx, instr_idx, ptr_size)
-                && mem_op.defines_memory()
-            {
-                // The op defines its own location *and clobbers every location
-                // it may alias*. A store to `*(p+16)` invalidates the overlapping
-                // `*(p+0)`; a call, fence, atomic, volatile or opaque op
-                // classifies to `Unknown`, which may-aliases everything and so
-                // invalidates all of memory. Versioning only the named location
-                // is what let a value survive across a block boundary that a
-                // barrier or an overlapping store had already destroyed.
-                //
-                // Matches `place_memory_phis`, which places phis for the same
-                // set, so every clobbered location has a merge point.
-                let defined = mem_op.location().clone();
-                let clobbered: Vec<MemoryLocation<T>> = self
-                    .ordered_locations
-                    .iter()
-                    .filter(|candidate| candidate.may_alias(&defined))
-                    .cloned()
-                    .collect();
-                for location in clobbered {
-                    let new_version = self.allocate_version(&location);
-                    version_stacks
-                        .entry(location.clone())
-                        .or_default()
-                        .push(new_version);
-                    self.definitions.insert(
-                        MemoryVersion::new(location.clone(), new_version),
-                        MemoryDefSite::Store {
-                            block: block_idx,
-                            instr: instr_idx,
-                        },
-                    );
-                    pushed.push(location);
-                }
+            // The op defines its own location *and clobbers every location it
+            // may alias*. A store to `*(p+16)` invalidates the overlapping
+            // `*(p+0)`; a call, fence, atomic, volatile or opaque op classifies
+            // to `Unknown`, which may-aliases everything and so invalidates all
+            // of memory. Versioning only the named location is what let a value
+            // survive across a block boundary that a barrier or an overlapping
+            // store had already destroyed.
+            //
+            // Matches `place_memory_phis`, which places phis for the same set,
+            // so every clobbered location has a merge point.
+            //
+            // A call its host described defines only what it may write.
+            let instr = mem_op.instr();
+            for &location in clobbers.get(index).map_or(&[][..], |row| &**row) {
+                let new_version = self.define(
+                    location,
+                    MemoryDefSite::Store {
+                        block: block_idx,
+                        instr,
+                    },
+                );
+                live.push(location, new_version);
+                pushed.push(location);
             }
         }
 
         // Record exit versions
-        for (location, stack) in version_stacks.iter() {
-            if let Some((&version, &id)) = stack.last().zip(self.location_ids.get(location)) {
-                self.exit_versions.insert((id, block_idx), version);
-            }
-        }
+        self.exit_versions.record(block_idx, live);
 
         // Fill in phi operands for successors
         for succ_id in eh.successors(NodeId::new(block_idx)) {
             let succ_idx = succ_id.index();
-            if let Some(phis) = self.memory_phis.get_mut(&succ_idx) {
-                for phi in phis {
-                    if let Some(&version) = version_stacks.get(&phi.location).and_then(|s| s.last())
-                    {
+            if let (Some(phis), Some(locations)) = (
+                self.memory_phis.get_mut(succ_idx),
+                self.phi_locations.get(succ_idx),
+            ) {
+                for (phi, &location) in phis.iter_mut().zip(locations) {
+                    if let Some(version) = live.live(location) {
                         phi.add_operand(block_idx, version);
                     }
                 }
@@ -1509,17 +3215,27 @@ impl<T: Target> MemorySsa<T> {
     /// Returns statistics about the Memory SSA.
     #[must_use]
     pub fn stats(&self) -> MemorySsaStats {
-        let total_phis = self.memory_phis.values().map(Vec::len).sum();
+        let total_phis = self.memory_phis.iter().map(Vec::len).sum();
         let store_count = self
             .operations
             .iter()
-            .filter(|op| matches!(op, MemoryOp::Store { .. } | MemoryOp::ReadWrite { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    MemoryOp::Store { .. } | MemoryOp::ReadWrite { .. } | MemoryOp::Write { .. }
+                )
+            })
             .count();
         let load_count = self.operations.iter().filter(|op| op.is_load()).count();
         let barrier_count = self
             .operations
             .iter()
             .filter(|op| matches!(op, MemoryOp::Barrier { .. }))
+            .count();
+        let call_count = self
+            .operations
+            .iter()
+            .filter(|op| matches!(op, MemoryOp::Call { .. }))
             .count();
 
         MemorySsaStats {
@@ -1528,7 +3244,8 @@ impl<T: Target> MemorySsa<T> {
             store_count,
             load_count,
             barrier_count,
-            version_count: self.definitions.len(),
+            call_count,
+            version_count: self.definitions.iter().map(Vec::len).sum(),
         }
     }
 }
@@ -1550,20 +3267,44 @@ pub struct MemorySsaStats {
     pub store_count: usize,
     /// Number of load operations.
     pub load_count: usize,
-    /// Number of barrier, call, or opaque memory operations.
+    /// Number of barriers: calls nobody described and opaque memory
+    /// operations ([`MemoryOp::Barrier`]).
     pub barrier_count: usize,
+    /// Number of calls whose effects their host stated ([`MemoryOp::Call`]),
+    /// each defining the locations it may write.
+    pub call_count: usize,
     /// Total number of memory versions.
     pub version_count: usize,
 }
 
-/// Memory state tracker for path-aware evaluation.
+/// SSA identities and memory versions retained along one analysis path.
 ///
-/// This tracks the memory values along a specific execution path, enabling
-/// precise tracking of memory contents during symbolic or concrete evaluation.
+/// Stores invalidate every location they may overwrite; loads resolve exact or
+/// must-aliasing cells. The payload names an SSA definition rather than copying
+/// its current evaluated value. An executor that revisits definitions uses
+/// store-time value snapshots, as [`crate::analysis::evaluator::SsaEvaluator`]
+/// does, rather than reading this identity's later value.
+///
+/// # Examples
+///
+/// ```
+/// use analyssa::{
+///     analysis::memory::{MemoryLocation, MemoryState},
+///     ir::variable::SsaVarId,
+///     testing::MockTarget,
+/// };
+/// let mut state = MemoryState::<MockTarget>::new();
+/// let value = SsaVarId::from_index(0);
+/// let field = MemoryLocation::StaticField(1);
+/// state.store(field.clone(), value, 1);
+/// assert_eq!(state.load(&field), Some(value));
+/// state.forget(&MemoryLocation::Unknown);
+/// assert!(state.load(&field).is_none());
+/// ```
 #[derive(Debug, Clone)]
 pub struct MemoryState<T: Target> {
     /// Current memory values: location -> (version, value as SSA variable).
-    values: HashMap<MemoryLocation<T>, (u32, SsaVarId)>,
+    values: MemoryCells<T, (u32, SsaVarId)>,
 }
 
 impl<T: Target> MemoryState<T> {
@@ -1571,51 +3312,69 @@ impl<T: Target> MemoryState<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            values: HashMap::new(),
+            values: MemoryCells::new(),
         }
     }
 
-    /// Records a memory store.
+    /// Records a memory store, overwriting any previous value for `location`.
+    ///
+    /// # Arguments
+    ///
+    /// * `location` - The cell being written.
+    /// * `value` - SSA variable holding the stored value.
+    /// * `version` - Memory version this store produces for the location.
+    ///
+    /// Whatever the store may overwrite is forgotten first: a cell that only
+    /// may alias `location` no longer holds what was stored to it, and keeping
+    /// it would answer a later load with a value this store may have replaced.
     pub fn store(&mut self, location: MemoryLocation<T>, value: SsaVarId, version: u32) {
-        self.values.insert(location, (version, value));
+        self.values.store(location, (version, value));
     }
 
-    /// Loads from a memory location.
+    /// Forgets every value a write to `location` may change: each tracked
+    /// cell that may alias it.
     ///
-    /// Returns the SSA variable holding the value, if known.
+    /// # Arguments
+    ///
+    /// * `location` - The memory written, or [`MemoryLocation::Unknown`] for
+    ///   a write that may reach anything.
+    pub fn forget(&mut self, location: &MemoryLocation<T>) {
+        self.values.forget(location);
+    }
+
+    /// Loads from a memory location, resolving through must-aliasing cells.
+    ///
+    /// A direct hit on `location` wins immediately. Otherwise the stored cells
+    /// that must-alias the query are considered, and because several can hold
+    /// different values, the most recently stored version wins, with the lower
+    /// SSA id breaking a tie. That rule is deterministic, which matters because
+    /// the downstream pipeline is content-addressed and must not depend on the
+    /// hasher's per-instance seed.
+    ///
+    /// # Arguments
+    ///
+    /// * `location` - The cell to read.
+    ///
+    /// # Returns
+    ///
+    /// The SSA variable holding the value, or `None` if nothing is known.
     #[must_use]
     pub fn load(&self, location: &MemoryLocation<T>) -> Option<SsaVarId> {
-        // Direct match
-        if let Some((_, value)) = self.values.get(location) {
-            return Some(*value);
-        }
-
-        // Check for aliasing locations.
-        //
-        // More than one stored location can must-alias the query, and they can
-        // hold different values. Returning whichever the map yielded first made
-        // the answer a function of the hasher's per-instance seed, so the same
-        // bytes could lift to different SSA on consecutive runs. The most
-        // recently stored version wins, with the lower variable id breaking a
-        // tie — a rule that is both deterministic and the one a load actually
-        // wants.
         self.values
-            .iter()
-            .filter(|(loc, _)| location.must_alias(loc))
-            .max_by_key(|(_, (version, value))| (*version, std::cmp::Reverse(*value)))
-            .map(|(_, (_, value))| *value)
+            .load(location, |(version, value)| (*version, Reverse(*value)))
+            .map(|(_, value)| *value)
     }
 
     /// Returns the current version for a location, if known.
     #[must_use]
     pub fn version(&self, location: &MemoryLocation<T>) -> Option<u32> {
-        self.values.get(location).map(|(v, _)| *v)
+        self.values.direct(location).map(|(v, _)| *v)
     }
 
     /// Checks if any stored location may alias the given location.
     #[must_use]
     pub fn has_may_alias(&self, location: &MemoryLocation<T>) -> bool {
-        self.values.keys().any(|loc| loc.may_alias(location))
+        self.values.has_may_alias(location)
     }
 
     /// Clears all memory state.
@@ -1663,6 +3422,20 @@ pub enum AliasResult {
 }
 
 /// Performs alias analysis between two memory locations.
+///
+/// Collapses the two boolean predicates into the three-valued [`AliasResult`]:
+/// [`must_alias`](MemoryLocation::must_alias) proves `MustAlias`, else
+/// [`may_alias`](MemoryLocation::may_alias) gives `MayAlias`, else the locations
+/// are proven disjoint and the result is `NoAlias`.
+///
+/// # Arguments
+///
+/// * `loc1` - First location.
+/// * `loc2` - Second location.
+///
+/// # Returns
+///
+/// The three-valued alias relationship between the two locations.
 #[must_use]
 pub fn analyze_alias<T: Target>(loc1: &MemoryLocation<T>, loc2: &MemoryLocation<T>) -> AliasResult {
     if loc1.must_alias(loc2) {
@@ -1671,5 +3444,77 @@ pub fn analyze_alias<T: Target>(loc1: &MemoryLocation<T>, loc2: &MemoryLocation<
         AliasResult::MayAlias
     } else {
         AliasResult::NoAlias
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use crate::{
+        analysis::{
+            context::AnalysisContext,
+            memory::{MemoryDefSite, MemorySsa},
+        },
+        ir::{
+            function::{SsaDefSpec, SsaFunctionBuilder},
+            variable::{DefSite, VariableOrigin},
+        },
+        testing::{MACHINE, MockTarget, MockType},
+    };
+
+    /// Builds actual ordered writes to one mutable cell, followed by return.
+    fn writes(count: usize) -> MemorySsa<MockTarget> {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(1, 0);
+        let pointer = builder.function_mut().create_variable(
+            VariableOrigin::Argument(0),
+            0,
+            DefSite::entry(),
+            MockType::Ptr,
+        );
+        builder
+            .in_block(0, |block| {
+                let value = block.const_i32(SsaDefSpec::tmp(MockType::I32), 42)?;
+                for _ in 0..count {
+                    block.store_indirect(pointer, value, MockType::I32)?;
+                }
+                block.ret(None)
+            })
+            .unwrap();
+        let ssa = builder.finish().unwrap();
+        MemorySsa::build(&ssa, &AnalysisContext::new(MACHINE))
+    }
+
+    /// Interior queries initialize the write index once and reuse the exact versions.
+    #[test]
+    fn canonical_point_index_is_lazy_and_reusable() {
+        let memory = writes(4096);
+        let location = memory.location_by_id(0).unwrap();
+        assert!(memory.write_versions.get().is_none());
+        let version = memory.version_before(location, 0, 4096).unwrap();
+        assert_eq!(
+            memory.definition_of(location, version),
+            Some(MemoryDefSite::Store {
+                block: 0,
+                instr: 4095
+            })
+        );
+        let index = memory.write_versions.get().unwrap();
+        assert_eq!(memory.version_before(location, 0, 4096), Some(version));
+        assert!(ptr::eq(index, memory.write_versions.get().unwrap()));
+    }
+
+    /// Entry and exit queries use canonical tables without constructing a write index.
+    #[test]
+    fn canonical_point_boundaries_need_no_index_allocation() {
+        let memory = writes(4);
+        let location = memory.location_by_id(0).unwrap();
+        for (instruction, expected) in [
+            (0, memory.version_at_entry(location, 0)),
+            (6, memory.version_at_exit(location, 0)),
+        ] {
+            assert_eq!(memory.version_before(location, 0, instruction), expected);
+            assert!(memory.write_versions.get().is_none());
+        }
     }
 }

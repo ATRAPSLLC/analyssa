@@ -19,12 +19,12 @@
 //!
 //! # Losses are returned, not dropped
 //!
-//! A clause can fail to become a region — it names blocks the function does not
+//! A clause can fail to become a region - it names blocks the function does not
 //! have, or its protected range half-overlaps another's. [`structure_ssa`]
 //! returns [`Recovered`], which carries the tree *and*
 //! [`ProtectedRegions::rejected`]. A bare `Structured` would have no channel for
 //! that, and the one path a host is told to use would be the one that loses
-//! clauses silently — the exact degradation this module exists to make visible.
+//! clauses silently - the exact degradation this module exists to make visible.
 //!
 //! # What a recovered tree is not
 //!
@@ -36,6 +36,10 @@
 //! would make a block ending in an unconditional jump look like a conditional
 //! branch, and it would be recovered as one.
 
+use std::collections::BTreeMap;
+
+use thiserror::Error;
+
 use crate::{
     BitSet,
     analysis::{
@@ -43,7 +47,7 @@ use crate::{
         defuse::DefUseIndex,
         structure::{
             BlockSet, DEFAULT_MAX_DEPTH, HandlerFilter, ProtectedHandler, ProtectedHandlerKind,
-            ProtectedRegion, StructureOptions, Structured, structure_with,
+            ProtectedRegion, StructureOptions, Structured, structure,
         },
     },
     graph::NodeId,
@@ -56,7 +60,7 @@ use crate::{
 };
 
 /// Why a clause of the exception table did not become a protected region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 pub enum ClauseRejection {
     /// The clause cannot be laid out over the function's blocks at all.
     #[error("{0}")]
@@ -65,7 +69,7 @@ pub enum ClauseRejection {
     /// The clause's protected range overlaps another accepted clause's without
     /// either containing the other.
     ///
-    /// Nesting is accepted — `try { try {} catch {} } finally {}` is the
+    /// Nesting is accepted - `try { try {} catch {} } finally {}` is the
     /// ordinary ECMA-335 and JVM encoding, and both regions open. A *partial*
     /// overlap is a shape no structured form has: neither region can open
     /// inside the other, so one of them would have to be torn.
@@ -98,7 +102,7 @@ pub struct RejectedClause {
 /// Clauses are grouped by **identical protected range**: `try/catch(A)/catch(B)`
 /// is two table rows sharing one try range, and it becomes one region with two
 /// handlers. One region per row would give the two an identical `entry`, and
-/// `structure_with` keys its protected map by entry — so the second catch would
+/// `structure` keys its protected map by entry - so the second catch would
 /// be dropped and swept up as an orphan.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProtectedRegions {
@@ -117,7 +121,7 @@ impl ProtectedRegions {
     /// - it lays out and opens a new region;
     /// - it lays out and joins an existing region with the same protected
     ///   range;
-    /// - it maps no block of this function — a funclet handler — and is skipped
+    /// - it maps no block of this function - a funclet handler - and is skipped
     ///   silently, which is 28 of the 29 clauses on the corpus's one
     ///   exception-carrying fixture;
     /// - it is rejected, and appears in [`rejected`](Self::rejected).
@@ -225,7 +229,7 @@ impl ProtectedRegions {
 ///
 /// The single expansion point: [`BlockRange::to_bitset`] is the crate's only
 /// interval-to-set conversion, and this is its only caller, so no set narrower
-/// than the graph can reach `structure_with`.
+/// than the graph can reach `structure`.
 ///
 /// `to_bitset` declines a range that does not fit, which
 /// [`layout`](crate::ir::SsaExceptionHandler::layout) has already ruled out for
@@ -247,16 +251,16 @@ fn blocks_of(range: BlockRange, block_count: usize) -> BlockSet {
 /// the instructions a block holds rather than assumed. A block qualifies when
 /// all four hold:
 ///
-/// 1. **it has no phi nodes** — a phi is a statement about where control came
+/// 1. **it has no phi nodes** - a phi is a statement about where control came
 ///    from, and moving the block moves that question;
-/// 2. **it ends in a branching terminator** — a jump, a two-way branch or a
+/// 2. **it ends in a branching terminator** - a jump, a two-way branch or a
 ///    multi-way dispatch. A `return`, a `throw` and a region exit are not
 ///    conditions and are never folded into one, and `endfinally` / `endfilter`
 ///    additionally carry unwind semantics a move would lose;
-/// 3. **every other instruction is pure** — no store, no call, nothing that can
+/// 3. **every other instruction is pure** - no store, no call, nothing that can
 ///    trap. Folding a block's test into another's condition relocates its work,
 ///    and a block that writes memory cannot be relocated;
-/// 4. **nothing it defines is read elsewhere** — a value the block computes for
+/// 4. **nothing it defines is read elsewhere** - a value the block computes for
 ///    another block is work that must happen whether the condition short-circuits
 ///    or not.
 ///
@@ -289,7 +293,7 @@ pub fn condition_only_blocks<T: Target>(ssa: &SsaFunction<T>) -> BlockSet {
         }
         let escapes = defs.defs_in_block(index).iter().any(|var| {
             defs.uses_of(*var)
-                .is_some_and(|uses| uses.iter().any(|use_site| use_site.block != index))
+                .is_some_and(|uses| uses.iter().any(|use_site| use_site.block() != index))
         });
         if escapes {
             continue;
@@ -297,6 +301,22 @@ pub fn condition_only_blocks<T: Target>(ssa: &SsaFunction<T>) -> BlockSet {
         set.insert(NodeId::new(index));
     }
 
+    set
+}
+
+/// The blocks whose terminator is a two-way conditional branch, whose
+/// successors' order says only which way the condition reads
+/// ([`StructureOptions::polar`]); a switch's are its cases'.
+fn polar_blocks<T: Target>(ssa: &SsaFunction<T>) -> BlockSet {
+    let mut set = BlockSet::new(ssa.block_count());
+    for (index, block) in ssa.iter_blocks() {
+        if matches!(
+            block.control_terminator(),
+            Some(SsaOp::Branch { .. } | SsaOp::BranchCmp { .. } | SsaOp::BranchFlags { .. })
+        ) {
+            set.insert(NodeId::new(index));
+        }
+    }
     set
 }
 
@@ -324,6 +344,29 @@ pub struct Recovered {
     pub regions: ProtectedRegions,
 }
 
+/// Returns the blocks of `ssa` that end the method without returning: a
+/// `throw`, a `rethrow`, or a terminator no path reaches.
+///
+/// Structuring reads them as paths that end where they are
+/// ([`StructureOptions::no_return`]), so `if (x == null) throw ..;` joins at
+/// the statement after it.
+#[must_use]
+fn no_return_blocks<T: Target>(ssa: &SsaFunction<T>) -> BlockSet {
+    BlockSet::from_nodes(
+        ssa.block_count(),
+        ssa.iter_blocks()
+            .filter(|(_, block)| {
+                block.instructions().last().is_some_and(|last| {
+                    matches!(
+                        last.op(),
+                        SsaOp::Throw { .. } | SsaOp::Rethrow | SsaOp::Unreachable
+                    )
+                })
+            })
+            .map(|(index, _)| NodeId::new(index)),
+    )
+}
+
 /// Recovers structured control flow for an SSA function, with its protected
 /// regions.
 ///
@@ -334,7 +377,7 @@ pub struct Recovered {
 ///
 /// Takes the function rather than a [`SsaCfg`], deliberately. The recovery is
 /// only correct on a graph carrying terminator edges alone, and taking a graph
-/// would let a caller hand in one built any other way — a precondition with
+/// would let a caller hand in one built any other way - a precondition with
 /// nothing to enforce it.
 ///
 /// Always succeeds. Recovery quality is a count on
@@ -363,8 +406,12 @@ pub fn structure_ssa<T: Target>(ssa: &SsaFunction<T>) -> Recovered {
     let condition_only = condition_only_blocks(ssa);
     let cfg = SsaCfg::from_ssa(ssa);
 
-    let structured = structure_with(
-        &cfg,
+    // The terminator view: a structured tree says what the *code* branches on,
+    // and a throw is not a branch. Where control goes when one happens is the
+    // protected regions this recovery reports separately, read from the clause
+    // table rather than from the graph.
+    let structured = structure(
+        &cfg.terminator_view(),
         NodeId::new(0),
         &StructureOptions {
             regions: regions.regions(),
@@ -373,8 +420,30 @@ pub fn structure_ssa<T: Target>(ssa: &SsaFunction<T>) -> Recovered {
             // blocks. Nothing else is: a block carrying a store is no more
             // expressible in a condition than it is movable into one.
             condition_expressible: condition_only.clone(),
+            // What a condition-only block computes is already its test, so
+            // no block's statements stand for the test's operand.
+            condition_operand: BlockSet::new(ssa.block_count()),
+            // No block's membership above was decided from what it reaches:
+            // a value is assigned once and the use index says every block
+            // that reads it, so a block whose definitions no other block
+            // reads is such a block in any graph. The recovery is free to
+            // rethread.
+            condition_reachability: BlockSet::new(ssa.block_count()),
             condition_only,
+            case_tests: BTreeMap::new(),
+            no_return: no_return_blocks(ssa),
             max_depth: DEFAULT_MAX_DEPTH,
+            polar: polar_blocks(ssa),
+            // Every SSA block holds the program's code: none stands for an edge.
+            edge_blocks: BlockSet::new(ssa.block_count()),
+            repeated_tests: BTreeMap::new(),
+            threaded_tests: BTreeMap::new(),
+            // A block's rows, each a statement at most.
+            statements: ssa
+                .blocks()
+                .iter()
+                .map(|block| block.instructions().len())
+                .collect(),
         },
     );
 
@@ -391,7 +460,9 @@ mod tests {
         ir::{
             SsaExceptionHandler,
             block::SsaBlock,
+            exception::ClausePart,
             instruction::SsaInstruction,
+            ops::AccessQualifiers,
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
@@ -432,13 +503,14 @@ mod tests {
             protected_range: protected,
             handler_range: handler,
             filter_range: filter,
+            selector: None,
         }
     }
 
     /// `try/catch(A)/catch(B)` is two table rows sharing one protected range.
     ///
     /// One region per row would give both the same `entry`, and
-    /// `structure_with` keys its protected map by entry — so the second catch
+    /// `structure` keys its protected map by entry - so the second catch
     /// would be dropped and swept up as an orphan. Grouping by protected range
     /// is what keeps both.
     #[test]
@@ -446,9 +518,9 @@ mod tests {
         let mut ssa = function(vec![
             vec![SsaOp::Jump { target: 1 }],
             vec![SsaOp::Jump { target: 4 }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
         ]);
         ssa.set_exception_handlers(vec![
             clause(0, BlockRange::new(1, 2), BlockRange::new(2, 3), None),
@@ -481,9 +553,9 @@ mod tests {
             vec![SsaOp::Jump { target: 1 }],
             vec![SsaOp::Jump { target: 2 }],
             vec![SsaOp::Jump { target: 5 }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
         ]);
         ssa.set_exception_handlers(vec![
             clause(0, BlockRange::new(1, 2), BlockRange::new(3, 4), None),
@@ -523,9 +595,9 @@ mod tests {
         let mut ssa = function(vec![
             vec![SsaOp::Jump { target: 1 }],
             vec![SsaOp::Jump { target: 4 }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
         ]);
         ssa.set_exception_handlers(vec![clause(
             1, // a filter handler, in `MockTarget`'s flag convention
@@ -566,7 +638,7 @@ mod tests {
         let mut ssa = function(vec![
             vec![SsaOp::Jump { target: 1 }],
             vec![SsaOp::Jump { target: 2 }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
         ]);
         ssa.set_exception_handlers(vec![clause(
             0,
@@ -586,7 +658,7 @@ mod tests {
             &[RejectedClause {
                 clause: 0,
                 reason: ClauseRejection::Malformed(ExceptionTableError::OutOfRange {
-                    part: crate::ir::exception::ClausePart::Handler,
+                    part: ClausePart::Handler,
                     end: 9,
                     block_count: 3,
                 }),
@@ -609,9 +681,9 @@ mod tests {
             vec![SsaOp::Jump { target: 2 }],
             vec![SsaOp::Jump { target: 3 }],
             vec![SsaOp::Jump { target: 6 }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
+            vec![SsaOp::returns(None)],
         ]);
         ssa.set_exception_handlers(vec![
             clause(0, BlockRange::new(1, 3), BlockRange::new(4, 5), None),
@@ -677,7 +749,7 @@ mod tests {
             addr: address,
             value: stored,
             value_type: MockType::I32,
-            address_space: None,
+            access: AccessQualifiers::FLAT,
         }));
         b1.add_instruction(instr(SsaOp::Jump { target: 3 }));
         ssa.add_block(b1);
@@ -693,9 +765,7 @@ mod tests {
 
         // B3: leaves the function; not a condition at all.
         let mut b3 = SsaBlock::new(3);
-        b3.add_instruction(instr(SsaOp::Return {
-            value: Some(escaping),
-        }));
+        b3.add_instruction(instr(SsaOp::returns(Some(escaping))));
         ssa.add_block(b3);
         ssa.recompute_uses();
 
@@ -744,7 +814,7 @@ mod tests {
         let ssa = function(vec![
             vec![SsaOp::Jump { target: 1 }],
             vec![SsaOp::Jump { target: 2 }],
-            vec![SsaOp::Return { value: None }],
+            vec![SsaOp::returns(None)],
         ]);
 
         let recovered = structure_ssa(&ssa);
@@ -753,14 +823,24 @@ mod tests {
 
         let condition_only = condition_only_blocks(&ssa);
         let cfg = SsaCfg::from_ssa(&ssa);
-        let direct = structure_with(
+        let direct = structure(
             &cfg,
             NodeId::new(0),
             &StructureOptions {
+                statements: Vec::new(),
                 regions: &[],
                 condition_expressible: condition_only.clone(),
+                condition_operand: BlockSet::new(ssa.block_count()),
+                condition_reachability: BlockSet::new(ssa.block_count()),
                 condition_only,
+                case_tests: BTreeMap::new(),
+                no_return: no_return_blocks(&ssa),
                 max_depth: DEFAULT_MAX_DEPTH,
+                polar: polar_blocks(&ssa),
+                // Every SSA block holds the program's code: none stands for an edge.
+                edge_blocks: BlockSet::new(ssa.block_count()),
+                repeated_tests: BTreeMap::new(),
+                threaded_tests: BTreeMap::new(),
             },
         );
 

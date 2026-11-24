@@ -31,7 +31,7 @@
 //!
 //! The `ReachingDefsResult` lattice uses `MeetSemiLattice` with:
 //! - **Meet = union**: A definition reaches if it reaches from ANY predecessor
-//!   (may analysis — standard for reaching definitions)
+//!   (may analysis - standard for reaching definitions)
 //! - **Boundary**: At function entry, initial definitions of arguments and
 //!   version-0 locals are present
 //! - **Initial**: Interior blocks start with empty sets
@@ -55,8 +55,8 @@ use crate::{
 /// ```rust
 /// use analyssa::{
 ///     analysis::{
+///         SsaCfg,
 ///         dataflow::{DataFlowSolver, ReachingDefinitions},
-///         exceptions::EhCfg,
 ///     },
 ///     ir::SsaVarId,
 ///     testing,
@@ -64,7 +64,7 @@ use crate::{
 ///
 /// // Diamond CFG: block 0 branches to blocks 1 and 2, which both jump to 3.
 /// let ssa = testing::diamond_phi_fixture();
-/// let graph = EhCfg::from_ssa(&ssa);
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = ReachingDefinitions::new(&ssa);
 /// let solver = DataFlowSolver::new(analysis);
@@ -93,7 +93,20 @@ pub struct ReachingDefinitions {
 }
 
 impl ReachingDefinitions {
-    /// Creates a new reaching definitions analysis for the given SSA function.
+    /// Precomputes the per-block GEN set that drives the forward solve.
+    ///
+    /// Walks each block once, inserting every variable defined by a phi node or
+    /// an instruction into that block's GEN set. There is no KILL set: SSA gives
+    /// each variable a single definition, so a definition is never overwritten and
+    /// the transfer function collapses to `OUT = GEN ∪ IN`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The SSA function whose block definitions form the GEN sets.
+    ///
+    /// # Returns
+    ///
+    /// An analysis primed for the dataflow solver.
     #[must_use]
     pub fn new<T: Target>(ssa: &SsaFunction<T>) -> Self {
         let num_vars = ssa.variable_count();
@@ -138,6 +151,8 @@ impl<T: Target> DataFlowAnalysis<T> for ReachingDefinitions {
     type Lattice = ReachingDefsResult;
     const DIRECTION: Direction = Direction::Forward;
 
+    /// Boundary value at function entry: the version-0 definitions of arguments
+    /// and locals are already in scope.
     fn boundary(&self, ssa: &SsaFunction<T>) -> Self::Lattice {
         // At function entry, the initial definitions of arguments and locals reach
         let mut defs = BitSet::new(self.num_vars);
@@ -152,6 +167,7 @@ impl<T: Target> DataFlowAnalysis<T> for ReachingDefinitions {
         ReachingDefsResult { defs }
     }
 
+    /// Initial value for interior blocks: no definitions reach yet.
     fn initial(&self, _ssa: &SsaFunction<T>) -> Self::Lattice {
         // Initially, no definitions reach interior blocks
         ReachingDefsResult {
@@ -159,6 +175,10 @@ impl<T: Target> DataFlowAnalysis<T> for ReachingDefinitions {
         }
     }
 
+    /// Forward transfer for one block: `OUT = GEN ∪ IN`.
+    ///
+    /// SSA has no KILL set, so a block only ever adds its own definitions to the
+    /// set reaching its entry.
     fn transfer(
         &self,
         block_id: usize,
@@ -240,7 +260,7 @@ impl MeetSemiLattice for ReachingDefsResult {
         Self { defs: result }
     }
 
-    /// Union in place — no temporary set per predecessor.
+    /// Union in place - no temporary set per predecessor.
     fn meet_into(&mut self, other: &Self) {
         self.defs.union_with(&other.defs);
     }
@@ -255,6 +275,7 @@ impl MeetSemiLattice for ReachingDefsResult {
 mod tests {
     use super::*;
 
+    /// Exercises the `ReachingDefsResult` set operations: add, remove, membership, count.
     #[test]
     fn test_reaching_defs_result() {
         let mut result = ReachingDefsResult::new(10);
@@ -274,6 +295,7 @@ mod tests {
         assert_eq!(result.count(), 1);
     }
 
+    /// The meet of two reaching-definition sets is their union.
     #[test]
     fn test_reaching_defs_meet() {
         let mut a = ReachingDefsResult::new(10);
@@ -291,6 +313,7 @@ mod tests {
         assert_eq!(result.count(), 3);
     }
 
+    /// `definitions()` yields exactly the reaching definitions, whatever their index spread.
     #[test]
     fn test_reaching_defs_iterator() {
         let mut result = ReachingDefsResult::new(100);

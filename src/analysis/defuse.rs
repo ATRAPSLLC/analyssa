@@ -34,10 +34,10 @@
 //! The per-variable and per-location lists are **flattened** (CSR: an offsets
 //! array plus one concatenated values array) rather than a vector per variable
 //! or a `BTreeMap<Location, Vec<_>>`. This index is rebuilt from scratch by
-//! nearly every pass, and the nested form allocated once per variable and once
-//! per instruction on every rebuild — measured as the largest single source of
-//! allocations in a native lift. The flat form costs one extra counting walk and
-//! a fixed handful of buffers, and keeps every query O(1)/O(k) on a slice.
+//! nearly every pass, and the nested form would allocate once per variable and
+//! once per instruction on every rebuild. The flat form costs one extra counting
+//! walk and a fixed handful of buffers, and keeps every query O(1)/O(k) on a
+//! slice.
 //!
 //! - `Vec<Option<DefSite>>`, dense by `SsaVarId::index()`: O(1) definition lookup
 //! - Flattened per-variable use lists: O(1) to reach a variable's use slice
@@ -56,7 +56,7 @@
 //! // Find all uses of variable v0
 //! if let Some(uses) = index.uses_of(v0) {
 //!     for use_site in uses {
-//!         println!("v0 used at block {}, instr {}", use_site.block, use_site.instruction);
+//!         println!("v0 used at block {}, instr {}", use_site.block(), use_site.index());
 //!     }
 //! }
 //!
@@ -102,6 +102,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     bitset::BitSet,
+    graph::Adjacency,
     ir::{
         function::SsaFunction,
         ops::SsaOp,
@@ -156,47 +157,44 @@ pub struct DefUseIndex<T: Target> {
     /// `None` marks an index outside the registered variable range.
     definitions: Vec<Option<DefSite>>,
 
-    /// Start offset into [`Self::use_values`] for each variable's use list,
-    /// indexed densely by `SsaVarId::index()`. Length is `capacity + 1`, so
-    /// variable `i` owns `use_values[use_offsets[i]..use_offsets[i + 1]]`.
+    /// The use sites of each variable, indexed densely by `SsaVarId::index()`
+    /// over `0..capacity`.
     ///
-    /// Flattened (CSR) rather than a `Vec<Vec<UseSite>>` because this index is
+    /// Compressed rather than a `Vec<Vec<UseSite>>` because this index is
     /// rebuilt from scratch by nearly every pass, and a vector-per-variable
-    /// allocates once for every variable that has any use — measured as the
-    /// single largest source of allocations in the whole lift. The flattened
-    /// form costs one extra counting walk and a fixed two allocations.
-    use_offsets: Vec<u32>,
-
-    /// Concatenated per-variable use lists; see [`Self::use_offsets`].
-    use_values: Vec<UseSite>,
+    /// allocates once for every variable that has any use, on every rebuild.
+    uses: Adjacency<UseSite>,
 
     /// Row base for each block: block `b` owns rows
     /// `block_row_base[b]..block_row_base[b + 1]`, and row `block_row_base[b] + i`
     /// is `Location(b, i)`. Length is `block_count + 1`.
     ///
     /// A block owns `max(phi_nodes, instructions)` rows because phi-operand uses
-    /// and instruction uses **share** a row index — preserving the behaviour of
+    /// and instruction uses **share** a row index - preserving the behaviour of
     /// the `Location`-keyed maps this replaces, where `Location(b, 0)` held both
     /// phi 0's operands and instruction 0's uses.
-    block_row_base: Vec<u32>,
+    block_row_base: Vec<usize>,
 
-    /// Variables defined at each row, flattened: row `r` owns
-    /// `loc_defs_values[loc_defs_offsets[r]..loc_defs_offsets[r + 1]]`.
+    /// Variables defined at each row.
     ///
-    /// Flattened for the same reason as [`Self::use_offsets`]: the previous
+    /// Compressed for the same reason as [`Self::uses`]: the previous
     /// `BTreeMap<Location, Vec<SsaVarId>>` cost a tree node *and* a vector for
     /// every instruction, on an index that is rebuilt by nearly every pass.
-    loc_defs_offsets: Vec<u32>,
-    /// Concatenated per-row definition lists; see [`Self::loc_defs_offsets`].
-    loc_defs_values: Vec<SsaVarId>,
+    loc_defs: Adjacency<SsaVarId>,
 
-    /// Variables used at each row; see [`Self::loc_defs_offsets`] for the layout.
-    loc_uses_offsets: Vec<u32>,
-    /// Concatenated per-row use lists; see [`Self::loc_uses_offsets`].
-    loc_uses_values: Vec<SsaVarId>,
+    /// Variables used at each row.
+    loc_uses: Adjacency<SsaVarId>,
 
     /// Variables defined in each block (including phi nodes), indexed by block.
     defs_in_block: Vec<Vec<SsaVarId>>,
+
+    /// Variables some phi or instruction in the function defines, found by
+    /// scanning the IR.
+    ///
+    /// Not the same question as [`Self::def_site`], which answers from the
+    /// variable table first and so still names the instruction that defined a
+    /// value after a pass removed that instruction.
+    active_defs: BitSet,
 
     /// Variables defined by phi nodes.
     phi_defs: BitSet,
@@ -217,54 +215,16 @@ impl<T: Target> Default for DefUseIndex<T> {
     fn default() -> Self {
         Self {
             definitions: Vec::new(),
-            use_offsets: Vec::new(),
-            use_values: Vec::new(),
+            uses: Adjacency::default(),
             block_row_base: Vec::new(),
-            loc_defs_offsets: Vec::new(),
-            loc_defs_values: Vec::new(),
-            loc_uses_offsets: Vec::new(),
-            loc_uses_values: Vec::new(),
+            loc_defs: Adjacency::default(),
+            loc_uses: Adjacency::default(),
             defs_in_block: Vec::new(),
             phi_defs: BitSet::default(),
+            active_defs: BitSet::default(),
             unused_vars: BitSet::default(),
             var_count: 0,
             def_ops: None,
-        }
-    }
-}
-
-/// Appends `var` to `row`'s region of a CSR pair, advancing that row's cursor.
-///
-/// The cursor array starts as a copy of the offsets, so each row fills forward
-/// from its own start; a row can never overrun because the offsets were sized by
-/// a counting walk over the same data.
-fn csr_push(cursors: &mut [u32], values: &mut [SsaVarId], row: usize, var: SsaVarId) {
-    if let Some(cursor) = cursors.get_mut(row) {
-        if let Some(slot) = values.get_mut(*cursor as usize) {
-            *slot = var;
-        }
-        *cursor = cursor.saturating_add(1);
-    }
-}
-
-/// Visits every `(variable, use site)` pair in the function, in the order the
-/// def-use index records them: for each block, phi operands first, then
-/// instruction operands.
-///
-/// Factored out so the counting walk and the filling walk that build the
-/// flattened use lists cannot drift apart — they must agree exactly, or a
-/// variable's uses land at the wrong offsets.
-fn visit_uses<T: Target>(ssa: &SsaFunction<T>, mut visit: impl FnMut(SsaVarId, UseSite)) {
-    for (block_idx, block) in ssa.blocks().iter().enumerate() {
-        for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-            for operand in phi.operands() {
-                visit(operand.value(), UseSite::phi_operand(block_idx, phi_idx));
-            }
-        }
-        for (instr_idx, instr) in block.instructions().iter().enumerate() {
-            instr
-                .op()
-                .for_each_use(|var| visit(var, UseSite::instruction(block_idx, instr_idx)));
         }
     }
 }
@@ -273,34 +233,16 @@ impl<T: Target> DefUseIndex<T> {
     /// Returns the recorded use sites for a dense variable index, or `None`
     /// when the index falls outside the registered variable range.
     fn uses_slice(&self, index: usize) -> Option<&[UseSite]> {
-        let start = *self.use_offsets.get(index)? as usize;
-        let end = *self.use_offsets.get(index.checked_add(1)?)? as usize;
-        self.use_values.get(start..end)
+        (index < self.uses.node_count()).then(|| self.uses.row(index))
     }
 
     /// Returns the flat row index for `Location(block, index)`, or `None` when
     /// the block does not exist or the index is past the block's row count.
     fn row_of(&self, block: usize, index: usize) -> Option<usize> {
-        let base = *self.block_row_base.get(block)? as usize;
-        let end = *self.block_row_base.get(block.checked_add(1)?)? as usize;
+        let base = *self.block_row_base.get(block)?;
+        let end = *self.block_row_base.get(block.checked_add(1)?)?;
         let row = base.checked_add(index)?;
         (row < end).then_some(row)
-    }
-
-    /// Returns one row's slice out of a CSR pair, or an empty slice when the row
-    /// does not exist.
-    fn csr_row<'s>(offsets: &[u32], values: &'s [SsaVarId], row: usize) -> &'s [SsaVarId] {
-        let Some(start) = offsets.get(row).map(|offset| *offset as usize) else {
-            return &[];
-        };
-        let Some(end) = row
-            .checked_add(1)
-            .and_then(|next| offsets.get(next))
-            .map(|offset| *offset as usize)
-        else {
-            return &[];
-        };
-        values.get(start..end).unwrap_or(&[])
     }
 
     /// Builds a def-use index from an SSA function.
@@ -317,208 +259,113 @@ impl<T: Target> DefUseIndex<T> {
     /// A new `DefUseIndex` with all relationships computed.
     #[must_use]
     pub fn build(ssa: &SsaFunction<T>) -> Self {
-        // Row layout for the location-indexed lists: block-major, with
-        // `max(phis, instructions)` rows per block so a phi index and an
-        // instruction index share a row exactly as the `Location` key did.
-        let mut block_row_base: Vec<u32> = Vec::with_capacity(ssa.blocks().len().saturating_add(1));
-        let mut row_total: u32 = 0;
+        let mut block_row_base = Vec::with_capacity(ssa.block_count().saturating_add(1));
+        let mut row_total = 0usize;
         block_row_base.push(0);
         for block in ssa.blocks() {
-            let rows = block.phi_nodes().len().max(block.instructions().len());
-            row_total = row_total.saturating_add(u32::try_from(rows).unwrap_or(u32::MAX));
+            row_total =
+                row_total.saturating_add(block.phi_nodes().len().max(block.instructions().len()));
             block_row_base.push(row_total);
         }
-        let row_count = row_total as usize;
-
-        // Count defs/uses per row (staged one slot high, as for `use_offsets`),
-        // prefix-sum into offsets, then fill through per-row cursors.
-        let mut loc_defs_offsets: Vec<u32> = vec![0; row_count.saturating_add(1)];
-        let mut loc_uses_offsets: Vec<u32> = vec![0; row_count.saturating_add(1)];
-        for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            let base = block_row_base.get(block_idx).map_or(0, |b| *b as usize);
-            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-                if let Some(slot) = base
-                    .checked_add(phi_idx)
-                    .and_then(|row| row.checked_add(1))
-                    .and_then(|next| loc_uses_offsets.get_mut(next))
-                {
-                    *slot = slot
-                        .saturating_add(u32::try_from(phi.operands().len()).unwrap_or(u32::MAX));
-                }
-            }
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let Some(next) = base
-                    .checked_add(instr_idx)
-                    .and_then(|row| row.checked_add(1))
-                else {
-                    continue;
-                };
-                let op = instr.op();
-                if let Some(slot) = loc_defs_offsets.get_mut(next) {
-                    *slot =
-                        slot.saturating_add(u32::try_from(op.defs().count()).unwrap_or(u32::MAX));
-                }
-                if let Some(slot) = loc_uses_offsets.get_mut(next) {
-                    *slot = slot.saturating_add(u32::try_from(op.use_count()).unwrap_or(u32::MAX));
-                }
-            }
-        }
-        let mut running_defs: u32 = 0;
-        for slot in &mut loc_defs_offsets {
-            running_defs = running_defs.saturating_add(*slot);
-            *slot = running_defs;
-        }
-        let mut running_uses: u32 = 0;
-        for slot in &mut loc_uses_offsets {
-            running_uses = running_uses.saturating_add(*slot);
-            *slot = running_uses;
-        }
-        let mut loc_defs_values: Vec<SsaVarId> = vec![SsaVarId::PLACEHOLDER; running_defs as usize];
-        let mut loc_uses_values: Vec<SsaVarId> = vec![SsaVarId::PLACEHOLDER; running_uses as usize];
-        let mut defs_cursors: Vec<u32> = loc_defs_offsets.clone();
-        let mut uses_cursors: Vec<u32> = loc_uses_offsets.clone();
-        let variable_count = ssa.variable_count();
-        let max_var_idx = ssa
-            .variables()
-            .iter()
-            .map(|v| v.id().index().saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        let bitset_capacity = max_var_idx.max(variable_count);
-        let block_count = ssa.blocks().len();
-
-        // Variables are densely indexed by `SsaVarId::index()`, so back the
-        // per-variable relationships with `Vec`s for O(1) cache-friendly lookup
-        // instead of `BTreeMap`'s O(log n) probes.
-        let mut definitions: Vec<Option<DefSite>> = vec![None; bitset_capacity];
-        let mut defs_in_block: Vec<Vec<SsaVarId>> = vec![Vec::new(); block_count];
-        let mut phi_defs = BitSet::new(bitset_capacity);
-
-        // Flattened per-variable use lists: count first, prefix-sum into
-        // offsets, then fill through per-variable cursors. Both walks go through
-        // `visit_uses`, so the recorded order matches a per-variable `push`.
-        let mut use_offsets: Vec<u32> = vec![0; bitset_capacity.saturating_add(1)];
-        visit_uses(ssa, |var, _site| {
-            // Counts are staged one slot high so the prefix sum below turns this
-            // same vector into the offsets array without a second allocation.
-            if let Some(slot) = var
-                .index()
-                .checked_add(1)
-                .and_then(|next| use_offsets.get_mut(next))
-            {
-                *slot = slot.saturating_add(1);
-            }
-        });
-        let mut running: u32 = 0;
-        for slot in &mut use_offsets {
-            running = running.saturating_add(*slot);
-            *slot = running;
-        }
-        let mut use_values: Vec<UseSite> = vec![UseSite::instruction(0, 0); running as usize];
-        // Cursors start at each variable's region start, i.e. the *previous*
-        // entry of the offsets array.
-        let mut cursors: Vec<u32> = use_offsets.clone();
-        visit_uses(ssa, |var, site| {
-            if let Some(cursor) = cursors.get_mut(var.index()) {
-                if let Some(slot) = use_values.get_mut(*cursor as usize) {
-                    *slot = site;
-                }
-                *cursor = cursor.saturating_add(1);
-            }
-        });
-
-        // Helper: write a definition site at a variable's dense index.
-        let set_def = |definitions: &mut Vec<Option<DefSite>>, var: SsaVarId, site: DefSite| {
-            if let Some(slot) = definitions.get_mut(var.index()) {
-                *slot = Some(site);
-            }
-        };
-        // Seed every registered variable so entry values and unused variables
-        // remain queryable even when they have no active instruction or phi
-        // definition. Active definitions and uses are then scanned from the IR
-        // itself so stale variable metadata cannot mislead optimization passes.
-        for var in ssa.variables() {
-            set_def(&mut definitions, var.id(), var.def_site());
-        }
-
-        for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            let row_base = block_row_base.get(block_idx).map_or(0, |b| *b as usize);
-            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-                let result = phi.result();
-                set_def(&mut definitions, result, DefSite::phi(block_idx));
-                // `insert_checked`: the capacity comes from the *registered*
-                // variables, and malformed IR can name a phi result the
-                // allocator never issued. `set_def` above is already tolerant of
-                // that (it uses `get_mut`), so this matches — an unregistered
-                // variable simply has no entry, which is the same answer every
-                // query here gives for one.
-                phi_defs.insert_checked(result.index());
-                if let Some(slot) = defs_in_block.get_mut(block_idx) {
-                    slot.push(result);
-                }
-
-                let Some(row) = row_base.checked_add(phi_idx) else {
-                    continue;
-                };
-                for operand in phi.operands() {
-                    csr_push(
-                        &mut uses_cursors,
-                        &mut loc_uses_values,
-                        row,
-                        operand.value(),
-                    );
-                }
-            }
-
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let Some(row) = row_base.checked_add(instr_idx) else {
-                    continue;
-                };
-                let op = instr.op();
-                for dest in op.defs() {
-                    set_def(
-                        &mut definitions,
-                        dest,
-                        DefSite::instruction(block_idx, instr_idx),
-                    );
-                    csr_push(&mut defs_cursors, &mut loc_defs_values, row, dest);
-                    if let Some(slot) = defs_in_block.get_mut(block_idx) {
-                        slot.push(dest);
+        let loc_defs = Adjacency::from_walk(row_total, SsaVarId::PLACEHOLDER, |visit| {
+            for (block_index, block) in ssa.blocks().iter().enumerate() {
+                let base = block_row_base.get(block_index).copied().unwrap_or(0);
+                for (instruction_index, instruction) in block.instructions().iter().enumerate() {
+                    if let Some(row) = base.checked_add(instruction_index) {
+                        instruction.op().for_each_def(|dest| visit(row, dest));
                     }
                 }
-                op.for_each_use(|var| {
-                    csr_push(&mut uses_cursors, &mut loc_uses_values, row, var);
+            }
+        });
+        let loc_uses = Adjacency::from_walk(row_total, SsaVarId::PLACEHOLDER, |visit| {
+            for (block_index, block) in ssa.blocks().iter().enumerate() {
+                let base = block_row_base.get(block_index).copied().unwrap_or(0);
+                for (phi_index, phi) in block.phi_nodes().iter().enumerate() {
+                    if let Some(row) = base.checked_add(phi_index) {
+                        for operand in phi.operands() {
+                            visit(row, operand.value());
+                        }
+                    }
+                }
+                for (instruction_index, instruction) in block.instructions().iter().enumerate() {
+                    if let Some(row) = base.checked_add(instruction_index) {
+                        instruction.op().for_each_use(|var| visit(row, var));
+                    }
+                }
+            }
+        });
+        let capacity = ssa.var_id_bound();
+        let uses = Adjacency::from_walk(capacity, UseSite::instruction(0, 0), |visit| {
+            for (block_index, block) in ssa.blocks().iter().enumerate() {
+                for (phi_index, phi) in block.phi_nodes().iter().enumerate() {
+                    for operand in phi.operands() {
+                        visit(
+                            operand.value().index(),
+                            UseSite::phi_operand(block_index, phi_index),
+                        );
+                    }
+                }
+                for (instruction_index, instruction) in block.instructions().iter().enumerate() {
+                    instruction.op().for_each_use(|var| {
+                        visit(
+                            var.index(),
+                            UseSite::instruction(block_index, instruction_index),
+                        );
+                    });
+                }
+            }
+        });
+        let mut definitions = vec![None; capacity];
+        let mut defs_in_block = vec![Vec::new(); ssa.block_count()];
+        let mut phi_defs = BitSet::new(capacity);
+        let mut active_defs = BitSet::new(capacity);
+        for variable in ssa.variables() {
+            if let Some(slot) = definitions.get_mut(variable.id().index()) {
+                *slot = Some(variable.def_site());
+            }
+        }
+        for (block_index, block) in ssa.blocks().iter().enumerate() {
+            for phi in block.phi_nodes() {
+                let dest = phi.result();
+                if let Some(slot) = definitions.get_mut(dest.index()) {
+                    *slot = Some(DefSite::phi(block_index));
+                }
+                phi_defs.insert_checked(dest.index());
+                active_defs.insert_checked(dest.index());
+                if let Some(slot) = defs_in_block.get_mut(block_index) {
+                    slot.push(dest);
+                }
+            }
+            for (instruction_index, instruction) in block.instructions().iter().enumerate() {
+                instruction.op().for_each_def(|dest| {
+                    if let Some(slot) = definitions.get_mut(dest.index()) {
+                        *slot = Some(DefSite::instruction(block_index, instruction_index));
+                    }
+                    active_defs.insert_checked(dest.index());
+                    if let Some(slot) = defs_in_block.get_mut(block_index) {
+                        slot.push(dest);
+                    }
                 });
             }
         }
-
-        // Identify unused variables. Only registered variables are considered,
-        // matching the previous seeded-map behavior.
-        let mut unused_vars = BitSet::new(bitset_capacity);
-        for var in ssa.variables() {
-            let i = var.id().index();
-            if use_offsets
-                .get(i)
-                .zip(i.checked_add(1).and_then(|next| use_offsets.get(next)))
-                .is_some_and(|(start, end)| start == end)
-            {
-                unused_vars.insert(i);
+        let mut unused_vars = BitSet::new(capacity);
+        for variable in ssa.variables() {
+            let index = variable.id().index();
+            if index < uses.node_count() && uses.row(index).is_empty() {
+                unused_vars.insert_checked(index);
             }
         }
-
         Self {
             definitions,
-            use_offsets,
-            use_values,
+            uses,
             block_row_base,
-            loc_defs_offsets,
-            loc_defs_values,
-            loc_uses_offsets,
-            loc_uses_values,
+            loc_defs,
+            loc_uses,
             defs_in_block,
+            active_defs,
             phi_defs,
             unused_vars,
-            var_count: variable_count,
+            var_count: ssa.variable_count(),
             def_ops: None,
         }
     }
@@ -675,9 +522,9 @@ impl<T: Target> DefUseIndex<T> {
     #[must_use]
     pub fn full_definition(&self, var: SsaVarId) -> Option<(usize, usize, &SsaOp<T>)> {
         let site = self.def_site(var)?;
-        let instr = site.instruction?; // None for phi nodes
+        let instr = site.index()?; // None for phi nodes
         let op = self.def_op(var)?;
-        Some((site.block, instr, op))
+        Some((site.block(), instr, op))
     }
 
     /// Returns the definition site for a variable.
@@ -750,6 +597,40 @@ impl<T: Target> DefUseIndex<T> {
         var.index() < self.unused_vars.len() && self.unused_vars.contains(var.index())
     }
 
+    /// Checks whether a variable is absent from the program: no instruction or
+    /// phi in the function defines it, and nothing reads it.
+    ///
+    /// Such a value keeps its entry in the variable table - an entry
+    /// placeholder SSA construction rewrote to another value, a definition a
+    /// pass removed - but describes nothing the program computes or consumes.
+    /// A value the function is entered with is present exactly while something
+    /// reads it.
+    ///
+    /// # Arguments
+    ///
+    /// * `var` - The variable ID to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if nothing in the function defines or reads the variable.
+    #[must_use]
+    pub fn is_absent(&self, var: SsaVarId) -> bool {
+        let defined =
+            var.index() < self.active_defs.len() && self.active_defs.contains(var.index());
+        !defined && self.is_unused(var)
+    }
+
+    /// Returns a site only when the current IR actually defines the value.
+    ///
+    /// Registered historical sites remain available through [`Self::def_site`],
+    /// but are not evidence that a removed definition still produces a value.
+    pub fn active_def_site(&self, var: SsaVarId) -> Option<DefSite> {
+        self.active_defs
+            .contains_checked(var.index())
+            .then(|| self.def_site(var))
+            .flatten()
+    }
+
     /// Checks if a variable is defined by a phi node.
     ///
     /// # Arguments
@@ -776,9 +657,8 @@ impl<T: Target> DefUseIndex<T> {
     /// A slice of variable IDs defined at that location.
     #[must_use]
     pub fn defs_at(&self, block: usize, instruction: usize) -> &[SsaVarId] {
-        self.row_of(block, instruction).map_or(&[], |row| {
-            Self::csr_row(&self.loc_defs_offsets, &self.loc_defs_values, row)
-        })
+        self.row_of(block, instruction)
+            .map_or(&[], |row| self.loc_defs.row(row))
     }
 
     /// Returns variables used at a specific location.
@@ -793,9 +673,8 @@ impl<T: Target> DefUseIndex<T> {
     /// A slice of variable IDs used at that location.
     #[must_use]
     pub fn uses_at(&self, block: usize, instruction: usize) -> &[SsaVarId] {
-        self.row_of(block, instruction).map_or(&[], |row| {
-            Self::csr_row(&self.loc_uses_offsets, &self.loc_uses_values, row)
-        })
+        self.row_of(block, instruction)
+            .map_or(&[], |row| self.loc_uses.row(row))
     }
 
     /// Returns all variables defined in a block.
@@ -876,7 +755,7 @@ impl<T: Target> DefUseIndex<T> {
     #[must_use]
     pub fn only_used_in_phis(&self, var: SsaVarId) -> bool {
         self.uses_slice(var.index())
-            .is_some_and(|uses| !uses.is_empty() && uses.iter().all(|u| u.is_phi_operand))
+            .is_some_and(|uses| !uses.is_empty() && uses.iter().all(|u| u.is_phi_operand()))
     }
 
     /// Returns all variables used in a block.
@@ -893,21 +772,16 @@ impl<T: Target> DefUseIndex<T> {
     #[must_use]
     pub fn uses_in_block(&self, block: usize) -> BTreeSet<SsaVarId> {
         let mut result = BTreeSet::new();
-        let (Some(base), Some(end)) = (
-            self.block_row_base.get(block).map(|b| *b as usize),
+        let (Some(&base), Some(&end)) = (
+            self.block_row_base.get(block),
             block
                 .checked_add(1)
-                .and_then(|next| self.block_row_base.get(next))
-                .map(|b| *b as usize),
+                .and_then(|next| self.block_row_base.get(next)),
         ) else {
             return result;
         };
         for row in base..end {
-            result.extend(
-                Self::csr_row(&self.loc_uses_offsets, &self.loc_uses_values, row)
-                    .iter()
-                    .copied(),
-            );
+            result.extend(self.loc_uses.row(row).iter().copied());
         }
         result
     }
@@ -935,10 +809,12 @@ impl<T: Target> DefUseIndex<T> {
 
 #[cfg(test)]
 mod tests {
+
     use super::DefUseIndex;
     use crate::{
         ir::{
             block::SsaBlock,
+            float::{FloatExceptionLayout, FloatExceptions},
             function::SsaFunction,
             instruction::SsaInstruction,
             ops::SsaOp,
@@ -1002,15 +878,64 @@ mod tests {
         }));
 
         // ret v1
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(id1),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(id1))));
 
         ssa.add_block(block);
 
         (ssa, id0, id1)
     }
 
+    /// A value is absent when the program neither defines nor reads it, whatever
+    /// the variable table still records for it.
+    ///
+    /// `stale` names an instruction in its table entry that the function does
+    /// not contain, and nothing reads it. `arrives` is defined at entry and read.
+    /// `unread` is defined by an instruction and never read. Only `stale` is
+    /// absent: a read makes an entry value present, and so does a definition.
+    #[test]
+    fn a_value_neither_defined_nor_read_is_absent() {
+        let (mut ssa, id0, id1) = make_test_ssa();
+        let stale = SsaVarId::from_index(2);
+        ssa.variables_mut().push(SsaVariable::new(
+            stale,
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(0, 7),
+            SsaType::Unknown,
+        ));
+        let arrives = SsaVarId::from_index(3);
+        ssa.variables_mut().push(SsaVariable::new(
+            arrives,
+            VariableOrigin::Argument(0),
+            0,
+            DefSite::entry(),
+            SsaType::Unknown,
+        ));
+        let unread = SsaVarId::from_index(4);
+        ssa.variables_mut().push(SsaVariable::new(
+            unread,
+            VariableOrigin::Local(4),
+            0,
+            DefSite::instruction(0, 0),
+            SsaType::Unknown,
+        ));
+        let mut block = SsaBlock::new(1);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: unread,
+            value: ConstValue::I32(7),
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(arrives))));
+        ssa.add_block(block);
+
+        let index = DefUseIndex::build(&ssa);
+        assert!(index.is_absent(stale));
+        assert!(!index.is_absent(arrives));
+        assert!(!index.is_absent(unread));
+        assert!(!index.is_absent(id0));
+        assert!(!index.is_absent(id1));
+    }
+
+    /// Verifies a built index reports the number of registered variables.
     #[test]
     fn test_build_index() {
         let (ssa, _id0, _id1) = make_test_ssa();
@@ -1019,20 +944,22 @@ mod tests {
         assert_eq!(index.variable_count(), 2);
     }
 
+    /// Verifies `def_site` returns each variable's defining block and instruction.
     #[test]
     fn test_def_site_lookup() {
         let (ssa, id0, id1) = make_test_ssa();
         let index = DefUseIndex::build(&ssa);
 
         let def0 = index.def_site(id0).unwrap();
-        assert_eq!(def0.block, 0);
-        assert_eq!(def0.instruction, Some(0));
+        assert_eq!(def0.block(), 0);
+        assert_eq!(def0.index(), Some(0));
 
         let def1 = index.def_site(id1).unwrap();
-        assert_eq!(def1.block, 0);
-        assert_eq!(def1.instruction, Some(1));
+        assert_eq!(def1.block(), 0);
+        assert_eq!(def1.index(), Some(1));
     }
 
+    /// Verifies `uses_of` returns every recorded use site of a variable.
     #[test]
     fn test_uses_of() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1047,6 +974,7 @@ mod tests {
         assert_eq!(uses1.len(), 1);
     }
 
+    /// Verifies `use_count` counts uses and returns zero for an unknown variable.
     #[test]
     fn test_use_count() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1057,6 +985,7 @@ mod tests {
         assert_eq!(index.use_count(SsaVarId::from_index(999999)), 0); // Unknown var
     }
 
+    /// Verifies `defs_at` reports the variable defined at each instruction and none at a non-defining one.
     #[test]
     fn test_defs_at_location() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1075,6 +1004,7 @@ mod tests {
         assert!(defs_0_2.is_empty());
     }
 
+    /// Verifies `build_with_ops` indexes secondary definitions so both an op's primary result and its flags result resolve to that op.
     #[test]
     fn test_build_with_ops_indexes_secondary_defs() {
         let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
@@ -1146,6 +1076,7 @@ mod tests {
         ));
     }
 
+    /// Verifies `uses_at` reports the variables used at a given instruction.
     #[test]
     fn test_uses_at_location() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1160,6 +1091,7 @@ mod tests {
         assert!(uses_0_2.contains(&id1));
     }
 
+    /// Verifies `defs_in_block` lists every variable defined in a block.
     #[test]
     fn test_defs_in_block() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1171,6 +1103,7 @@ mod tests {
         assert!(defs.contains(&id1));
     }
 
+    /// Verifies unused-variable detection flags a defined-but-never-used variable and not a used one.
     #[test]
     fn test_unused_variables() {
         // Create SSA with an unused variable
@@ -1187,9 +1120,7 @@ mod tests {
             dest: dest1,
             value: ConstValue::I32(0),
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(dest1),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest1))));
 
         ssa.add_block(block);
 
@@ -1224,6 +1155,7 @@ mod tests {
         assert!(index.unused_variables().contains(v0_id.index()));
     }
 
+    /// Verifies `is_single_use` and `single_use_site` identify variables with exactly one use.
     #[test]
     fn test_single_use() {
         let (ssa, v0_id, v1_id) = make_test_ssa();
@@ -1237,13 +1169,14 @@ mod tests {
 
         // Get the single use site
         let use_site = index.single_use_site(v1_id).unwrap();
-        assert_eq!(use_site.block, 0);
-        assert_eq!(use_site.instruction, 2);
+        assert_eq!(use_site.block(), 0);
+        assert_eq!(use_site.index(), 2);
 
         // v0 doesn't have single use site
         assert!(index.single_use_site(v0_id).is_none());
     }
 
+    /// Verifies phi-defined variables are distinguished from instruction-defined ones.
     #[test]
     fn test_phi_definitions() {
         let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
@@ -1284,6 +1217,7 @@ mod tests {
         assert!(index.phi_definitions().contains(v0_id.index()));
     }
 
+    /// Verifies `uses_in_block` gathers all variables used anywhere in a block.
     #[test]
     fn test_uses_in_block() {
         let (ssa, v0_id, v1_id) = make_test_ssa();
@@ -1294,6 +1228,7 @@ mod tests {
         assert!(uses.contains(&v1_id));
     }
 
+    /// Verifies a default-constructed index is empty.
     #[test]
     fn test_default() {
         let index: DefUseIndex<MockTarget> = DefUseIndex::default();
@@ -1301,6 +1236,7 @@ mod tests {
         assert_eq!(index.unused_count(), 0);
     }
 
+    /// Verifies an index built without ops reports no operation information.
     #[test]
     fn test_build_without_ops() {
         let (ssa, id0, _id1) = make_test_ssa();
@@ -1312,6 +1248,7 @@ mod tests {
         assert!(index.full_definition(id0).is_none());
     }
 
+    /// Verifies `build_with_ops` records each variable's defining operation.
     #[test]
     fn test_build_with_ops() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1329,6 +1266,7 @@ mod tests {
         assert!(matches!(op1, SsaOp::Add { .. }));
     }
 
+    /// Verifies `full_definition` returns block, instruction, and defining op together.
     #[test]
     fn test_full_definition() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1347,6 +1285,7 @@ mod tests {
         assert!(matches!(op1, SsaOp::Add { .. }));
     }
 
+    /// Verifies `full_definition` returns `None` for phi-defined variables while `def_site` still resolves them.
     #[test]
     fn test_full_definition_phi_returns_none() {
         let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
@@ -1372,10 +1311,11 @@ mod tests {
 
         // But def_site still works
         let site = index.def_site(v0_id).unwrap();
-        assert_eq!(site.block, 0);
-        assert!(site.instruction.is_none());
+        assert_eq!(site.block(), 0);
+        assert!(site.index().is_none());
     }
 
+    /// Verifies `build_with_ops_map` returns a standalone op map matching the index's own ops.
     #[test]
     fn test_build_with_ops_map_compatibility() {
         let (ssa, id0, id1) = make_test_ssa();
@@ -1393,5 +1333,157 @@ mod tests {
         let op0_from_map = ops.get(&id0).unwrap();
         assert!(matches!(op0_from_index, SsaOp::Const { .. }));
         assert!(matches!(op0_from_map, SsaOp::Const { .. }));
+    }
+
+    /// A loop with a phi, flags, duplicate uses, stale sites and one unregistered operand.
+    fn canonical_defuse_fixture() -> (SsaFunction<MockTarget>, [SsaVarId; 7]) {
+        let mut ssa = SsaFunction::<MockTarget>::new(2, 5);
+        let ids = [
+            VariableOrigin::Argument(0),
+            VariableOrigin::Local(0),
+            VariableOrigin::Local(1),
+            VariableOrigin::Local(2),
+            VariableOrigin::Local(3),
+            VariableOrigin::Argument(1),
+            VariableOrigin::Local(4),
+        ]
+        .map(|origin| ssa.create_variable(origin, 0, DefSite::entry(), MockType::I32));
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: ids[1],
+            value: ConstValue::I32(7),
+        }));
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(entry);
+        let mut body = SsaBlock::new(1);
+        let mut phi = PhiNode::new(ids[2], VariableOrigin::Local(1));
+        phi.set_operand(0, ids[0]);
+        phi.set_operand(1, ids[3]);
+        body.add_phi(phi);
+        body.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: ids[3],
+            left: ids[2],
+            right: ids[0],
+            flags: Some(ids[6]),
+        }));
+        body.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: ids[3],
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(body);
+        let mut exit = SsaBlock::new(2);
+        exit.add_instruction(SsaInstruction::synthetic(SsaOp::returns_with(
+            Some(ids[3]),
+            vec![ids[2], ids[6], SsaVarId::from_index(900)],
+        )));
+        ssa.add_block(exit);
+        for index in [1, 2, 3, 6] {
+            ssa.variable_mut(ids[index])
+                .unwrap()
+                .set_def_site(DefSite::instruction(99, 99));
+        }
+        ssa.variable_mut(ids[4])
+            .unwrap()
+            .set_def_site(DefSite::instruction(1, 0));
+        (ssa, ids)
+    }
+
+    /// Actual IR overrides stale metadata while preserving phi/instruction row overlap and use order.
+    #[test]
+    fn canonical_defuse_matches_independent_literal_site_and_use_oracles() {
+        let (ssa, v) = canonical_defuse_fixture();
+        let index = DefUseIndex::build(&ssa);
+        assert_eq!(index.variable_count(), 7);
+        assert_eq!(index.def_site(v[0]), Some(DefSite::entry()));
+        assert_eq!(index.active_def_site(v[0]), None);
+        assert_eq!(index.def_site(v[1]), Some(DefSite::instruction(0, 0)));
+        assert_eq!(index.active_def_site(v[2]), Some(DefSite::phi(1)));
+        assert_eq!(
+            index.active_def_site(v[3]),
+            Some(DefSite::instruction(1, 0))
+        );
+        assert_eq!(
+            index.active_def_site(v[6]),
+            Some(DefSite::instruction(1, 0))
+        );
+        assert_eq!(index.def_site(v[4]), Some(DefSite::instruction(1, 0)));
+        assert_eq!(index.active_def_site(v[4]), None);
+        assert_eq!(index.defs_at(0, 0), [v[1]]);
+        assert_eq!(index.defs_at(1, 0), [v[3], v[6]]);
+        assert_eq!(index.defs_in_block(1), [v[2], v[3], v[6]]);
+        assert_eq!(index.uses_at(1, 0), [v[0], v[3], v[2], v[0]]);
+        assert_eq!(
+            index.uses_at(2, 0),
+            [v[3], v[2], v[6], SsaVarId::from_index(900)]
+        );
+        assert_eq!(
+            index.uses_of(v[0]),
+            Some(&[UseSite::phi_operand(1, 0), UseSite::instruction(1, 0)][..])
+        );
+        assert_eq!(
+            index.uses_of(v[3]),
+            Some(
+                &[
+                    UseSite::phi_operand(1, 0),
+                    UseSite::instruction(1, 1),
+                    UseSite::instruction(2, 0)
+                ][..]
+            )
+        );
+        assert_eq!(index.uses_of(SsaVarId::from_index(900)), None);
+        assert!(index.is_unused(v[1]));
+        assert!(!index.is_absent(v[1]));
+        assert!(index.is_absent(v[4]));
+        assert!(index.is_absent(v[5]));
+    }
+
+    /// Nested raises retain only their effective definitions and every mask use.
+    #[test]
+    fn canonical_defuse_preserves_nested_raise_definitions_and_mask_uses() {
+        for masked in [false, true] {
+            let mut ssa = SsaFunction::<MockTarget>::new(2, 1);
+            let left = ssa.create_variable(
+                VariableOrigin::Argument(0),
+                0,
+                DefSite::entry(),
+                MockType::I32,
+            );
+            let right = ssa.create_variable(
+                VariableOrigin::Argument(1),
+                0,
+                DefSite::entry(),
+                MockType::I32,
+            );
+            let dest = ssa.create_variable(
+                VariableOrigin::Local(0),
+                0,
+                DefSite::instruction(0, 0),
+                MockType::I32,
+            );
+            let mut operation = SsaOp::Add {
+                dest: SsaVarId::from_index(900),
+                left,
+                right,
+                flags: Some(SsaVarId::from_index(901)),
+            };
+            for _ in 0..1024 {
+                operation = SsaOp::FloatRaise {
+                    dest,
+                    op: Box::new(operation),
+                    lanes: masked.then_some(left),
+                    raises: FloatExceptions::NONE,
+                    layout: FloatExceptionLayout::IEEE,
+                };
+            }
+            let mut block = SsaBlock::new(0);
+            block.add_instruction(SsaInstruction::synthetic(operation));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
+            ssa.add_block(block);
+            let index = DefUseIndex::build(&ssa);
+            assert_eq!(index.defs_at(0, 0), [dest]);
+            assert_eq!(index.use_count(left), if masked { 1025 } else { 1 });
+            assert_eq!(index.use_count(right), 1);
+        }
     }
 }
