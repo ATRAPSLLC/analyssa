@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-23
+
 A static execution engine, an operation set that states every ISA's semantics
 exactly (no opaque native operations), and a points-to and memory model over
 the bytes of objects. The analyses take their host facts (machine, image, call
