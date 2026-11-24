@@ -11,19 +11,19 @@
 #   scripts/check.sh all            every gate that currently exists
 #   scripts/check.sh release-gate   the stable-only subset (no nightly, no coverage)
 #
-# Gates: fmt clippy test doc doctest deny coverage release
+# Gates: fmt clippy test doc doctest deny coverage release conventions fuzz
 
 set -euo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-readonly ALL_GATES=(fmt clippy test doc doctest deny coverage release)
+readonly ALL_GATES=(fmt clippy test doc doctest deny coverage release conventions fuzz)
 
 # The subset a stock stable toolchain can run: no nightly rustfmt, no cargo-deny,
 # no cargo-llvm-cov. Still blocks a broken --all-features build and a failing
 # docs.rs build (Cargo.toml sets all-features = true for docs.rs).
-readonly RELEASE_GATES=(clippy test doc doctest release)
+readonly RELEASE_GATES=(clippy test doc doctest release conventions fuzz)
 
 log() { printf '\n\033[1m== %s\033[0m\n' "$*" >&2; }
 
@@ -63,6 +63,19 @@ gate_release() {
     # Manifest, lockfile and changelog agree. On a tag ref, pass the tag so the
     # stricter release-state rules apply.
     scripts/check-release.sh "${GITHUB_REF_NAME:-}"
+}
+
+gate_conventions() {
+    # Source-text conventions the compiler does not check. They read the tree,
+    # so they are a gate rather than tests: `cargo test` stays hermetic.
+    scripts/check-conventions.sh
+}
+
+gate_fuzz() {
+    # The fuzz targets are a separate crate the other gates never build, so an
+    # API change the library makes would otherwise break them unnoticed.
+    # Type-checking needs no nightly and no sanitizer; running them does.
+    cargo check --manifest-path fuzz/Cargo.toml --bins
 }
 
 gate_coverage() {
