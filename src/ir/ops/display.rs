@@ -1,30 +1,22 @@
 //! Human-readable rendering of [`SsaOp`].
 //!
-//! The format is diagnostic output — verifier messages, pass logs, test
-//! assertions — not a parseable serialization; use the `serde` feature for
+//! The format is diagnostic output - verifier messages, pass logs, test
+//! assertions - not a parseable serialization; use the `serde` feature for
 //! round-tripping.
 
-use std::fmt;
+use std::fmt::{self, Write};
 
 use crate::{
     ir::{
+        float::{FloatExceptionLayout, FloatExceptions},
         ops::{
+            calls::{AccessMode, CallData, CallLocation, CallTermination, Callee, FrameOrigin},
             def::SsaOp,
-            kinds::{
-                BcdAdjustData, BcdAdjustKind, KindedVecData, NativeInstructionMetadata,
-                NativeKindedData, NativeOpaqueData, VecImm8Data,
-            },
-            native::{BlockStringOpData, WideCmpXchgData},
+            kinds::{CompareBlkData, KindedVecData, NativeInstructionMetadata, NativeKindedData},
             vector::{
-                VectorBitfieldData, VectorComplexAddData, VectorConditionalMoveData,
-                VectorCountAdjustData, VectorDotProductData, VectorElementCountData,
-                VectorExtendInLaneData, VectorHorizontalMinPosData, VectorHorizontalReduceData,
-                VectorIntDotProductData, VectorIntersectData, VectorMatrixMulAccData,
-                VectorNarrowSaturateData, VectorPackNarrowData, VectorPermuteData,
-                VectorPredicateBreakData, VectorPredicateOpData, VectorPredicateWhileData,
-                VectorReverseChunksData, VectorShuffleBitsData, VectorSmeMiscData,
-                VectorSmeOuterProductData, VectorStringCompareData, VectorStructLoadReplicateData,
-                VectorSveAddressGenData, VectorSveComputeData,
+                Contraction, MatrixLayout, ReduceGroups, VectorElementCountData,
+                VectorExtendInLaneData, VectorPredicateWhileData, VectorStructLoadReplicateData,
+                VectorSveComputeData,
             },
         },
         variable::SsaVarId,
@@ -95,13 +87,77 @@ fn write_native_metadata(
     Ok(())
 }
 
-/// Writes an `addrspace(N)` qualifier prefix, or nothing for the default
-/// (flat) space.
-fn write_address_space(f: &mut fmt::Formatter<'_>, address_space: Option<u16>) -> fmt::Result {
-    match address_space {
-        Some(space) => write!(f, "addrspace({space}) "),
-        None => Ok(()),
+/// Streams text after discarding one exact ASCII definition prefix.
+///
+/// A mismatch flushes the partial prefix before forwarding the remaining text.
+/// Only the bounded SSA identifier prefix is retained, never the operation text.
+struct PrefixWriter<'a, 'b> {
+    /// The caller's diagnostic formatter.
+    inner: &'a mut fmt::Formatter<'b>,
+    /// The definition prefix that may be elided.
+    prefix: &'a str,
+    /// Prefix bytes seen so far, all ASCII and therefore character boundaries.
+    matched: usize,
+    /// Whether subsequent text can be forwarded immediately.
+    passthrough: bool,
+}
+
+impl PrefixWriter<'_, '_> {
+    /// Flushes an incomplete prefix when the operation ended before matching it.
+    fn finish(&mut self) -> fmt::Result {
+        if !self.passthrough && self.matched != 0 {
+            self.inner.write_str(&self.prefix[..self.matched])?;
+        }
+        Ok(())
     }
+}
+
+impl fmt::Write for PrefixWriter<'_, '_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if self.passthrough {
+            return self.inner.write_str(text);
+        }
+        let matched = self.prefix[self.matched..]
+            .bytes()
+            .zip(text.bytes())
+            .take_while(|(expected, actual)| expected == actual)
+            .count();
+        self.matched = self.matched.checked_add(matched).ok_or(fmt::Error)?;
+        if matched == text.len() && self.matched < self.prefix.len() {
+            return Ok(());
+        }
+        self.passthrough = true;
+        if self.matched < self.prefix.len() && self.matched != 0 {
+            self.inner.write_str(&self.prefix[..self.matched])?;
+        }
+        if matched == text.len() {
+            Ok(())
+        } else {
+            self.inner.write_str(&text[matched..])
+        }
+    }
+}
+
+/// Writes one raise's flags and optional definition prefix without visiting its child.
+fn write_raise_head(
+    f: &mut fmt::Formatter<'_>,
+    dest: Option<SsaVarId>,
+    raises: FloatExceptions,
+    layout: FloatExceptionLayout,
+) -> fmt::Result {
+    if let Some(dest) = dest {
+        write!(f, "{dest} = ")?;
+    }
+    write!(f, "float.raise")?;
+    for (index, (name, bit)) in FloatExceptions::NAMES.iter().zip(layout.bits()).enumerate() {
+        let flag = FloatExceptions::from_bits(1 << index);
+        if let Some(bit) = bit
+            && raises.contains(flag)
+        {
+            write!(f, " {name}@{bit}")?;
+        }
+    }
+    Ok(())
 }
 
 impl<T: Target> fmt::Display for SsaOp<T>
@@ -113,8 +169,69 @@ where
     T::SigRef: fmt::Display,
     T::Type: fmt::Display,
 {
+    /// Renders one operation in the `dest = mnemonic operands` diagnostic form.
+    ///
+    /// One match arm per [`SsaOp`] variant, since the rendered mnemonic and the
+    /// order and spelling of operands are per-variant facts with no structural
+    /// shortcut. The compact arithmetic and control variants inline their whole
+    /// line; the boxed-payload variants (native, vector, and the wider mixed
+    /// forms) route their shared pieces through `write_defs`, `write_inputs`,
+    /// and `write_native_metadata`, and every memory access its
+    /// [`AccessQualifiers`](crate::ir::ops::kinds::AccessQualifiers),
+    /// so the definition prefix, operand list, provenance suffix, and space qualifier stay
+    /// spelled the same across every arm that has them. Optional modifiers
+    /// (`flags=`, the `.ovf`/`.un`/`.signaling` suffixes) are appended only when
+    /// present, so an operation with none renders no trailing noise.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_operation(f)?;
+        // The environment's rounding mode an operation rounds by, which it
+        // reads beside its operands.
+        match self.environment() {
+            Some(mode) => write!(f, " mode={mode}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T: Target> SsaOp<T>
+where
+    T::TypeRef: fmt::Display,
+    T::MethodRef: fmt::Display,
+    T::FieldRef: fmt::Display,
+    T::SymbolRef: fmt::Display,
+    T::SigRef: fmt::Display,
+    T::Type: fmt::Display,
+{
+    /// The operation's line without the environment's rounding mode it
+    /// reads ([`fmt::Display::fmt`]).
+    fn fmt_operation(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::VectorSlice {
+                dest,
+                vector,
+                offset,
+                length,
+                target_type,
+            } => write!(
+                f,
+                "{dest} = vslice.{target_type} {vector}, {offset}, {length}"
+            ),
+            Self::VectorInsertSlice {
+                dest,
+                vector,
+                offset,
+                value,
+                target_type,
+            } => write!(
+                f,
+                "{dest} = vinsert.slice.{target_type} {vector}, {offset}, {value}"
+            ),
+            Self::VectorConcat {
+                dest,
+                left,
+                right,
+                target_type,
+            } => write!(f, "{dest} = vconcat.{target_type} {left}, {right}"),
             Self::Const { dest, value } => write!(f, "{dest} = {value}"),
             Self::Add {
                 dest,
@@ -349,40 +466,42 @@ where
                 value,
                 amount,
             } => write!(f, "{dest} = ror {value}, {amount}"),
-            Self::Rcl {
-                dest,
-                value,
-                amount,
-            } => write!(f, "{dest} = rcl {value}, {amount}"),
-            Self::Rcr {
-                dest,
-                value,
-                amount,
-            } => write!(f, "{dest} = rcr {value}, {amount}"),
             Self::BSwap { dest, src } => write!(f, "{dest} = bswap {src}"),
             Self::BRev { dest, src } => write!(f, "{dest} = brev {src}"),
             Self::BitScanForward { dest, src } => write!(f, "{dest} = bsf {src}"),
             Self::BitScanReverse { dest, src } => write!(f, "{dest} = bsr {src}"),
             Self::Popcount { dest, src } => write!(f, "{dest} = popcnt {src}"),
             Self::Parity { dest, src } => write!(f, "{dest} = parity {src}"),
-            Self::Ceq { dest, left, right } => write!(f, "{dest} = ceq {left}, {right}"),
+            Self::Ceq {
+                dest,
+                left,
+                right,
+                signaling,
+            } => {
+                let signal = if *signaling { ".signaling" } else { "" };
+                write!(f, "{dest} = ceq{signal} {left}, {right}")
+            }
             Self::Clt {
                 dest,
                 left,
                 right,
                 unsigned,
+                signaling,
             } => {
                 let suffix = if *unsigned { ".un" } else { "" };
-                write!(f, "{dest} = clt{suffix} {left}, {right}")
+                let signal = if *signaling { ".signaling" } else { "" };
+                write!(f, "{dest} = clt{suffix}{signal} {left}, {right}")
             }
             Self::Cgt {
                 dest,
                 left,
                 right,
                 unsigned,
+                signaling,
             } => {
                 let suffix = if *unsigned { ".un" } else { "" };
-                write!(f, "{dest} = cgt{suffix} {left}, {right}")
+                let signal = if *signaling { ".signaling" } else { "" };
+                write!(f, "{dest} = cgt{suffix}{signal} {left}, {right}")
             }
             Self::BoolAnd { dest, left, right } => {
                 write!(f, "{dest} = bool.and {left}, {right}")
@@ -394,12 +513,21 @@ where
                 write!(f, "{dest} = bool.xor {left}, {right}")
             }
             Self::BoolNot { dest, value } => write!(f, "{dest} = bool.not {value}"),
+            // CIL's spelling: `.ovf` checks the result fits, `.un` reads the
+            // integer operand unsigned. An `IntConv` from a narrower source
+            // zero-extends where it is `.un` and sign-extends where not.
             Self::IntConv {
                 dest,
                 operand,
                 target,
-                ..
-            } => write!(f, "{dest} = conv.{target} {operand}"),
+                overflow_check,
+                unsigned,
+            } => write!(
+                f,
+                "{dest} = conv{}.{target}{} {operand}",
+                if *overflow_check { ".ovf" } else { "" },
+                if *unsigned { ".un" } else { "" }
+            ),
             Self::IntToPtr {
                 dest,
                 operand,
@@ -414,19 +542,45 @@ where
                 dest,
                 operand,
                 target,
+                unsigned,
+                rounding,
                 ..
-            } => write!(f, "{dest} = inttofloat.{target} {operand}"),
+            } => {
+                write!(f, "{dest} = inttofloat.{target}")?;
+                if *unsigned {
+                    write!(f, ".un")?;
+                }
+                if let Some(rounding) = rounding {
+                    write!(f, ".{rounding}")?;
+                }
+                write!(f, " {operand}")
+            }
             Self::FloatToInt {
                 dest,
                 operand,
                 target,
+                overflow_check,
+                unsigned,
                 ..
-            } => write!(f, "{dest} = floattoint.{target} {operand}"),
+            } => write!(
+                f,
+                "{dest} = floattoint{}.{target}{} {operand}",
+                if *overflow_check { ".ovf" } else { "" },
+                if *unsigned { ".un" } else { "" }
+            ),
             Self::FloatConv {
                 dest,
                 operand,
                 target,
-            } => write!(f, "{dest} = fconv.{target} {operand}"),
+                rounding,
+                ..
+            } => {
+                write!(f, "{dest} = fconv.{target}")?;
+                if let Some(rounding) = rounding {
+                    write!(f, ".{rounding}")?;
+                }
+                write!(f, " {operand}")
+            }
             Self::Bitcast {
                 dest,
                 operand,
@@ -435,35 +589,123 @@ where
             Self::ReadFlags { dest, flags, mask } => {
                 write!(f, "{dest} = readflags {flags}, {mask}")
             }
-            Self::ComputeFlags { dest, inputs } => {
-                write_defs(f, std::slice::from_ref(dest))?;
-                write!(f, "flags.compute")?;
-                write_inputs(f, inputs)?;
+            Self::MergeFlags {
+                dest,
+                base,
+                update,
+                mask,
+            } => write!(f, "{dest} = mergeflags {base}, {update}, {mask}"),
+            Self::InsertFlag {
+                dest,
+                base,
+                bit,
+                mask,
+            } => write!(f, "{dest} = insertflag {base}, {bit}, {mask}"),
+            Self::FloatRaise {
+                dest,
+                op,
+                lanes,
+                raises,
+                layout,
+            } => {
+                write_raise_head(f, Some(*dest), *raises, *layout)?;
+                write!(f, " (")?;
+                let mut parent = *dest;
+                let mut operation = op.as_ref();
+                let mut masks = Vec::new();
+                while let Self::FloatRaise {
+                    dest,
+                    op,
+                    lanes,
+                    raises,
+                    layout,
+                } = operation
+                {
+                    write_raise_head(f, (*dest != parent).then_some(*dest), *raises, *layout)?;
+                    write!(f, " (")?;
+                    masks.push(*lanes);
+                    parent = *dest;
+                    operation = op;
+                }
+                // Stream the leaf once, stripping only its exact parent prefix.
+                // Neither a full subtree string nor recursive formatting is needed.
+                let prefix = format!("{parent} = ");
+                let mut writer = PrefixWriter {
+                    inner: f,
+                    prefix: &prefix,
+                    matched: 0,
+                    passthrough: false,
+                };
+                write!(&mut writer, "{operation}")?;
+                writer.finish()?;
+                for mask in masks.into_iter().rev() {
+                    write!(f, ")")?;
+                    if let Some(mask) = mask {
+                        write!(f, " lanes={mask}")?;
+                    }
+                }
+                write!(f, ")")?;
+                if let Some(lanes) = lanes {
+                    write!(f, " lanes={lanes}")?;
+                }
                 Ok(())
             }
-            Self::CallClobber { outputs } => {
+            Self::CallClobber { outputs, machine } => {
                 write_defs(f, outputs)?;
-                write!(f, "call.clobber")
+                write!(f, "call.clobber")?;
+                if let Some(machine) = machine.as_deref().filter(|values| !values.is_empty()) {
+                    write!(f, " [machine ")?;
+                    for (index, output) in machine.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}:#{}", output.key.get(), output.index)?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
             }
             Self::VectorUnary {
-                dest, value, kind, ..
+                dest,
+                value,
+                kind,
+                element,
+                ..
             } => {
-                write!(f, "{dest} = vunary.{kind:?} {value}")
+                let rounding = element.rounding_suffix();
+                write!(f, "{dest} = vunary.{kind:?}{rounding} {value}")
             }
             Self::VectorBinary {
                 dest,
                 left,
                 right,
                 kind,
+                element,
                 ..
-            } => write!(f, "{dest} = vbinary.{kind:?} {left}, {right}"),
+            } => {
+                let signedness = element.signedness_suffix();
+                let rounding = element.rounding_suffix();
+                write!(
+                    f,
+                    "{dest} = vbinary.{kind:?}{signedness}{rounding} {left}, {right}"
+                )
+            }
             Self::VectorTernary {
                 dest,
                 first,
                 second,
                 third,
                 kind,
-            } => write!(f, "{dest} = vternary.{kind:?} {first}, {second}, {third}"),
+                element,
+                ..
+            } => {
+                let signedness = element.signedness_suffix();
+                let rounding = element.rounding_suffix();
+                write!(
+                    f,
+                    "{dest} = vternary.{kind:?}{signedness}{rounding} {first}, {second}, {third}"
+                )
+            }
             Self::VectorPredicatedUnary {
                 dest,
                 value,
@@ -471,6 +713,7 @@ where
                 passthrough,
                 kind,
                 mode,
+                ..
             } => {
                 if let Some(passthrough) = passthrough {
                     write!(
@@ -488,17 +731,20 @@ where
                 mask,
                 passthrough,
                 kind,
+                element,
                 mode,
+                ..
             } => {
+                let signedness = element.signedness_suffix();
                 if let Some(passthrough) = passthrough {
                     write!(
                         f,
-                        "{dest} = vbinary.pred.{kind:?}.{mode:?} {left}, {right}, {mask}, {passthrough}"
+                        "{dest} = vbinary.pred.{kind:?}{signedness}.{mode:?} {left}, {right}, {mask}, {passthrough}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dest} = vbinary.pred.{kind:?}.{mode:?} {left}, {right}, {mask}"
+                        "{dest} = vbinary.pred.{kind:?}{signedness}.{mode:?} {left}, {right}, {mask}"
                     )
                 }
             }
@@ -510,17 +756,20 @@ where
                 mask,
                 passthrough,
                 kind,
+                element,
                 mode,
+                ..
             } => {
+                let signedness = element.signedness_suffix();
                 if let Some(passthrough) = passthrough {
                     write!(
                         f,
-                        "{dest} = vternary.pred.{kind:?}.{mode:?} {first}, {second}, {third}, {mask}, {passthrough}"
+                        "{dest} = vternary.pred.{kind:?}{signedness}.{mode:?} {first}, {second}, {third}, {mask}, {passthrough}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dest} = vternary.pred.{kind:?}.{mode:?} {first}, {second}, {third}, {mask}"
+                        "{dest} = vternary.pred.{kind:?}{signedness}.{mode:?} {first}, {second}, {third}, {mask}"
                     )
                 }
             }
@@ -529,21 +778,29 @@ where
                 left,
                 right,
                 kind,
-                unsigned,
+                element,
+                signaling,
             } => {
-                let suffix = if *unsigned { ".un" } else { "" };
-                write!(f, "{dest} = vcmp.{kind:?}{suffix} {left}, {right}")
+                let float = if element.kind.is_float() { ".f" } else { "" };
+                let signedness = element.signedness_suffix();
+                let signaling = if *signaling { ".signaling" } else { "" };
+                write!(
+                    f,
+                    "{dest} = vcmp.{kind:?}{float}{signedness}{signaling} {left}, {right}"
+                )
             }
             Self::VectorLoad {
                 dest,
                 addr,
                 vector_type,
-            } => write!(f, "{dest} = vload.{vector_type} {addr}"),
+                access: space,
+            } => write!(f, "{dest} = vload.{vector_type} {space}{addr}"),
             Self::VectorStore {
                 addr,
                 value,
                 vector_type,
-            } => write!(f, "vstore.{vector_type} {addr}, {value}"),
+                access: space,
+            } => write!(f, "vstore.{vector_type} {space}{addr}, {value}"),
             Self::VectorMaskedLoad {
                 dest,
                 addr,
@@ -551,16 +808,17 @@ where
                 passthrough,
                 vector_type,
                 mode,
+                access: space,
             } => {
                 if let Some(passthrough) = passthrough {
                     write!(
                         f,
-                        "{dest} = vload.masked.{mode:?}.{vector_type} {addr}, {mask}, {passthrough}"
+                        "{dest} = vload.masked.{mode:?}.{vector_type} {space}{addr}, {mask}, {passthrough}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dest} = vload.masked.{mode:?}.{vector_type} {addr}, {mask}"
+                        "{dest} = vload.masked.{mode:?}.{vector_type} {space}{addr}, {mask}"
                     )
                 }
             }
@@ -569,12 +827,17 @@ where
                 value,
                 mask,
                 vector_type,
-            } => write!(f, "vstore.masked.{vector_type} {addr}, {value}, {mask}"),
+                access: space,
+            } => write!(
+                f,
+                "vstore.masked.{vector_type} {space}{addr}, {value}, {mask}"
+            ),
             Self::VectorBroadcastLoad {
                 dest,
                 addr,
                 vector_type,
-            } => write!(f, "{dest} = vbroadcast.load.{vector_type} {addr}"),
+                access: space,
+            } => write!(f, "{dest} = vbroadcast.load.{vector_type} {space}{addr}"),
             Self::VectorGather {
                 dest,
                 base,
@@ -583,16 +846,17 @@ where
                 passthrough,
                 vector_type,
                 mode,
+                access: space,
             } => {
                 if let Some(passthrough) = passthrough {
                     write!(
                         f,
-                        "{dest} = vgather.{mode:?}.{vector_type} {base}, {indices}, {mask}, {passthrough}"
+                        "{dest} = vgather.{mode:?}.{vector_type} {space}{base}, {indices}, {mask}, {passthrough}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dest} = vgather.{mode:?}.{vector_type} {base}, {indices}, {mask}"
+                        "{dest} = vgather.{mode:?}.{vector_type} {space}{base}, {indices}, {mask}"
                     )
                 }
             }
@@ -605,38 +869,39 @@ where
                 vector_type,
                 fault_mode,
                 mask_mode,
+                access: space,
             } => match (fault, mask, passthrough) {
                 (Some(fault), Some(mask), Some(passthrough)) => write!(
                     f,
-                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {mask}, {passthrough}"
+                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {mask}, {passthrough}"
                 ),
                 (Some(fault), Some(mask), None) => write!(
                     f,
-                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {mask}"
+                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {mask}"
                 ),
                 (Some(fault), None, Some(passthrough)) => write!(
                     f,
-                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {passthrough}"
+                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {passthrough}"
                 ),
                 (Some(fault), None, None) => write!(
                     f,
-                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}"
+                    "{dest}, {fault} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}"
                 ),
                 (None, Some(mask), Some(passthrough)) => write!(
                     f,
-                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {mask}, {passthrough}"
+                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {mask}, {passthrough}"
                 ),
                 (None, Some(mask), None) => write!(
                     f,
-                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {mask}"
+                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {mask}"
                 ),
                 (None, None, Some(passthrough)) => write!(
                     f,
-                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}, {passthrough}"
+                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}, {passthrough}"
                 ),
                 (None, None, None) => write!(
                     f,
-                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {addr}"
+                    "{dest} = vload.faulting.{fault_mode:?}.{mask_mode:?}.{vector_type} {space}{addr}"
                 ),
             },
             Self::VectorSegmentLoad {
@@ -646,17 +911,18 @@ where
                 vector_type,
                 segments,
                 layout,
+                access: space,
             } => {
                 write_defs(f, dests)?;
                 if let Some(mask) = mask {
                     write!(
                         f,
-                        "vload.segment.{layout:?}.{segments}.{vector_type} {base}, {mask}"
+                        "vload.segment.{layout:?}.{segments}.{vector_type} {space}{base}, {mask}"
                     )
                 } else {
                     write!(
                         f,
-                        "vload.segment.{layout:?}.{segments}.{vector_type} {base}"
+                        "vload.segment.{layout:?}.{segments}.{vector_type} {space}{base}"
                     )
                 }
             }
@@ -666,9 +932,10 @@ where
                 value,
                 mask,
                 vector_type,
+                access: space,
             } => write!(
                 f,
-                "vscatter.{vector_type} {base}, {indices}, {value}, {mask}"
+                "vscatter.{vector_type} {space}{base}, {indices}, {value}, {mask}"
             ),
             Self::VectorSegmentStore {
                 base,
@@ -677,16 +944,17 @@ where
                 vector_type,
                 segments,
                 layout,
+                access: space,
             } => {
                 if let Some(mask) = mask {
                     write!(
                         f,
-                        "vstore.segment.{layout:?}.{segments}.{vector_type} {base}, {values:?}, {mask}"
+                        "vstore.segment.{layout:?}.{segments}.{vector_type} {space}{base}, {values:?}, {mask}"
                     )
                 } else {
                     write!(
                         f,
-                        "vstore.segment.{layout:?}.{segments}.{vector_type} {base}, {values:?}"
+                        "vstore.segment.{layout:?}.{segments}.{vector_type} {space}{base}, {values:?}"
                     )
                 }
             }
@@ -705,20 +973,39 @@ where
                 vector_type,
             } => write!(f, "{dest} = vsplat.{vector_type} {value}"),
             Self::VectorShuffle {
-                dest, left, right, ..
+                dest,
+                left,
+                right,
+                selector,
             } => {
+                write!(f, "{dest} = vshuffle {left}")?;
                 if let Some(right) = right {
-                    write!(f, "{dest} = vshuffle {left}, {right}")
-                } else {
-                    write!(f, "{dest} = vshuffle {left}")
+                    write!(f, ", {right}")?;
+                }
+                match selector.index() {
+                    Some(index) => write!(f, " by {index}"),
+                    None => Ok(()),
                 }
             }
             Self::VectorCast {
                 dest,
                 value,
                 target_type,
-                kind,
-            } => write!(f, "{dest} = vcast.{kind:?}.{target_type} {value}"),
+                from,
+                to,
+                rounding,
+                saturate,
+                ..
+            } => {
+                write!(f, "{dest} = vcast.{from:?}.{to:?}.{target_type}")?;
+                if let Some(rounding) = rounding {
+                    write!(f, ".{rounding}")?;
+                }
+                if *saturate {
+                    write!(f, ".sat")?;
+                }
+                write!(f, " {value}")
+            }
             Self::VectorReinterpret {
                 dest,
                 value,
@@ -755,16 +1042,17 @@ where
                 element_bits,
                 kind,
                 mode,
+                access: space,
             } => {
                 if let Some(passthrough) = passthrough {
                     write!(
                         f,
-                        "{dest} = vpack.load.{kind:?}.{mode:?}.e{element_bits}.{vector_type} [{addr}], {mask}, {passthrough}"
+                        "{dest} = vpack.load.{kind:?}.{mode:?}.e{element_bits}.{vector_type} {space}[{addr}], {mask}, {passthrough}"
                     )
                 } else {
                     write!(
                         f,
-                        "{dest} = vpack.load.{kind:?}.{mode:?}.e{element_bits}.{vector_type} [{addr}], {mask}"
+                        "{dest} = vpack.load.{kind:?}.{mode:?}.e{element_bits}.{vector_type} {space}[{addr}], {mask}"
                     )
                 }
             }
@@ -775,25 +1063,33 @@ where
                 vector_type,
                 element_bits,
                 kind,
+                access: space,
             } => write!(
                 f,
-                "vpack.store.{kind:?}.e{element_bits}.{vector_type} [{addr}], {value}, {mask}"
+                "vpack.store.{kind:?}.e{element_bits}.{vector_type} {space}[{addr}], {value}, {mask}"
             ),
-            Self::VectorZeroUpper { all } => {
-                let suffix = if *all { "all" } else { "upper" };
-                write!(f, "vzero.{suffix}")
-            }
-            Self::VectorMaskUnary { dest, mask, kind } => {
-                write!(f, "{dest} = vmask.unary.{kind:?} {mask}")
-            }
-            Self::VectorMaskBinary {
+            Self::VectorReduce {
                 dest,
-                left,
-                right,
+                value,
                 kind,
-            } => write!(f, "{dest} = vmask.binary.{kind:?} {left}, {right}"),
-            Self::VectorReduce { dest, value, kind } => {
-                write!(f, "{dest} = vreduce.{kind:?} {value}")
+                element,
+                initial,
+                ordered,
+                groups,
+                ..
+            } => {
+                let signedness = element.signedness_suffix();
+                let rounding = element.rounding_suffix();
+                let order = if *ordered { ".ordered" } else { "" };
+                write!(f, "{dest} = vreduce.{kind:?}{signedness}{rounding}{order}")?;
+                if let Some(ReduceGroups { lanes, bits }) = groups {
+                    write!(f, ".groups{lanes}.i{bits}")?;
+                }
+                write!(f, " {value}")?;
+                match initial {
+                    Some(initial) => write!(f, " from {initial}"),
+                    None => Ok(()),
+                }
             }
             Self::VectorBitmask { dest, value, kind } => {
                 write!(f, "{dest} = vbitmask.{kind:?} {value}")
@@ -852,6 +1148,7 @@ where
             Self::IndirectBranch {
                 target,
                 resolved_targets,
+                state,
             } => {
                 write!(f, "branch.indirect {target}")?;
                 if !resolved_targets.is_empty() {
@@ -864,24 +1161,88 @@ where
                     }
                     write!(f, "]")?;
                 }
+                if !state.is_empty() {
+                    write!(f, " [state ")?;
+                    for (index, input) in state.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}:{}", input.key.get(), input.value)?;
+                    }
+                    write!(f, "]")?;
+                }
                 Ok(())
             }
-            Self::Return { value: Some(v) } => write!(f, "ret {v}"),
-            Self::Return { value: None } => write!(f, "ret"),
+            Self::Return {
+                value,
+                state,
+                results,
+                transfer,
+            } => {
+                let target = transfer.as_ref().and_then(|transfer| transfer.target);
+                let handover = transfer
+                    .as_ref()
+                    .map_or(&[][..], |transfer| &transfer.handover[..]);
+                f.write_str("ret")?;
+                if let Some(v) = value {
+                    write!(f, " {v}")?;
+                }
+                if let Some((first, rest)) = state.split_first() {
+                    write!(f, " [state {first}")?;
+                    for held in rest {
+                        write!(f, ", {held}")?;
+                    }
+                    f.write_str("]")?;
+                }
+                if !results.is_empty() {
+                    f.write_str(" [results ")?;
+                    for (index, result) in results.iter().enumerate() {
+                        if index > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}:{}", result.key.get(), result.value)?;
+                    }
+                    f.write_str("]")?;
+                }
+                if let Some(target) = target {
+                    write!(f, " [through {target}]")?;
+                }
+                if !handover.is_empty() {
+                    f.write_str(" [handover ")?;
+                    for (index, input) in handover.iter().enumerate() {
+                        if index > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}:{}", input.key.get(), input.value)?;
+                    }
+                    f.write_str("]")?;
+                }
+                Ok(())
+            }
             Self::LoadField {
                 dest,
                 object,
                 field,
+                access,
             } => {
-                write!(f, "{dest} = ldfld {field}, {object}")
+                write!(f, "{dest} = ldfld {field}, {access}{object}")
             }
             Self::StoreField {
                 object,
                 field,
                 value,
-            } => write!(f, "stfld {field}, {object}, {value}"),
-            Self::LoadStaticField { dest, field } => write!(f, "{dest} = ldsfld {field}"),
-            Self::StoreStaticField { field, value } => write!(f, "stsfld {field}, {value}"),
+                access,
+            } => write!(f, "stfld {field}, {access}{object}, {value}"),
+            Self::LoadStaticField {
+                dest,
+                field,
+                access,
+            } => write!(f, "{dest} = ldsfld {access}{field}"),
+            Self::StoreStaticField {
+                field,
+                value,
+                access,
+            } => write!(f, "stsfld {access}{field}, {value}"),
             Self::LoadFieldAddr {
                 dest,
                 object,
@@ -903,8 +1264,15 @@ where
                 elem_type,
             } => write!(f, "stelem.{elem_type} {array}[{index}], {value}"),
             Self::LoadElementAddr {
-                dest, array, index, ..
-            } => write!(f, "{dest} = ldelema {array}[{index}]"),
+                dest,
+                array,
+                index,
+                readonly,
+                ..
+            } => {
+                let readonly = if *readonly { ".readonly" } else { "" };
+                write!(f, "{dest} = ldelema{readonly} {array}[{index}]")
+            }
             Self::PtrAdd {
                 dest,
                 base,
@@ -927,22 +1295,14 @@ where
                 dest,
                 addr,
                 value_type,
-                address_space,
-            } => {
-                write!(f, "{dest} = ldind.{value_type} ")?;
-                write_address_space(f, *address_space)?;
-                write!(f, "{addr}")
-            }
+                access: space,
+            } => write!(f, "{dest} = ldind.{value_type} {space}{addr}"),
             Self::StoreIndirect {
                 addr,
                 value,
                 value_type,
-                address_space,
-            } => {
-                write!(f, "stind.{value_type} ")?;
-                write_address_space(f, *address_space)?;
-                write!(f, "{addr}, {value}")
-            }
+                access: space,
+            } => write!(f, "stind.{value_type} {space}{addr}, {value}"),
             Self::NewObj { dest, ctor, args } => {
                 write!(f, "{dest} = newobj {ctor}(")?;
                 for (i, arg) in args.iter().enumerate() {
@@ -985,48 +1345,36 @@ where
             } => write!(f, "{dest} = unbox.any {value_type}, {object}"),
             Self::SizeOf { dest, value_type } => write!(f, "{dest} = sizeof {value_type}"),
             Self::LoadToken { dest, token } => write!(f, "{dest} = ldtoken {token}"),
-            Self::Call { dest, method, args } => {
-                if let Some(d) = dest {
-                    write!(f, "{d} = ")?;
-                }
-                write!(f, "call {method}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")")
-            }
-            Self::CallVirt { dest, method, args } => {
-                if let Some(d) = dest {
-                    write!(f, "{d} = ")?;
-                }
-                write!(f, "callvirt {method}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")")
-            }
-            Self::CallIndirect {
-                dest, fptr, args, ..
-            } => {
-                if let Some(d) = dest {
-                    write!(f, "{d} = ")?;
-                }
-                write!(f, "calli {fptr}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")")
-            }
-            Self::LoadFunctionPtr { dest, method } => write!(f, "{dest} = ldftn {method}"),
+            Self::ArgList { dest } => write!(f, "{dest} = arglist"),
+            Self::ArgNext { dest, list, ty } => write!(f, "{dest} = arg.next.{ty} {list}"),
+            Self::ArgStep {
+                dest,
+                next,
+                list,
+                ty,
+            } => write!(f, "{dest}, {next} = arg.step.{ty} {list}"),
+            Self::MakeTypedRef {
+                dest,
+                address,
+                value_type,
+            } => write!(f, "{dest} = mkrefany {value_type}, {address}"),
+            Self::TypedRefValue {
+                dest,
+                typed_ref,
+                value_type,
+            } => write!(f, "{dest} = refanyval {value_type}, {typed_ref}"),
+            Self::TypedRefType { dest, typed_ref } => write!(f, "{dest} = refanytype {typed_ref}"),
+            Self::Call(call) => write!(f, "{call}"),
+            Self::LoadFunctionPtr {
+                dest,
+                method,
+                constraint: None,
+            } => write!(f, "{dest} = ldftn {method}"),
+            Self::LoadFunctionPtr {
+                dest,
+                method,
+                constraint: Some(constraint),
+            } => write!(f, "{dest} = constrained({constraint}) ldftn {method}"),
             Self::LoadVirtFunctionPtr {
                 dest,
                 object,
@@ -1046,42 +1394,51 @@ where
             Self::InterruptReturn => write!(f, "iret"),
             Self::Unreachable => write!(f, "unreachable"),
             Self::EndFilter { result } => write!(f, "endfilter {result}"),
+            Self::RuntimeValue { dest, kind } => write!(f, "{dest} = runtime {kind}"),
             Self::Leave { target } => write!(f, "leave B{target}"),
             Self::InitBlk {
                 dest_addr,
                 value,
                 size,
-                reverse,
-            } => write!(
-                f,
-                "initblk{} {dest_addr}, {value}, {size}",
-                if *reverse { " rev" } else { "" }
-            ),
+                backward,
+                access: space,
+            } => {
+                write!(f, "initblk {space}{dest_addr}, {value}, {size}")?;
+                match backward {
+                    Some(flag) => write!(f, " backward={flag}"),
+                    None => Ok(()),
+                }
+            }
             Self::CopyBlk {
                 dest_addr,
                 src_addr,
                 size,
-                reverse,
+                element_bytes,
+                backward,
+                src_access: src_space,
+                dest_access: dest_space,
+            } => {
+                write!(f, "cpblk")?;
+                if *element_bytes != 1 {
+                    write!(f, ".{element_bytes}")?;
+                }
+                write!(f, " {dest_space}{dest_addr}, {src_space}{src_addr}, {size}")?;
+                match backward {
+                    Some(flag) => write!(f, " backward={flag}"),
+                    None => Ok(()),
+                }
+            }
+            Self::MoveBlk {
+                dest_addr,
+                src_addr,
+                size,
+                src_access: src_space,
+                dest_access: dest_space,
             } => write!(
                 f,
-                "cpblk{} {dest_addr}, {src_addr}, {size}",
-                if *reverse { " rev" } else { "" }
+                "mvblk {dest_space}{dest_addr}, {src_space}{src_addr}, {size}"
             ),
             Self::Fence { kind } => write!(f, "fence {kind}"),
-            Self::NativeOpaque(data) => {
-                let NativeOpaqueData {
-                    mnemonic,
-                    metadata,
-                    outputs,
-                    inputs,
-                    effects,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "native.opaque {mnemonic}")?;
-                write_inputs(f, inputs)?;
-                write_native_metadata(f, metadata.as_ref())?;
-                write!(f, " effects={:?}", effects.kind)
-            }
             Self::SystemOp(data) => {
                 let NativeKindedData {
                     kind,
@@ -1096,143 +1453,84 @@ where
                 write_native_metadata(f, metadata.as_ref())?;
                 write!(f, " effects={:?}", kind.effects().kind)
             }
-            Self::ComputeOp(data) => {
-                let NativeKindedData {
-                    kind,
-                    mnemonic,
-                    metadata,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{} {mnemonic}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                write_native_metadata(f, metadata.as_ref())?;
-                write!(f, " effects={:?}", kind.effects().kind)
+            Self::Compute(data) => {
+                write_defs(f, &data.outputs)?;
+                write!(f, "{}", data.kind)?;
+                write_inputs(f, &data.inputs)
             }
-            Self::BcdAdjust(data) => {
-                let BcdAdjustData {
+            Self::Contract(data) => {
+                let KindedVecData {
                     kind,
-                    base,
-                    mnemonic,
-                    metadata,
                     outputs,
                     inputs,
                 } = data.as_ref();
                 write_defs(f, outputs)?;
-                write!(f, "{} {mnemonic}", kind.kind_str())?;
-                if matches!(
-                    kind,
-                    BcdAdjustKind::AsciiMulAdjust | BcdAdjustKind::AsciiDivAdjust
-                ) {
-                    write!(f, " base={base}")?;
+                write!(f, "contract.{}", kind.name())?;
+                write_inputs(f, inputs)?;
+                match kind {
+                    Contraction::Dot(shape) => {
+                        let sign = |signed: bool| if signed { 'i' } else { 'u' };
+                        write!(
+                            f,
+                            " {}{}x{}{} -> {}",
+                            sign(shape.signed_a),
+                            shape.source_bits,
+                            sign(shape.signed_b),
+                            shape.source_bits,
+                            shape.dest_bits
+                        )?;
+                        if shape.accumulates {
+                            write!(f, " acc")?;
+                        }
+                        match shape.saturates {
+                            Some(true) => write!(f, " sat.i"),
+                            Some(false) => write!(f, " sat.u"),
+                            None => Ok(()),
+                        }
+                    }
+                    Contraction::MaskedDot {
+                        control,
+                        element_bits,
+                    } => write!(f, " e{element_bits} control={control:#04x}"),
+                    Contraction::Matrix(shape) => {
+                        write!(f, " {}", shape.elements)?;
+                        match shape.layout {
+                            MatrixLayout::Segments { segment_bits } => {
+                                write!(f, " seg{segment_bits}")
+                            }
+                            MatrixLayout::Tiles => write!(f, " tiles"),
+                        }
+                    }
+                    Contraction::Outer(shape) => {
+                        write!(f, " {}", shape.elements)?;
+                        match shape.selection {
+                            Some(selection) => write!(
+                                f,
+                                " sparse{}of{}{}",
+                                shape.elements.group(),
+                                u32::from(selection.values)
+                                    .saturating_mul(u32::from(selection.candidates)),
+                                if selection.per_value { ".each" } else { "" }
+                            ),
+                            None => Ok(()),
+                        }
+                    }
+                    Contraction::Complex(shape) => {
+                        write!(
+                            f,
+                            " e{}{}{}",
+                            shape.element.bits,
+                            shape.element.signedness_suffix(),
+                            shape.element.rounding_suffix()
+                        )?;
+                        if shape.saturates {
+                            write!(f, " sat")?;
+                        }
+                        Ok(())
+                    }
+                    Contraction::FloatDot { elements, .. } => write!(f, " {elements}"),
+                    Contraction::MultiplyAdd52 { .. } => Ok(()),
                 }
-                write_inputs(f, inputs)?;
-                write_native_metadata(f, metadata.as_ref())?;
-                write!(f, " effects={:?}", kind.effects().kind)
-            }
-            Self::VectorCrypto(data) => {
-                let KindedVecData {
-                    kind,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                write!(f, " effects={:?}", kind.effects().kind)
-            }
-            Self::TileOp(data) => {
-                let KindedVecData {
-                    kind,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                write!(f, " effects={:?}", kind.effects().kind)
-            }
-            Self::VectorPermute(data) => {
-                let VectorPermuteData { outputs, inputs } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.permute")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorMultiplyAdd(data) => {
-                let KindedVecData {
-                    kind,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorSvePermute(data) => {
-                let KindedVecData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.sve.perm")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorFpHelper(data) => {
-                let KindedVecData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.fphelper")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorPredicateGen(data) => {
-                let KindedVecData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.pgen")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorSmeOuterProduct(data) => {
-                let VectorSmeOuterProductData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.sme.mopa")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorMatrixMulAcc(data) => {
-                let VectorMatrixMulAccData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.mmla")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorReverseChunks(data) => {
-                let VectorReverseChunksData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.revchunks")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorCountAdjust(data) => {
-                let VectorCountAdjustData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.countadj")?;
-                write_inputs(f, inputs)?;
-                Ok(())
             }
             Self::VectorExtendInLane(data) => {
                 let VectorExtendInLaneData {
@@ -1252,38 +1550,15 @@ where
                 let VectorElementCountData {
                     element_bits,
                     multiplier,
+                    pattern,
+                    streaming,
                     outputs,
                 } = data.as_ref();
                 write_defs(f, outputs)?;
-                write!(f, "vector.cnt e{element_bits} x{multiplier}")?;
-                Ok(())
-            }
-            Self::VectorSveAddressGen(data) => {
-                let VectorSveAddressGenData {
-                    signed_extend,
-                    shift,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                let ext = match signed_extend {
-                    Some(true) => "sxtw",
-                    Some(false) => "uxtw",
-                    None => "lsl",
-                };
-                write!(f, "vector.adr {ext} #{shift}")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::FlagAdjust(data) => {
-                let KindedVecData {
-                    kind,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
+                write!(f, "vector.cnt e{element_bits} {pattern} x{multiplier}")?;
+                if let Some(streaming) = streaming {
+                    write!(f, " streaming={streaming}")?;
+                }
                 Ok(())
             }
             Self::VectorStructLoadReplicate(data) => {
@@ -1292,24 +1567,6 @@ where
                 } = data.as_ref();
                 write_defs(f, outputs)?;
                 write!(f, "vector.ldNr")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorSmeMisc(data) => {
-                let VectorSmeMiscData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.sme.misc")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorPredicateOp(data) => {
-                let VectorPredicateOpData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.predop")?;
                 write_inputs(f, inputs)?;
                 Ok(())
             }
@@ -1322,24 +1579,6 @@ where
                 write_inputs(f, inputs)?;
                 Ok(())
             }
-            Self::VectorComplexAdd(data) => {
-                let VectorComplexAddData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.cadd")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorPredicateBreak(data) => {
-                let VectorPredicateBreakData {
-                    outputs, inputs, ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.break")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
             Self::VectorPredicateWhile(data) => {
                 let VectorPredicateWhileData {
                     outputs, inputs, ..
@@ -1349,248 +1588,91 @@ where
                 write_inputs(f, inputs)?;
                 Ok(())
             }
-            Self::VectorNarrowSaturate(data) => {
-                let VectorNarrowSaturateData {
-                    unsigned_dst,
-                    outputs,
-                    inputs,
-                    ..
+            Self::CompareBlk(data) => {
+                let CompareBlkData {
+                    remaining,
+                    left_next,
+                    right_next,
+                    flags,
+                    left,
+                    right,
+                    count,
+                    flags_in,
+                    backward,
+                    element_bytes,
+                    while_equal,
+                    left_access,
+                    right_access,
                 } = data.as_ref();
-                write_defs(f, outputs)?;
                 write!(
                     f,
-                    "{}",
-                    if *unsigned_dst {
-                        "vector.narrow.saturate.u"
-                    } else {
-                        "vector.narrow.saturate.s"
-                    }
+                    "{remaining}, {left_next}, {right_next}, {flags} = compare.blk.{element_bytes}.{} {left_access}{left}, {right_access}{right}, {count}",
+                    if *while_equal { "eq" } else { "ne" }
                 )?;
-                write_inputs(f, inputs)?;
-                Ok(())
+                if let Some(flags_in) = flags_in {
+                    write!(f, ", {flags_in}")?;
+                }
+                match backward {
+                    Some(flag) => write!(f, " backward={flag}"),
+                    None => Ok(()),
+                }
             }
-            Self::VectorPackNarrow(data) => {
-                let VectorPackNarrowData {
-                    unsigned,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
+            Self::ScanBlk {
+                remaining,
+                next,
+                flags,
+                address,
+                value,
+                count,
+                flags_in,
+                backward,
+                element_bytes,
+                while_equal,
+                access,
+            } => {
                 write!(
                     f,
-                    "{}",
-                    if *unsigned {
-                        "vector.pack.narrow.u"
-                    } else {
-                        "vector.pack.narrow.s"
-                    }
+                    "{remaining}, {next}, {flags} = scan.blk.{element_bytes}.{} {access}{address}, {value}, {count}",
+                    if *while_equal { "eq" } else { "ne" }
                 )?;
-                write_inputs(f, inputs)?;
-                Ok(())
+                if let Some(flags_in) = flags_in {
+                    write!(f, ", {flags_in}")?;
+                }
+                match backward {
+                    Some(flag) => write!(f, " backward={flag}"),
+                    None => Ok(()),
+                }
             }
-            Self::VectorTernaryLogic(data) => {
-                let VecImm8Data {
-                    imm8,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.ternlog")?;
-                write_inputs(f, inputs)?;
-                write!(f, " imm={imm8:#04x}")
-            }
-            Self::VectorDotProduct(data) => {
-                let VectorDotProductData {
-                    imm8,
-                    element_bits,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.dotproduct.{element_bits}")?;
-                write_inputs(f, inputs)?;
-                write!(f, " imm={imm8:#04x}")
-            }
-            Self::VectorMultiSad(data) => {
-                let VecImm8Data {
-                    imm8,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.mpsadbw")?;
-                write_inputs(f, inputs)?;
-                write!(f, " imm={imm8:#04x}")
-            }
-            Self::VectorIntDotProduct(data) => {
-                let VectorIntDotProductData {
-                    signed_a,
-                    signed_b,
-                    source_bits,
-                    dest_bits,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.intdot")?;
-                write_inputs(f, inputs)?;
+            Self::LoadBlk {
+                value,
+                next,
+                address,
+                count,
+                value_in,
+                backward,
+                element_bytes,
+                access,
+            } => {
                 write!(
                     f,
-                    " s_a={signed_a} s_b={signed_b} src={source_bits} dst={dest_bits}"
-                )
-            }
-            Self::VectorStringCompare(data) => {
-                let VectorStringCompareData {
-                    imm8,
-                    explicit_length,
-                    result_index,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(
-                    f,
-                    "vector.pcmp{}str{}",
-                    if *explicit_length { "e" } else { "i" },
-                    if *result_index { "i" } else { "m" }
+                    "{value}, {next} = load.blk.{element_bytes} {access}{address}, {count}"
                 )?;
-                write_inputs(f, inputs)?;
-                write!(f, " imm={imm8:#04x}")
+                if let Some(value_in) = value_in {
+                    write!(f, ", {value_in}")?;
+                }
+                match backward {
+                    Some(flag) => write!(f, " backward={flag}"),
+                    None => Ok(()),
+                }
             }
-            Self::VectorBitfield(data) => {
-                let VectorBitfieldData {
-                    insert,
-                    index,
-                    length,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.{}", if *insert { "insertq" } else { "extrq" })?;
-                write_inputs(f, inputs)?;
-                write!(f, " index={index} length={length}")
-            }
-            Self::VectorIntersect(data) => {
-                let VectorIntersectData { outputs, inputs } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.p2intersect")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorShuffleBits(data) => {
-                let VectorShuffleBitsData { outputs, inputs } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.shufbitqmb")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorConditionalMove(data) => {
-                let VectorConditionalMoveData {
-                    condition,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.condmove.{}", condition.kind_str())?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorHorizontalMinPos(data) => {
-                let VectorHorizontalMinPosData { outputs, inputs } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.phminposuw")?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorComplexMul(data) => {
+            Self::FloatFunction(data) => {
                 let KindedVecData {
                     kind,
                     outputs,
                     inputs,
                 } = data.as_ref();
                 write_defs(f, outputs)?;
-                write!(f, "{}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::VectorClassify(data) => {
-                let VecImm8Data {
-                    imm8,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "vector.fpclass")?;
-                write_inputs(f, inputs)?;
-                write!(f, " imm={imm8:#04x}")
-            }
-            Self::VectorHorizontalReduce(data) => {
-                let VectorHorizontalReduceData {
-                    subtract,
-                    source_bits,
-                    dest_bits,
-                    outputs,
-                    inputs,
-                    ..
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(
-                    f,
-                    "vector.hreduce.{} {}->{}",
-                    if *subtract { "sub" } else { "add" },
-                    source_bits,
-                    dest_bits
-                )?;
-                write_inputs(f, inputs)?;
-                Ok(())
-            }
-            Self::BlockString(data) => {
-                let BlockStringOpData {
-                    kind,
-                    prefix: _,
-                    element_bits: _,
-                    mnemonic,
-                    metadata,
-                    outputs,
-                    inputs,
-                    reverse: _,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "{} {mnemonic}", kind.kind_str())?;
-                write_inputs(f, inputs)?;
-                write_native_metadata(f, metadata.as_ref())?;
-                write!(f, " effects={:?}", kind.effects().kind)
-            }
-            Self::WideCompareExchange(data) => {
-                let WideCmpXchgData {
-                    wide,
-                    mnemonic,
-                    metadata,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(
-                    f,
-                    "{} {mnemonic}",
-                    if *wide {
-                        "atomic.cmpxchg16b"
-                    } else {
-                        "atomic.cmpxchg8b"
-                    }
-                )?;
-                write_inputs(f, inputs)?;
-                write_native_metadata(f, metadata.as_ref())?;
-                write!(f, " effects=Atomic")
-            }
-            Self::FpTranscendental(data) => {
-                let KindedVecData {
-                    kind,
-                    outputs,
-                    inputs,
-                } = data.as_ref();
-                write_defs(f, outputs)?;
-                write!(f, "fp.transcendental.{kind:?}")?;
+                write!(f, "float.{}", kind.name())?;
                 write_inputs(f, inputs)?;
                 Ok(())
             }
@@ -1601,34 +1683,23 @@ where
                     inputs,
                 } = data.as_ref();
                 write_defs(f, outputs)?;
-                write!(f, "fpu.control.{kind:?}")?;
+                write!(f, "{}", kind.name())?;
                 write_inputs(f, inputs)?;
                 Ok(())
             }
-            Self::CmpXchg {
-                dest,
-                addr,
-                expected,
-                desired,
-            } => write!(f, "{dest} = cmpxchg {addr}, {expected}, {desired}"),
-            Self::AtomicRmw {
-                dest,
-                addr,
-                value,
-                op,
-            } => write!(f, "{dest} = atomicrmw.{op} {addr}, {value}"),
             Self::AtomicLoad {
                 dest,
                 addr,
                 value_type,
                 ordering,
                 width,
-                volatile,
+                reserves,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
+                let reserves = if *reserves { ".reserve" } else { "" };
                 write!(
                     f,
-                    "{dest} = atomicload{volatile}.{ordering}.{width} {value_type}, {addr}"
+                    "{dest} = atomicload{reserves}.{ordering}.{width} {value_type}, {space}{addr}"
                 )
             }
             Self::AtomicStore {
@@ -1637,28 +1708,33 @@ where
                 value_type,
                 ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    "atomicstore{volatile}.{ordering}.{width} {value_type}, {addr}, {value}"
+                    "atomicstore.{ordering}.{width} {value_type}, {space}{addr}, {value}"
                 )
             }
             Self::AtomicStoreConditional {
                 status,
+                status_encoding,
+                consumes_reservation,
                 addr,
                 value,
                 value_type,
                 success_ordering,
                 failure_ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
+                let consume = if *consumes_reservation {
+                    ".consume"
+                } else {
+                    ""
+                };
                 write!(
                     f,
-                    "{status} = atomicstore.conditional{volatile}.{success_ordering}/{failure_ordering}.{width} {value_type}, {addr}, {value}"
+                    "{status} = atomicstore.conditional.{success_ordering}/{failure_ordering}.{width}.status({status_encoding:?}){consume} {value_type}, {space}{addr}, {value}"
                 )
             }
             Self::AtomicPairLoad {
@@ -1669,16 +1745,17 @@ where
                 second_type,
                 ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    "{first}, {second} = atomicload.pair{volatile}.{ordering}.{width} {first_type}/{second_type}, {addr}"
+                    "{first}, {second} = atomicload.pair.{ordering}.{width} {first_type}/{second_type}, {space}{addr}"
                 )
             }
             Self::AtomicPairStoreConditional {
                 status,
+                status_encoding,
+                consumes_reservation,
                 addr,
                 first_value,
                 second_value,
@@ -1687,12 +1764,16 @@ where
                 success_ordering,
                 failure_ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
+                let consume = if *consumes_reservation {
+                    ".consume"
+                } else {
+                    ""
+                };
                 write!(
                     f,
-                    "{status} = atomicstore.conditional.pair{volatile}.{success_ordering}/{failure_ordering}.{width} {first_type}/{second_type}, {addr}, {first_value}, {second_value}"
+                    "{status} = atomicstore.conditional.pair.{success_ordering}/{failure_ordering}.{width}.status({status_encoding:?}){consume} {first_type}/{second_type}, {space}{addr}, {first_value}, {second_value}"
                 )
             }
             Self::AtomicExchange {
@@ -1701,12 +1782,11 @@ where
                 value,
                 ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    "{dest} = atomicxchg{volatile}.{ordering}.{width} {addr}, {value}"
+                    "{dest} = atomicxchg.{ordering}.{width} {space}{addr}, {value}"
                 )
             }
             Self::AtomicLockRmw {
@@ -1716,12 +1796,11 @@ where
                 op,
                 ordering,
                 width,
-                volatile,
+                access: space,
             } => {
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    "{dest} = lock.atomicrmw{volatile}.{op}.{ordering}.{width} {addr}, {value}"
+                    "{dest} = lock.atomicrmw.{op}.{ordering}.{width} {space}{addr}, {value}"
                 )
             }
             Self::AtomicCmpXchg {
@@ -1734,17 +1813,16 @@ where
                 failure_ordering,
                 width,
                 weak,
-                volatile,
+                access: space,
             } => {
                 write!(f, "{old}")?;
                 if let Some(success) = success {
                     write!(f, ", {success}")?;
                 }
                 let weak = if *weak { ".weak" } else { "" };
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    " = cmpxchg{weak}{volatile}.{success_ordering}/{failure_ordering}.{width} {addr}, {expected}, {desired}"
+                    " = cmpxchg{weak}.{success_ordering}/{failure_ordering}.{width} {space}{addr}, {expected}, {desired}"
                 )
             }
             Self::AtomicPairCmpXchg {
@@ -1759,14 +1837,73 @@ where
                 failure_ordering,
                 width,
                 weak,
-                volatile,
+                access: space,
             } => {
                 let weak = if *weak { ".weak" } else { "" };
-                let volatile = if *volatile { ".volatile" } else { "" };
                 write!(
                     f,
-                    "{old_first}, {old_second} = cmpxchg.pair{weak}{volatile}.{success_ordering}/{failure_ordering}.{width} {addr}, {expected_first}, {expected_second}, {desired_first}, {desired_second}"
+                    "{old_first}, {old_second} = cmpxchg.pair{weak}.{success_ordering}/{failure_ordering}.{width} {space}{addr}, {expected_first}, {expected_second}, {desired_first}, {desired_second}"
                 )
+            }
+            Self::AtomicCondRmw {
+                old,
+                addr,
+                compare,
+                value,
+                op,
+                condition,
+                ordering,
+                width,
+                access: space,
+            } => {
+                write!(
+                    f,
+                    "{old} = atomicrmw.cond.{op}.{condition}.{ordering}.{width} {space}{addr}, {compare}, {value}"
+                )
+            }
+            Self::AtomicPairRmw {
+                old_first,
+                old_second,
+                addr,
+                value_first,
+                value_second,
+                op,
+                ordering,
+                width,
+                access: space,
+            } => {
+                write!(
+                    f,
+                    "{old_first}, {old_second} = atomicrmw.pair.{op}.{ordering}.{width} {space}{addr}, {value_first}, {value_second}"
+                )
+            }
+            Self::AtomicCheckedRmw {
+                old,
+                status,
+                addr,
+                compare,
+                value,
+                op,
+                rcw_mask,
+                rcws_mask,
+                protection,
+                ordering,
+                width,
+                access: space,
+            } => {
+                let soft = if rcws_mask.is_some() { ".soft" } else { "" };
+                write!(
+                    f,
+                    "{old}, {status} = atomicrmw.checked.{op}{soft}.{protection}.{ordering}.{width} {space}{addr}, "
+                )?;
+                if let Some(compare) = compare {
+                    write!(f, "{compare}, ")?;
+                }
+                write!(f, "{value}, {rcw_mask}")?;
+                if let Some(rcws_mask) = rcws_mask {
+                    write!(f, ", {rcws_mask}")?;
+                }
+                Ok(())
             }
             Self::InitObj {
                 dest_addr,
@@ -1781,22 +1918,24 @@ where
                 dest,
                 src_addr,
                 value_type,
-            } => write!(f, "{dest} = ldobj {value_type}, {src_addr}"),
+                access,
+            } => write!(f, "{dest} = ldobj {value_type}, {access}{src_addr}"),
             Self::StoreObj {
                 dest_addr,
                 value,
                 value_type,
-            } => write!(f, "stobj {value_type}, {dest_addr}, {value}"),
-            Self::LocalAlloc { dest, size } => write!(f, "{dest} = localloc {size}"),
-            Self::Constrained { constraint_type } => {
-                write!(f, "constrained. {constraint_type}")
+                access,
+            } => write!(f, "stobj {value_type}, {access}{dest_addr}, {value}"),
+            Self::LocalAlloc { dest, size, zeroed } => {
+                let zeroed = if *zeroed { " zeroed" } else { "" };
+                write!(f, "{dest} = localloc {size}{zeroed}")
             }
-            Self::Volatile => write!(f, "volatile."),
-            Self::Unaligned { alignment } => write!(f, "unaligned. {alignment}"),
-            Self::TailPrefix => write!(f, "tail."),
-            Self::Readonly => write!(f, "readonly."),
             Self::Ckfinite { dest, operand } => write!(f, "{dest} = ckfinite {operand}"),
-            Self::FpClassify { dest, operand } => write!(f, "{dest} = fpclassify {operand}"),
+            Self::FpClassify {
+                dest,
+                operand,
+                layout,
+            } => write!(f, "{dest} = fpclassify.{} {operand}", layout.name()),
             Self::Nop => write!(f, "nop"),
             Self::Break(op) => write!(f, "{}", op.mnemonic()),
             Self::Phi { dest, operands } => {
@@ -1810,5 +1949,132 @@ where
                 write!(f, ")")
             }
         }
+    }
+}
+
+impl<T: Target> fmt::Display for CallData<T>
+where
+    T::TypeRef: fmt::Display,
+    T::MethodRef: fmt::Display,
+    T::FieldRef: fmt::Display,
+    T::SigRef: fmt::Display,
+{
+    /// Renders `dest = [tail ]call m(args)`, `callvirt`, `constrained(T)
+    /// callvirt` or `calli fptr(args)`, with the values returned beside the
+    /// result after it under their keys (`v1, 2:v4 = call m()`, `_` where only
+    /// those are read), the values staged beside the arguments
+    /// (`staged[sp+8: v3]`), and the effects the host stated: `[pure]` or the
+    /// memory, world and control it names.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.dest, self.results.is_empty()) {
+            (Some(dest), true) => write!(f, "{dest} = ")?,
+            (None, true) => {}
+            (dest, false) => {
+                match dest {
+                    Some(dest) => write!(f, "{dest}")?,
+                    None => f.write_str("_")?,
+                }
+                for result in &self.results {
+                    write!(f, ", {}:{}", result.key.get(), result.value)?;
+                }
+                f.write_str(" = ")?;
+            }
+        }
+        if self.tail {
+            write!(f, "tail ")?;
+        }
+        match &self.callee {
+            Callee::Direct(method) => write!(f, "call {method}(")?,
+            Callee::Virtual(method) => write!(f, "callvirt {method}(")?,
+            Callee::Constrained {
+                method,
+                constraint_type,
+                instance,
+            } => {
+                let call = if *instance { "callvirt" } else { "call" };
+                write!(f, "constrained({constraint_type}) {call} {method}(")?;
+            }
+            Callee::Indirect { fptr, .. } => write!(f, "calli {fptr}(")?,
+        }
+        let (args, effects) = (&self.args, self.effects.as_ref());
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, ")")?;
+        // Staged values are no arguments, and printed apart from them.
+        if !self.staged.is_empty() {
+            write!(f, " staged[")?;
+            for (i, staged) in self.staged.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "sp+{}: {}", staged.offset, staged.value)?;
+            }
+            write!(f, "]")?;
+        }
+        if !self.implicit_inputs.is_empty() {
+            write!(f, " with {{")?;
+            for (index, input) in self.implicit_inputs.iter().enumerate() {
+                if index > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}={}", input.key.get(), input.value)?;
+            }
+            write!(f, "}}")?;
+        }
+        let Some(effects) = effects else {
+            return Ok(());
+        };
+        if effects.is_pure() {
+            return write!(f, " [pure]");
+        }
+        let mut parts: Vec<String> = Vec::new();
+        match effects.accesses() {
+            None => parts.push("memory".to_owned()),
+            Some(accesses) => {
+                for access in accesses {
+                    let location = match &access.location {
+                        CallLocation::Pointee { arg, .. } => format!("*arg{arg}"),
+                        CallLocation::Field(field) => field.to_string(),
+                        CallLocation::Escaped => "escaped".to_owned(),
+                        CallLocation::Frame {
+                            origin: FrameOrigin::Entry,
+                            offset,
+                            bytes,
+                        } => format!("frame[{offset}; {bytes}]"),
+                        CallLocation::Frame {
+                            origin: FrameOrigin::Alignment,
+                            offset,
+                            bytes,
+                        } => format!("aligned[{offset}; {bytes}]"),
+                    };
+                    let mode = match access.access {
+                        AccessMode::Read => "reads",
+                        AccessMode::Write => "writes",
+                        AccessMode::MayWrite => "may write",
+                        AccessMode::Update => "updates",
+                    };
+                    parts.push(format!("{mode} {location}"));
+                }
+            }
+        }
+        if effects.world {
+            parts.push("world".to_owned());
+        }
+        match effects.termination {
+            CallTermination::Returns => {}
+            CallTermination::MayNotReturn => parts.push("may not return".to_owned()),
+            CallTermination::NeverReturns => parts.push("never returns".to_owned()),
+        }
+        if effects.returns_twice {
+            parts.push("returns twice".to_owned());
+        }
+        if effects.may_throw {
+            parts.push("may throw".to_owned());
+        }
+        write!(f, " [{}]", parts.join("; "))
     }
 }

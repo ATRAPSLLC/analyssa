@@ -18,29 +18,43 @@
 //! such as type compatibility, self-reference prevention, and same-block
 //! use-before-def prevention into shared infrastructure.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::{Deref, DerefMut},
+};
 
 use crate::{
-    BitSet,
     analysis::{
-        exceptions::EhCfg,
+        cfg::SsaCfg,
+        exceptions::FunctionRoots,
         verifier::{SsaVerifier, VerifierError, VerifyLevel},
     },
+    bitset::BitSet,
     error::{Error, Result},
+    facts::{Substitution, VariableFacts},
     graph::{
         NodeId,
         algorithms::{DominatorTree, compute_dominators},
     },
     ir::{
-        block::{ReplaceResult, SsaBlock},
-        function::{CopyPropagationResult, SsaFunction},
+        block::ReplaceResult,
+        function::SsaFunction,
+        identity::Identity,
         instruction::SsaInstruction,
-        ops::SsaOp,
-        phi::{PhiNode, PhiOperand},
-        variable::{DefSite, SsaVarId, UseSite, VariableOrigin},
+        phi::{PhiEdge, PhiOperand},
+        variable::{DefSite, SsaVarId, UseSite},
     },
     target::Target,
 };
+
+mod blocks;
+mod instructions;
+mod merges;
+mod phis;
+mod routes;
+mod terminators;
+mod uses;
+mod variables;
 
 /// Required cleanup after a sequence of SSA edits.
 ///
@@ -55,21 +69,35 @@ pub enum SsaEditScope {
     /// Finishing this scope recomputes use-site metadata but does not strip
     /// instructions or compact variables.
     UsesOnly,
+    /// Edges were given blocks of their own that jump on to where the edges
+    /// went ([`SsaEditor::split_edges`]), and nothing else changed: every
+    /// value means what it meant and is read where it was.
+    ///
+    /// Finishing this scope restores definition sites, use-site metadata and
+    /// instruction identities, and nothing more: there is nothing to tidy, and
+    /// tidying would renumber values a caller holding facts about them still
+    /// names.
+    EdgesSplit,
     /// Instructions were replaced, nopped, inserted, or removed without
     /// changing the control-flow graph.
     ///
     /// Finishing this scope runs [`SsaFunction::repair_ssa`].
     InstructionsOnly,
-    /// The control-flow graph may have changed.
+    /// The control-flow graph changed, and the caller restored every value
+    /// the change disturbed (see [`SsaEditor::declare_repaired`]).
     ///
-    /// Finishing this scope runs [`SsaFunction::rebuild_ssa`].
+    /// Finishing this scope empties the blocks the edits cut off, drops the phi
+    /// operands of edges that no longer exist, and runs
+    /// [`SsaFunction::repair_ssa`].
+    CfgRepaired,
+    /// The control-flow graph changed, and the caller has not said that the
+    /// values the change disturbed are restored.
     ///
-    /// This subsumes what was previously a separate `StructuredCfg` scope for
-    /// "the CFG changed but the caller maintained phi edges". That variant ran
-    /// `rebuild_ssa` too, so it was behaviourally identical while its
-    /// documentation promised a cheaper boundary — an edge edit can invalidate
-    /// dominance, liveness, and definition placement regardless of whether phi
-    /// operands were kept consistent, so there was nothing cheaper to do.
+    /// Finishing this scope fails, and the session's rollback policy decides
+    /// what becomes of its edits: an edge carries values only the editing
+    /// caller knows, so the caller restores them and declares it
+    /// ([`SsaEditor::declare_repaired`]), which makes the scope
+    /// [`Self::CfgRepaired`].
     CfgModifying,
 }
 
@@ -197,7 +225,21 @@ pub struct CheckedReplaceResult {
 }
 
 impl CheckedReplaceResult {
+    /// Whether the substitution took: it rewrote a use, or refused none,
+    /// which is so for a value nothing read.
+    #[must_use]
+    pub fn took(&self) -> bool {
+        self.replaced > 0 || self.skipped.is_empty()
+    }
+
     /// Returns `true` if no replacements were skipped.
+    ///
+    /// Every use was considered - instruction operands and phi operands alike -
+    /// so a complete result means the replaced variable is read nowhere any more
+    /// and its definition may be removed. A phi operand the replacement cannot
+    /// reach is skipped, never silently left behind: a caller that deleted the
+    /// definition on a result that ignored phi operands left the operand naming
+    /// a value nothing defines.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty()
@@ -213,6 +255,48 @@ impl CheckedReplaceResult {
     }
 }
 
+/// The function an edit session changes, and the rollback copy of it.
+///
+/// Reads go straight through. The first access that can change the function
+/// takes the copy a rollback would restore, when the session asked for one, so
+/// a session that changes nothing never pays for it. Every mutation of the
+/// function goes through [`DerefMut`], and recording a change without mutating
+/// (see [`SsaEditor::mark_cfg_changed`]) takes the copy too, so the copy exists
+/// before the first change of either kind and holds the function exactly as the
+/// session found it.
+struct EditTarget<'a, T: Target> {
+    /// Function being edited.
+    ssa: &'a mut SsaFunction<T>,
+    /// Whether the session wants a copy to restore on failure.
+    keeps_original: bool,
+    /// The function as the session found it, once something asked to change it.
+    original: Option<SsaFunction<T>>,
+}
+
+impl<T: Target> EditTarget<'_, T> {
+    /// Takes the rollback copy if the session wants one and has none yet.
+    fn keep_original(&mut self) {
+        if self.keeps_original && self.original.is_none() {
+            self.original = Some(self.ssa.clone());
+        }
+    }
+}
+
+impl<T: Target> Deref for EditTarget<'_, T> {
+    type Target = SsaFunction<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.ssa
+    }
+}
+
+impl<T: Target> DerefMut for EditTarget<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.keep_original();
+        self.ssa
+    }
+}
+
 /// Checked mutation facade for an [`SsaFunction`].
 ///
 /// The editor performs local checks before mutating and records the strongest
@@ -220,7 +304,7 @@ impl CheckedReplaceResult {
 /// after each operation; [`SsaFunction::edit`] performs that boundary work once.
 pub struct SsaEditor<'a, T: Target> {
     /// Function being edited.
-    ssa: &'a mut SsaFunction<T>,
+    ssa: EditTarget<'a, T>,
     /// Whether any operation changed the function.
     changed: bool,
     /// Strongest repair scope required so far.
@@ -232,6 +316,9 @@ pub struct SsaEditor<'a, T: Target> {
     /// is what lets [`Self::replace_uses_checked_with`] consult the use index
     /// instead of scanning the function on every call.
     uses_indexed: bool,
+    /// Whether the caller restored every value its CFG edits disturbed; see
+    /// [`Self::declare_repaired`].
+    repaired: bool,
 }
 
 impl<T: Target> SsaFunction<T> {
@@ -242,43 +329,70 @@ impl<T: Target> SsaFunction<T> {
     /// applies the repair required by the editor's accumulated
     /// [`SsaEditScope`]. Optional verification runs after repair.
     ///
+    /// # Arguments
+    ///
+    /// * `options` - Verification toggle, verify level, and rollback policy for
+    ///   the session.
+    /// * `edit` - Closure that performs the mutations through the editor.
+    ///
+    /// # Returns
+    ///
+    /// An [`SsaEditReport`] recording whether the function changed and the
+    /// strongest repair scope that ran.
+    ///
     /// # Errors
     ///
     /// Returns an error if the edit closure fails, SSA rebuild fails, or
     /// verification is enabled and detects malformed SSA. If
     /// [`SsaRollbackPolicy::OnFailure`] is selected, the original function is
-    /// restored before returning the error.
+    /// restored before returning the error. Otherwise any edit made before the
+    /// failure stays applied, and the function is marked dirty (see
+    /// [`SsaFunction::take_edit_dirty`]).
     pub fn edit<F>(&mut self, options: SsaEditOptions, edit: F) -> Result<SsaEditReport>
     where
         F: FnOnce(&mut SsaEditor<T>) -> Result<()>,
     {
-        let original = if matches!(options.rollback, SsaRollbackPolicy::OnFailure) {
-            Some(self.clone())
-        } else {
-            None
-        };
-
-        let edit_result = {
+        let (edit_result, original) = {
             let mut editor = SsaEditor {
-                ssa: self,
+                ssa: EditTarget {
+                    ssa: self,
+                    keeps_original: matches!(options.rollback, SsaRollbackPolicy::OnFailure),
+                    original: None,
+                },
                 changed: false,
                 scope: SsaEditScope::None,
                 // Pessimistic: a caller may have mutated the function directly
                 // before opening this session, so the first indexed
                 // replacement pays one `recompute_uses` to establish the index.
                 uses_indexed: false,
+                repaired: false,
             };
             let result = edit(&mut editor);
-            result.map(|_| SsaEditReport {
-                changed: editor.changed,
-                scope: editor.scope,
-            })
+            let changed = editor.changed;
+            let scope = if editor.repaired && editor.scope == SsaEditScope::CfgModifying {
+                SsaEditScope::CfgRepaired
+            } else {
+                editor.scope
+            };
+            let original = editor.ssa.original.take();
+            let result = result
+                .map(|_| SsaEditReport { changed, scope })
+                .map_err(|error| (error, changed));
+            (result, original)
         };
 
         let report = match edit_result {
             Ok(report) => report,
-            Err(error) => {
-                restore_on_failure(self, original);
+            Err((error, changed)) => {
+                // A closure that mutated and then failed leaves its edits in
+                // place unless the rollback below restores the snapshot. The
+                // caller's "did anything change" cannot be trusted on an error
+                // path any more than on a success path, so the flag records it
+                // here; a restored snapshot carries its own pre-edit flag.
+                if changed {
+                    self.mark_edit_dirty();
+                }
+                restore_on_failure(self, original, &error, changed);
                 return Err(error);
             }
         };
@@ -287,12 +401,12 @@ impl<T: Target> SsaFunction<T> {
             // Set before boundary repair can fail. Under
             // `SsaRollbackPolicy::Never` a failed repair leaves these edits
             // applied, and the caller's own "changed" return has repeatedly
-            // been written to say otherwise — so the pass group reads this
+            // been written to say otherwise - so the pass group reads this
             // instead of trusting it. A rollback below replaces the whole
             // function with its pre-edit clone, which clears the flag.
             self.mark_edit_dirty();
             if let Err(error) = finish_edit_scope(self, report.scope) {
-                restore_on_failure(self, original);
+                restore_on_failure(self, original, &error, true);
                 return Err(error);
             }
         }
@@ -300,20 +414,40 @@ impl<T: Target> SsaFunction<T> {
         if options.verify {
             let errors = SsaVerifier::new(self).verify(options.verify_level);
             if !errors.is_empty() {
-                restore_on_failure(self, original);
-                return Err(Error::new(format_verifier_errors(&errors)));
+                let error = Error::new(format_verifier_errors(&errors));
+                restore_on_failure(self, original, &error, report.changed);
+                return Err(error);
             }
         }
 
         Ok(report)
     }
 
-    /// Replaces instruction uses of `old_var` with `new_var` after shared checks.
+    /// Replaces every use of `old_var` - instruction operands and phi operands -
+    /// with `new_var` after shared checks.
     ///
-    /// This method mutates instruction operands directly and does not run repair
+    /// A phi operand is read on its incoming edge, so it is rewritten when
+    /// `new_var`'s definition reaches the end of the operand's predecessor, and
+    /// reported as skipped when it does not.
+    ///
+    /// This method mutates operands directly and does not run repair
     /// or recompute use metadata. Callers that use it outside [`SsaFunction::edit`]
     /// should call [`SsaFunction::recompute_uses`] or the appropriate repair
     /// method before relying on def-use metadata.
+    ///
+    /// A dominator tree is built here only when `new_var` is defined outside at
+    /// least one block that uses `old_var`; a purely same-block rewrite needs no
+    /// dominance check and skips the CFG construction entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The variable whose instruction uses are rewritten.
+    /// * `new_var` - The variable substituted at each accepted use site.
+    ///
+    /// # Returns
+    ///
+    /// The count of operand occurrences replaced together with the sites the
+    /// shared safety checks skipped.
     #[must_use]
     pub fn replace_uses_checked(
         &mut self,
@@ -323,166 +457,31 @@ impl<T: Target> SsaFunction<T> {
         let needs_dominance = self
             .variable(new_var)
             .map(|new| {
-                let def_block = new.def_site().block;
+                let def_block = new.def_site().block();
                 self.blocks().iter().enumerate().any(|(block_idx, block)| {
-                    block_idx != def_block
+                    (block_idx != def_block
                         && block
                             .instructions()
                             .iter()
-                            .any(|instr| instr.op().uses_var(old_var))
+                            .any(|instr| instr.op().uses_var(old_var)))
+                        || block.phi_nodes().iter().any(|phi| {
+                            phi.operands().iter().any(|operand| {
+                                operand.value() == old_var && operand.predecessor() != def_block
+                            })
+                        })
                 })
             })
             .unwrap_or(false);
         let dominators = if needs_dominance && self.block_count() > 0 {
-            let eh = EhCfg::from_ssa(self);
+            let eh = SsaCfg::from_ssa(self);
             Some(compute_dominators(&eh, NodeId::new(0)))
         } else {
             None
         };
 
-        self.replace_uses_checked_with(old_var, new_var, dominators.as_ref())
-    }
-
-    /// Performs a checked use replacement against a caller-supplied dominator
-    /// tree, skipping the per-call CFG/dominator construction.
-    ///
-    /// Replacing instruction uses never changes any terminator, so a single
-    /// dominator tree stays valid across a batch of replacements. Callers that
-    /// rewrite many copies (e.g. copy propagation) should build the tree once
-    /// and reuse it via this method instead of calling
-    /// [`replace_uses_checked`](Self::replace_uses_checked) per pair.
-    #[must_use]
-    /// Checked use replacement driven by `old_var`'s recorded use sites rather
-    /// than a scan of the whole function.
-    ///
-    /// Same result as [`Self::replace_uses_checked_with`], at O(uses of
-    /// `old_var`) instead of O(function). The scanning form is called once per
-    /// redundant pair by GVN and once per copy by copy propagation, which makes
-    /// those passes O(pairs x function) — the dominant cost on large functions.
-    ///
-    /// # Correctness
-    ///
-    /// Requires `old_var`'s use list to be current; [`SsaEditor`] guarantees
-    /// that by recomputing once before its first indexed replacement and then
-    /// keeping the lists exact, which this method does by moving each rewritten
-    /// site from `old_var` to `new_var`.
-    pub(in crate::ir::function) fn replace_uses_checked_indexed(
-        &mut self,
-        old_var: SsaVarId,
-        new_var: SsaVarId,
-        dominators: Option<&DominatorTree>,
-    ) -> CheckedReplaceResult {
-        // Instruction uses only, mirroring the scanning form; phi operands are
-        // handled by the phi-specific paths.
-        let candidates: Vec<UseSite> = self
-            .variable(old_var)
-            .map(|var| {
-                var.uses()
-                    .iter()
-                    .filter(|site| !site.is_phi_operand)
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut allowed = Vec::new();
-        let mut skipped = Vec::new();
-        for site in candidates {
-            // The list can name a site whose op no longer reads `old_var` (a
-            // previous rewrite in this session); skip those rather than trust it
-            // blindly.
-            let still_uses = self
-                .block(site.block)
-                .and_then(|block| block.instruction(site.instruction))
-                .is_some_and(|instr| instr.op().uses_var(old_var));
-            if !still_uses {
-                continue;
-            }
-            match can_replace_instruction_use_with_dominators(
-                self,
-                old_var,
-                new_var,
-                site.block,
-                site.instruction,
-                dominators,
-            ) {
-                Ok(()) => allowed.push(site),
-                Err(reason) => skipped.push(SkippedReplacement { site, reason }),
-            }
-        }
-
-        let mut replaced = 0usize;
-        let mut moved: Vec<UseSite> = Vec::new();
-        for site in allowed {
-            if let Some(instr) = self
-                .block_mut(site.block)
-                .and_then(|block| block.instruction_mut(site.instruction))
-            {
-                let n = instr.op_mut().replace_uses(old_var, new_var);
-                if n > 0 {
-                    replaced = replaced.saturating_add(n);
-                    moved.push(site);
-                }
-            }
-        }
-
-        // Keep both use lists exact so the next indexed replacement stays valid.
-        if !moved.is_empty() {
-            if let Some(old) = self.variable_mut(old_var) {
-                old.retain_uses(|site| {
-                    !moved
-                        .iter()
-                        .any(|m| m.block == site.block && m.instruction == site.instruction)
-                });
-            }
-            if let Some(new) = self.variable_mut(new_var) {
-                for site in moved {
-                    new.add_use(site);
-                }
-            }
-        }
-
-        CheckedReplaceResult { replaced, skipped }
-    }
-
-    pub(in crate::ir::function) fn replace_uses_checked_with(
-        &mut self,
-        old_var: SsaVarId,
-        new_var: SsaVarId,
-        dominators: Option<&DominatorTree>,
-    ) -> CheckedReplaceResult {
-        let mut allowed = Vec::new();
-        let mut skipped = Vec::new();
-
-        for (block_idx, block) in self.blocks().iter().enumerate() {
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if !instr.op().uses_var(old_var) {
-                    continue;
-                }
-
-                match can_replace_instruction_use_with_dominators(
-                    self, old_var, new_var, block_idx, instr_idx, dominators,
-                ) {
-                    Ok(()) => allowed.push((block_idx, instr_idx)),
-                    Err(reason) => skipped.push(SkippedReplacement {
-                        site: UseSite::instruction(block_idx, instr_idx),
-                        reason,
-                    }),
-                }
-            }
-        }
-
-        let mut replaced = 0usize;
-        for (block_idx, instr_idx) in allowed {
-            if let Some(instr) = self
-                .block_mut(block_idx)
-                .and_then(|block| block.instruction_mut(instr_idx))
-            {
-                replaced = replaced.saturating_add(instr.op_mut().replace_uses(old_var, new_var));
-            }
-        }
-
-        CheckedReplaceResult { replaced, skipped }
+        let result = self.replace_uses_checked_with(old_var, new_var, dominators.as_ref());
+        self.inherit_rename_group(old_var, new_var, result.took(), Substitution::Host);
+        result
     }
 
     /// Checks whether one instruction use can be replaced safely.
@@ -490,6 +489,13 @@ impl<T: Target> SsaFunction<T> {
     /// This method is intentionally cheap enough for optimization passes. It
     /// validates variable existence, type compatibility, self-reference, same
     /// block ordering, and cross-block dominance for instruction uses.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The variable currently read at the use site.
+    /// * `new_var` - The candidate replacement variable.
+    /// * `block_idx` - Block containing the instruction whose use is checked.
+    /// * `instr_idx` - Index of that instruction within the block.
     ///
     /// # Errors
     ///
@@ -501,12 +507,12 @@ impl<T: Target> SsaFunction<T> {
         new_var: SsaVarId,
         block_idx: usize,
         instr_idx: usize,
-    ) -> std::result::Result<(), ReplacementSkipReason> {
+    ) -> Result<(), ReplacementSkipReason> {
         let needs_dominance = self
             .variable(new_var)
-            .is_some_and(|new| new.def_site().block != block_idx);
+            .is_some_and(|new| new.def_site().block() != block_idx);
         let dominators = if needs_dominance && self.block_count() > 0 {
-            let eh = EhCfg::from_ssa(self);
+            let eh = SsaCfg::from_ssa(self);
             Some(compute_dominators(&eh, NodeId::new(0)))
         } else {
             None
@@ -523,10 +529,56 @@ impl<T: Target> SsaFunction<T> {
 }
 
 impl<'a, T: Target> SsaEditor<'a, T> {
+    /// Declares that every value this session's CFG edits disturbed has been
+    /// restored.
+    ///
+    /// For a caller that repairs value by value - with
+    /// [`Self::reconstruct_values`] and phi operands it sets itself - after
+    /// editing edges. Without this a session that changed the graph is
+    /// refused ([`SsaEditScope::CfgModifying`]). A caller that declares this
+    /// should also verify the session, so an incomplete repair is rejected
+    /// rather than kept.
+    pub fn declare_repaired(&mut self) {
+        self.repaired = true;
+    }
+
     /// Returns an immutable view of the function being edited.
     #[must_use]
     pub const fn function(&self) -> &SsaFunction<T> {
-        self.ssa
+        self.ssa.ssa
+    }
+
+    /// Notes that `whole` is read from `start`, the part at its lowest
+    /// address, and `rest`, its other half where it is composed of two
+    /// values, so the host's facts can keep `whole` where they were kept
+    /// ([`VariableFacts::hold_whole`]).
+    ///
+    /// A fact, not an edit: nothing in the IR changes, and a rolled-back
+    /// session restores it with the function.
+    ///
+    /// # Arguments
+    ///
+    /// * `whole` - The value kept whole.
+    /// * `start` - The part at its lowest address.
+    /// * `rest` - Its other half, where it is two values.
+    pub fn note_whole(&mut self, whole: SsaVarId, start: SsaVarId, rest: Option<SsaVarId>) {
+        if whole == start || rest == Some(whole) {
+            return;
+        }
+        let facts = |var: SsaVarId| self.ssa.variable(var).map(|var| var.facts().clone());
+        let Some(start) = facts(start) else {
+            return;
+        };
+        let rest = match rest {
+            Some(rest) => match facts(rest) {
+                Some(facts) => Some(facts),
+                None => return,
+            },
+            None => None,
+        };
+        if let Some(kept) = self.ssa.variable_mut(whole) {
+            kept.facts_mut().hold_whole(&start, rest.as_ref());
+        }
     }
 
     /// Returns whether this edit session has changed the function.
@@ -541,474 +593,51 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         self.scope
     }
 
-    /// Replaces instruction uses after shared safety checks.
-    ///
-    /// The edit scope is widened to [`SsaEditScope::UsesOnly`] when at least
-    /// one operand occurrence is replaced.
-    pub fn replace_uses_checked(
-        &mut self,
-        old_var: SsaVarId,
-        new_var: SsaVarId,
-    ) -> CheckedReplaceResult {
-        let result = self.ssa.replace_uses_checked(old_var, new_var);
-        if result.replaced > 0 {
-            self.mark_changed(SsaEditScope::UsesOnly);
-        }
-        result
-    }
-
-    /// Replaces instruction uses of `old_var` with `new_var` against a
-    /// caller-supplied dominator tree, skipping the per-call CFG + dominator
-    /// construction that [`replace_uses_checked`](Self::replace_uses_checked)
-    /// performs internally.
-    ///
-    /// Replacing instruction uses never rewrites a terminator, so a single
-    /// dominator tree stays valid across an entire batch of replacements. A
-    /// pass that rewrites many variables (e.g. GVN) should build the tree once
-    /// from [`function`](Self::function) and reuse it here, turning a per-pair
-    /// O(blocks) dominator rebuild into one build for the whole batch.
-    ///
-    /// The edit scope is widened to [`SsaEditScope::UsesOnly`] when at least one
-    /// operand occurrence is replaced.
-    pub fn replace_uses_checked_with(
-        &mut self,
-        old_var: SsaVarId,
-        new_var: SsaVarId,
-        dominators: Option<&DominatorTree>,
-    ) -> CheckedReplaceResult {
-        // One `recompute_uses` per edit session, then O(uses) per replacement.
-        // The scanning form is O(function) *per call*, and callers such as GVN
-        // and copy propagation invoke this once per candidate pair.
-        if !self.uses_indexed {
-            self.ssa.recompute_uses();
-            self.uses_indexed = true;
-        }
-        let result = self
-            .ssa
-            .replace_uses_checked_indexed(old_var, new_var, dominators);
-        if result.replaced > 0 {
-            self.mark_changed(SsaEditScope::UsesOnly);
-            // `replace_uses_checked_indexed` moved the rewritten sites between
-            // the two variables, so the lists are still exact.
-            self.uses_indexed = true;
-        }
-        result
-    }
-
-    /// Propagates copy mappings through instruction operands.
-    ///
-    /// The edit scope is widened to [`SsaEditScope::UsesOnly`] when at least
-    /// one operand occurrence is replaced.
-    pub fn propagate_copies(
-        &mut self,
-        copies: &BTreeMap<SsaVarId, SsaVarId>,
-    ) -> CopyPropagationResult {
-        let result = self.ssa.propagate_copies(copies);
-        if result.total_replaced > 0 {
-            self.mark_changed(SsaEditScope::UsesOnly);
-        }
-        result
-    }
-
-    /// Replaces the copy instruction defining `dest` with [`SsaOp::Nop`].
-    ///
-    /// Boundary repair strips the nop and compacts variables once the edit
-    /// session finishes.
-    pub fn nop_copy_defining(&mut self, dest: SsaVarId) -> bool {
-        let changed = self.ssa.nop_copy_defining(dest);
-        if changed {
-            self.mark_changed(SsaEditScope::InstructionsOnly);
-        }
-        changed
-    }
-
-    /// Replaces an instruction operation and marks instruction repair required.
-    ///
-    /// If the new operation defines a variable, the variable's definition site
-    /// is updated to the instruction location. The final edit boundary repair
-    /// handles stale use metadata and any variables orphaned by the old
-    /// operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the target instruction does not exist.
-    pub fn replace_instruction_op(
-        &mut self,
-        block_idx: usize,
-        instr_idx: usize,
-        new_op: SsaOp<T>,
-    ) -> Result<()> {
-        let defs: Vec<SsaVarId> = new_op.defs().collect();
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-        let Some(instr) = block.instruction_mut(instr_idx) else {
-            return Err(Error::new(format!(
-                "missing instruction B{block_idx}:I{instr_idx}"
-            )));
-        };
-
-        instr.set_op_preserving_type(new_op);
-        for dest in defs {
-            if let Some(var) = self.ssa.variable_mut(dest) {
-                var.set_def_site(DefSite::instruction(block_idx, instr_idx));
-            }
-        }
-        self.mark_changed(SsaEditScope::InstructionsOnly);
-        Ok(())
-    }
-
-    /// Replaces an instruction with [`SsaOp::Nop`].
-    ///
-    /// This is the checked editor equivalent of instruction removal. Boundary
-    /// repair strips the nop and compacts variables once the edit session
-    /// finishes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the target instruction does not exist.
-    pub fn nop_instruction(&mut self, block_idx: usize, instr_idx: usize) -> Result<()> {
-        self.replace_instruction_op(block_idx, instr_idx, SsaOp::Nop)
-    }
-
-    /// Replaces the terminator operation for a block.
-    ///
-    /// The terminator is represented by the block's last instruction. This
-    /// helper marks the edit as [`SsaEditScope::CfgModifying`] because changing
-    /// a terminator can change successor edges even when the instruction count
-    /// stays fixed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist or has no instructions.
-    pub fn replace_terminator_op(&mut self, block_idx: usize, new_op: SsaOp<T>) -> Result<()> {
-        let Some(block) = self.ssa.block(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-        // The control question, not the positional one. Overwriting a last
-        // instruction that is an ordinary computation would delete a definition
-        // the block still needs, so such a block is reported as having no
-        // terminator rather than silently retargeted.
-        if block.control_terminator().is_none() {
-            return Err(Error::new(format!("block B{block_idx} has no terminator")));
-        }
-        let Some(instr_idx) = block.instructions().len().checked_sub(1) else {
-            return Err(Error::new(format!("block B{block_idx} has no terminator")));
-        };
-
-        self.replace_instruction_op(block_idx, instr_idx, new_op)?;
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(())
-    }
-
-    /// Removes all instructions in a block starting at `start_idx`.
-    ///
-    /// This is intended for dead-tail cleanup after a terminator. The function
-    /// truncates the instruction list and marks instruction repair required so
-    /// shifted or removed definition sites are reconciled at the edit boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn remove_instruction_tail(&mut self, block_idx: usize, start_idx: usize) -> Result<usize> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let original_len = block.instructions().len();
-        if start_idx >= original_len {
-            return Ok(0);
-        }
-        block.instructions_mut().truncate(start_idx);
-        let removed = original_len.saturating_sub(start_idx);
-        if removed > 0 {
-            self.mark_changed(SsaEditScope::InstructionsOnly);
-        }
-        Ok(removed)
-    }
-
-    /// Clears all phis and instructions from a block.
-    ///
-    /// Clearing a block changes CFG structure by removing its terminator and
-    /// definitions, so boundary cleanup uses full SSA rebuild.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn clear_block(&mut self, block_idx: usize) -> Result<bool> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        if block.is_empty() {
-            return Ok(false);
-        }
-
-        block.clear();
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(true)
-    }
-
-    /// Folds a block's terminator to a new op and repairs the phi operands of
-    /// any successor whose incoming edge that removes.
-    ///
-    /// This is the cheap path for branch folding — replacing
-    /// `Branch(cond, A, B)` with `Jump(A)`. Such an edit is *not* a general CFG
-    /// mutation and does not need [`SsaFunction::rebuild_ssa`]:
-    ///
-    /// - Removing an edge only ever **increases** dominance, because it removes
-    ///   paths. Every definition that dominated a use still does, so no
-    ///   def-use violation can be introduced and **no new phi can ever be
-    ///   required** — existing phis can only become redundant.
-    /// - The one thing that *does* need fixing is each dropped successor's phi
-    ///   operands for this predecessor, which this method prunes directly.
-    ///
-    /// The edit therefore settles at [`SsaEditScope::InstructionsOnly`]
-    /// (`repair_ssa`) rather than escalating the whole function to a 19-phase
-    /// Cytron reconstruction. Measured, `rebuild_ssa` costs 23-54x a full IR
-    /// clone, so avoiding one is worth more than eliminating every per-pass
-    /// snapshot in the same sweep.
-    ///
-    /// Returns the number of phi operands pruned.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block or its terminator does not exist, or if
-    /// `new_op` would **add** a successor edge — the reasoning above holds only
-    /// for edge removal, so an edge-adding fold is rejected rather than
-    /// under-repaired.
-    pub fn fold_terminator_pruning_phis(
-        &mut self,
-        block_idx: usize,
-        new_op: SsaOp<T>,
-    ) -> Result<usize> {
-        let Some(block) = self.ssa.block(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-        let Some(last_idx) = block.instructions().len().checked_sub(1) else {
-            return Err(Error::new(format!("block B{block_idx} has no terminator")));
-        };
-
-        let before: Vec<usize> = block.successors();
-        let after: Vec<usize> = new_op.successors();
-
-        // The whole justification for staying at `InstructionsOnly` is that this
-        // edit only *removes* edges: removing paths can only increase dominance,
-        // so no new phi can ever be required. An edit that adds an edge breaks
-        // that argument — it can make a definition stop dominating a use, and it
-        // can require a phi that does not exist — so it is rejected here rather
-        // than silently under-repaired. Use
-        // [`SsaEditor::redirect_terminator_target`] or
-        // [`SsaEditor::replace_terminator_op`] for the general case; both record
-        // [`SsaEditScope::CfgModifying`].
-        if let Some(added) = after.iter().find(|target| !before.contains(target)) {
-            return Err(Error::new(format!(
-                "fold_terminator_pruning_phis on B{block_idx} would add edge to B{added}; \
-                 this path only prunes removed edges — use `replace_terminator_op` \
-                 for an edit that adds one"
-            )));
-        }
-
-        self.replace_instruction_op(block_idx, last_idx, new_op)?;
-
-        // Prune only the edges this fold actually removed. A successor that
-        // still has another edge from this block (e.g. `Branch(c, A, A)`)
-        // keeps its operand.
-        let mut pruned = 0usize;
-        for successor in before {
-            if after.contains(&successor) {
-                continue;
-            }
-            if let Some(target) = self.ssa.block_mut(successor) {
-                for phi in target.phi_nodes_mut() {
-                    let operands = phi.operands_mut();
-                    let original = operands.len();
-                    // Never leave a phi empty; a single-operand phi is handled
-                    // by trivial-phi simplification, not here.
-                    if operands
-                        .iter()
-                        .filter(|op| op.predecessor() != block_idx)
-                        .count()
-                        == 0
-                    {
-                        continue;
-                    }
-                    operands.retain(|op| op.predecessor() != block_idx);
-                    pruned = pruned.saturating_add(original.saturating_sub(operands.len()));
-                }
-            }
-        }
-
-        self.mark_changed(SsaEditScope::InstructionsOnly);
-        Ok(pruned)
-    }
-
-    /// Redirects one successor edge in a block terminator.
-    ///
-    /// The block's last instruction is treated as its terminator. If that
-    /// operation references `old_target`, all matching target fields are
-    /// rewritten to `new_target` through [`SsaOp::redirect_target`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist or has no instructions.
-    pub fn redirect_terminator_target(
-        &mut self,
-        block_idx: usize,
-        old_target: usize,
-        new_target: usize,
-    ) -> Result<bool> {
-        let Some(mut op) = self
-            .ssa
-            .block(block_idx)
-            .and_then(SsaBlock::control_terminator)
-            .cloned()
-        else {
-            return Err(Error::new(format!("block B{block_idx} has no terminator")));
-        };
-
-        if !op.redirect_target(old_target, new_target) {
-            return Ok(false);
-        }
-
-        self.replace_terminator_op(block_idx, op)?;
-        Ok(true)
-    }
-
-    /// Redirects one terminator target, for a caller that also fixes up the
-    /// affected successor phi operands in the same edit session.
-    ///
-    /// Behaviourally identical to [`SsaEditor::redirect_terminator_target`] —
-    /// both record [`SsaEditScope::CfgModifying`], because an edge edit
-    /// invalidates dominance and definition placement whether or not phi
-    /// operands were kept consistent. Retained as a distinct name so call sites
-    /// that *do* maintain phis stay self-documenting.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist or has no instructions.
-    pub fn redirect_terminator_target_structured(
-        &mut self,
-        block_idx: usize,
-        old_target: usize,
-        new_target: usize,
-    ) -> Result<bool> {
-        let Some(mut op) = self
-            .ssa
-            .block(block_idx)
-            .and_then(SsaBlock::control_terminator)
-            .cloned()
-        else {
-            return Err(Error::new(format!("block B{block_idx} has no terminator")));
-        };
-
-        if !op.redirect_target(old_target, new_target) {
-            return Ok(false);
-        }
-
-        let instr_idx = self
-            .ssa
-            .block(block_idx)
-            .and_then(|block| block.instructions().len().checked_sub(1))
-            .ok_or_else(|| Error::new(format!("block B{block_idx} has no terminator")))?;
-        self.replace_instruction_op(block_idx, instr_idx, op)?;
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(true)
-    }
-
-    /// Replaces one predecessor in phi operands with one or more predecessors.
-    ///
-    /// For each phi in `block_idx`, the first operand whose predecessor is
-    /// `old_pred` is rewritten to the first value in `new_preds`. Additional
-    /// predecessors receive duplicate operands carrying the same value. This
-    /// preserves phi value attribution when multiple incoming edges are
-    /// redirected through a single removed block.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn expand_phi_predecessor(
+    /// [`Self::duplicate_phi_edge`] without recording a scope.
+    fn add_edge_like(
         &mut self,
         block_idx: usize,
         old_pred: usize,
-        new_preds: &[usize],
+        new_pred: usize,
     ) -> Result<usize> {
         let Some(block) = self.ssa.block_mut(block_idx) else {
             return Err(Error::new(format!("missing block B{block_idx}")));
         };
-        if new_preds.is_empty() {
-            return Ok(0);
-        }
-
-        let mut updated = 0usize;
-        for phi in block.phi_nodes_mut() {
+        let mut added = 0usize;
+        for (phi_idx, phi) in block.phi_nodes_mut().iter_mut().enumerate() {
             let Some(value) = phi
-                .operands()
-                .iter()
+                .normal_operands()
                 .find(|operand| operand.predecessor() == old_pred)
-                .map(|operand| operand.value())
+                .map(PhiOperand::value)
             else {
-                continue;
+                return Err(Error::new(format!(
+                    "B{block_idx} phi {phi_idx} has no operand for B{old_pred}"
+                )));
             };
-
-            // Drop the edge being replaced, then re-add one operand per new
-            // predecessor — but never for a predecessor the phi already names.
-            //
-            // A predecessor can reach this block *both* directly and through the
-            // block being bypassed; redirecting then collapses the two paths onto
-            // one edge. Adding an operand regardless leaves two operands for that
-            // single edge, which has no defined meaning and which consumers
-            // disagree about: `PhiNode::operand_from` returns the first and
-            // discards the rest, while SCCP meets them all and yields Bottom.
-            // `retarget_phi_predecessor` already guards this case; this is the
-            // same guard for the one-to-many form.
-            //
-            // When an operand for that predecessor already exists it is kept as
-            // it stands: it describes the direct edge, which is the edge that
-            // survives.
-            phi.operands_mut()
-                .retain(|operand| operand.predecessor() != old_pred);
-            updated = updated.saturating_add(1);
-
-            for &pred in new_preds {
-                if phi
-                    .operands()
-                    .iter()
-                    .any(|operand| operand.predecessor() == pred)
-                {
-                    continue;
+            let existing = phi
+                .normal_operands()
+                .find(|operand| operand.predecessor() == new_pred)
+                .map(PhiOperand::value);
+            match existing {
+                Some(existing) if existing == value => {}
+                Some(existing) => {
+                    return Err(Error::new(format!(
+                        "B{block_idx} phi {phi_idx}: B{new_pred} already carries {existing}, \
+                         not {value}"
+                    )));
                 }
-                phi.add_operand(PhiOperand::new(value, pred));
-                updated = updated.saturating_add(1);
+                None => {
+                    phi.add_operand(PhiOperand::new(value, new_pred));
+                    added = added.saturating_add(1);
+                }
             }
         }
-
-        if updated > 0 {
-            self.mark_changed(SsaEditScope::CfgModifying);
-        }
-        Ok(updated)
+        Ok(added)
     }
 
-    /// Rewrites phi operands that name one predecessor to another predecessor.
-    ///
-    /// This is useful after block coalescing, where successor phis that pointed
-    /// at the removed block must instead point at the block that absorbed it.
-    ///
-    /// When the phi already carries an operand for `new_pred`, retargeting would
-    /// leave two operands on one edge — which has no defined meaning, and which
-    /// consumers disagree about: [`PhiNode::operand_from`] returns the first and
-    /// discards the rest, while SCCP meets them all and yields Bottom. Both
-    /// edges merging into one carry the same value only if their operands agree;
-    /// when they do, the redundant operand is dropped, and when they do not the
-    /// merge is not semantics-preserving and is rejected.
-    ///
-    /// [`PhiNode::operand_from`]: crate::ir::phi::PhiNode::operand_from
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist, or if the two edges being
-    /// merged carry different values for the same phi.
-    pub fn replace_phi_predecessor(
+    /// [`Self::replace_phi_predecessor`] without recording a scope: for an
+    /// operation that retargets as part of an edit whose scope it states itself.
+    fn retarget_phi_operands(
         &mut self,
         block_idx: usize,
         old_pred: usize,
@@ -1020,28 +649,35 @@ impl<'a, T: Target> SsaEditor<'a, T> {
 
         let mut updated = 0usize;
         for (phi_idx, phi) in block.phi_nodes_mut().iter_mut().enumerate() {
-            let value_on = |pred: usize| {
-                phi.operands()
-                    .iter()
+            // Only the terminator edge is one per predecessor. Operands for
+            // throws name program points inside a block, and a block has as
+            // many as it has points a throw can leave from - so an exceptional
+            // operand from `new_pred` is no second value for its edge, and one
+            // from `old_pred` simply moves with the code it describes.
+            let normal_value_on = |pred: usize| {
+                phi.normal_operands()
                     .find(|operand| operand.predecessor() == pred)
                     .map(PhiOperand::value)
             };
-            match (value_on(new_pred), value_on(old_pred)) {
+            match (normal_value_on(new_pred), normal_value_on(old_pred)) {
                 (Some(existing), Some(retargeted)) if existing != retargeted => {
                     return Err(Error::new(format!(
-                        "B{block_idx} phi {phi_idx}: cannot redirect B{old_pred} to B{new_pred},                          the edges carry different values ({retargeted} and {existing})"
+                        "B{block_idx} phi {phi_idx}: cannot redirect B{old_pred} to \
+                         B{new_pred}, the edges carry different values ({retargeted} and \
+                         {existing})"
                     )));
                 }
                 (Some(_), Some(_)) => {
                     // Both edges already agree, so the retargeted operand is
                     // redundant rather than a second value for the edge.
-                    phi.operands_mut()
-                        .retain(|operand| operand.predecessor() != old_pred);
+                    phi.operands_mut().retain(|operand| {
+                        operand.is_exceptional() || operand.predecessor() != old_pred
+                    });
                     updated = updated.saturating_add(1);
                 }
                 (None, Some(_)) => {
                     for operand in phi.operands_mut() {
-                        if operand.predecessor() == old_pred {
+                        if !operand.is_exceptional() && operand.predecessor() == old_pred {
                             operand.set_predecessor(new_pred);
                             updated = updated.saturating_add(1);
                         }
@@ -1049,435 +685,89 @@ impl<'a, T: Target> SsaEditor<'a, T> {
                 }
                 (_, None) => {}
             }
+            // The throws move with the code: each keeps its kind and value and
+            // now names the block that holds it. One that becomes an exact copy
+            // of an operand already there says nothing new.
+            let mut retargeted = false;
+            for operand in phi.operands_mut() {
+                if operand.is_exceptional() && operand.predecessor() == old_pred {
+                    operand.set_predecessor(new_pred);
+                    retargeted = true;
+                    updated = updated.saturating_add(1);
+                }
+            }
+            if retargeted {
+                let mut seen: Vec<(usize, SsaVarId)> = Vec::new();
+                phi.operands_mut().retain(|operand| {
+                    if !operand.is_exceptional() {
+                        return true;
+                    }
+                    let key = (operand.predecessor(), operand.value());
+                    if seen.contains(&key) {
+                        false
+                    } else {
+                        seen.push(key);
+                        true
+                    }
+                });
+            }
         }
 
-        if updated > 0 {
-            self.mark_changed(SsaEditScope::CfgModifying);
-        }
         Ok(updated)
     }
 
-    /// Coalesces a block into its unconditional predecessor.
-    ///
-    /// `predecessor_idx` must end with `Jump { target: successor_idx }`.
-    /// The predecessor's jump is removed, successor phis are converted into
-    /// `Copy` instructions, successor instructions are appended, self-targets
-    /// inside the moved instructions are redirected to the predecessor, and
-    /// the successor block is cleared. Phi operands in other blocks that
-    /// referenced the successor are rewritten to the predecessor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either block is missing, or if the predecessor does
-    /// not end in an unconditional jump to the successor.
-    pub fn coalesce_unconditional_successor(
-        &mut self,
-        predecessor_idx: usize,
-        successor_idx: usize,
-    ) -> Result<bool> {
-        let Some(predecessor) = self.ssa.block(predecessor_idx) else {
-            return Err(Error::new(format!("missing block B{predecessor_idx}")));
-        };
-        if !matches!(
-            predecessor.control_terminator(),
-            Some(SsaOp::Jump { target }) if *target == successor_idx
-        ) {
-            return Err(Error::new(format!(
-                "block B{predecessor_idx} does not jump to B{successor_idx}"
-            )));
+    /// Gives an instruction arriving without an identity one, so it is
+    /// identified on the way in rather than at the next repair: a pass that
+    /// inserts and then reads back the id gets the same answer whichever
+    /// insertion it used. An instruction that already has one (a move) keeps it.
+    fn identify(&mut self, instr: &mut SsaInstruction<T>) {
+        if instr.id().is_none() {
+            instr.set_id(self.ssa.mint_instr_id());
         }
-
-        let Some(successor) = self.ssa.block(successor_idx) else {
-            return Err(Error::new(format!("missing block B{successor_idx}")));
-        };
-        if successor.instructions().is_empty() {
-            return Ok(false);
-        }
-
-        let phi_copies: Vec<SsaInstruction<T>> = successor
-            .phi_nodes()
-            .iter()
-            .filter_map(|phi| {
-                let operand = phi.operands().first()?;
-                let dest = phi.result();
-                let src = operand.value();
-                if dest == src {
-                    return None;
-                }
-                Some(SsaInstruction::synthetic(SsaOp::Copy { dest, src }))
-            })
-            .collect();
-        let successor_instrs = successor.instructions().to_vec();
-
-        let Some(predecessor) = self.ssa.block_mut(predecessor_idx) else {
-            return Err(Error::new(format!("missing block B{predecessor_idx}")));
-        };
-        let instrs = predecessor.instructions_mut();
-        instrs.pop();
-        instrs.extend(phi_copies);
-        instrs.extend(successor_instrs);
-        for instr in instrs {
-            instr
-                .op_mut()
-                .redirect_target(successor_idx, predecessor_idx);
-        }
-
-        self.clear_block(successor_idx)?;
-
-        let block_count = self.ssa.block_count();
-        for block_idx in 0..block_count {
-            if block_idx == predecessor_idx || block_idx == successor_idx {
-                continue;
-            }
-            self.replace_phi_predecessor(block_idx, successor_idx, predecessor_idx)?;
-        }
-
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(true)
     }
 
-    /// Appends a basic block to the function.
+    /// Sets the def site of every instruction definition in `block_idx` from
+    /// index `from` onward to where it now is.
     ///
-    /// The block id must match the next dense block index. This keeps block
-    /// creation explicit and avoids silently introducing an inconsistent block
-    /// id that would later require canonicalization to interpret.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block id is not equal to the current block
-    /// count.
-    pub fn append_block(&mut self, block: SsaBlock<T>) -> Result<usize> {
-        let block_idx = self.ssa.block_count();
-        if block.id() != block_idx {
-            return Err(Error::new(format!(
-                "new block id B{} does not match next block B{block_idx}",
-                block.id()
-            )));
-        }
-
-        self.ssa.add_block(block);
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(block_idx)
-    }
-
-    /// Creates a variable using the function's registered origin type.
-    ///
-    /// This is the editor-facing equivalent of
-    /// [`SsaFunction::create_variable_for_origin`]. Creating a variable does
-    /// not by itself require repair, because the caller must still insert the
-    /// corresponding definition before the edit boundary.
-    #[must_use]
-    pub fn create_variable_for_origin(
-        &mut self,
-        origin: VariableOrigin,
-        version: u32,
-        def_site: DefSite,
-    ) -> SsaVarId {
-        self.ssa
-            .create_variable_for_origin(origin, version, def_site)
-    }
-
-    /// Appends a phi node to a block.
-    ///
-    /// If the phi result already exists in the function variable table, its
-    /// definition site is updated to the destination block. Boundary repair
-    /// refreshes uses and removes any stale definitions if later edits discard
-    /// the phi.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn add_phi(&mut self, block_idx: usize, phi: PhiNode) -> Result<usize> {
-        let result = phi.result();
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let phi_idx = block.phi_nodes().len();
-        block.phi_nodes_mut().push(phi);
-        if let Some(var) = self.ssa.variable_mut(result) {
-            var.set_def_site(DefSite::phi(block_idx));
-        }
-        self.mark_changed(SsaEditScope::CfgModifying);
-        Ok(phi_idx)
-    }
-
-    /// Replaces phi operands from a predecessor group with one operand.
-    ///
-    /// Every operand whose predecessor appears in `old_preds` is removed. If
-    /// at least one operand was removed, `new_operand` is appended. This models
-    /// canonical CFG insertion such as replacing several incoming header edges
-    /// with a single preheader or unified latch edge.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn replace_phi_predecessor_group(
-        &mut self,
-        block_idx: usize,
-        old_preds: &[usize],
-        new_operand: PhiOperand,
-    ) -> Result<bool> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let mut changed = false;
-        for phi in block.phi_nodes_mut() {
-            let before = phi.operands().len();
-            phi.operands_mut()
-                .retain(|operand| !old_preds.contains(&operand.predecessor()));
-            if phi.operands().len() != before {
-                phi.add_operand(new_operand);
-                changed = true;
-            }
-        }
-
-        if changed {
-            self.mark_changed(SsaEditScope::CfgModifying);
-        }
-        Ok(changed)
-    }
-
-    /// Replaces the operands of **one** phi — identified by its result — that
-    /// come from `old_preds`, with a single `new_operand`.
-    ///
-    /// Prefer this over
-    /// [`replace_phi_predecessor_group_for_origin`](Self::replace_phi_predecessor_group_for_origin)
-    /// whenever the caller means a specific phi. A [`VariableOrigin`] does not
-    /// identify one: [`VariableOrigin::Phi`] is a unit variant, so every phi
-    /// merging earlier phis — the common shape in lifted native code — shares
-    /// it, and the origin-keyed form rewrites all of them to the same value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `block_idx` names no block.
-    pub fn replace_phi_predecessor_group_for_result(
-        &mut self,
-        block_idx: usize,
-        phi_result: SsaVarId,
-        old_preds: &[usize],
-        new_operand: PhiOperand,
-    ) -> Result<bool> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let mut changed = false;
-        if let Some(phi) = block
-            .phi_nodes_mut()
-            .iter_mut()
-            .find(|phi| phi.result() == phi_result)
-        {
-            let before = phi.operands().len();
-            phi.operands_mut()
-                .retain(|operand| !old_preds.contains(&operand.predecessor()));
-            if phi.operands().len() != before {
-                phi.add_operand(new_operand);
-                changed = true;
-            }
-        }
-
-        if changed {
-            self.mark_changed(SsaEditScope::CfgModifying);
-        }
-        Ok(changed)
-    }
-
-    /// Replaces one origin's phi operands from a predecessor group.
-    ///
-    /// Only the phi node whose [`PhiNode::origin`] equals `origin` is updated.
-    /// This lets loop canonicalization rewrite each header phi to the value
-    /// produced by the matching inserted preheader or latch phi.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn replace_phi_predecessor_group_for_origin(
-        &mut self,
-        block_idx: usize,
-        origin: VariableOrigin,
-        old_preds: &[usize],
-        new_operand: PhiOperand,
-    ) -> Result<bool> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let mut changed = false;
-        for phi in block.phi_nodes_mut() {
-            if phi.origin() != origin {
-                continue;
-            }
-            let before = phi.operands().len();
-            phi.operands_mut()
-                .retain(|operand| !old_preds.contains(&operand.predecessor()));
-            if phi.operands().len() != before {
-                phi.add_operand(new_operand);
-                changed = true;
-            }
-        }
-
-        if changed {
-            self.mark_changed(SsaEditScope::CfgModifying);
-        }
-        Ok(changed)
-    }
-
-    /// Prunes phi operands that refer to unreachable predecessors.
-    ///
-    /// This is the editor-facing wrapper around
-    /// [`SsaFunction::prune_phi_operands`]. It marks the edit as
-    /// [`SsaEditScope::UsesOnly`] when operands are removed, so the boundary
-    /// refreshes use metadata without simplifying phis before the calling pass
-    /// can account for them.
-    #[must_use]
-    pub fn prune_phi_operands(&mut self, reachable: &BitSet) -> usize {
-        let pruned = self.ssa.prune_phi_operands(reachable);
-        if pruned > 0 {
-            self.mark_changed(SsaEditScope::UsesOnly);
-        }
-        pruned
-    }
-
-    /// Simplifies a phi node by replacing its result with a source variable.
-    ///
-    /// This is intended for phi nodes already proven trivial by analysis.
-    /// Instruction uses are replaced through dominance-aware checks, and the
-    /// phi is removed only when no remaining uses of its result exist outside
-    /// the phi being removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block or phi node does not exist.
-    pub fn simplify_phi_to_copy(
-        &mut self,
-        block_idx: usize,
-        phi_idx: usize,
-        source: SsaVarId,
-    ) -> Result<()> {
-        if self
+    /// Costs one pass over the block's tail, which an insertion has just paid
+    /// for anyway.
+    fn refresh_def_sites_from(&mut self, block_idx: usize, from: usize) {
+        let moved: Vec<(SsaVarId, usize)> = self
             .ssa
             .block(block_idx)
-            .and_then(|block| block.phi_nodes().get(phi_idx))
-            .is_none()
-        {
-            return Err(Error::new(format!("missing phi B{block_idx}:P{phi_idx}")));
-        }
-
-        if self.ssa.simplify_phi_to_copy(block_idx, phi_idx, source) {
-            self.mark_changed(SsaEditScope::InstructionsOnly);
-            Ok(())
-        } else {
-            Err(Error::new(format!(
-                "failed to simplify phi B{block_idx}:P{phi_idx}"
-            )))
-        }
-    }
-
-    /// Inserts an instruction before the block terminator.
-    ///
-    /// If the block has no terminator, the instruction is appended. If the
-    /// inserted instruction defines a variable, its definition site is updated
-    /// to the inserted location.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn insert_before_terminator(
-        &mut self,
-        block_idx: usize,
-        instr: SsaInstruction<T>,
-    ) -> Result<usize> {
-        let defs: Vec<SsaVarId> = instr.defs().collect();
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let insert_idx = block
-            .instructions()
-            .iter()
-            .position(SsaInstruction::is_terminator)
-            .unwrap_or_else(|| block.instructions().len());
-        block.instructions_mut().insert(insert_idx, instr);
-
-        for dest in defs {
+            .map(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .flat_map(|(index, instr)| instr.defs().map(move |dest| (dest, index)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (dest, index) in moved {
             if let Some(var) = self.ssa.variable_mut(dest) {
-                var.set_def_site(DefSite::instruction(block_idx, insert_idx));
+                var.set_def_site(DefSite::instruction(block_idx, index));
             }
         }
-        self.mark_changed(SsaEditScope::InstructionsOnly);
-        Ok(insert_idx)
-    }
-
-    /// Inserts an instruction at a specific index within a block.
-    ///
-    /// The index is clamped to the end of the instruction list, so callers can
-    /// use a large index to append. If the inserted instruction defines a
-    /// variable, that variable's definition site is updated to the insertion
-    /// location. Boundary repair fixes definition sites for later instructions
-    /// shifted by the insertion.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block does not exist.
-    pub fn insert_instruction(
-        &mut self,
-        block_idx: usize,
-        instr_idx: usize,
-        instr: SsaInstruction<T>,
-    ) -> Result<usize> {
-        let defs: Vec<SsaVarId> = instr.defs().collect();
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-
-        let insert_idx = instr_idx.min(block.instructions().len());
-        block.instructions_mut().insert(insert_idx, instr);
-
-        for dest in defs {
-            if let Some(var) = self.ssa.variable_mut(dest) {
-                var.set_def_site(DefSite::instruction(block_idx, insert_idx));
-            }
-        }
-        self.mark_changed(SsaEditScope::InstructionsOnly);
-        Ok(insert_idx)
-    }
-
-    /// Removes a phi node at a specific block-local index.
-    ///
-    /// Boundary repair removes any orphaned phi result variables and refreshes
-    /// def-use metadata. This helper intentionally does not replace uses of the
-    /// phi result; callers must insert or otherwise provide a replacement
-    /// definition when uses remain.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the block or phi index does not exist.
-    pub fn remove_phi(&mut self, block_idx: usize, phi_idx: usize) -> Result<()> {
-        let Some(block) = self.ssa.block_mut(block_idx) else {
-            return Err(Error::new(format!("missing block B{block_idx}")));
-        };
-        if phi_idx >= block.phi_nodes().len() {
-            return Err(Error::new(format!("missing phi B{block_idx}:P{phi_idx}")));
-        }
-
-        block.phi_nodes_mut().remove(phi_idx);
-        self.mark_changed(SsaEditScope::InstructionsOnly);
-        Ok(())
     }
 
     /// Marks that the edit session changed the control-flow graph.
     ///
     /// Low-level CFG transformations can call this after performing block or
-    /// edge edits through existing APIs. The edit boundary will run
-    /// [`SsaFunction::rebuild_ssa`].
+    /// edge edits through existing APIs. The boundary refuses the session
+    /// unless the caller also restored the values the edits disturbed and said
+    /// so with [`Self::declare_repaired`].
     pub fn mark_cfg_changed(&mut self) {
         self.mark_changed(SsaEditScope::CfgModifying);
     }
 
     /// Widens the accumulated edit scope and records that a mutation occurred.
+    ///
+    /// The session's rollback copy exists from here on, so a session that only
+    /// records a change still restores the function it found.
     fn mark_changed(&mut self, scope: SsaEditScope) {
+        self.ssa.keep_original();
         self.changed = true;
         self.scope = self.scope.max(scope);
         // Conservative: only the replacement path below knows how to keep the
@@ -1486,37 +776,86 @@ impl<'a, T: Target> SsaEditor<'a, T> {
     }
 }
 
-/// Restores the original function when a rollback snapshot exists.
-fn restore_on_failure<T: Target>(ssa: &mut SsaFunction<T>, original: Option<SsaFunction<T>>) {
-    if let Some(original) = original {
-        *ssa = original;
+/// A use site as an ordered key; `UseSite` itself has no ordering.
+fn use_site_key(site: UseSite) -> (usize, usize, bool) {
+    (site.block(), site.index(), site.is_phi_operand())
+}
+
+/// Restores the original function when a rollback snapshot exists, and
+/// otherwise records the failure on it when the session had changed it (see
+/// [`SsaFunction::take_edit_failure`]).
+fn restore_on_failure<T: Target>(
+    ssa: &mut SsaFunction<T>,
+    original: Option<SsaFunction<T>>,
+    error: &Error,
+    mutated: bool,
+) {
+    match original {
+        Some(original) => *ssa = original,
+        // No snapshot to restore: whatever the session changed stays, and the
+        // function says so for whoever runs the pass.
+        None if mutated => ssa.mark_edit_failed(error),
+        None => {}
     }
 }
 
 /// Applies boundary cleanup for an edit scope.
 ///
-/// Every scope leaves the def sites and the use index **exact**. `repair_ssa`
-/// and `rebuild_ssa` rewrite instructions and variables without restoring the
-/// index, so an edit that declared anything above `UsesOnly` used to end with a
-/// use index that no longer described the function.
+/// Every scope leaves the def sites and the use index **exact**.
 ///
 /// That matters because the index is not merely metadata: it is the candidate
 /// list `replace_uses_checked_indexed` iterates, so the next pass's rewrites are
-/// chosen from it.
+/// chosen from it, and the sparse analyses revisit a value's consumers only by
+/// walking it.
 ///
-/// The scope-specific work below therefore does *not* recompute uses itself —
-/// the unconditional pair afterwards supersedes it, and doing both would scan
-/// the function twice for one edit.
+/// `repair_ssa` restores def sites and the index as its own last step, because
+/// it is called directly and not only from here. Only `UsesOnly` - which runs
+/// no repair - needs the pair applied here, so one edit costs one scan rather
+/// than two.
+///
+/// A session that changed the graph and did not declare its values restored
+/// ([`SsaEditor::declare_repaired`]) is refused: an edge a session adds
+/// carries values only the session knows, and no reconstruction of the whole
+/// function can recover them without inventing them from rename groups the
+/// edits may have invalidated.
+///
+/// # Errors
+///
+/// Returns an error for a [`SsaEditScope::CfgModifying`] session.
 fn finish_edit_scope<T: Target>(ssa: &mut SsaFunction<T>, scope: SsaEditScope) -> Result<()> {
     match scope {
-        SsaEditScope::None => return Ok(()),
-        SsaEditScope::UsesOnly => {}
+        SsaEditScope::None => {}
+        SsaEditScope::UsesOnly | SsaEditScope::EdgesSplit => {
+            ssa.refresh_def_sites();
+            ssa.recompute_uses();
+            ssa.assign_instr_ids();
+        }
         SsaEditScope::InstructionsOnly => ssa.repair_ssa(),
-        SsaEditScope::CfgModifying => ssa.rebuild_ssa()?,
+        SsaEditScope::CfgRepaired => {
+            // What the edits cut off goes: the caller restored every value
+            // reachable code reads, so nothing it reads is defined there, and
+            // the verification a repairing caller runs says so if not.
+            let cfg = SsaCfg::from_ssa(ssa);
+            let live = FunctionRoots::of(ssa).live_blocks(&cfg);
+            drop(cfg);
+            for block_idx in 1..ssa.block_count() {
+                if !live.contains_checked(block_idx)
+                    && let Some(block) = ssa.block_mut(block_idx)
+                {
+                    block.clear();
+                }
+            }
+            ssa.prune_phi_operands(&live);
+            ssa.repair_ssa();
+        }
+        SsaEditScope::CfgModifying => {
+            return Err(Error::new(
+                "an SSA edit changed the control-flow graph without restoring the values its \
+                 edges carry; state them (phi operands, reconstruct_values) and declare the \
+                 session repaired",
+            ));
+        }
     }
-
-    ssa.refresh_def_sites();
-    ssa.recompute_uses();
     Ok(())
 }
 
@@ -1543,7 +882,7 @@ fn can_replace_instruction_use_with_dominators<T: Target>(
     block_idx: usize,
     instr_idx: usize,
     dominators: Option<&DominatorTree>,
-) -> std::result::Result<(), ReplacementSkipReason> {
+) -> Result<(), ReplacementSkipReason> {
     if old_var == new_var {
         return Err(ReplacementSkipReason::SameVariable);
     }
@@ -1575,17 +914,63 @@ fn can_replace_instruction_use_with_dominators<T: Target>(
     }
 
     let def_site = new.def_site();
-    if def_site.block == block_idx {
-        if def_site
-            .instruction
-            .is_some_and(|def_idx| def_idx >= instr_idx)
-        {
+    if def_site.block() == block_idx {
+        if def_site.index().is_some_and(|def_idx| def_idx >= instr_idx) {
             return Err(ReplacementSkipReason::SameBlockUseBeforeDef);
         }
         return Ok(());
     }
 
     if definition_dominates_block(ssa, def_site, block_idx, dominators) {
+        Ok(())
+    } else {
+        Err(ReplacementSkipReason::DominanceViolation)
+    }
+}
+
+/// Checks whether a phi operand's read of `old_var`, arriving from
+/// `predecessor`, can read `new_var` instead.
+///
+/// A phi operand is read on its incoming edge - at the end of the predecessor,
+/// not in the phi's own block - so the replacement's definition has to reach
+/// the end of `predecessor`: defined inside it (a phi of it included), or in a
+/// block that dominates it. Judging the phi's own block instead would accept a
+/// value that is not available on the edge.
+fn can_replace_phi_operand_use_with_dominators<T: Target>(
+    ssa: &SsaFunction<T>,
+    old_var: SsaVarId,
+    new_var: SsaVarId,
+    block_idx: usize,
+    phi_idx: usize,
+    predecessor: usize,
+    dominators: Option<&DominatorTree>,
+) -> Result<(), ReplacementSkipReason> {
+    if old_var == new_var {
+        return Err(ReplacementSkipReason::SameVariable);
+    }
+    let Some(old) = ssa.variable(old_var) else {
+        return Err(ReplacementSkipReason::MissingOldVariable);
+    };
+    let Some(new) = ssa.variable(new_var) else {
+        return Err(ReplacementSkipReason::MissingNewVariable);
+    };
+    if !types_compatible::<T>(old.var_type(), new.var_type()) {
+        return Err(ReplacementSkipReason::TypeMismatch);
+    }
+    let Some(phi) = ssa
+        .block(block_idx)
+        .and_then(|block| block.phi_nodes().get(phi_idx))
+    else {
+        return Err(ReplacementSkipReason::MissingInstruction);
+    };
+    if !phi
+        .operands()
+        .iter()
+        .any(|operand| operand.predecessor() == predecessor && operand.value() == old_var)
+    {
+        return Err(ReplacementSkipReason::UseNotFound);
+    }
+    if definition_dominates_block(ssa, new.def_site(), predecessor, dominators) {
         Ok(())
     } else {
         Err(ReplacementSkipReason::DominanceViolation)
@@ -1599,34 +984,582 @@ fn definition_dominates_block<T: Target>(
     use_block: usize,
     dominators: Option<&DominatorTree>,
 ) -> bool {
-    if def_site.block == use_block {
+    if def_site.block() == use_block {
         return true;
     }
-    if def_site.block >= ssa.block_count() || use_block >= ssa.block_count() {
+    if def_site.block() >= ssa.block_count() || use_block >= ssa.block_count() {
         return false;
     }
 
-    dominators
-        .is_some_and(|tree| tree.dominates(NodeId::new(def_site.block), NodeId::new(use_block)))
+    if !dominators
+        .is_some_and(|tree| tree.dominates(NodeId::new(def_site.block()), NodeId::new(use_block)))
+    {
+        return false;
+    }
+    // A definition at an instruction is missing wherever an exception raised
+    // in its block before it can go: the handler and what follows it, even
+    // where the block dominates them because the region also enters them
+    // normally.
+    !(def_site.index().is_some()
+        && !ssa.exception_handlers().is_empty()
+        && FunctionRoots::of(ssa).raise_reaches(ssa, def_site.block(), use_block))
+}
+
+/// Rewiring a value's uses to another, the way an edit session does it.
+///
+/// The session's replacements check each use against dominance and the types,
+/// and carry the rename group a value is in to the one replacing it; the
+/// function's own repairs rewire through the same two steps. Not a caller's:
+/// a pass rewires through an edit session.
+pub trait Rewiring<T: Target> {
+    /// Carries a rename group across a substitution.
+    ///
+    /// A **rename group is one variable**: the set of SSA values that are
+    /// versions of one storage location, and every reconstruction the rebuild
+    /// performs is per group. The group is therefore only sound while it is
+    /// **complete** - a definition the group cannot see is one the rename walks
+    /// a read straight past, resolving it to a value that never reached it.
+    ///
+    /// A pass that mints a value to stand in for another is exactly where a
+    /// definition would go missing: the new value is the storage's value
+    /// wherever the old one was, and it is born with no group. Substitution is
+    /// the one place the relationship is stated, so it is the one place that
+    /// can carry the group - a hundred-odd `create_variable` calls across the
+    /// passes cannot each be asked to remember.
+    ///
+    /// An existing group on the new value is never overwritten: it already
+    /// names the storage it is a version of, and the substitution says nothing
+    /// about which of the two names is right.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The variable that was substituted out.
+    /// * `new_var` - The variable substituted in.
+    /// * `took` - Whether the substitution took: it rewrote a use of
+    ///   `old_var`, or refused none, as for a value nothing reads any more,
+    ///   which stands for `new_var` as wholly as one whose readers it
+    ///   rewrote. Nothing is carried when it was refused everywhere.
+    fn inherit_rename_group(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        took: bool,
+        cause: Substitution,
+    );
+
+    /// Performs a checked use replacement against a caller-supplied dominator
+    /// tree, skipping the per-call CFG/dominator construction.
+    ///
+    /// Replacing instruction uses never changes any terminator, so a single
+    /// dominator tree stays valid across a batch of replacements. Callers that
+    /// rewrite many copies (e.g. copy propagation) should build the tree once
+    /// and reuse it via this method instead of calling
+    /// [`SsaFunction::replace_uses_checked`] per pair.
+    ///
+    /// Unlike [`SsaFunction::replace_uses_checked_indexed`], this form rescans every
+    /// instruction in the function rather than consulting `old_var`'s use list,
+    /// so it stays correct even when no use index has been established.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The variable whose instruction uses are rewritten.
+    /// * `new_var` - The variable substituted at each accepted use site.
+    /// * `dominators` - Optional precomputed dominator tree reused across a
+    ///   batch; when `None`, a cross-block use that would need one is skipped.
+    ///
+    /// # Returns
+    ///
+    /// The count of operand occurrences replaced together with the sites the
+    /// shared safety checks skipped.
+    fn replace_uses_checked_with(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        dominators: Option<&DominatorTree>,
+    ) -> CheckedReplaceResult;
+
+    #[must_use]
+    /// Checked use replacement driven by `old_var`'s recorded use sites rather
+    /// than a scan of the whole function.
+    ///
+    /// Same result as [`Self::replace_uses_checked_with`], at O(uses of
+    /// `old_var`) instead of O(function). The scanning form is called once per
+    /// redundant pair by GVN and once per copy by copy propagation, which makes
+    /// those passes O(pairs x function) - the dominant cost on large functions.
+    ///
+    /// # Correctness
+    ///
+    /// Requires `old_var`'s use list to be current; [`SsaEditor`] guarantees
+    /// that by recomputing once before its first indexed replacement and then
+    /// keeping the lists exact, which this method does by moving each rewritten
+    /// site from `old_var` to `new_var`.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_var` - The variable whose recorded instruction uses are rewritten.
+    /// * `new_var` - The variable substituted at each accepted use site.
+    /// * `dominators` - Optional precomputed dominator tree reused across a
+    ///   batch; when `None`, a cross-block use that would need one is skipped.
+    /// * `within` - The blocks whose uses may be rewritten, an instruction's
+    ///   where it lies in one and a phi operand's where its edge leaves one;
+    ///   `None` for every block.
+    ///
+    /// # Returns
+    ///
+    /// The count of operand occurrences replaced together with the sites the
+    /// shared safety checks skipped.
+    fn replace_uses_checked_indexed(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        dominators: Option<&DominatorTree>,
+        within: Option<&BitSet>,
+    ) -> CheckedReplaceResult;
+}
+
+impl<T: Target> Rewiring<T> for SsaFunction<T> {
+    fn replace_uses_checked_indexed(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        dominators: Option<&DominatorTree>,
+        within: Option<&BitSet>,
+    ) -> CheckedReplaceResult {
+        let inside = |block: usize| within.is_none_or(|blocks| blocks.contains(block));
+        // What each reader takes in where it then computes in `old_var`'s
+        // place ([`Self::substituted_facts`]).
+        let carried = self.substituted_facts(old_var, new_var);
+        let candidates: Vec<UseSite> = self
+            .variable(old_var)
+            .map(|var| var.uses().to_vec())
+            .unwrap_or_default();
+
+        let mut allowed = Vec::new();
+        let mut allowed_edges: Vec<(UseSite, usize, PhiEdge)> = Vec::new();
+        let mut skipped = Vec::new();
+        // The list holds one entry per operand occurrence, so a site reading
+        // `old_var` twice appears twice; each is judged once.
+        let mut sites_seen: BTreeSet<(usize, usize, bool)> = BTreeSet::new();
+        for site in candidates {
+            if !sites_seen.insert(use_site_key(site)) {
+                continue;
+            }
+            if site.is_phi_operand() {
+                // Every operand of the phi naming `old_var` is judged on its
+                // own edge.
+                let edges: Vec<(usize, PhiEdge)> = self
+                    .block(site.block())
+                    .and_then(|block| block.phi_nodes().get(site.index()))
+                    .map(|phi| {
+                        phi.operands()
+                            .iter()
+                            .filter(|operand| operand.value() == old_var)
+                            .map(|operand| (operand.predecessor(), operand.edge()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // A predecessor listed twice is judged per operand, as the
+                // scanning form judges it; the first `replace_operand_value`
+                // rewrites both, and the second finds nothing left to move.
+                for (predecessor, edge) in edges
+                    .into_iter()
+                    .filter(|(predecessor, _)| inside(*predecessor))
+                {
+                    match can_replace_phi_operand_use_with_dominators(
+                        self,
+                        old_var,
+                        new_var,
+                        site.block(),
+                        site.index(),
+                        predecessor,
+                        dominators,
+                    ) {
+                        Ok(()) => allowed_edges.push((site, predecessor, edge)),
+                        Err(reason) => skipped.push(SkippedReplacement { site, reason }),
+                    }
+                }
+                continue;
+            }
+            // The list can name a site whose op no longer reads `old_var` (a
+            // previous rewrite in this session); skip those rather than trust it
+            // blindly.
+            let still_uses = self
+                .block(site.block())
+                .and_then(|block| block.instruction(site.index()))
+                .is_some_and(|instr| instr.op().uses_var(old_var));
+            if !still_uses || !inside(site.block()) {
+                continue;
+            }
+            match can_replace_instruction_use_with_dominators(
+                self,
+                old_var,
+                new_var,
+                site.block(),
+                site.index(),
+                dominators,
+            ) {
+                Ok(()) => allowed.push(site),
+                Err(reason) => skipped.push(SkippedReplacement { site, reason }),
+            }
+        }
+
+        // Each rewritten occurrence, by site: how many entries leave
+        // `old_var`'s list, and how many of them join `new_var`'s. An
+        // exceptional operand merged into one already naming `new_var` leaves
+        // the first and joins nothing.
+        let mut moved: BTreeMap<(usize, usize, bool), (UseSite, usize, usize)> = BTreeMap::new();
+        let mut replaced = 0usize;
+        for site in allowed {
+            if let Some(instr) = self
+                .block_mut(site.block())
+                .and_then(|block| block.instruction_mut(site.index()))
+            {
+                let n = instr.replace_uses(old_var, new_var, &carried);
+                if n > 0 {
+                    replaced = replaced.saturating_add(n);
+                    let slot = moved.entry(use_site_key(site)).or_insert((site, 0, 0));
+                    slot.1 = slot.1.saturating_add(n);
+                    slot.2 = slot.2.saturating_add(n);
+                }
+            }
+        }
+        for (site, predecessor, edge) in allowed_edges {
+            if let Some(phi) = self
+                .block_mut(site.block())
+                .and_then(|block| block.phi_mut(site.index()))
+            {
+                let replacement = phi.replace_operand_value(predecessor, edge, old_var, new_var);
+                if replacement.total() > 0 {
+                    replaced = replaced.saturating_add(replacement.total());
+                    let slot = moved.entry(use_site_key(site)).or_insert((site, 0, 0));
+                    slot.1 = slot.1.saturating_add(replacement.total());
+                    slot.2 = slot.2.saturating_add(replacement.rewritten);
+                }
+            }
+        }
+
+        // Keep both use lists exact so the next indexed replacement stays valid.
+        // Sites are compared whole: a phi index and an instruction index can be
+        // the same number. Entries are moved by count, so an operand the
+        // replacement could not reach keeps its entry.
+        if !moved.is_empty() {
+            if let Some(old) = self.variable_mut(old_var) {
+                let mut to_remove: BTreeMap<(usize, usize, bool), usize> = moved
+                    .iter()
+                    .map(|(key, &(_, removed, _))| (*key, removed))
+                    .collect();
+                old.retain_uses(|site| match to_remove.get_mut(&use_site_key(*site)) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining = remaining.saturating_sub(1);
+                        false
+                    }
+                    _ => true,
+                });
+            }
+            if let Some(new) = self.variable_mut(new_var) {
+                for (site, _, added) in moved.into_values() {
+                    for _ in 0..added {
+                        new.add_use(site);
+                    }
+                }
+            }
+        }
+
+        CheckedReplaceResult { replaced, skipped }
+    }
+
+    fn inherit_rename_group(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        took: bool,
+        cause: Substitution,
+    ) {
+        if !took {
+            return;
+        }
+        // The host's facts fold in wherever a substitution took, including when
+        // the new value already names a group: either way the two describe one
+        // value from here on.
+        self.note_substitution(old_var, new_var, cause);
+        self.machine.substituted(old_var, new_var);
+        if self.rename_group(new_var) != u32::MAX {
+            return;
+        }
+        let group = self.rename_group(old_var);
+        if group != u32::MAX {
+            self.set_rename_group(new_var, group);
+        }
+    }
+
+    fn replace_uses_checked_with(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        dominators: Option<&DominatorTree>,
+    ) -> CheckedReplaceResult {
+        // What each reader takes in where it then computes in `old_var`'s
+        // place ([`SsaFunction::substituted_facts`]).
+        let carried = self.substituted_facts(old_var, new_var);
+        let mut allowed = Vec::new();
+        let mut skipped = Vec::new();
+
+        for (block_idx, block) in self.blocks().iter().enumerate() {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                if !instr.op().uses_var(old_var) {
+                    continue;
+                }
+
+                match can_replace_instruction_use_with_dominators(
+                    self, old_var, new_var, block_idx, instr_idx, dominators,
+                ) {
+                    Ok(()) => allowed.push((block_idx, instr_idx)),
+                    Err(reason) => skipped.push(SkippedReplacement {
+                        site: UseSite::instruction(block_idx, instr_idx),
+                        reason,
+                    }),
+                }
+            }
+        }
+
+        let mut allowed_edges = Vec::new();
+        for (block_idx, block) in self.blocks().iter().enumerate() {
+            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
+                for operand in phi.operands() {
+                    if operand.value() != old_var {
+                        continue;
+                    }
+                    match can_replace_phi_operand_use_with_dominators(
+                        self,
+                        old_var,
+                        new_var,
+                        block_idx,
+                        phi_idx,
+                        operand.predecessor(),
+                        dominators,
+                    ) {
+                        Ok(()) => allowed_edges.push((
+                            block_idx,
+                            phi_idx,
+                            operand.predecessor(),
+                            operand.edge(),
+                        )),
+                        Err(reason) => skipped.push(SkippedReplacement {
+                            site: UseSite::phi_operand(block_idx, phi_idx),
+                            reason,
+                        }),
+                    }
+                }
+            }
+        }
+
+        let mut replaced = 0usize;
+        for (block_idx, instr_idx) in allowed {
+            if let Some(instr) = self
+                .block_mut(block_idx)
+                .and_then(|block| block.instruction_mut(instr_idx))
+            {
+                replaced = replaced.saturating_add(instr.replace_uses(old_var, new_var, &carried));
+            }
+        }
+        for (block_idx, phi_idx, predecessor, edge) in allowed_edges {
+            if let Some(phi) = self
+                .block_mut(block_idx)
+                .and_then(|block| block.phi_mut(phi_idx))
+            {
+                replaced = replaced.saturating_add(
+                    phi.replace_operand_value(predecessor, edge, old_var, new_var)
+                        .total(),
+                );
+            }
+        }
+
+        CheckedReplaceResult { replaced, skipped }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process;
+
     use super::*;
     use crate::{
+        BitSet,
+        analysis::{SsaEvaluator, SsaVerifier, VerifyLevel},
         ir::{
             block::SsaBlock,
+            exception::{BlockRange, SsaExceptionHandler},
+            function::{SsaDefSpec, SsaFunctionBuilder},
             instruction::SsaInstruction,
             ops::SsaOp,
+            phi::PhiNode,
             value::ConstValue,
-            variable::{DefSite, VariableOrigin},
+            variable::{DefSite, SsaVariable, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{
+            MACHINE, MockTarget, MockType, assert_mock_valid_full, diamond_chain_fixture,
+            diamond_phi_fixture, loop_counter_fixture, memory_effect_fixture, mock_i32,
+            scalar_rewrite_fixture, straight_line_fixture,
+        },
     };
 
     /// Returns a test variable ID by dense index.
     fn var(index: usize) -> SsaVarId {
         SsaVarId::from_index(index)
+    }
+
+    /// `B0` defines `early` and enters the protected `B1`, which defines `late`
+    /// and returns it from `B2`; the handler `B3` merges what a throw in `B1`
+    /// may see: `late`, and `early` too when `both`. Returns the function with
+    /// `early` and `late`.
+    fn handler_reading(both: bool) -> (SsaFunction<MockTarget>, SsaVarId, SsaVarId) {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let early = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let late = ssa.create_variable(
+            VariableOrigin::Local(0),
+            1,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+        let seen = ssa.create_variable(VariableOrigin::Local(0), 2, DefSite::phi(3), MockType::I32);
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: early,
+            value: ConstValue::I32(7),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        ssa.add_block(b0);
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: late,
+            value: ConstValue::I32(7),
+        }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 2 }));
+        ssa.add_block(b1);
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(late))));
+        ssa.add_block(b2);
+        let mut b3 = SsaBlock::new(3);
+        let mut phi = PhiNode::new(seen, VariableOrigin::Local(0));
+        if both {
+            phi.add_exceptional_operand(1, early);
+        }
+        phi.add_exceptional_operand(1, late);
+        b3.add_phi(phi);
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(seen))));
+        ssa.add_block(b3);
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 0,
+            try_offset: 0,
+            try_length: 0,
+            handler_offset: 0,
+            handler_length: 0,
+            class_token_or_filter: 0,
+            protected_range: BlockRange::new(1, 2),
+            handler_range: BlockRange::new(3, 4),
+            filter_range: None,
+            selector: None,
+        }]);
+        ssa.recompute_uses();
+        (ssa, early, late)
+    }
+
+    /// The handler's operands, as `(block, value)` pairs naming a throw.
+    fn thrown(ssa: &SsaFunction<MockTarget>) -> Vec<(usize, SsaVarId)> {
+        ssa.block(3)
+            .and_then(|block| block.phi_nodes().first())
+            .map(|phi| {
+                phi.exceptional_operands()
+                    .map(|operand| (operand.predecessor(), operand.value()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// **A substitution reaches what a throw may bring a handler.** `late`
+    /// equals `early`, which dominates it; substituting `early` for `late`
+    /// rewrites the return and the handler's operand naming `late`, so the
+    /// definition can go, and the function verifies. Before, the handler kept
+    /// naming `late`, the result still claimed every use replaced, and the
+    /// caller removed a definition the handler read: analysir's memory pass
+    /// forwarded a load so, on a Delphi x64 routine. Both forms, the scan and
+    /// the use-list walk, are asked; where the handler already lists `early`
+    /// for the block the operand naming `late` merges into it, and the use
+    /// lists stay exact.
+    #[test]
+    fn a_substitution_reaches_the_values_a_throw_brings_a_handler() {
+        for both in [false, true] {
+            for indexed in [false, true] {
+                let (mut ssa, early, late) = handler_reading(both);
+                let result = if indexed {
+                    let dominators = compute_dominators(&SsaCfg::from_ssa(&ssa), NodeId::new(0));
+                    ssa.replace_uses_checked_indexed(late, early, Some(&dominators), None)
+                } else {
+                    ssa.replace_uses_checked(late, early)
+                };
+                assert!(result.is_complete(), "both {both} indexed {indexed}");
+                assert_eq!(
+                    thrown(&ssa),
+                    vec![(1, early)],
+                    "both {both} indexed {indexed}"
+                );
+                if indexed {
+                    let phi_uses = |value: SsaVarId| {
+                        ssa.variable(value).map_or(0, |variable| {
+                            variable
+                                .uses()
+                                .iter()
+                                .filter(|site| site.is_phi_operand())
+                                .count()
+                        })
+                    };
+                    assert_eq!(phi_uses(late), 0, "both {both}");
+                    assert_eq!(phi_uses(early), 1, "both {both}");
+                }
+                let outcome =
+                    ssa.edit(SsaEditOptions::new(), |editor| editor.nop_instruction(1, 0));
+                assert!(outcome.is_ok(), "both {both} indexed {indexed}");
+                let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+                assert!(
+                    errors.is_empty(),
+                    "both {both} indexed {indexed}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// A block nothing reaches is dead code, and clearing it forgets the host
+    /// block it stood for; the live one keeps its own.
+    #[test]
+    fn a_cleared_unreached_block_stands_for_nothing() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        for (id, host) in [(0, 0x10), (1, 0x20)] {
+            let mut block = SsaBlock::new(id);
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
+            block.provenance_mut().carry(host);
+            ssa.add_block(block);
+        }
+        ssa.recompute_uses();
+        let mut reachable = BitSet::new(2);
+        reachable.insert(0);
+        let outcome = ssa.edit(SsaEditOptions::new(), |editor| {
+            assert_eq!(editor.clear_unreached_blocks(&reachable), vec![1]);
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert_eq!(
+            ssa.block(0).map(|block| block.provenance().carried()),
+            Some(&[0x10][..])
+        );
+        assert!(
+            ssa.block(1)
+                .is_some_and(|block| block.provenance().is_empty())
+        );
     }
 
     /// Builds a one-block function where `v1` is used before `v2` is defined.
@@ -1673,7 +1606,7 @@ mod tests {
             dest: v2,
             value: ConstValue::I32(2),
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v3) }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v3))));
         ssa.add_block(block);
         ssa.recompute_uses();
         ssa
@@ -1739,7 +1672,7 @@ mod tests {
         right.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
 
         let mut exit = SsaBlock::new(3);
-        exit.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        exit.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
 
         ssa.add_block(entry);
         ssa.add_block(left);
@@ -1786,12 +1719,143 @@ mod tests {
             right: old,
             flags: None,
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(dest),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
         ssa.add_block(block);
         ssa.recompute_uses();
         ssa
+    }
+
+    /// A two-way function: `B0` branches on a local to `B1` or `B2`, each of
+    /// which returns.
+    fn two_way() -> (SsaFunction<MockTarget>, SsaVarId) {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let cond = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+        ssa.add_block(b0);
+        for id in [1usize, 2] {
+            let mut block = SsaBlock::new(id);
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
+            ssa.add_block(block);
+        }
+        ssa.recompute_uses();
+        (ssa, cond)
+    }
+
+    /// **A session folds a branch and removes what the fold left unread, and
+    /// its boundary repairs both.** The condition is read until the branch
+    /// becomes a jump; removed in the same session, it is gone from the
+    /// function the session leaves, and the session needs no declared repair.
+    #[test]
+    fn a_session_removes_what_its_fold_left_unread() {
+        let (mut ssa, _) = two_way();
+        let report = ssa
+            .edit(
+                SsaEditOptions::new()
+                    .with_verify(true)
+                    .with_rollback(SsaRollbackPolicy::OnFailure),
+                |editor| {
+                    editor.fold_terminator_pruning_phis(0, SsaOp::Jump { target: 1 })?;
+                    let removed = editor.remove_unread_instructions([(0, 0)]);
+                    assert_eq!(removed.len(), 1, "the condition is no longer read");
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|_| process::abort());
+        assert_eq!(report.scope, SsaEditScope::InstructionsOnly);
+        let ops: Vec<&SsaOp<MockTarget>> = ssa
+            .block(0)
+            .map(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .map(SsaInstruction::op)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(ops, vec![&SsaOp::Jump { target: 1 }], "{ssa}");
+
+        // A removal alone is a change the session repairs.
+        let (mut ssa, _) = two_way();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            editor.fold_terminator_pruning_phis(0, SsaOp::Jump { target: 1 })?;
+            Ok(())
+        })
+        .unwrap_or_else(|_| process::abort());
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            assert_eq!(editor.remove_unread_instructions([(0, 0)]).len(), 1);
+            Ok(())
+        })
+        .unwrap_or_else(|_| process::abort());
+        let ops: Vec<&SsaOp<MockTarget>> = ssa
+            .block(0)
+            .map(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .map(SsaInstruction::op)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(ops, vec![&SsaOp::Jump { target: 1 }], "{ssa}");
+
+        // A definition still read stays.
+        let (mut ssa, _) = two_way();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            assert!(editor.remove_unread_instructions([(0, 0)]).is_empty());
+            Ok(())
+        })
+        .unwrap_or_else(|_| process::abort());
+        assert!(matches!(
+            ssa.block(0)
+                .and_then(|block| block.instructions().first())
+                .map(SsaInstruction::op),
+            Some(SsaOp::Const { .. })
+        ));
+    }
+
+    /// **A terminator rewritten with the same edges is not a change to the
+    /// control flow.** Swapping the branch's targets keeps both edges and needs
+    /// no repair; replacing it with a jump drops one, and a session that does
+    /// not say what that leaves of the values is refused and rolled back.
+    #[test]
+    fn a_terminator_keeping_its_edges_needs_no_reconstruction() {
+        let (mut ssa, cond) = two_way();
+        let report = ssa
+            .edit(SsaEditOptions::new(), |editor| {
+                editor.replace_terminator_op(
+                    0,
+                    SsaOp::Branch {
+                        condition: cond,
+                        true_target: 2,
+                        false_target: 1,
+                    },
+                )
+            })
+            .unwrap_or_else(|_| process::abort());
+        assert_eq!(report.scope, SsaEditScope::InstructionsOnly);
+
+        let (mut ssa, _) = two_way();
+        let before = format!("{ssa:?}");
+        let refused = ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| editor.replace_terminator_op(0, SsaOp::Jump { target: 1 }),
+        );
+        assert!(refused.is_err(), "an unrepaired graph change is refused");
+        assert_eq!(format!("{ssa:?}"), before, "and rolled back");
     }
 
     /// `fold_terminator_pruning_phis` stays at `InstructionsOnly` because
@@ -1818,7 +1882,7 @@ mod tests {
 
         for id in [1usize, 2] {
             let mut block = SsaBlock::new(id);
-            block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
             ssa.add_block(block);
         }
         ssa.recompute_uses();
@@ -1849,6 +1913,126 @@ mod tests {
         assert!(outcome.is_ok());
     }
 
+    /// B0 branches to B1 or B2, each of which branches to the merge B3 or to
+    /// the exit B4; B3 returns `phi(a from B1, b from B2)`.
+    fn two_edges_into_a_merge() -> SsaFunction<MockTarget> {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let cond = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let a = ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+        let b = ssa.create_variable(
+            VariableOrigin::Local(1),
+            1,
+            DefSite::instruction(2, 0),
+            MockType::I32,
+        );
+        let merged = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::phi(3), MockType::I32);
+        let branch = || {
+            SsaInstruction::synthetic(SsaOp::Branch {
+                condition: cond,
+                true_target: 3,
+                false_target: 4,
+            })
+        };
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: a,
+            value: ConstValue::I32(7),
+        }));
+        b1.add_instruction(branch());
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: b,
+            value: ConstValue::I32(8),
+        }));
+        b2.add_instruction(branch());
+        let mut b3 = SsaBlock::new(3);
+        let mut phi = PhiNode::new(merged, VariableOrigin::Phi);
+        phi.add_operand(PhiOperand::new(a, 1));
+        phi.add_operand(PhiOperand::new(b, 2));
+        b3.add_phi(phi);
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(merged))));
+        let mut b4 = SsaBlock::new(4);
+        b4.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
+        for block in [b0, b1, b2, b3, b4] {
+            ssa.add_block(block);
+        }
+        ssa.recompute_uses();
+        ssa
+    }
+
+    /// **Folding away a merge's last incoming edge leaves valid SSA.** Each
+    /// fold keeps a phi's last operand rather than empty it, and once both of
+    /// B3's edges are gone that operand names an edge that does not exist: the
+    /// verifier rejected the phi, and trivial-phi simplification could not
+    /// retire it, because nothing dominates a block the entry cannot reach.
+    /// The phi becomes a copy of the value it still named.
+    #[test]
+    fn folding_away_a_merges_last_edge_leaves_valid_ssa() {
+        let mut ssa = two_edges_into_a_merge();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            editor.fold_terminator_pruning_phis(1, SsaOp::Jump { target: 4 })?;
+            editor.fold_terminator_pruning_phis(2, SsaOp::Jump { target: 4 })?;
+            Ok(())
+        })
+        .unwrap_or_else(|_| process::abort());
+        assert_eq!(ssa.validate(), Ok(()));
+        let merge = ssa.block(3).unwrap_or_else(|| process::abort());
+        assert!(
+            merge.phi_nodes().is_empty(),
+            "a stranded block keeps no phi"
+        );
+        assert!(
+            matches!(
+                merge.instructions().first().map(SsaInstruction::op),
+                Some(SsaOp::Copy { dest, src }) if *dest == var(3) && *src == var(2)
+            ),
+            "the phi is a copy of the operand it last kept"
+        );
+    }
+
+    /// The control: a merge that keeps an edge keeps its phi's meaning. One
+    /// fold leaves B3 reached from B2, so nothing is stranded and no copy is
+    /// placed; the one-operand phi is simplification's to settle.
+    #[test]
+    fn folding_away_one_of_a_merges_edges_strands_nothing() {
+        let mut ssa = two_edges_into_a_merge();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            editor.fold_terminator_pruning_phis(1, SsaOp::Jump { target: 4 })?;
+            Ok(())
+        })
+        .unwrap_or_else(|_| process::abort());
+        assert_eq!(ssa.validate(), Ok(()));
+        let merge = ssa.block(3).unwrap_or_else(|| process::abort());
+        assert!(
+            !merge
+                .instructions()
+                .iter()
+                .any(|instr| matches!(instr.op(), SsaOp::Copy { .. })),
+            "a reachable merge is not settled as a stranded one"
+        );
+    }
+
+    /// A source defined later than its use in the same block is rejected.
     #[test]
     fn checked_replacement_rejects_same_block_late_definition() {
         let mut ssa = same_block_late_def_function();
@@ -1863,6 +2047,8 @@ mod tests {
         );
     }
 
+    /// A replacement that would make an instruction read its own destination is
+    /// rejected.
     #[test]
     fn checked_replacement_rejects_self_reference() {
         let mut ssa = same_block_late_def_function();
@@ -1877,6 +2063,7 @@ mod tests {
         );
     }
 
+    /// A source whose definition does not dominate the use block is rejected.
     #[test]
     fn checked_replacement_rejects_non_dominating_definition() {
         let mut ssa = non_dominating_definition_function();
@@ -1891,6 +2078,156 @@ mod tests {
         );
     }
 
+    /// A merge that reads `old` only as a phi operand.
+    ///
+    /// ```text
+    /// b0: replacement = 7; cond = 1; branch cond -> b1, b2
+    /// b1: old = 7;   jump b3
+    /// b2: other = 8; jump b3
+    /// b3: merged = phi(old from b1, other from b2); return merged
+    /// ```
+    ///
+    /// `replacement` (v0) dominates b1; `other` (v3) does not.
+    fn phi_operand_function() -> SsaFunction<MockTarget> {
+        let mut ssa = SsaFunction::new(0, 0);
+        let replacement = ssa.create_variable(
+            VariableOrigin::Phi,
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let cond = ssa.create_variable(
+            VariableOrigin::Phi,
+            0,
+            DefSite::instruction(0, 1),
+            MockType::I32,
+        );
+        let old = ssa.create_variable(
+            VariableOrigin::Phi,
+            0,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+        let other = ssa.create_variable(
+            VariableOrigin::Phi,
+            0,
+            DefSite::instruction(2, 0),
+            MockType::I32,
+        );
+        let merged = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::phi(3), MockType::I32);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: replacement,
+            value: ConstValue::I32(7),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: old,
+            value: ConstValue::I32(7),
+        }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: other,
+            value: ConstValue::I32(8),
+        }));
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+        let mut b3 = SsaBlock::new(3);
+        let mut phi = PhiNode::new(merged, VariableOrigin::Phi);
+        phi.add_operand(PhiOperand::new(old, 1));
+        phi.add_operand(PhiOperand::new(other, 2));
+        b3.add_phi(phi);
+        b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(merged))));
+        for block in [b0, b1, b2, b3] {
+            ssa.add_block(block);
+        }
+        ssa.recompute_uses();
+        ssa
+    }
+
+    /// The value merged in from `b1` in [`phi_operand_function`].
+    fn operand_from_b1(ssa: &SsaFunction<MockTarget>) -> Option<SsaVarId> {
+        ssa.block(3)
+            .and_then(|block| block.phi_nodes().first())
+            .and_then(|phi| phi.operand_from(1))
+            .map(PhiOperand::value)
+    }
+
+    /// A phi operand is a use. A replacement whose definition reaches the
+    /// operand's predecessor rewrites it, and only then is the result complete -
+    /// which is what lets a caller delete the old definition.
+    #[test]
+    fn checked_replacement_rewrites_a_phi_operand_its_definition_reaches() {
+        let mut ssa = phi_operand_function();
+
+        let result = ssa.replace_uses_checked(var(2), var(0));
+
+        assert_eq!(result.replaced, 1, "the phi operand is the one use of v2");
+        assert!(result.is_complete());
+        assert_eq!(operand_from_b1(&ssa), Some(var(0)));
+    }
+
+    /// A phi operand the replacement cannot reach is reported as skipped, so the
+    /// result is incomplete and no caller deletes a definition it still needs.
+    #[test]
+    fn checked_replacement_reports_a_phi_operand_it_cannot_reach() {
+        let mut ssa = phi_operand_function();
+
+        let result = ssa.replace_uses_checked(var(2), var(3));
+
+        assert_eq!(result.replaced, 0);
+        assert!(
+            !result.is_complete(),
+            "a skipped phi operand is still a use"
+        );
+        assert_eq!(result.skipped.len(), 1);
+        assert!(result.skipped[0].site.is_phi_operand());
+        assert_eq!(
+            result.skipped[0].reason,
+            ReplacementSkipReason::DominanceViolation
+        );
+        assert_eq!(operand_from_b1(&ssa), Some(var(2)));
+    }
+
+    /// The indexed form treats phi operands exactly as the scanning form does,
+    /// and moves the use site between the two variables' use lists.
+    #[test]
+    fn indexed_replacement_rewrites_phi_operands_like_scanning() {
+        let mut scanned = phi_operand_function();
+        let mut indexed = phi_operand_function();
+        let tree = compute_dominators(&SsaCfg::from_ssa(&indexed), NodeId::new(0));
+
+        let by_scan = scanned.replace_uses_checked(var(2), var(0));
+        let by_index = indexed.replace_uses_checked_indexed(var(2), var(0), Some(&tree), None);
+
+        assert_eq!(by_scan, by_index);
+        assert_eq!(operand_from_b1(&indexed), Some(var(0)));
+        let phi_site = UseSite::phi_operand(3, 0);
+        assert!(
+            !indexed
+                .variable(var(2))
+                .is_some_and(|v| v.uses().contains(&phi_site)),
+            "the rewritten operand no longer reads v2"
+        );
+        assert!(
+            indexed
+                .variable(var(0))
+                .is_some_and(|v| v.uses().contains(&phi_site)),
+            "and now reads v0"
+        );
+    }
+
+    /// A replacement between incompatible variable types is rejected.
     #[test]
     fn checked_replacement_rejects_type_mismatch() {
         let mut ssa = type_mismatch_function();
@@ -1905,6 +2242,8 @@ mod tests {
         );
     }
 
+    /// Instruction edits settle at `InstructionsOnly` and one boundary repair
+    /// strips the resulting nops.
     #[test]
     fn editor_repairs_once_after_instruction_edits() {
         let mut ssa = same_block_late_def_function();
@@ -1927,6 +2266,8 @@ mod tests {
         );
     }
 
+    /// With `OnFailure` rollback, a verification failure restores the original
+    /// function unchanged.
     #[test]
     fn editor_rolls_back_when_verification_fails() {
         let mut ssa = same_block_late_def_function();
@@ -1940,9 +2281,7 @@ mod tests {
                 editor.replace_instruction_op(
                     0,
                     4,
-                    SsaOp::Return {
-                        value: Some(SsaVarId::from_index(999)),
-                    },
+                    SsaOp::returns(Some(SsaVarId::from_index(999))),
                 )?;
                 Ok(())
             },
@@ -1963,20 +2302,20 @@ mod tests {
     /// The indexed replacement must be indistinguishable from the scanning one.
     ///
     /// `replace_uses_checked_indexed` exists purely to avoid the O(function)
-    /// scan; if it ever diverges — by consulting a stale use list, by missing a
-    /// site, or by replacing one the checks should have rejected — it silently
+    /// scan; if it ever diverges - by consulting a stale use list, by missing a
+    /// site, or by replacing one the checks should have rejected - it silently
     /// changes optimizer output. This runs both forms against identical copies
     /// of every fixture, for every variable pair, and requires the replacement
     /// count, the skip reasons, and the resulting IR to match exactly.
     #[test]
     fn indexed_replacement_matches_scanning_replacement() {
         let fixtures: Vec<(&str, SsaFunction<MockTarget>)> = vec![
-            ("scalar", crate::testing::scalar_rewrite_fixture()),
-            ("diamond", crate::testing::diamond_phi_fixture()),
-            ("loop", crate::testing::loop_counter_fixture()),
-            ("memory", crate::testing::memory_effect_fixture()),
-            ("straight_32", crate::testing::straight_line_fixture(32)),
-            ("diamonds_8", crate::testing::diamond_chain_fixture(8)),
+            ("scalar", scalar_rewrite_fixture()),
+            ("diamond", diamond_phi_fixture()),
+            ("loop", loop_counter_fixture()),
+            ("memory", memory_effect_fixture()),
+            ("straight_32", straight_line_fixture(32)),
+            ("diamonds_8", diamond_chain_fixture(8)),
         ];
 
         for (name, base) in fixtures {
@@ -1993,7 +2332,8 @@ mod tests {
 
                     let mut indexed = base.clone();
                     indexed.recompute_uses();
-                    let index_result = indexed.replace_uses_checked_indexed(old_var, new_var, None);
+                    let index_result =
+                        indexed.replace_uses_checked_indexed(old_var, new_var, None, None);
 
                     assert_eq!(
                         scan_result.replaced, index_result.replaced,
@@ -2046,18 +2386,18 @@ mod tests {
     ///
     /// Verified to fail if the use-list maintenance in
     /// `replace_uses_checked_indexed` is removed. The stale-site guard there is
-    /// defensive rather than load-bearing — with maintenance correct no stale
+    /// defensive rather than load-bearing - with maintenance correct no stale
     /// site arises, so removing it does not fail this test; it protects against
     /// a future caller mutating the IR mid-session without clearing
     /// `uses_indexed`.
     #[test]
     fn chained_indexed_replacements_match_scanning() {
         let fixtures: Vec<(&str, SsaFunction<MockTarget>)> = vec![
-            ("scalar", crate::testing::scalar_rewrite_fixture()),
-            ("diamond", crate::testing::diamond_phi_fixture()),
-            ("loop", crate::testing::loop_counter_fixture()),
-            ("straight_16", crate::testing::straight_line_fixture(16)),
-            ("diamonds_4", crate::testing::diamond_chain_fixture(4)),
+            ("scalar", scalar_rewrite_fixture()),
+            ("diamond", diamond_phi_fixture()),
+            ("loop", loop_counter_fixture()),
+            ("straight_16", straight_line_fixture(16)),
+            ("diamonds_4", diamond_chain_fixture(4)),
         ];
 
         for (name, base) in fixtures {
@@ -2093,7 +2433,7 @@ mod tests {
                 for &(old_var, new_var) in &pairs {
                     index_total = index_total.saturating_add(
                         editor
-                            .replace_uses_checked_with(old_var, new_var, None)
+                            .replace_uses_checked_with(old_var, new_var, None, Substitution::Host)
                             .replaced,
                     );
                 }
@@ -2119,5 +2459,660 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Runs the function from its entry and returns the value it returns.
+    fn returned(ssa: &SsaFunction<MockTarget>) -> Option<ConstValue<MockTarget>> {
+        let mut evaluator = SsaEvaluator::new(ssa, MACHINE);
+        let trace = evaluator.execute_from_entry(1_000);
+        let last = trace.last_block()?;
+        match ssa.block(last)?.control_terminator()? {
+            SsaOp::Return {
+                value: Some(value), ..
+            } => evaluator.get_concrete(*value).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Every variable's recorded uses, as a sorted multiset of sites.
+    fn use_lists(ssa: &SsaFunction<MockTarget>) -> Vec<Vec<(usize, usize, bool)>> {
+        ssa.variables()
+            .iter()
+            .map(|variable| {
+                let mut sites: Vec<(usize, usize, bool)> = variable
+                    .uses()
+                    .iter()
+                    .map(|site| (site.block(), site.index(), site.is_phi_operand()))
+                    .collect();
+                sites.sort_unstable();
+                sites
+            })
+            .collect()
+    }
+
+    /// Asserts the use lists are what a full recomputation would record.
+    fn assert_uses_exact(ssa: &SsaFunction<MockTarget>, context: &str) {
+        let mut recomputed = ssa.clone();
+        recomputed.recompute_uses();
+        assert_eq!(use_lists(ssa), use_lists(&recomputed), "{context}\n{ssa}");
+    }
+
+    /// `old = 1; u = add old, old; new = 5; s = add u, new; ret s`, returning 7.
+    fn late_replacement_function() -> (SsaFunction<MockTarget>, [SsaVarId; 4]) {
+        let mut ssa = SsaFunction::new(0, 0);
+        let [old, u, new, s] = [0, 1, 2, 3].map(|index| {
+            ssa.create_variable(
+                VariableOrigin::Phi,
+                0,
+                DefSite::instruction(0, index),
+                MockType::I32,
+            )
+        });
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: old,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: u,
+            left: old,
+            right: old,
+            flags: None,
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: new,
+            value: ConstValue::I32(5),
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: s,
+            left: u,
+            right: new,
+            flags: None,
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(s))));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+        (ssa, [old, u, new, s])
+    }
+
+    /// An insertion moves the definitions below it, and a later check in the
+    /// same session judges order by where they now are.
+    ///
+    /// The same-block order check reads the replacement's def site. Two
+    /// insertions at the top push `new` from index 2 to 4; a def site still
+    /// saying 2 lets `u = add old, old` at index 3 read `new` before it is
+    /// defined, and boundary repair then papers over that use with a value
+    /// nothing defines.
+    #[test]
+    fn an_insertion_keeps_the_def_sites_it_shifts_exact() {
+        let (mut ssa, [old, _, new, _]) = late_replacement_function();
+        assert_eq!(
+            returned(&ssa),
+            Some(ConstValue::I32(7)),
+            "the fixture itself"
+        );
+        let padding = [0, 1]
+            .map(|_| ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32));
+
+        let mut replaced = None;
+        ssa.edit(
+            SsaEditOptions::new()
+                .with_verify(true)
+                .with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                for (value, dest) in (100..).zip(padding) {
+                    editor.insert_instruction(
+                        0,
+                        0,
+                        SsaInstruction::synthetic(SsaOp::Const {
+                            dest,
+                            value: ConstValue::I32(value),
+                        }),
+                    )?;
+                }
+                replaced =
+                    Some(editor.replace_uses_checked_with(old, new, None, Substitution::Host));
+                Ok(())
+            },
+        )
+        .expect("the edit is valid");
+
+        let result = replaced.expect("the edit ran");
+        assert_eq!(result.replaced, 0, "{ssa}");
+        assert!(
+            result
+                .skipped
+                .iter()
+                .all(|skip| skip.reason == ReplacementSkipReason::SameBlockUseBeforeDef)
+        );
+        assert_eq!(returned(&ssa), Some(ConstValue::I32(7)), "{ssa}");
+    }
+
+    /// An insertion mid-block moves the def site of every definition below it.
+    #[test]
+    fn an_insertion_shifts_every_definition_below_it() {
+        let (mut ssa, [_, _, new, s]) = late_replacement_function();
+        let padding = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32);
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            editor.insert_instruction(
+                0,
+                2,
+                SsaInstruction::synthetic(SsaOp::Const {
+                    dest: padding,
+                    value: ConstValue::I32(0),
+                }),
+            )?;
+            let function = editor.function();
+            assert_eq!(
+                function.variable(new).map(SsaVariable::def_site),
+                Some(DefSite::instruction(0, 3))
+            );
+            assert_eq!(
+                function.variable(s).map(SsaVariable::def_site),
+                Some(DefSite::instruction(0, 4))
+            );
+            Ok(())
+        })
+        .expect("the edit is valid");
+    }
+
+    /// An indexed replacement leaves every use list exactly as a full
+    /// recomputation would.
+    ///
+    /// The lists hold one entry per operand occurrence, and the next indexed
+    /// replacement in the session iterates them: an instruction reading the
+    /// value twice moves two entries, and a phi rewritten on one edge but not
+    /// another keeps exactly one.
+    #[test]
+    fn an_indexed_replacement_keeps_the_use_lists_exact() {
+        // `add old, old` moves two occurrences.
+        let (mut ssa, [old, ..]) = late_replacement_function();
+        let earlier = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32);
+        ssa.block_mut(0)
+            .expect("the block")
+            .instructions_mut()
+            .insert(
+                0,
+                SsaInstruction::synthetic(SsaOp::Const {
+                    dest: earlier,
+                    value: ConstValue::I32(3),
+                }),
+            );
+        ssa.refresh_def_sites();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            let result = editor.replace_uses_checked_with(old, earlier, None, Substitution::Host);
+            assert_eq!(result.replaced, 2);
+            assert_uses_exact(editor.function(), "after replacing both operands of an add");
+            Ok(())
+        })
+        .expect("the edit is valid");
+
+        // A phi rewritten on the edge `new` reaches, and not on the other.
+        let mut ssa = non_dominating_definition_function();
+        let reaching = var(1);
+        let merged = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::phi(3), MockType::I32);
+        let mut phi = PhiNode::new(merged, VariableOrigin::Phi);
+        phi.add_operand(PhiOperand::new(var(0), 1));
+        phi.add_operand(PhiOperand::new(var(0), 2));
+        ssa.block_mut(3).expect("the exit").add_phi(phi);
+        ssa.recompute_uses();
+        let eh = SsaCfg::from_ssa(&ssa);
+        let dominators = compute_dominators(&eh, NodeId::new(0));
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            let result = editor.replace_uses_checked_with(
+                var(0),
+                reaching,
+                Some(&dominators),
+                Substitution::Host,
+            );
+            assert_eq!(result.replaced, 1, "only the edge from B1 sees `reaching`");
+            assert_uses_exact(editor.function(), "after rewriting one edge of a phi");
+            Ok(())
+        })
+        .expect("the edit is valid");
+
+        // Two operands on one predecessor, both rewritten by one edge.
+        let mut ssa = non_dominating_definition_function();
+        let merged = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::phi(3), MockType::I32);
+        let mut phi = PhiNode::new(merged, VariableOrigin::Phi);
+        phi.add_operand(PhiOperand::new(var(2), 2));
+        phi.add_operand(PhiOperand::new(var(2), 2));
+        ssa.block_mut(3).expect("the exit").add_phi(phi);
+        ssa.recompute_uses();
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            let result = editor.replace_uses_checked_with(var(2), var(3), None, Substitution::Host);
+            assert_eq!(
+                result.replaced, 2,
+                "both phi operands; the add defines var(3)"
+            );
+            assert_uses_exact(editor.function(), "after rewriting a doubled phi edge");
+            Ok(())
+        })
+        .expect("the edit is valid");
+    }
+
+    /// A closure that edits and then fails leaves the function marked dirty
+    /// when its edits stay applied, and clean when they are rolled back.
+    ///
+    /// The scheduler reads the flag rather than the pass's own "changed"
+    /// return, so an edit that survives a failed session has to be visible
+    /// there, and one that was undone must not be.
+    #[test]
+    fn a_failed_edit_session_marks_the_function_dirty_only_when_its_edits_stay() {
+        for (policy, expect_dirty) in [
+            (SsaRollbackPolicy::Never, true),
+            (SsaRollbackPolicy::OnFailure, false),
+        ] {
+            let (mut ssa, _) = late_replacement_function();
+            let padding =
+                ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32);
+            let _ = ssa.take_edit_dirty();
+            let outcome = ssa.edit(SsaEditOptions::new().with_rollback(policy), |editor| {
+                editor.insert_instruction(
+                    0,
+                    0,
+                    SsaInstruction::synthetic(SsaOp::Const {
+                        dest: padding,
+                        value: ConstValue::I32(0),
+                    }),
+                )?;
+                Err(Error::new("the pass gives up after editing"))
+            });
+
+            assert!(outcome.is_err());
+            assert_eq!(
+                ssa.block(0).map(|block| block.instructions().len()),
+                Some(if expect_dirty { 6 } else { 5 }),
+                "{policy:?}: the insertion stays only without rollback"
+            );
+            assert_eq!(ssa.take_edit_dirty(), expect_dirty, "{policy:?}");
+        }
+    }
+
+    /// A session that changes nothing has nothing to restore, so a failure at
+    /// its boundary leaves the function exactly as it was and records no failed
+    /// edit.
+    #[test]
+    fn a_failed_session_that_changed_nothing_leaves_the_function_alone() {
+        for policy in [SsaRollbackPolicy::Never, SsaRollbackPolicy::OnFailure] {
+            let (mut ssa, _) = late_replacement_function();
+            // A defect the session did not cause, which its verification finds.
+            let ghost = ssa.create_variable(
+                VariableOrigin::Local(40),
+                1,
+                DefSite::instruction(0, 3),
+                MockType::I32,
+            );
+            let sink = ssa.create_variable(
+                VariableOrigin::Local(41),
+                0,
+                DefSite::instruction(0, 0),
+                MockType::I32,
+            );
+            if let Some(block) = ssa.block_mut(0) {
+                block.instructions_mut().insert(
+                    0,
+                    SsaInstruction::synthetic(SsaOp::Copy {
+                        dest: sink,
+                        src: ghost,
+                    }),
+                );
+            }
+            ssa.refresh_def_sites();
+            ssa.recompute_uses();
+            let _ = ssa.take_edit_dirty();
+            let before = format!("{ssa:?}");
+
+            let outcome = ssa.edit(
+                SsaEditOptions::new()
+                    .with_verify(true)
+                    .with_rollback(policy),
+                |_| Ok(()),
+            );
+
+            assert!(outcome.is_err(), "{policy:?}: the defect is found");
+            assert_eq!(format!("{ssa:?}"), before, "{policy:?}");
+            assert!(!ssa.take_edit_dirty(), "{policy:?}");
+            assert!(ssa.take_edit_failure().is_none(), "{policy:?}");
+        }
+    }
+
+    /// A session whose only change is the declaration that the control-flow
+    /// graph changed still has the function it found restored when its
+    /// boundary fails: the declaration takes the rollback copy, as a mutation
+    /// does. Without rollback the failure stays on the function, which the
+    /// restored case must not carry.
+    #[test]
+    fn a_declared_cfg_change_alone_is_rolled_back() {
+        for (policy, restored) in [
+            (SsaRollbackPolicy::OnFailure, true),
+            (SsaRollbackPolicy::Never, false),
+        ] {
+            let mut ssa = diamond_phi_fixture();
+            // A defect the session did not cause: block 1 reads a variable
+            // nothing defines.
+            let ghost = ssa.create_variable(
+                VariableOrigin::Local(40),
+                1,
+                DefSite::instruction(1, 5),
+                MockType::I32,
+            );
+            let sink = ssa.create_variable(
+                VariableOrigin::Local(41),
+                0,
+                DefSite::instruction(1, 0),
+                MockType::I32,
+            );
+            if let Some(block) = ssa.block_mut(1) {
+                block.instructions_mut().insert(
+                    0,
+                    SsaInstruction::synthetic(SsaOp::Copy {
+                        dest: sink,
+                        src: ghost,
+                    }),
+                );
+            }
+            ssa.refresh_def_sites();
+            ssa.recompute_uses();
+            let _ = ssa.take_edit_dirty();
+            let _ = ssa.take_edit_failure();
+            let before = format!("{ssa:?}");
+
+            let outcome = ssa.edit(
+                SsaEditOptions::new()
+                    .with_verify(true)
+                    .with_rollback(policy),
+                |editor| {
+                    editor.mark_cfg_changed();
+                    Ok(())
+                },
+            );
+
+            assert!(outcome.is_err(), "{policy:?}: the defect is found");
+            assert_eq!(format!("{ssa:?}") == before, restored, "{policy:?}");
+            assert_eq!(ssa.take_edit_dirty(), !restored, "{policy:?}");
+            assert_eq!(ssa.take_edit_failure().is_some(), !restored, "{policy:?}");
+        }
+    }
+
+    /// The function a rollback restores is the one the session found, however
+    /// late in the session the first change comes and however many follow it.
+    #[test]
+    fn a_rollback_restores_the_function_as_the_session_found_it() {
+        let (mut ssa, _) = late_replacement_function();
+        let before = format!("{ssa:?}");
+        let padding = ssa.create_variable(VariableOrigin::Phi, 0, DefSite::entry(), MockType::I32);
+        let before_padding = format!("{ssa:?}");
+        assert_ne!(before, before_padding);
+
+        let outcome = ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                // Reads first: nothing has changed yet.
+                assert!(editor.function().block(0).is_some());
+                for _ in 0..3 {
+                    editor.insert_instruction(
+                        0,
+                        0,
+                        SsaInstruction::synthetic(SsaOp::Const {
+                            dest: padding,
+                            value: ConstValue::I32(0),
+                        }),
+                    )?;
+                }
+                Err(Error::new("the pass gives up after several edits"))
+            },
+        );
+
+        assert!(outcome.is_err());
+        assert_eq!(format!("{ssa:?}"), before_padding);
+    }
+
+    /// An edit that changes the function and then fails verification is undone
+    /// under rollback, and stays, flagged, without it.
+    #[test]
+    fn an_edit_that_fails_verification_is_undone_only_under_rollback() {
+        for (policy, undone) in [
+            (SsaRollbackPolicy::OnFailure, true),
+            (SsaRollbackPolicy::Never, false),
+        ] {
+            let (mut ssa, _) = late_replacement_function();
+            let before = format!("{ssa:?}");
+            let dangling = SsaVarId::from_index(ssa.variables().len().saturating_add(5));
+
+            let outcome = ssa.edit(
+                SsaEditOptions::new()
+                    .with_verify(true)
+                    .with_rollback(policy),
+                |editor| {
+                    editor
+                        .insert_instruction(
+                            0,
+                            0,
+                            SsaInstruction::synthetic(SsaOp::Copy {
+                                dest: SsaVarId::from_index(0),
+                                src: dangling,
+                            }),
+                        )
+                        .map(|_| ())
+                },
+            );
+
+            assert!(outcome.is_err(), "{policy:?}: the dangling read is found");
+            assert_eq!(format!("{ssa:?}") == before, undone, "{policy:?}");
+        }
+    }
+
+    /// `B0` tests and goes to `B1` or straight to the join `B2`, whose phi
+    /// takes `B0`'s value on that edge and `B1`'s on the other: the edge
+    /// `B0 -> B2` is critical. Returns the function and `B0`'s value.
+    fn triangle() -> (SsaFunction<MockTarget>, SsaVarId) {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
+        builder.ensure_block(2);
+        let early = builder
+            .in_block(0, |block| {
+                let value = block.const_i32(mock_i32(), 10)?;
+                let condition = block.const_bool(mock_i32(), true)?;
+                block.branch(condition, 1, 2)?;
+                Ok(value)
+            })
+            .expect("B0 builds");
+        let late = builder
+            .in_block(1, |block| {
+                let value = block.const_i32(mock_i32(), 20)?;
+                block.jump(2)?;
+                Ok(value)
+            })
+            .expect("B1 builds");
+        builder
+            .in_block(2, |block| {
+                let merged =
+                    block.phi(SsaDefSpec::local(0, MockType::I32), [(0, early), (1, late)])?;
+                block.ret(Some(merged))?;
+                Ok(())
+            })
+            .expect("B2 builds");
+        (builder.finish().expect("the triangle builds"), early)
+    }
+
+    /// **A split edge passes through a block of its own and carries what it
+    /// carried.** `B0 -> B2` goes through the new `B3`, which jumps to `B2`;
+    /// the phi takes `B0`'s value from `B3`, and the function verifies.
+    #[test]
+    fn a_split_edge_carries_its_value_through_a_block_of_its_own() {
+        let (mut ssa, early) = triangle();
+        let mut split = None;
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            split = editor.split_edges(&[0], 2)?;
+            Ok(())
+        })
+        .expect("the split commits");
+        assert_eq!(split, Some(3));
+        assert_eq!(
+            ssa.block(0).map(SsaBlock::successors),
+            Some(vec![1, 3]),
+            "B0 branches to the split block"
+        );
+        assert_eq!(ssa.block(3).map(SsaBlock::successors), Some(vec![2]));
+        let operands: Vec<(usize, SsaVarId)> = ssa
+            .block(2)
+            .and_then(|block| block.phi_nodes().first())
+            .map(|phi| {
+                phi.operands()
+                    .iter()
+                    .map(|operand| (operand.predecessor(), operand.value()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(operands.contains(&(3, early)), "{operands:?}");
+        assert!(!operands.iter().any(|(from, _)| *from == 0), "{operands:?}");
+        assert_mock_valid_full(&ssa, "split edge");
+    }
+
+    /// **An edge the terminator does not take, or one inside a protected
+    /// region, is not split.** `B1` does not branch to `B0`; and with `B0` to
+    /// `B2` all inside a `try`, the new block would lie outside it and the
+    /// edge through it would leave the region it stayed in.
+    #[test]
+    fn an_edge_that_is_not_there_or_stays_in_a_region_is_not_split() {
+        let (mut ssa, _) = triangle();
+        let mut split = Some(0);
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            split = editor.split_edges(&[1], 0)?;
+            Ok(())
+        })
+        .expect("nothing to commit");
+        assert_eq!(split, None);
+        assert_eq!(ssa.block_count(), 3);
+
+        let (mut ssa, _) = triangle();
+        ssa.set_exception_handlers(vec![SsaExceptionHandler {
+            flags: 0,
+            try_offset: 0,
+            try_length: 0,
+            handler_offset: 0,
+            handler_length: 0,
+            class_token_or_filter: 0,
+            protected_range: BlockRange::new(0, 3),
+            handler_range: BlockRange::new(3, 3),
+            filter_range: None,
+            selector: None,
+        }]);
+        let mut split = Some(0);
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            split = editor.split_edges(&[0], 2)?;
+            Ok(())
+        })
+        .expect("nothing to commit");
+        assert_eq!(split, None);
+        assert_eq!(ssa.block_count(), 3);
+    }
+
+    /// `B0` tests and goes to `B1` or to the join `B2`; `B1` tests again and
+    /// goes to `B2` or to `B3`, which enters `B2` with a value of its own.
+    /// The join's phi takes `B0`'s value from `B0`, and from `B1` that value
+    /// too or, where `differ`, one of `B1`'s own.
+    fn chain(differ: bool) -> SsaFunction<MockTarget> {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
+        builder.ensure_block(3);
+        let (early, condition) = builder
+            .in_block(0, |block| {
+                let value = block.const_i32(mock_i32(), 10)?;
+                let condition = block.const_bool(mock_i32(), true)?;
+                block.branch(condition, 1, 2)?;
+                Ok((value, condition))
+            })
+            .expect("B0 builds");
+        let late = builder
+            .in_block(1, |block| {
+                let value = block.const_i32(mock_i32(), 20)?;
+                block.branch(condition, 2, 3)?;
+                Ok(value)
+            })
+            .expect("B1 builds");
+        let other = builder
+            .in_block(3, |block| {
+                let value = block.const_i32(mock_i32(), 30)?;
+                block.jump(2)?;
+                Ok(value)
+            })
+            .expect("B3 builds");
+        builder
+            .in_block(2, |block| {
+                let from_one = if differ { late } else { early };
+                let merged = block.phi(
+                    SsaDefSpec::local(0, MockType::I32),
+                    [(0, early), (1, from_one), (3, other)],
+                )?;
+                block.ret(Some(merged))?;
+                Ok(())
+            })
+            .expect("B2 builds");
+        builder.finish().expect("the chain builds")
+    }
+
+    /// **Edges carrying the same values share one block.** Both edges into
+    /// `B2` carry `B0`'s value, so one block takes both: `B0` and `B1` branch
+    /// to it, and the phi takes the value from it once. Edges carrying
+    /// different values are not split.
+    #[test]
+    fn edges_carrying_the_same_values_share_one_block() {
+        let mut ssa = chain(false);
+        // Read by nothing: a session that tidied would remove it, and with it
+        // a value a caller may hold facts about.
+        let unread =
+            ssa.create_variable(VariableOrigin::Local(9), 0, DefSite::phi(2), MockType::I32);
+        let (early, other) = ssa
+            .block(2)
+            .and_then(|block| block.phi_nodes().first())
+            .map(|phi| (phi.operands()[0].value(), phi.operands()[2].value()))
+            .expect("the join's phi");
+        let mut dead = PhiNode::new(unread, VariableOrigin::Local(9));
+        for (value, from) in [(early, 0), (early, 1), (other, 3)] {
+            dead.add_operand(PhiOperand::new(value, from));
+        }
+        if let Some(block) = ssa.block_mut(2) {
+            block.phi_nodes_mut().push(dead);
+        }
+        ssa.recompute_uses();
+        let bound = ssa.var_id_bound();
+        let mut split = None;
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            split = editor.split_edges(&[0, 1], 2)?;
+            Ok(())
+        })
+        .expect("the split commits with no repair declared");
+        assert_eq!(ssa.var_id_bound(), bound, "no value is renumbered");
+        assert_eq!(
+            ssa.block(2).map(|block| block.phi_nodes().len()),
+            Some(2),
+            "the unread phi is still there"
+        );
+        assert_eq!(split, Some(4));
+        assert!(
+            ssa.block(0)
+                .is_some_and(|block| block.successors().contains(&4))
+        );
+        assert!(
+            ssa.block(1)
+                .is_some_and(|block| block.successors().contains(&4))
+        );
+        let operands: Vec<usize> = ssa
+            .block(2)
+            .and_then(|block| block.phi_nodes().first())
+            .map(|phi| phi.operands().iter().map(PhiOperand::predecessor).collect())
+            .unwrap_or_default();
+        assert_eq!(operands, vec![3, 4]);
+        assert_mock_valid_full(&ssa, "shared split");
+
+        let mut ssa = chain(true);
+        let mut split = Some(0);
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            split = editor.split_edges(&[0, 1], 2)?;
+            Ok(())
+        })
+        .expect("nothing to commit");
+        assert_eq!(split, None);
+        assert_eq!(ssa.block_count(), 4);
     }
 }

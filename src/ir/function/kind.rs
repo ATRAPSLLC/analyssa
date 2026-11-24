@@ -1,7 +1,7 @@
 //! Function kind classification for the SSA IR.
 //!
 //! Distinguishes normal functions from interrupt service routines (ISRs) and
-//! other special function types. The kind is stored on [`SsaFunction`](super::SsaFunction)
+//! other special function types. The kind is stored on [`SsaFunction`](crate::ir::function::SsaFunction)
 //! and drives validation, code generation, and pass behavior.
 //!
 //! # Interrupt Handlers
@@ -31,13 +31,16 @@
 
 use std::fmt;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Classification of a function's execution context.
 ///
 /// Defaults to [`Normal`](FunctionKind::Normal) for all functions constructed
-/// via [`SsaFunction::new`](super::SsaFunction::new) or
-/// [`SsaFunction::with_capacity`](super::SsaFunction::with_capacity).
+/// via [`SsaFunction::new`](crate::ir::function::SsaFunction::new) or
+/// [`SsaFunction::with_capacity`](crate::ir::function::SsaFunction::with_capacity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum FunctionKind {
     /// A regular function with standard call/return semantics.
     ///
@@ -76,6 +79,8 @@ impl FunctionKind {
 }
 
 impl fmt::Display for FunctionKind {
+    /// Writes the kind as a lowercase snake_case tag (`normal` or
+    /// `interrupt_handler`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Normal => write!(f, "normal"),
@@ -88,23 +93,28 @@ impl fmt::Display for FunctionKind {
 mod tests {
     use super::*;
 
+    /// The `Normal` variant reports as normal and not as an interrupt handler.
     #[test]
     fn default_kind_is_normal() {
         assert!(FunctionKind::Normal.is_normal());
         assert!(!FunctionKind::Normal.is_interrupt_handler());
     }
 
+    /// The `InterruptHandler` variant reports as an interrupt handler and not
+    /// as normal.
     #[test]
     fn interrupt_handler_classification() {
         assert!(FunctionKind::InterruptHandler.is_interrupt_handler());
         assert!(!FunctionKind::InterruptHandler.is_normal());
     }
 
+    /// `Normal` renders as the string `normal`.
     #[test]
     fn display_normal() {
         assert_eq!(FunctionKind::Normal.to_string(), "normal");
     }
 
+    /// `InterruptHandler` renders as the string `interrupt_handler`.
     #[test]
     fn display_interrupt_handler() {
         assert_eq!(
@@ -113,6 +123,8 @@ mod tests {
         );
     }
 
+    /// Equal kinds compare equal and distinct kinds compare unequal, exercising
+    /// the derived `Copy`/`Eq` impls.
     #[test]
     fn kind_is_copy_and_eq() {
         assert_eq!(FunctionKind::Normal, FunctionKind::Normal);

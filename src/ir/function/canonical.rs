@@ -32,25 +32,42 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     BitSet,
+    facts::Derivation,
     ir::{
-        block::SsaBlock,
-        function::SsaFunction,
+        block::{BlockProvenance, SsaBlock},
+        function::{SsaFunction, transforms::Cleanup},
+        identity::Identity,
         instruction::SsaInstruction,
         ops::SsaOp,
         phi::PhiOperand,
-        variable::{DefSite, SsaVarId},
+        variable::{DefSite, SsaVarId, VariableOrigin},
     },
     target::Target,
 };
 
-/// Finds kept predecessors of a removed block during canonicalization.
+/// Finds the surviving predecessors that flow into a removed block.
 ///
-/// When a block is removed, we need to find the actual predecessor blocks
-/// (that are being kept) which would flow into the removed block. This is
-/// used to properly update PHI node predecessors.
+/// When canonicalization deletes an empty block, any phi that named it as a
+/// predecessor must instead name the still-live blocks that reach it. This
+/// walks predecessor chains through other removed blocks (those present in
+/// `redirect_map`) until it reaches blocks that survive compaction (those with
+/// a `Some` entry in `block_remap`), returning their post-compaction indices.
+/// The `BitSet` visited-guard makes the walk terminate on cyclic chains of
+/// removed blocks.
 ///
-/// The function follows predecessor chains through removed blocks until it
-/// finds blocks that are being kept (have entries in `block_remap`).
+/// # Arguments
+///
+/// * `removed_block` - Old index of the block being deleted whose live
+///   predecessors are sought.
+/// * `predecessors` - Map from each block to the old indices of the blocks with
+///   an edge into it.
+/// * `block_remap` - Per old block, its new index if kept or `None` if removed.
+/// * `redirect_map` - Removed blocks that have a known ultimate jump target.
+///
+/// # Returns
+///
+/// The new (post-compaction) indices of the kept blocks that flow into
+/// `removed_block`.
 fn find_kept_predecessors(
     removed_block: usize,
     predecessors: &BTreeMap<usize, Vec<usize>>,
@@ -119,7 +136,7 @@ impl<T: Target> SsaFunction<T> {
         }
 
         // Protect Leave targets (exception handler exit blocks)
-        for block in &self.blocks {
+        for block in self.blocks.iter() {
             if let Some(SsaOp::Leave { target }) = block.control_terminator()
                 && *target < block_count
             {
@@ -150,12 +167,22 @@ impl<T: Target> SsaFunction<T> {
         // For each removed block, find its ultimate jump target (following jump chains).
         // If we can't find a redirect for a block, we must keep it instead of removing it.
         let mut redirect_map: BTreeMap<usize, usize> = BTreeMap::new();
+        // What an edge redirected past each removed block runs through: the
+        // host blocks the removed chain stood for.
+        let mut passed: BTreeMap<usize, BlockProvenance> = BTreeMap::new();
 
         for old_index in 0..self.blocks.len() {
             if matches!(block_remap.get(old_index), Some(None)) {
                 // This block is being removed - find where it would jump to
-                if let Some(target) = self.find_ultimate_target(old_index, &block_remap) {
+                if let Some((target, chain)) = self.find_ultimate_target(old_index, &block_remap) {
                     redirect_map.insert(old_index, target);
+                    let mut through = BlockProvenance::default();
+                    for removed in chain.iter().filter_map(|&index| self.blocks.get(index)) {
+                        through.pass_through(removed.provenance());
+                    }
+                    if !through.is_empty() {
+                        passed.insert(old_index, through);
+                    }
                 } else {
                     // Can't find a redirect target - we must keep this block.
                     // Reassign it a new index.
@@ -176,10 +203,39 @@ impl<T: Target> SsaFunction<T> {
             });
         }
 
-        // Phase 4: Update all branch targets in remaining blocks.
-        for block in &mut self.blocks {
+        // Phase 4: Update all branch targets in remaining blocks. An edge
+        // redirected past a removed chain passes what the chain stood for, on
+        // that edge, and every edge a block's record names is restated as its
+        // branch is: the redirect a removed block's edge takes, or a kept
+        // block's new index.
+        let moved = |target: usize| {
+            redirect_map
+                .get(&target)
+                .copied()
+                .or_else(|| block_remap.get(target).copied().flatten())
+        };
+        for block in self.blocks.iter_mut() {
+            let mut through: Vec<(usize, &BlockProvenance)> = Vec::new();
+            block.for_each_successor(|target| {
+                if let Some(chain) = passed.get(&target)
+                    && let Some(onward) = moved(target)
+                {
+                    through.push((onward, chain));
+                }
+            });
+            block.provenance_mut().retarget(moved);
+            for (onward, chain) in through {
+                block.provenance_mut().pass_through_on(onward, chain);
+            }
+            // A removed block whose control was forwarded resolves to where it
+            // went; a kept one to its new index; any other target is left.
             for instr in block.instructions_mut() {
-                Self::remap_branch_targets(instr.op_mut(), &block_remap, &redirect_map);
+                instr.op_mut().remap_branch_targets(|target| {
+                    redirect_map
+                        .get(&target)
+                        .copied()
+                        .or_else(|| block_remap.get(target).copied().flatten())
+                });
             }
         }
 
@@ -218,6 +274,22 @@ impl<T: Target> SsaFunction<T> {
                     let old_pred = operand.predecessor();
                     let value = operand.value();
 
+                    // An operand for a throw names the block the throw leaves
+                    // from, not an edge a terminator takes, and keeps being one:
+                    // renumbered with its block, or dropped with it. A removed
+                    // block is empty, and an empty block cannot throw.
+                    if operand.is_exceptional() {
+                        match block_remap.get(old_pred) {
+                            Some(Some(new_pred)) => {
+                                let mut moved = *operand;
+                                moved.set_predecessor(*new_pred);
+                                changes.push((op_idx, Some(moved), Vec::new()));
+                            }
+                            _ => changes.push((op_idx, None, Vec::new())),
+                        }
+                        continue;
+                    }
+
                     if redirect_map.contains_key(&old_pred) {
                         // This predecessor was removed. Find all kept blocks that flow into it.
                         let kept_preds = find_kept_predecessors(
@@ -241,7 +313,9 @@ impl<T: Target> SsaFunction<T> {
                         changes.push((op_idx, None, replacements));
                     } else if let Some(Some(new_pred)) = block_remap.get(old_pred) {
                         // Predecessor was kept but renumbered - update in place
-                        changes.push((op_idx, Some(PhiOperand::new(value, *new_pred)), Vec::new()));
+                        let mut moved = *operand;
+                        moved.set_predecessor(*new_pred);
+                        changes.push((op_idx, Some(moved), Vec::new()));
                     }
                 }
 
@@ -265,9 +339,10 @@ impl<T: Target> SsaFunction<T> {
                 // Post-processing: try to recover orphaned values by assigning them
                 // to unaccounted-for predecessors.
                 if !orphaned_values.is_empty() {
-                    // Get the predecessors that are currently accounted for in the PHI
+                    // Get the predecessors that are currently accounted for in the
+                    // PHI, by the terminator edges its normal operands name.
                     let accounted_preds: BTreeSet<usize> =
-                        phi.operands().iter().map(PhiOperand::predecessor).collect();
+                        phi.normal_operands().map(PhiOperand::predecessor).collect();
 
                     // Find predecessors that are NOT accounted for
                     let unaccounted_preds: Vec<usize> = kept_phi_block_preds
@@ -299,7 +374,7 @@ impl<T: Target> SsaFunction<T> {
             block.set_id(new_idx);
         }
 
-        self.blocks = kept_blocks;
+        *self.blocks = kept_blocks;
         self.remap_variable_def_sites_after_block_compaction(&block_remap);
 
         // Phase 7: Remap exception handler block indices.
@@ -309,9 +384,187 @@ impl<T: Target> SsaFunction<T> {
 
         // Phase 8: Ensure the method has a valid terminator.
         self.ensure_valid_terminator();
+
+        // Use sites name blocks by position, and every position after a removed
+        // block moved.
+        self.recompute_uses();
     }
 
-    /// Remaps variable definition sites after block compaction.
+    /// Gives the function an entry block no terminator transfers to.
+    ///
+    /// The entry block is where a call enters, and nothing else may: forward
+    /// analyses seed their boundary state there, and a block with one incoming
+    /// edge is taken to know that edge's condition. A lifter produces the
+    /// violating shape when a loop starts at the function's first instruction
+    /// (a self tail-call lowered to a jump, or a `while` compiled without a
+    /// preamble). The verifier rejects it with
+    /// [`VerifierError::EntryHasPredecessors`](crate::analysis::VerifierError::EntryHasPredecessors);
+    /// this repairs it.
+    ///
+    /// Every block moves up by one index and a new, empty block 0 jumps to the
+    /// old entry. Shifting rather than relocating keeps every exception clause's
+    /// block range contiguous. Terminator targets, phi predecessors, def sites
+    /// and clause ranges are renumbered; a variable defined at function entry
+    /// (an argument or initialised local, [`DefSite::entry`]) stays on the new
+    /// entry block.
+    ///
+    /// A phi in the old entry block has no operand for the new entry edge -
+    /// there was no such edge to name - so each gains one: the value its
+    /// variable holds on entry. That is the argument, initialised local or
+    /// entry live-in the function already has for it, and otherwise a new entry
+    /// live-in, the slot's value on entry, which nothing in the function
+    /// computed.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the entry block had predecessors and was split off, `false`
+    /// if the function already satisfied the invariant.
+    pub fn ensure_entry_has_no_predecessors(&mut self) -> bool {
+        let mut entry_has_predecessor = false;
+        for block in self.blocks.iter() {
+            block.for_each_successor(|succ| entry_has_predecessor |= succ == 0);
+        }
+        if !entry_has_predecessor {
+            return false;
+        }
+
+        let block_count = self.blocks.len();
+        let block_remap: Vec<Option<usize>> = (1..=block_count).map(Some).collect();
+
+        // `DefSite::entry()` and `DefSite::phi(0)` are the same value, so the
+        // old entry's phi results are what tells them apart.
+        let old_entry_phis: BTreeSet<SsaVarId> = self
+            .blocks
+            .first()
+            .map(|block| block.phi_nodes().iter().map(|phi| phi.result()).collect())
+            .unwrap_or_default();
+
+        for block in self.blocks.iter_mut() {
+            if let Some(op) = block
+                .instructions_mut()
+                .last_mut()
+                .map(SsaInstruction::op_mut)
+            {
+                op.remap_branch_targets(|target| block_remap.get(target).copied().flatten());
+            }
+            for phi in block.phi_nodes_mut() {
+                for operand in phi.operands_mut() {
+                    let shifted = operand.predecessor().saturating_add(1);
+                    operand.set_predecessor(shifted);
+                }
+            }
+        }
+
+        for var in &mut self.variables {
+            let site = var.def_site();
+            let is_function_entry = site == DefSite::entry() && !old_entry_phis.contains(&var.id());
+            if !is_function_entry {
+                var.set_def_site(site.with_block(site.block().saturating_add(1)));
+            }
+        }
+
+        for handler in &mut self.exception_handlers {
+            handler.remap_block_indices(&block_remap);
+        }
+
+        let mut entry = SsaBlock::new(0);
+        let jump = self.instr_allocator.alloc();
+        let mut instruction = SsaInstruction::synthetic(SsaOp::Jump { target: 1 });
+        instruction.set_id(jump);
+        entry.add_instruction(instruction);
+        self.blocks.insert(0, entry);
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            block.set_id(index);
+        }
+
+        // Each old entry phi reads its variable's entry value on the new edge
+        // from block 0, as the function's first pass through the old entry did.
+        let entry_operands: Vec<(SsaVarId, SsaVarId)> = old_entry_phis
+            .iter()
+            .map(|phi| (*phi, self.entry_value_of(*phi, &old_entry_phis)))
+            .collect();
+        if let Some(old_entry) = self.blocks.get_mut(1) {
+            for phi in old_entry.phi_nodes_mut() {
+                if let Some((_, value)) = entry_operands
+                    .iter()
+                    .find(|(result, _)| *result == phi.result())
+                {
+                    phi.add_operand(PhiOperand::new(*value, 0));
+                }
+            }
+        }
+        self.recompute_uses();
+        true
+    }
+
+    /// The value the variable the phi `phi` merges holds when the function is
+    /// entered.
+    ///
+    /// The variable's version 0 defined at entry - an argument, an initialised
+    /// local or an entry live-in of the phi's rename group, or, in no group,
+    /// of the phi's origin - and otherwise a new entry live-in derived from
+    /// the phi, in its group: the slot's value on entry, which nothing in the
+    /// function computed.
+    ///
+    /// # Arguments
+    ///
+    /// * `phi` - The result of a phi of the old entry block.
+    /// * `entry_phis` - Every such result; none of them is an entry value,
+    ///   though each shares the entry's def site.
+    fn entry_value_of(&mut self, phi: SsaVarId, entry_phis: &BTreeSet<SsaVarId>) -> SsaVarId {
+        let group = self.rename_group(phi);
+        let origin = self.variable(phi).map(|var| var.origin());
+        let held = self.variables.iter().find(|var| {
+            let same = if group == u32::MAX {
+                Some(var.origin()) == origin && self.rename_group(var.id()) == u32::MAX
+            } else {
+                self.rename_group(var.id()) == group
+            };
+            same && var.version() == 0
+                && var.def_site() == DefSite::entry()
+                && !entry_phis.contains(&var.id())
+                && matches!(
+                    var.origin(),
+                    VariableOrigin::Argument(_)
+                        | VariableOrigin::Local(_)
+                        | VariableOrigin::EntryLiveIn
+                )
+        });
+        if let Some(held) = held {
+            return held.id();
+        }
+        let var_type = self
+            .variable(phi)
+            .map_or_else(T::unknown_type, |var| var.var_type().clone());
+        let value = self.create_variable_derived(
+            phi,
+            VariableOrigin::EntryLiveIn,
+            0,
+            DefSite::entry(),
+            var_type,
+            Derivation::EntryValue,
+        );
+        if group != u32::MAX {
+            self.set_rename_group(value, group);
+        }
+        value
+    }
+
+    /// Rewrites every variable's def site to its post-compaction location.
+    ///
+    /// Block removal and renumbering invalidate the block and instruction
+    /// indices stored on each variable's [`DefSite`]. A variable whose defining
+    /// block or instruction no longer exists is rebased onto an entry def site,
+    /// but only when nothing still reads it: stamping `DefSite::entry()` on a
+    /// still-read variable would make a dangling read indistinguishable from a
+    /// function argument, the exact disguise the verifier must be able to see
+    /// through. Phi and instruction sites that survive are translated to their
+    /// new block index in place.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_remap` - Per old block, its new index if kept or `None` if
+    ///   removed.
     fn remap_variable_def_sites_after_block_compaction(&mut self, block_remap: &[Option<usize>]) {
         let block_instr_counts: Vec<usize> = self
             .blocks
@@ -320,7 +573,7 @@ impl<T: Target> SsaFunction<T> {
             .collect();
 
         // A variable whose defining block or instruction no longer exists falls
-        // back to an entry def site — but only when nothing reads it. Stamping
+        // back to an entry def site - but only when nothing reads it. Stamping
         // `DefSite::entry()` on a still-read variable makes a dangling read
         // indistinguishable from an argument, which is precisely the disguise
         // the verifier must be able to see through. See
@@ -328,15 +581,15 @@ impl<T: Target> SsaFunction<T> {
         let still_read = self.collect_read_variables();
         for var in &mut self.variables {
             let site = var.def_site();
-            let readable = still_read.contains_checked(var.id().index());
-            let Some(Some(new_block)) = block_remap.get(site.block) else {
+            let readable = still_read.contains(var.id());
+            let Some(Some(new_block)) = block_remap.get(site.block()) else {
                 if !readable {
                     var.set_def_site(DefSite::entry());
                 }
                 continue;
             };
 
-            if let Some(instr_idx) = site.instruction {
+            if let Some(instr_idx) = site.index() {
                 if block_instr_counts
                     .get(*new_block)
                     .is_some_and(|count| instr_idx < *count)
@@ -373,27 +626,52 @@ impl<T: Target> SsaFunction<T> {
         });
 
         // If there's no useful code, replace entry block with just a Return
-        if !has_useful_code && let Some(entry_block) = self.blocks.first_mut() {
-            entry_block.instructions_mut().clear();
-            entry_block.phi_nodes_mut().clear();
-            entry_block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        if !has_useful_code {
+            let id = self.instr_allocator.alloc();
+            if let Some(entry_block) = self.blocks.first_mut() {
+                entry_block.instructions_mut().clear();
+                entry_block.phi_nodes_mut().clear();
+                let mut instruction = SsaInstruction::synthetic(SsaOp::returns(None));
+                instruction.set_id(id);
+                entry_block.add_instruction(instruction);
+            }
         }
     }
 
-    /// Finds the ultimate jump target for a block, following jump chains.
+    /// Finds where a block transfers control once empty blocks collapse.
     ///
-    /// Used during canonicalization to find where an empty block would
-    /// ultimately transfer control to.
+    /// Follows the block's jump chain (and, for a truly empty terminator-less
+    /// block, CIL fall-through to the next block) across other removed blocks
+    /// until it lands on a block that survives compaction, returning that
+    /// survivor's new index. Branches, switches, and other multi-target
+    /// terminators stop the walk: such a block is not genuinely empty and cannot
+    /// be redirected. The `BitSet` visited-guard yields `None` on a cycle rather
+    /// than looping forever.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_idx` - Old index of the removed block whose redirect target is
+    ///   sought.
+    /// * `block_remap` - Per old block, its new index if kept or `None` if
+    ///   removed.
+    ///
+    /// # Returns
+    ///
+    /// The new index of the surviving block control reaches, with the removed
+    /// blocks walked to get there, or `None` when no single redirect target
+    /// exists (a branch, a dead end, or a cycle).
     fn find_ultimate_target(
         &self,
         block_idx: usize,
         block_remap: &[Option<usize>],
-    ) -> Option<usize> {
+    ) -> Option<(usize, Vec<usize>)> {
         let mut visited = BitSet::new(self.blocks.len());
         let mut current = block_idx;
+        let mut chain = Vec::new();
 
         while visited.insert(current) {
             let block = self.blocks.get(current)?;
+            chain.push(current);
 
             // Get the terminator's target
             let terminator = block.control_terminator();
@@ -407,7 +685,11 @@ impl<T: Target> SsaFunction<T> {
             match target {
                 Some(t) if block_remap.get(t).copied().flatten().is_some() => {
                     // Target exists in new layout
-                    return block_remap.get(t).copied().flatten();
+                    return block_remap
+                        .get(t)
+                        .copied()
+                        .flatten()
+                        .map(|target| (target, chain));
                 }
                 Some(t) => {
                     // Target is also being removed, follow the chain
@@ -422,7 +704,7 @@ impl<T: Target> SsaFunction<T> {
                         if next_block < self.blocks.len() {
                             if let Some(Some(new_idx)) = block_remap.get(next_block) {
                                 // Next block exists in new layout
-                                return Some(*new_idx);
+                                return Some((*new_idx, chain));
                             } else if block_remap.get(next_block).is_some() {
                                 // Next block is also being removed, follow the chain
                                 current = next_block;
@@ -438,64 +720,46 @@ impl<T: Target> SsaFunction<T> {
 
         None // Cycle detected
     }
+}
 
-    /// Remaps branch targets according to the block remapping.
-    fn remap_branch_targets(
-        op: &mut SsaOp<T>,
-        block_remap: &[Option<usize>],
-        redirect_map: &BTreeMap<usize, usize>,
-    ) {
-        // Helper closure to remap a single target
-        let remap_target = |target: &mut usize| {
-            // First try redirect_map (for removed blocks with known targets)
-            if let Some(&new_target) = redirect_map.get(target) {
-                *target = new_target;
-                return;
-            }
-            // Then try block_remap (for kept blocks)
-            if let Some(Some(new_target)) = block_remap.get(*target) {
-                *target = *new_target;
-            }
-        };
+#[cfg(test)]
+mod tests {
+    use crate::{
+        ir::{block::SsaBlock, function::SsaFunction, instruction::SsaInstruction, ops::SsaOp},
+        testing::MockTarget,
+    };
 
-        match op {
-            SsaOp::Jump { target } | SsaOp::Leave { target } => {
-                remap_target(target);
-            }
-            SsaOp::Branch {
-                true_target,
-                false_target,
-                ..
-            }
-            | SsaOp::BranchCmp {
-                true_target,
-                false_target,
-                ..
-            }
-            | SsaOp::BranchFlags {
-                true_target,
-                false_target,
-                ..
-            } => {
-                remap_target(true_target);
-                remap_target(false_target);
-            }
-            SsaOp::Switch {
-                targets, default, ..
-            } => {
-                for target in targets.iter_mut() {
-                    remap_target(target);
-                }
-                remap_target(default);
-            }
-            SsaOp::IndirectBranch {
-                resolved_targets, ..
-            } => {
-                for target in resolved_targets.iter_mut() {
-                    remap_target(target);
-                }
-            }
-            _ => {}
-        }
+    /// An edge redirected past an empty block that still stands for a host
+    /// block - a host whose blocks fall through, emptied - passes through it.
+    #[test]
+    fn an_edge_redirected_past_an_empty_block_passes_through_it() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 1 }));
+        entry.provenance_mut().carry(0x10);
+        ssa.add_block(entry);
+        let mut empty = SsaBlock::new(1);
+        empty.provenance_mut().carry(0x20);
+        ssa.add_block(empty);
+        let mut exit = SsaBlock::new(2);
+        exit.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
+        ssa.add_block(exit);
+        ssa.recompute_uses();
+
+        ssa.canonicalize();
+
+        assert_eq!(ssa.block_count(), 2, "the empty block is gone");
+        let entry = ssa.block(0).unwrap_or_else(|| panic!("the entry stays"));
+        assert!(matches!(
+            entry.control_terminator(),
+            Some(SsaOp::Jump { target: 1 })
+        ));
+        assert_eq!(entry.provenance().carried(), &[0x10]);
+        assert_eq!(entry.provenance().passed(), &[0x20]);
+        assert_eq!(
+            entry.provenance().passed_edges().collect::<Vec<_>>(),
+            [Some(1)],
+            "on the edge redirected past the removed block, renumbered"
+        );
     }
 }

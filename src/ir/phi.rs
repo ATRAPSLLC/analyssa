@@ -1,6 +1,6 @@
 //! Phi node representation for SSA form.
 //!
-//! Phi nodes are the cornerstone of SSA form — they merge values at control flow
+//! Phi nodes are the cornerstone of SSA form - they merge values at control flow
 //! join points. When multiple control flow paths converge, a phi node selects
 //! which value to use based on which predecessor path was taken.
 //!
@@ -42,7 +42,52 @@
 
 use std::fmt;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::ir::variable::{SsaVarId, VariableOrigin};
+
+/// Which kind of incoming edge a phi operand names.
+///
+/// A phi merges the values that reach a block, and control reaches a block two
+/// ways: a terminator transfers to it, or a throw somewhere inside a protected
+/// region dispatches to the handler that guards it. The second kind has no
+/// edge to place a copy on and no single point it leaves from, so telling the
+/// two apart is what lets a consumer treat each correctly rather than treating
+/// all operands as one kind and being wrong about the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum PhiEdge {
+    /// A terminator in the named block transfers control here.
+    #[default]
+    Normal,
+    /// A throw anywhere in the named block - a block of a protected region -
+    /// may dispatch here.
+    ///
+    /// One block can contribute several values this way: the throw can happen
+    /// at any point in it, so every value the merged storage may hold while the
+    /// block runs is a value the handler may see.
+    Exceptional,
+}
+
+/// What [`PhiNode::replace_operand_value`] did to the operands naming the
+/// replaced value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperandReplacement {
+    /// Operands that name the new value instead.
+    pub rewritten: usize,
+    /// Operands dropped because the block already listed the new value for a
+    /// throw.
+    pub merged: usize,
+}
+
+impl OperandReplacement {
+    /// How many operands no longer name the replaced value.
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.rewritten.saturating_add(self.merged)
+    }
+}
 
 /// An operand of a phi node - a value coming from a specific predecessor block.
 ///
@@ -61,7 +106,7 @@ use crate::ir::variable::{SsaVarId, VariableOrigin};
 /// assert_eq!(operand.predecessor(), 1);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PhiOperand {
     /// The SSA variable providing the value.
     value: SsaVarId,
@@ -69,6 +114,9 @@ pub struct PhiOperand {
     /// (block counts never approach 2^32) to keep `PhiOperand` compact, since
     /// phi nodes hold one operand per predecessor.
     predecessor: u32,
+    /// How control gets here from that block.
+    #[cfg_attr(feature = "serde", serde(default))]
+    edge: PhiEdge,
 }
 
 impl PhiOperand {
@@ -83,13 +131,56 @@ impl PhiOperand {
         Self {
             value,
             predecessor: predecessor as u32,
+            edge: PhiEdge::Normal,
         }
+    }
+
+    /// Creates an operand for a value a throw in `source` may bring here.
+    ///
+    /// `source` is a block of the protected region this phi's block guards, not
+    /// a block whose terminator transfers here.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The SSA variable the merged storage may hold at the throw.
+    /// * `source` - The protected block the throw may happen in.
+    #[must_use]
+    pub const fn exceptional(value: SsaVarId, source: usize) -> Self {
+        Self {
+            value,
+            predecessor: source as u32,
+            edge: PhiEdge::Exceptional,
+        }
+    }
+
+    /// Returns how control gets here from the named block.
+    #[must_use]
+    pub const fn edge(&self) -> PhiEdge {
+        self.edge
+    }
+
+    /// Returns whether this operand names an exceptional edge.
+    #[must_use]
+    pub const fn is_exceptional(&self) -> bool {
+        matches!(self.edge, PhiEdge::Exceptional)
     }
 
     /// Returns the SSA variable providing the value.
     #[must_use]
     pub const fn value(&self) -> SsaVarId {
         self.value
+    }
+
+    /// Replaces the value this operand carries, keeping the edge it names.
+    ///
+    /// Rebuilding the operand instead would reset its [`PhiEdge`] to `Normal`,
+    /// turning a value a throw brings into a value a terminator brings.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The SSA variable the operand now carries.
+    pub const fn set_value(&mut self, value: SsaVarId) {
+        self.value = value;
     }
 
     /// Returns the predecessor block index.
@@ -118,7 +209,10 @@ impl PhiOperand {
 
 impl fmt::Display for PhiOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} from B{}", self.value, self.predecessor)
+        match self.edge {
+            PhiEdge::Normal => write!(f, "{} from B{}", self.value, self.predecessor),
+            PhiEdge::Exceptional => write!(f, "{} thrown in B{}", self.value, self.predecessor),
+        }
     }
 }
 
@@ -149,14 +243,14 @@ impl fmt::Display for PhiOperand {
 /// assert_eq!(phi.operand_count(), 2);
 /// ```
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PhiNode {
     /// The SSA variable that this phi node defines (its result).
     /// This is the variable that subsequent instructions in this block
     /// should use to read the merged value.
     result: SsaVarId,
 
-    /// The original variable this phi node merges — identifies which
+    /// The original variable this phi node merges - identifies which
     /// CIL argument or local variable this phi corresponds to. Used
     /// during SSA construction and rebuild for rename grouping.
     origin: VariableOrigin,
@@ -281,9 +375,9 @@ impl PhiNode {
     ///
     /// **Unchecked**: this does not verify that the operand's predecessor is a
     /// real CFG predecessor, nor that no operand already names it. A phi with two
-    /// operands on one edge has no defined meaning — [`Self::operand_from`]
+    /// operands on one edge has no defined meaning - [`Self::operand_from`]
     /// returns the first and discards the rest, while SCCP meets them all and
-    /// yields Bottom — and the verifier reports it as
+    /// yields Bottom - and the verifier reports it as
     /// [`VerifierError::DuplicatePhiOperand`]. Callers redirecting an existing
     /// edge should use
     /// [`SsaEditor::replace_phi_predecessor`](crate::ir::function::SsaEditor::replace_phi_predecessor),
@@ -326,7 +420,55 @@ impl PhiNode {
     pub fn operand_from(&self, predecessor: usize) -> Option<&PhiOperand> {
         self.operands
             .iter()
-            .find(|op| op.predecessor() == predecessor)
+            .find(|op| !op.is_exceptional() && op.predecessor() == predecessor)
+    }
+
+    /// Returns the operands naming terminator edges.
+    pub fn normal_operands(&self) -> impl Iterator<Item = &PhiOperand> + '_ {
+        self.operands.iter().filter(|op| !op.is_exceptional())
+    }
+
+    /// Returns the operands naming values a throw may bring here.
+    pub fn exceptional_operands(&self) -> impl Iterator<Item = &PhiOperand> + '_ {
+        self.operands.iter().filter(|op| op.is_exceptional())
+    }
+
+    /// Returns every operand naming `block`, of either kind.
+    ///
+    /// # Arguments
+    ///
+    /// * `block` - The block the operands name.
+    pub fn operands_from(&self, block: usize) -> impl Iterator<Item = &PhiOperand> + '_ {
+        self.operands
+            .iter()
+            .filter(move |op| op.predecessor() == block)
+    }
+
+    /// Adds an operand for a value a throw in `source` may bring here, unless
+    /// that pairing is already recorded.
+    ///
+    /// A protected block contributes one operand per value the merged storage
+    /// may hold while it runs, so several operands may name the same block -
+    /// but the same `(block, value)` twice says nothing new.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The protected block a throw may happen in.
+    /// * `value` - The value the storage may hold at that point.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the operand was added.
+    pub fn add_exceptional_operand(&mut self, source: usize, value: SsaVarId) -> bool {
+        let known = self
+            .operands
+            .iter()
+            .any(|op| op.is_exceptional() && op.predecessor() == source && op.value == value);
+        if known {
+            return false;
+        }
+        self.operands.push(PhiOperand::exceptional(value, source));
+        true
     }
 
     /// Returns all the SSA variables used by this phi node.
@@ -336,9 +478,13 @@ impl PhiNode {
         self.operands.iter().map(|op| op.value)
     }
 
-    /// Retains only operands whose predecessor satisfies the predicate.
-    pub fn retain_operands<F: Fn(usize) -> bool>(&mut self, pred: F) {
-        self.operands.retain(|op| pred(op.predecessor()));
+    /// Retains only the operands the predicate accepts.
+    ///
+    /// Takes the whole operand rather than its predecessor: an exceptional
+    /// operand and a normal one can name the same block and mean different
+    /// things, so a rule stated over block indices alone cannot separate them.
+    pub fn retain_operands<F: Fn(&PhiOperand) -> bool>(&mut self, pred: F) {
+        self.operands.retain(|op| pred(op));
     }
 
     /// Sets the origin of this phi node.
@@ -347,6 +493,60 @@ impl PhiNode {
     /// after unused locals are removed.
     pub fn set_origin(&mut self, origin: VariableOrigin) {
         self.origin = origin;
+    }
+
+    /// Replaces `old` with `new` in the operands of kind `edge` naming
+    /// `predecessor`.
+    ///
+    /// Only operands that name that edge, that kind and that value change:
+    /// unlike [`Self::set_operand`], this never adds an operand and never
+    /// rewrites an operand carrying some other value on the same edge. The
+    /// kind is the caller's to state, because a block can owe a phi both: the
+    /// value it hands over when its terminator transfers here, and the values
+    /// a throw in it may bring. A substitution that reached only the first
+    /// would leave the handler reading a value whose definition the caller
+    /// then removes.
+    ///
+    /// An exceptional operand is keyed by its value as well as its block
+    /// ([`Self::add_exceptional_operand`]), so where the block already lists
+    /// `new` the operand naming `old` is dropped rather than rewritten into a
+    /// second copy of the same claim.
+    ///
+    /// # Arguments
+    ///
+    /// * `predecessor` - The block whose operands are rewritten.
+    /// * `edge` - Which of that block's operands: the transfer's, or a throw's.
+    /// * `old` - The value being replaced.
+    /// * `new` - The value substituted for it.
+    ///
+    /// # Returns
+    ///
+    /// How many operands now name `new` instead, and how many were dropped
+    /// because one naming `new` was already there.
+    pub fn replace_operand_value(
+        &mut self,
+        predecessor: usize,
+        edge: PhiEdge,
+        old: SsaVarId,
+        new: SsaVarId,
+    ) -> OperandReplacement {
+        let names = |operand: &PhiOperand, value: SsaVarId| {
+            operand.edge == edge && operand.predecessor() == predecessor && operand.value == value
+        };
+        let mut replacement = OperandReplacement::default();
+        if edge == PhiEdge::Exceptional && self.operands.iter().any(|operand| names(operand, new)) {
+            let before = self.operands.len();
+            self.operands.retain(|operand| !names(operand, old));
+            replacement.merged = before.saturating_sub(self.operands.len());
+            return replacement;
+        }
+        for operand in &mut self.operands {
+            if names(operand, old) {
+                operand.value = new;
+                replacement.rewritten = replacement.rewritten.saturating_add(1);
+            }
+        }
+        replacement
     }
 
     /// Sets the operand value for a specific predecessor.
@@ -362,7 +562,7 @@ impl PhiNode {
         if let Some(existing) = self
             .operands
             .iter_mut()
-            .find(|op| op.predecessor() == predecessor)
+            .find(|op| !op.is_exceptional() && op.predecessor() == predecessor)
         {
             existing.value = value;
         } else {
@@ -388,6 +588,85 @@ impl fmt::Display for PhiNode {
 mod tests {
     use super::*;
 
+    /// **A replacement names the kind of operand it rewrites.** A block owes
+    /// the phi the value its transfer hands over and the values a throw in it
+    /// may bring; rewriting one leaves the other. An exceptional operand
+    /// replaced by a value the block already lists for a throw merges into it.
+    #[test]
+    fn a_replacement_names_the_kind_of_operand_it_rewrites() {
+        let (result, old, new) = (
+            SsaVarId::from_index(0),
+            SsaVarId::from_index(1),
+            SsaVarId::from_index(2),
+        );
+        let phi = || {
+            let mut phi = PhiNode::new(result, VariableOrigin::Local(0));
+            phi.add_operand(PhiOperand::new(old, 1));
+            phi.add_exceptional_operand(1, old);
+            phi
+        };
+        let operands = |phi: &PhiNode| {
+            phi.operands()
+                .iter()
+                .map(|operand| (operand.edge(), operand.value()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut normal = phi();
+        let done = normal.replace_operand_value(1, PhiEdge::Normal, old, new);
+        assert_eq!((done.rewritten, done.merged), (1, 0));
+        assert_eq!(
+            operands(&normal),
+            vec![(PhiEdge::Normal, new), (PhiEdge::Exceptional, old)]
+        );
+
+        let mut thrown = phi();
+        let done = thrown.replace_operand_value(1, PhiEdge::Exceptional, old, new);
+        assert_eq!((done.rewritten, done.merged), (1, 0));
+        assert_eq!(
+            operands(&thrown),
+            vec![(PhiEdge::Normal, old), (PhiEdge::Exceptional, new)]
+        );
+
+        let mut merged = phi();
+        merged.add_exceptional_operand(1, new);
+        let done = merged.replace_operand_value(1, PhiEdge::Exceptional, old, new);
+        assert_eq!((done.rewritten, done.merged), (0, 1));
+        assert_eq!(
+            operands(&merged),
+            vec![(PhiEdge::Normal, old), (PhiEdge::Exceptional, new)]
+        );
+    }
+
+    /// A phi operand round-trips the value and predecessor it was built with.
+    /// **A block's operands are of either kind.** A block that hands the phi
+    /// a value at its terminator and another at a throw names two operands;
+    /// [`PhiNode::operand_from`] answers the terminator's alone.
+    #[test]
+    fn a_block_names_operands_of_either_kind() {
+        let (result, handed, thrown) = (
+            SsaVarId::from_index(0),
+            SsaVarId::from_index(1),
+            SsaVarId::from_index(2),
+        );
+        let mut phi = PhiNode::new(result, VariableOrigin::Local(0));
+        phi.add_operand(PhiOperand::new(handed, 1));
+        phi.add_exceptional_operand(1, thrown);
+        phi.add_operand(PhiOperand::new(handed, 2));
+        let from = |block| {
+            phi.operands_from(block)
+                .map(|operand| (operand.edge(), operand.value()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            from(1),
+            vec![(PhiEdge::Normal, handed), (PhiEdge::Exceptional, thrown)]
+        );
+        assert_eq!(from(2), vec![(PhiEdge::Normal, handed)]);
+        assert!(from(3).is_empty());
+        assert_eq!(phi.operand_from(1).map(PhiOperand::value), Some(handed));
+    }
+
     #[test]
     fn test_phi_operand_creation() {
         let v = SsaVarId::from_index(0);
@@ -396,12 +675,14 @@ mod tests {
         assert_eq!(operand.predecessor(), 2);
     }
 
+    /// A phi operand renders as `<value> from B<predecessor>`.
     #[test]
     fn test_phi_operand_display() {
         let operand = PhiOperand::new(SsaVarId::from_index(3), 1);
         assert_eq!(format!("{operand}"), "v3 from B1");
     }
 
+    /// A freshly created phi carries its result and origin and starts empty.
     #[test]
     fn test_phi_node_creation() {
         let result = SsaVarId::from_index(0);
@@ -412,6 +693,8 @@ mod tests {
         assert_eq!(phi.operand_count(), 0);
     }
 
+    /// Pre-allocating operand capacity does not add operands: the phi is still
+    /// empty and reports its result and origin.
     #[test]
     fn test_phi_node_with_capacity() {
         let result = SsaVarId::from_index(0);
@@ -421,6 +704,8 @@ mod tests {
         assert!(phi.is_empty());
     }
 
+    /// Added operands are appended in order, each preserving its value and
+    /// predecessor.
     #[test]
     fn test_phi_node_add_operands() {
         let result = SsaVarId::from_index(0);
@@ -441,6 +726,8 @@ mod tests {
         assert_eq!(ops[1].predecessor(), 1);
     }
 
+    /// `operand_from` returns the operand on a matching predecessor edge and
+    /// `None` for edges the phi has no operand on.
     #[test]
     fn test_phi_node_operand_from() {
         let result = SsaVarId::from_index(0);
@@ -460,6 +747,7 @@ mod tests {
         assert!(phi.operand_from(99).is_none());
     }
 
+    /// `set_operand` on an unseen predecessor adds a fresh operand.
     #[test]
     fn test_phi_node_set_operand_new() {
         let result = SsaVarId::from_index(0);
@@ -471,6 +759,8 @@ mod tests {
         assert_eq!(phi.operand_from(1).unwrap().value(), v10);
     }
 
+    /// `set_operand` on an existing predecessor updates its value in place
+    /// rather than adding a duplicate operand.
     #[test]
     fn test_phi_node_set_operand_update() {
         let result = SsaVarId::from_index(0);
@@ -485,6 +775,7 @@ mod tests {
         assert_eq!(phi.operand_from(1).unwrap().value(), v20);
     }
 
+    /// `used_variables` yields every operand's value variable.
     #[test]
     fn test_phi_node_used_variables() {
         let result = SsaVarId::from_index(0);
@@ -503,6 +794,7 @@ mod tests {
         assert!(used.contains(&v3));
     }
 
+    /// A multi-operand phi renders as `<result> = phi(<op>, <op>)`.
     #[test]
     fn test_phi_node_display() {
         let mut phi = PhiNode::new(SsaVarId::from_index(5), VariableOrigin::Local(0));
@@ -513,12 +805,14 @@ mod tests {
         assert_eq!(display, "v5 = phi(v1 from B0, v2 from B1)");
     }
 
+    /// An operand-less phi renders with empty parentheses.
     #[test]
     fn test_phi_node_display_empty() {
         let phi = PhiNode::new(SsaVarId::from_index(3), VariableOrigin::Local(0));
         assert_eq!(format!("{phi}"), "v3 = phi()");
     }
 
+    /// A single-operand phi renders without an operand separator.
     #[test]
     fn test_phi_node_display_single_operand() {
         let mut phi = PhiNode::new(SsaVarId::from_index(7), VariableOrigin::Local(0));

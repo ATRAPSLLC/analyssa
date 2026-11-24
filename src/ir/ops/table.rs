@@ -1,7 +1,7 @@
 //! The machine-checkable contract every operation-kind enum shares.
 //!
-//! The taxonomy in [`kinds`](super::kinds), [`native`](super::native) and
-//! [`vector`](super::vector) is a family of small enums that each name one
+//! The taxonomy in [`kinds`](crate::ir::ops::kinds), [`native`](crate::ir::ops::native) and
+//! [`vector`](crate::ir::ops::vector) is a family of small enums that each name one
 //! native operation per variant. Three things must hold of every one of them,
 //! and each is checked mechanically rather than asserted in prose:
 //!
@@ -10,7 +10,7 @@
 //!   stale the moment a variant is added.
 //! - **Injective spelling.** [`OpKindTable::kind_str`] is injective over that
 //!   domain, and [`OpKindTable::mnemonic`] is injective over the *union* of
-//!   every table. [`SsaOp::opcode_name`](super::SsaOp::opcode_name) is one flat
+//!   every table. [`SsaOp::opcode_name`](crate::ir::ops::SsaOp::opcode_name) is one flat
 //!   namespace, so two tables spelling one instruction two ways is the same
 //!   defect as one table spelling two instructions the same way.
 //! - **A pinned size.** [`OpKindTable::COUNT`] is asserted against
@@ -33,21 +33,17 @@
 //! # Open hole
 //!
 //! Nothing at the type level forces a *newly added* kind enum to implement
-//! this trait at all — Rust cannot express that without a proc macro or
+//! this trait at all - Rust cannot express that without a proc macro or
 //! link-time registration. Registration in `all_tables` is by hand, and the
 //! closest available forcing function is a renderer bounded on `OpKindTable`.
 //! Recorded here rather than claimed closed.
 
 use std::{fmt, marker::PhantomData};
 
-use crate::ir::ops::{
-    kinds::{
-        BarrierOp, BcdAdjustKind, BreakpointOp, CacheMaintenanceOp, HardwareEngineOp, HintOp,
-        HypervisorOp, InterruptReturnOp, MachineStateOp, PacKind, SysRegOp, SystemTransactionKind,
-        TlbMaintenanceOp, TrapOp,
-    },
-    native::BlockStringKind,
-    vector::FlagAdjustKind,
+use crate::ir::ops::kinds::{
+    BarrierOp, BcdAdjustKind, BreakpointOp, CacheMaintenanceOp, CarrylessPart, CrcPolynomial,
+    HardwareEngineOp, HintOp, HypervisorOp, InterruptReturnOp, MachineStateOp, MemoryTagKind,
+    PacKind, ScalarCipherKind, SysRegOp, SystemTransactionKind, TlbMaintenanceOp, TrapOp,
 };
 
 /// The contract shared by every operation-kind enum in the taxonomy.
@@ -72,8 +68,8 @@ pub trait OpKindTable: Copy + Eq + fmt::Debug + 'static {
 
     /// Returns the stable display / fingerprint key for this variant.
     ///
-    /// Injective over the enum, and — with every other table's keys — over the
-    /// union, because [`SsaOp::opcode_name`](super::SsaOp::opcode_name) hands
+    /// Injective over the enum, and - with every other table's keys - over the
+    /// union, because [`SsaOp::opcode_name`](crate::ir::ops::SsaOp::opcode_name) hands
     /// them all to one namespace.
     fn kind_str(self) -> &'static str;
 
@@ -175,37 +171,39 @@ macro_rules! op_kind_table {
 }
 
 op_kind_table!(CacheMaintenanceOp, 11, with_mnemonic);
-op_kind_table!(TlbMaintenanceOp, 10, with_mnemonic);
-op_kind_table!(BarrierOp, 3, with_mnemonic);
-op_kind_table!(HypervisorOp, 20, with_mnemonic);
+op_kind_table!(TlbMaintenanceOp, 17, with_mnemonic);
+op_kind_table!(BarrierOp, 8, with_mnemonic);
+op_kind_table!(HypervisorOp, 21, with_mnemonic);
 op_kind_table!(HardwareEngineOp, 12, with_mnemonic);
-op_kind_table!(InterruptReturnOp, 5, with_mnemonic);
-op_kind_table!(BreakpointOp, 3, with_mnemonic);
-op_kind_table!(TrapOp, 9, with_mnemonic);
-op_kind_table!(SysRegOp, 28, with_mnemonic);
-op_kind_table!(HintOp, 19, with_mnemonic);
-op_kind_table!(MachineStateOp, 140, with_mnemonic);
+op_kind_table!(InterruptReturnOp, 7, with_mnemonic);
+op_kind_table!(BreakpointOp, 4, with_mnemonic);
+op_kind_table!(TrapOp, 15, with_mnemonic);
+op_kind_table!(SysRegOp, 20, with_mnemonic);
+op_kind_table!(HintOp, 21, with_mnemonic);
+op_kind_table!(MachineStateOp, 158, with_mnemonic);
 op_kind_table!(SystemTransactionKind, 6, with_mnemonic);
-op_kind_table!(PacKind, 4, with_mnemonic);
-op_kind_table!(FlagAdjustKind, 17, with_mnemonic);
+op_kind_table!(PacKind, 6, with_mnemonic);
+op_kind_table!(CarrylessPart, 4, with_mnemonic);
+op_kind_table!(MemoryTagKind, 2, with_mnemonic);
+op_kind_table!(CrcPolynomial, 2, with_mnemonic);
+op_kind_table!(ScalarCipherKind, 13, with_mnemonic);
 op_kind_table!(BcdAdjustKind, 6);
-op_kind_table!(BlockStringKind, 3);
 
 /// One registered table, flattened so the cross-table checks can hold every
 /// table at once without being generic.
 #[cfg(test)]
 #[derive(Debug, Clone)]
-pub(crate) struct TableInfo {
+struct TableInfo {
     /// The enum's name, for diagnostics.
-    pub(crate) name: &'static str,
+    name: &'static str,
     /// The declared variant count.
-    pub(crate) count: u16,
-    /// Whether `from_index(COUNT - 1)` resolves — half of the count pin.
-    pub(crate) last_index_resolves: bool,
-    /// Whether `from_index(COUNT)` resolves — it must not.
-    pub(crate) count_index_resolves: bool,
+    count: u16,
+    /// Whether `from_index(COUNT - 1)` resolves - half of the count pin.
+    last_index_resolves: bool,
+    /// Whether `from_index(COUNT)` resolves - it must not.
+    count_index_resolves: bool,
     /// Every variant's `kind_str` and optional `mnemonic`, in order.
-    pub(crate) entries: Vec<(&'static str, Option<&'static str>)>,
+    entries: Vec<(&'static str, Option<&'static str>)>,
 }
 
 /// Flattens one table into a [`TableInfo`].
@@ -227,10 +225,10 @@ fn table_info<K: OpKindTable>() -> TableInfo {
 /// Returns every registered operation-kind table.
 ///
 /// The one place the registry lives, so a cross-table check is written once
-/// rather than once per enum. Adding an enum here is by hand — see the module
+/// rather than once per enum. Adding an enum here is by hand - see the module
 /// doc's open hole.
 #[cfg(test)]
-pub(crate) fn all_tables() -> Vec<TableInfo> {
+fn all_tables() -> Vec<TableInfo> {
     vec![
         table_info::<CacheMaintenanceOp>(),
         table_info::<TlbMaintenanceOp>(),
@@ -245,8 +243,138 @@ pub(crate) fn all_tables() -> Vec<TableInfo> {
         table_info::<MachineStateOp>(),
         table_info::<SystemTransactionKind>(),
         table_info::<PacKind>(),
-        table_info::<FlagAdjustKind>(),
+        table_info::<CarrylessPart>(),
+        table_info::<MemoryTagKind>(),
+        table_info::<CrcPolynomial>(),
+        table_info::<ScalarCipherKind>(),
         table_info::<BcdAdjustKind>(),
-        table_info::<BlockStringKind>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::ir::ops::{Kernel, kinds::SystemOpKind};
+
+    /// Per table: the count pin, injective spellings, and the lowercase-literal
+    /// precondition `coarse_token` now relies on.
+    ///
+    /// The count is the forcing function. A variant added without bumping `COUNT`
+    /// leaves `from_index(COUNT)` resolving, which fails here - so growing a table
+    /// is a deliberate two-line edit rather than a silent one that leaves every
+    /// registry-wide check quantifying over less than the whole domain.
+    #[test]
+    fn every_op_kind_table_has_unique_strings_and_a_pinned_count() {
+        for table in all_tables() {
+            assert!(
+                table.last_index_resolves,
+                "{}: COUNT is {}, but index {} resolves to nothing - the count is too high",
+                table.name,
+                table.count,
+                table.count.saturating_sub(1),
+            );
+            assert!(
+                !table.count_index_resolves,
+                "{}: index {} resolves, so the enum has more variants than COUNT claims",
+                table.name, table.count,
+            );
+            assert_eq!(
+                table.entries.len(),
+                usize::from(table.count),
+                "{}: iteration yielded a different number of variants than COUNT",
+                table.name,
+            );
+
+            let mut kind_strs = BTreeSet::new();
+            let mut mnemonics = BTreeSet::new();
+            for (kind_str, mnemonic) in &table.entries {
+                assert!(
+                    kind_strs.insert(*kind_str),
+                    "{}: kind_str {kind_str:?} names two variants",
+                    table.name,
+                );
+                assert_eq!(
+                    *kind_str,
+                    kind_str.trim().to_ascii_lowercase(),
+                    "{}: kind_str {kind_str:?} is not already trimmed and lowercase, so \
+                     `coarse_token` cannot skip normalizing it",
+                    table.name,
+                );
+                if let Some(mnemonic) = mnemonic {
+                    assert!(
+                        mnemonics.insert(*mnemonic),
+                        "{}: mnemonic {mnemonic:?} names two variants",
+                        table.name,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One instruction, one home - checked as a multiset over every registered
+    /// table at once, because `SsaOp::opcode_name` is one flat namespace.
+    ///
+    /// A per-table check cannot see the defect this exists for: two tables can each
+    /// be internally consistent and still name one instruction between them, with
+    /// contradictory effects, so which spelling a front-end picks decides what the
+    /// operation means. The `kind_str` half additionally spans both composites'
+    /// `identities()`, since those are the values that reach `opcode_name`.
+    #[test]
+    fn no_native_mnemonic_has_two_homes() {
+        let mut mnemonic_homes: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+        let mut kind_str_homes: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+
+        for table in all_tables() {
+            for (kind_str, mnemonic) in &table.entries {
+                if let Some(mnemonic) = mnemonic {
+                    mnemonic_homes.entry(mnemonic).or_default().push(table.name);
+                }
+                kind_str_homes
+                    .entry(kind_str)
+                    .or_default()
+                    .push(table.name.to_owned());
+            }
+        }
+        for kind in SystemOpKind::identities() {
+            kind_str_homes
+                .entry(kind.kind_str())
+                .or_default()
+                .push(format!("SystemOpKind::{kind:?}"));
+        }
+        for kind in Kernel::identities() {
+            kind_str_homes
+                .entry(kind.kind_str())
+                .or_default()
+                .push(format!("Kernel::{kind:?}"));
+        }
+
+        // A payload table and the composite carrying it legitimately report the
+        // same key: that is delegation, not a second home. Two *tables*, or two
+        // identities of one composite, are not.
+        let duplicate_mnemonics: Vec<String> = mnemonic_homes
+            .iter()
+            .filter(|(_, homes)| homes.len() > 1)
+            .map(|(mnemonic, homes)| format!("{mnemonic} <- {}", homes.join(", ")))
+            .collect();
+        assert!(
+            duplicate_mnemonics.is_empty(),
+            "{} mnemonic(s) with more than one home:\n{}",
+            duplicate_mnemonics.len(),
+            duplicate_mnemonics.join("\n"),
+        );
+
+        let duplicate_keys: Vec<String> = kind_str_homes
+            .iter()
+            .filter(|(_, homes)| homes.len() > 2)
+            .map(|(key, homes)| format!("{key} <- {}", homes.join(", ")))
+            .collect();
+        assert!(
+            duplicate_keys.is_empty(),
+            "{} kind_str key(s) reachable from more than one table plus its carrier:\n{}",
+            duplicate_keys.len(),
+            duplicate_keys.join("\n"),
+        );
+    }
 }

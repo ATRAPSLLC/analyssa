@@ -1,5 +1,5 @@
-//! Native machine-state modeling — block-string streams, wide compare-exchange,
-//! and condition-flag semantics — plus the structural binary / unary operation
+//! Native machine-state modeling - block-string streams, wide compare-exchange,
+//! and condition-flag semantics - plus the structural binary / unary operation
 //! views used by generic passes.
 //!
 //! State an operation touches is named by the operation: registers it writes
@@ -8,140 +8,25 @@
 //! [`SsaEffectKind::Opaque`], which is what
 //! actually constrains motion and elimination.
 //!
-//! [`SsaEffectKind::Opaque`]: super::SsaEffectKind::Opaque
+//! [`SsaEffectKind::Opaque`]: crate::ir::ops::SsaEffectKind::Opaque
 
 use std::fmt;
 
-use crate::ir::{
-    ops::{
-        effects::{SsaEffectKind, SsaEffects},
-        kinds::{AtomicRmwOp, NativeInstructionMetadata},
-        operands::impl_kinded_payload,
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    encoder::{ContentWriter, Emit},
+    ir::{
+        content::ContentSink,
+        ops::kinds::{AtomicRmwOp, CmpKind},
+        variable::SsaVarId,
     },
-    variable::SsaVarId,
+    target::Target,
 };
 
-/// Structured identity of a typed native **block-string** operation
-/// ([`SsaOp::BlockString`]) — the first-class replacement for the
-/// `rep`-prefixed compare / scan / load string streams formerly carried
-/// opaquely by `NativeOpaque`. (`rep movs`/`rep stos` already lower to the
-/// structured `CopyBlk`/`InitBlk` ops and are not represented here.) The kind
-/// drives a precise effect summary and a distinct similarity class.
-///
-/// [`SsaOp::BlockString`]: crate::ir::ops::def::SsaOp::BlockString
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[repr(u16)]
-#[derive(num_enum::IntoPrimitive, num_enum::TryFromPrimitive)]
-pub enum BlockStringKind {
-    /// `rep`/`repe`/`repne cmps*` — streamed element compare (reads two
-    /// buffers, sets flags). Reads and writes machine state (counter/pointers).
-    Compare,
-    /// `rep`/`repe`/`repne scas*` — streamed scan of one buffer against the
-    /// accumulator (reads a buffer, sets flags).
-    Scan,
-    /// `rep lods*` — streamed load of successive elements into the accumulator
-    /// (reads a buffer, no flag effect).
-    Load,
-}
-
-impl BlockStringKind {
-    /// Precise effect summary — `Read` for the load stream (`lods`), `ReadWrite`
-    /// for the compare / scan streams (they advance counter/pointers and set
-    /// flags). Never opaque.
-    #[must_use]
-    pub const fn effects(self) -> SsaEffects {
-        match self {
-            Self::Load => SsaEffects::new(SsaEffectKind::Read, false),
-            Self::Compare | Self::Scan => SsaEffects::new(SsaEffectKind::ReadWrite, false),
-        }
-    }
-
-    /// Stable display / fingerprint key for this block-string op (used by
-    /// [`SsaOp::opcode_name`]).
-    ///
-    /// [`SsaOp::opcode_name`]: crate::ir::ops::def::SsaOp::opcode_name
-    #[must_use]
-    pub const fn kind_str(self) -> &'static str {
-        match self {
-            Self::Compare => "blockstring.cmps",
-            Self::Scan => "blockstring.scas",
-            Self::Load => "blockstring.lods",
-        }
-    }
-}
-
-/// Repeat-prefix variant carried by a [`BlockStringOpData`] — preserves the
-/// exact `rep` / `repe` / `repne` semantics (the loop-termination condition) so
-/// the host can faithfully reconstruct the native mnemonic without re-decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum BlockStringPrefix {
-    /// `rep` — repeat `rcx` times unconditionally (used by `lods`).
-    Repeat,
-    /// `repe` / `repz` — repeat while equal (ZF=1) and `rcx != 0`.
-    RepeatEqual,
-    /// `repne` / `repnz` — repeat while not equal (ZF=0) and `rcx != 0`.
-    RepeatNotEqual,
-}
-
-/// Boxed payload for [`SsaOp::BlockString`]. Mirrors the native-op operand
-/// shape — explicit SSA inputs/outputs (advanced counter/pointers, loaded
-/// accumulator) and optional source provenance — with the effect summary and
-/// similarity class derived from the [`BlockStringKind`] rather than from an
-/// echoed opaque blob. Carries the repeat prefix and element width so the
-/// native mnemonic round-trips losslessly.
-///
-/// [`SsaOp::BlockString`]: crate::ir::ops::def::SsaOp::BlockString
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct BlockStringOpData {
-    /// Structured identity of the operation.
-    pub kind: BlockStringKind,
-    /// Repeat-prefix variant (`rep` / `repe` / `repne`).
-    pub prefix: BlockStringPrefix,
-    /// Element width streamed by the operation, in bits (8/16/32/64).
-    pub element_bits: u16,
-    /// Human-readable native mnemonic, for display / provenance only.
-    pub mnemonic: String,
-    /// Original native instruction metadata when known.
-    pub metadata: Option<NativeInstructionMetadata>,
-    /// Explicit SSA outputs defined by the operation (advanced counter /
-    /// pointers / accumulator).
-    pub outputs: Vec<SsaVarId>,
-    /// Explicit SSA inputs used by the operation (buffer addresses, count).
-    pub inputs: Vec<SsaVarId>,
-    /// `true` when the operation proceeds from high to low addresses (x86 `rep
-    /// cmps`/`scas`/`lods` with the direction flag set); `false` is forward.
-    pub reverse: bool,
-}
-
-/// Boxed payload for [`SsaOp::WideCompareExchange`] — the double-width
-/// compare-and-swap (`cmpxchg8b` / `cmpxchg16b`) that cannot be expressed as a
-/// single-width [`SsaOp::CmpXchg`] (which is fixed-width and pointer-typed).
-/// The first-class typed replacement for the wide-CAS case of `NativeOpaque`:
-/// it carries explicit `EDX:EAX`-vs-memory expected / `ECX:EBX` desired inputs
-/// and `EDX:EAX` readback outputs, with a precise sequentially-consistent
-/// atomic effect (never opaque).
-///
-/// [`SsaOp::WideCompareExchange`]: crate::ir::ops::def::SsaOp::WideCompareExchange
-/// [`SsaOp::CmpXchg`]: crate::ir::ops::def::SsaOp::CmpXchg
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct WideCmpXchgData {
-    /// `true` for the 128-bit `cmpxchg16b`; `false` for the 64-bit `cmpxchg8b`.
-    pub wide: bool,
-    /// Human-readable native mnemonic, for display / provenance only.
-    pub mnemonic: String,
-    /// Original native instruction metadata when known.
-    pub metadata: Option<NativeInstructionMetadata>,
-    /// Explicit SSA outputs (the `EDX:EAX` / `RDX:RAX` readback halves).
-    pub outputs: Vec<SsaVarId>,
-    /// Explicit SSA inputs (memory address, expected low/high, desired low/high).
-    pub inputs: Vec<SsaVarId>,
-}
-
 impl fmt::Display for AtomicRmwOp {
+    /// Writes the lowercase mnemonic for this atomic read-modify-write kind.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Xchg => write!(f, "xchg"),
@@ -155,13 +40,19 @@ impl fmt::Display for AtomicRmwOp {
             Self::AndNot => write!(f, "andnot"),
             Self::MinU => write!(f, "minu"),
             Self::MaxU => write!(f, "maxu"),
+            Self::Neg => write!(f, "neg"),
+            Self::FAdd => write!(f, "fadd"),
+            Self::FMax => write!(f, "fmax"),
+            Self::FMin => write!(f, "fmin"),
+            Self::FMaxNum => write!(f, "fmaxnm"),
+            Self::FMinNum => write!(f, "fminnm"),
         }
     }
 }
 
 /// Bitmask for selecting flag bits from a flags-defining operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FlagsMask(u16);
 
 impl FlagsMask {
@@ -192,7 +83,7 @@ impl FlagsMask {
     /// [`Display`](fmt::Display) impl are all derived from. A bit added here
     /// becomes valid, printable and round-trippable in one edit; a bit added as
     /// a bare constant and not listed here stays *undefined*, which the
-    /// verifier and the block builder both reject — so the table is the
+    /// verifier and the block builder both reject - so the table is the
     /// definition of the mask, not a copy of it.
     pub const NAMED: &'static [(Self, &'static str)] = &[
         (Self::CARRY, "CF"),
@@ -232,7 +123,7 @@ impl FlagsMask {
 
     /// Creates a flag mask from raw bits, rejecting undefined ones.
     ///
-    /// `None` when `bits` names a flag this crate does not model — which is a
+    /// `None` when `bits` names a flag this crate does not model - which is a
     /// diagnosable input error, not a mask with fewer bits.
     #[must_use]
     pub const fn from_bits_checked(bits: u16) -> Option<Self> {
@@ -278,6 +169,24 @@ impl FlagsMask {
         Self(self.0 | other.0)
     }
 
+    /// Returns the bits both masks select.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// Returns the bits this mask selects and `other` does not.
+    #[must_use]
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Returns `true` when the mask selects exactly one flag.
+    #[must_use]
+    pub const fn is_single_bit(self) -> bool {
+        self.0.count_ones() == 1
+    }
+
     /// Returns the x86/x64 arithmetic status flags.
     pub const fn x86_status() -> Self {
         Self(
@@ -312,7 +221,7 @@ impl fmt::Display for FlagsMask {
     ///
     /// Bits outside [`FlagsMask::NAMED`] are appended as `?0x…` rather than
     /// dropped, so an invalid mask cannot render as `none` or as a truncated
-    /// but plausible-looking list — the two spellings that would make a
+    /// but plausible-looking list - the two spellings that would make a
     /// malformed mask read as a well-formed one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
@@ -342,7 +251,7 @@ impl fmt::Display for FlagsMask {
 
 /// Target-independent status flag bit used by native flag semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum NativeFlagBit {
     /// Carry or borrow flag, such as x86 `CF` or AArch64 `C`.
     Carry,
@@ -356,7 +265,7 @@ pub enum NativeFlagBit {
     Sign,
     /// Signed overflow flag, such as x86 `OF` or AArch64 `V`.
     Overflow,
-    /// String-direction control flag (x86 `DF`) — selects whether the string
+    /// String-direction control flag (x86 `DF`) - selects whether the string
     /// operations advance or retreat. Not a status flag.
     Direction,
     /// Interrupt-enable control flag (x86 `IF`).
@@ -367,7 +276,7 @@ pub enum NativeFlagBit {
 
 /// Describes how an instruction writes one native status flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum FlagWriteState {
     /// The flag receives a defined value from the instruction semantics.
     Defined,
@@ -381,7 +290,7 @@ pub enum FlagWriteState {
 
 /// One native flag write performed by an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FlagWrite {
     /// Flag bit affected by the instruction.
     pub bit: NativeFlagBit,
@@ -473,7 +382,7 @@ const AARCH64_LOGICAL_WRITES: &[FlagWrite] = &[
 
 /// Canonical native flag producer semantics for common instruction families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum FlagProducerSemantics {
     /// x86/x64 add, adc, sub, sbb, cmp, inc, and dec style arithmetic flags.
     X86Arithmetic,
@@ -506,6 +415,12 @@ impl FlagProducerSemantics {
     }
 
     /// Returns the set of flags whose value is defined after this producer.
+    ///
+    /// Both `Defined` and `Cleared` writes count: a cleared flag holds a known
+    /// value (zero), so a later condition-code read can rely on it exactly as
+    /// on a computed one. `Undefined` writes (no reliable value) and
+    /// `Preserved` flags (untouched by this producer, so not defined *by it*)
+    /// are excluded.
     #[must_use]
     pub fn defined_mask(self) -> FlagsMask {
         let mut mask = FlagsMask::from_bits(0);
@@ -523,7 +438,7 @@ impl FlagProducerSemantics {
 
 /// Condition code for flag-based branch operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum FlagCondition {
     /// Tests whether carry is set.
     Carry,
@@ -547,7 +462,80 @@ pub enum FlagCondition {
     ParityOdd,
 }
 
+impl FlagCondition {
+    /// Returns the condition that holds exactly when this one does not.
+    ///
+    /// Every variant is one half of a pair testing a single flag bit set or
+    /// clear, so the complement is total and exact - and exact *whatever set the
+    /// flags*, because a bit is either set or it is not. That is what separates
+    /// this from [`CmpKind::negated`](crate::ir::ops::kinds::CmpKind::negated),
+    /// whose ordered relations stop partitioning once a NaN is involved: an
+    /// unordered float compare still leaves `ZF` in one definite state, and
+    /// `Zero`/`NotZero` still partition on it.
+    #[must_use]
+    pub const fn negated(self) -> Self {
+        match self {
+            Self::Carry => Self::NotCarry,
+            Self::NotCarry => Self::Carry,
+            Self::Zero => Self::NotZero,
+            Self::NotZero => Self::Zero,
+            Self::Overflow => Self::NotOverflow,
+            Self::NotOverflow => Self::Overflow,
+            Self::Negative => Self::Positive,
+            Self::Positive => Self::Negative,
+            Self::ParityEven => Self::ParityOdd,
+            Self::ParityOdd => Self::ParityEven,
+        }
+    }
+
+    /// The relation to zero this condition states about the value the flags
+    /// describe, when it states one.
+    ///
+    /// Flags describe a value - the result of the arithmetic that set them -
+    /// and four of the conditions say which side of zero that value is on. The
+    /// pair is `(comparison, whether the value is the comparison's left
+    /// operand)`, which is what decides the direction of an asymmetric
+    /// relation.
+    ///
+    /// `None` for the conditions that say nothing an interval can hold: carry,
+    /// overflow and parity are facts about how the arithmetic *ran*, not about
+    /// the magnitude of what it produced.
+    ///
+    /// # Returns
+    ///
+    /// `Some((cmp, value_is_left))` for the sign and zero tests, `None`
+    /// otherwise.
+    #[must_use]
+    pub const fn as_relation_to_zero(self) -> Option<(CmpKind, bool)> {
+        match self {
+            Self::Zero => Some((CmpKind::Eq, true)),
+            Self::NotZero => Some((CmpKind::Ne, true)),
+            Self::Negative => Some((CmpKind::Lt, true)),
+            Self::Positive => Some((CmpKind::Ge, true)),
+            Self::Carry
+            | Self::NotCarry
+            | Self::Overflow
+            | Self::NotOverflow
+            | Self::ParityEven
+            | Self::ParityOdd => None,
+        }
+    }
+
+    /// Returns the status flags required to evaluate this condition.
+    #[must_use]
+    pub const fn required_flags(self) -> FlagsMask {
+        match self {
+            Self::Carry | Self::NotCarry => FlagsMask::CARRY,
+            Self::Zero | Self::NotZero => FlagsMask::ZERO,
+            Self::Overflow | Self::NotOverflow => FlagsMask::OVERFLOW,
+            Self::Negative | Self::Positive => FlagsMask::SIGN,
+            Self::ParityEven | Self::ParityOdd => FlagsMask::PARITY,
+        }
+    }
+}
+
 impl fmt::Display for FlagCondition {
+    /// Writes the snake_case name of this branch condition.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Carry => write!(f, "carry"),
@@ -564,16 +552,35 @@ impl fmt::Display for FlagCondition {
     }
 }
 
-impl FlagCondition {
-    /// Returns the status flags required to evaluate this condition.
-    #[must_use]
-    pub const fn required_flags(self) -> FlagsMask {
+/// What a conditional operation tests of the comparison `left - right`: a
+/// relation of the two values, or one flag of their difference (x86
+/// `cmp<cc>xadd` names its condition by the flags of that subtraction, sign,
+/// overflow and parity among them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CompareCondition {
+    /// The relation `left cmp right`, with the operands unsigned or signed.
+    Relation {
+        /// The relation.
+        cmp: CmpKind,
+        /// Whether the operands are read unsigned.
+        unsigned: bool,
+    },
+    /// One flag of `left - right`.
+    Flag(FlagCondition),
+}
+
+impl fmt::Display for CompareCondition {
+    /// Writes the relation's mnemonic, `u`-prefixed when unsigned, or the
+    /// flag's name.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Carry | Self::NotCarry => FlagsMask::CARRY,
-            Self::Zero | Self::NotZero => FlagsMask::ZERO,
-            Self::Overflow | Self::NotOverflow => FlagsMask::OVERFLOW,
-            Self::Negative | Self::Positive => FlagsMask::SIGN,
-            Self::ParityEven | Self::ParityOdd => FlagsMask::PARITY,
+            Self::Relation {
+                cmp,
+                unsigned: true,
+            } => write!(f, "u{}", cmp.as_str()),
+            Self::Relation { cmp, .. } => write!(f, "{}", cmp.as_str()),
+            Self::Flag(flag) => write!(f, "{flag}"),
         }
     }
 }
@@ -583,7 +590,7 @@ impl FlagCondition {
 /// This enum categorizes all binary operations in `SsaOp` for uniform
 /// handling in optimization passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum BinaryOpKind {
     /// Addition: `left + right`
     Add,
@@ -621,13 +628,10 @@ pub enum BinaryOpKind {
     Rol,
     /// Rotate right
     Ror,
-    /// Rotate through carry left
-    Rcl,
-    /// Rotate through carry right.
-    Rcr,
 }
 
 impl fmt::Display for BinaryOpKind {
+    /// Writes the short mnemonic for this binary operation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Add => write!(f, "add"),
@@ -648,8 +652,6 @@ impl fmt::Display for BinaryOpKind {
             Self::Cgt => write!(f, "cgt"),
             Self::Rol => write!(f, "rol"),
             Self::Ror => write!(f, "ror"),
-            Self::Rcl => write!(f, "rcl"),
-            Self::Rcr => write!(f, "rcr"),
         }
     }
 }
@@ -755,7 +757,7 @@ impl BinaryOpKind {
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BinaryOpInfo {
     /// The kind of binary operation.
     pub kind: BinaryOpKind,
@@ -853,7 +855,7 @@ impl BinaryOpInfo {
 /// This enum categorizes all unary operations in `SsaOp` for uniform
 /// handling in optimization passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum UnaryOpKind {
     /// Negation: `-operand`
     Neg,
@@ -876,6 +878,7 @@ pub enum UnaryOpKind {
 }
 
 impl fmt::Display for UnaryOpKind {
+    /// Writes the short mnemonic for this unary operation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Neg => write!(f, "neg"),
@@ -915,7 +918,7 @@ impl fmt::Display for UnaryOpKind {
 /// assert_eq!(info.operand, SsaVarId::from_index(0));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct UnaryOpInfo {
     /// The kind of unary operation.
     pub kind: UnaryOpKind,
@@ -925,9 +928,73 @@ pub struct UnaryOpInfo {
     pub operand: SsaVarId,
 }
 
-impl_kinded_payload! {
-    BlockStringOpData {
-        kind, prefix, element_bits, mnemonic, metadata, outputs, inputs, reverse
-    };
-    WideCmpXchgData { wide, mnemonic, metadata, outputs, inputs };
+impl<T: Target> Emit<T> for CompareCondition {
+    fn emit<S: ContentSink<T> + ?Sized>(
+        &self,
+        writer: &mut ContentWriter<'_, T, S>,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Relation { cmp, unsigned } => {
+                Emit::emit(&0u16, writer)?;
+                Emit::emit(cmp, writer)?;
+                Emit::emit(unsigned, writer)?;
+                Ok(())
+            }
+            Self::Flag(field_0) => {
+                Emit::emit(&1u16, writer)?;
+                Emit::emit(field_0, writer)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<T: Target> Emit<T> for FlagCondition {
+    fn emit<S: ContentSink<T> + ?Sized>(
+        &self,
+        writer: &mut ContentWriter<'_, T, S>,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Carry => {
+                Emit::emit(&0u16, writer)?;
+                Ok(())
+            }
+            Self::NotCarry => {
+                Emit::emit(&1u16, writer)?;
+                Ok(())
+            }
+            Self::Zero => {
+                Emit::emit(&2u16, writer)?;
+                Ok(())
+            }
+            Self::NotZero => {
+                Emit::emit(&3u16, writer)?;
+                Ok(())
+            }
+            Self::Overflow => {
+                Emit::emit(&4u16, writer)?;
+                Ok(())
+            }
+            Self::NotOverflow => {
+                Emit::emit(&5u16, writer)?;
+                Ok(())
+            }
+            Self::Negative => {
+                Emit::emit(&6u16, writer)?;
+                Ok(())
+            }
+            Self::Positive => {
+                Emit::emit(&7u16, writer)?;
+                Ok(())
+            }
+            Self::ParityEven => {
+                Emit::emit(&8u16, writer)?;
+                Ok(())
+            }
+            Self::ParityOdd => {
+                Emit::emit(&9u16, writer)?;
+                Ok(())
+            }
+        }
+    }
 }

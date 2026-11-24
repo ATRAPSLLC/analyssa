@@ -11,30 +11,175 @@
 use std::borrow::Cow;
 
 use crate::{
-    ir::ops::{
-        def::SsaOp,
-        kinds::{
-            CmpKind, ComputeKind, Signedness, SsaFeatureToken, SsaOpClass, SsaSimilarityClass,
+    ir::{
+        ops::{
+            calls::{CallData, Callee},
+            def::SsaOp,
+            execution::Kernel,
+            kinds::{
+                CmpKind, FloatFunctionKind, MemoryTagKind, RuntimeValueKind, Signedness,
+                SsaFeatureToken, SsaOpClass, SsaSimilarityClass,
+            },
+            native::{BinaryOpInfo, BinaryOpKind, UnaryOpInfo, UnaryOpKind},
+            operands::KindedOperands,
+            vector::{
+                ControlledKind, VectorBinaryKind, VectorCompareKind, VectorElement,
+                VectorElementKind, VectorReduceKind, VectorShuffleSelector, VectorTernaryKind,
+                VectorUnaryKind,
+            },
         },
-        native::{BinaryOpInfo, BinaryOpKind, BlockStringKind, UnaryOpInfo, UnaryOpKind},
-        operands::KindedOperands,
-        vector::VectorCompareKind,
+        variable::SsaVarId,
     },
     target::Target,
 };
 
-/// Lowercases and trims a high-cardinality mnemonic for token use.
-///
-/// Applied only where the input is a *host-supplied* string — a native
-/// mnemonic echoed from a decoder. A `kind_str()` is a crate literal already in
-/// this form, pinned by the registry-wide assertion in the test module, so
-/// normalizing one would allocate to produce the string it was handed.
-fn normalize_token_text(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
 impl<T: Target> SsaOp<T> {
+    /// Whether the operation may compute on floats in a way that raises an
+    /// exception, and so is what a [`Self::FloatRaise`] of an instruction is
+    /// of: float arithmetic and its square root, rounds, estimates, compares,
+    /// conversions and transcendentals, scalar or lane-wise.
+    ///
+    /// It errs toward including: an operation whose lanes it cannot tell
+    /// are integers (an unknown element, a dot product or a complex multiply
+    /// of either kind) is included, since a raise of an integer computation
+    /// raises nothing, and a float computation left out would raise nothing
+    /// it does. What moves, selects, reinterprets or rearranges a value, a
+    /// negation, an absolute value and a sign copy (IEEE 754's
+    /// non-computational operations) and bitwise lane operations are not; a
+    /// negation or absolute value computed as arithmetic
+    /// ([`VectorUnaryKind::NegArithmetic`],
+    /// [`VectorUnaryKind::AbsArithmetic`]) is.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_float` - Whether a scalar variable holds a float, `None` where
+    ///   its type is not known.
+    #[must_use]
+    pub fn may_raise_float_exceptions(&self, is_float: impl Fn(SsaVarId) -> Option<bool>) -> bool {
+        let lanes = |element: &VectorElement| element.kind != VectorElementKind::Integer;
+        let unary = |kind: VectorUnaryKind| {
+            matches!(
+                kind,
+                VectorUnaryKind::Sqrt
+                    | VectorUnaryKind::Round
+                    | VectorUnaryKind::RoundExact
+                    | VectorUnaryKind::RoundInt32
+                    | VectorUnaryKind::RoundInt64
+                    | VectorUnaryKind::NegArithmetic
+                    | VectorUnaryKind::AbsArithmetic
+                    | VectorUnaryKind::Truncate
+                    | VectorUnaryKind::Floor
+                    | VectorUnaryKind::Ceil
+                    | VectorUnaryKind::RoundNearestEven
+                    | VectorUnaryKind::RoundNearestAway
+                    | VectorUnaryKind::Reciprocal
+                    | VectorUnaryKind::ReciprocalSqrt
+                    | VectorUnaryKind::GetExponent
+                    | VectorUnaryKind::Fraction
+                    | VectorUnaryKind::Exp2
+                    | VectorUnaryKind::Log2
+                    | VectorUnaryKind::HorizontalAdd
+            )
+        };
+        let binary = |kind: VectorBinaryKind| {
+            matches!(
+                kind,
+                VectorBinaryKind::Add
+                    | VectorBinaryKind::Sub
+                    | VectorBinaryKind::Mul
+                    | VectorBinaryKind::Div
+                    | VectorBinaryKind::Rem
+                    | VectorBinaryKind::Min
+                    | VectorBinaryKind::Max
+                    | VectorBinaryKind::MinNum
+                    | VectorBinaryKind::MaxNum
+                    | VectorBinaryKind::MinLess
+                    | VectorBinaryKind::MaxGreater
+                    | VectorBinaryKind::MinMagnitude
+                    | VectorBinaryKind::MaxMagnitude
+                    | VectorBinaryKind::MinimumNumber
+                    | VectorBinaryKind::MaximumNumber
+                    | VectorBinaryKind::MinimumMagnitude
+                    | VectorBinaryKind::MaximumMagnitude
+                    | VectorBinaryKind::MinimumMagnitudeNumber
+                    | VectorBinaryKind::MaximumMagnitudeNumber
+                    | VectorBinaryKind::MinAbs
+                    | VectorBinaryKind::MaxAbs
+                    | VectorBinaryKind::AbsDiff
+                    | VectorBinaryKind::AddAbs
+                    | VectorBinaryKind::MulNegate
+                    | VectorBinaryKind::Scale
+                    | VectorBinaryKind::ScaleInteger
+                    | VectorBinaryKind::ReciprocalIter1
+                    | VectorBinaryKind::ReciprocalIter2
+                    | VectorBinaryKind::ReciprocalSqrtIter1
+            )
+        };
+        let ternary = |kind: VectorTernaryKind| {
+            kind.fused_signs().is_some() || kind == VectorTernaryKind::FixupNan
+        };
+        match self {
+            Self::Add { dest, .. }
+            | Self::Sub { dest, .. }
+            | Self::Mul { dest, .. }
+            | Self::Div { dest, .. }
+            | Self::Rem { dest, .. } => is_float(*dest) != Some(false),
+            Self::Ceq { left, .. } | Self::Clt { left, .. } | Self::Cgt { left, .. } => {
+                is_float(*left) != Some(false)
+            }
+            Self::FloatCompareFlags { .. }
+            | Self::IntToFloat { .. }
+            | Self::FloatToInt { .. }
+            | Self::FloatConv { .. }
+            | Self::FloatFunction(_) => true,
+            Self::VectorUnary { kind, element, .. }
+            | Self::VectorPredicatedUnary { kind, element, .. } => lanes(element) && unary(*kind),
+            Self::VectorBinary { kind, element, .. }
+            | Self::VectorPredicatedBinary { kind, element, .. } => lanes(element) && binary(*kind),
+            Self::VectorTernary { kind, element, .. }
+            | Self::VectorPredicatedTernary { kind, element, .. } => {
+                lanes(element) && ternary(*kind)
+            }
+            Self::VectorCompare { element, .. } => lanes(element),
+            Self::VectorCast { from, to, .. } => from.is_float() || to.is_float(),
+            Self::VectorReduce { kind, element, .. } => {
+                lanes(element)
+                    && matches!(
+                        kind,
+                        VectorReduceKind::Add
+                            | VectorReduceKind::Mul
+                            | VectorReduceKind::Min
+                            | VectorReduceKind::Max
+                            | VectorReduceKind::MinNum
+                            | VectorReduceKind::MaxNum
+                            | VectorReduceKind::MinimumNumber
+                            | VectorReduceKind::MaximumNumber
+                            | VectorReduceKind::MinimumMagnitude
+                            | VectorReduceKind::MaximumMagnitude
+                            | VectorReduceKind::MinimumMagnitudeNumber
+                            | VectorReduceKind::MaximumMagnitudeNumber
+                    )
+            }
+            Self::Contract(data) => data.kind.raises_float_exceptions(),
+            // A lane computation reports what it raises in its status result.
+            Self::Compute(data) => match data.kind.kernel {
+                Kernel::FloatHelper(_) => true,
+                Kernel::FloatControlled { kind, .. } => kind != ControlledKind::Classify,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Returns the high-level operation family for this opcode.
+    ///
+    /// Partitions every [`SsaOp`] variant into one [`SsaOpClass`]. The match is
+    /// exhaustive with no `_` arm, so adding a variant is a compile error here,
+    /// in the crate that owns the taxonomy, rather than a silent
+    /// misclassification downstream. One split is not visible from the variant
+    /// name alone: flag-producing arithmetic (an `Add`/`Sub`/`Shl`/... whose
+    /// `flags` field is `Some`) classifies as [`SsaOpClass::Flags`], while the
+    /// same opcode without a flags destination is [`SsaOpClass::Scalar`].
     #[must_use]
     pub const fn class(&self) -> SsaOpClass {
         match self {
@@ -42,6 +187,7 @@ impl<T: Target> SsaOp<T> {
             | Self::Phi { .. }
             | Self::Copy { .. }
             | Self::Pop { .. }
+            | Self::RuntimeValue { .. }
             | Self::CallClobber { .. } => SsaOpClass::Synthetic,
 
             Self::BoolAnd { .. }
@@ -49,10 +195,11 @@ impl<T: Target> SsaOp<T> {
             | Self::BoolXor { .. }
             | Self::BoolNot { .. } => SsaOpClass::Boolean,
 
-            Self::FlagAdjust(_) => SsaOpClass::Flags,
-            Self::ReadFlags { .. } | Self::BranchFlags { .. } | Self::ComputeFlags { .. } => {
-                SsaOpClass::Flags
-            }
+            Self::FloatRaise { .. } => SsaOpClass::Flags,
+            Self::ReadFlags { .. }
+            | Self::BranchFlags { .. }
+            | Self::MergeFlags { .. }
+            | Self::InsertFlag { .. } => SsaOpClass::Flags,
 
             Self::VectorUnary { .. }
             | Self::VectorBinary { .. }
@@ -79,10 +226,10 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorSplat { .. }
             | Self::VectorCast { .. }
             | Self::VectorReinterpret { .. }
+            | Self::VectorSlice { .. }
+            | Self::VectorInsertSlice { .. }
+            | Self::VectorConcat { .. }
             | Self::VectorPack { .. }
-            | Self::VectorZeroUpper { .. }
-            | Self::VectorMaskUnary { .. }
-            | Self::VectorMaskBinary { .. }
             | Self::VectorReduce { .. }
             | Self::VectorBitmask { .. } => SsaOpClass::Vector,
 
@@ -98,6 +245,8 @@ impl<T: Target> SsaOp<T> {
             | Self::PtrAdd { .. }
             | Self::ArrayLength { .. }
             | Self::LoadIndirect { .. }
+            | Self::ArgNext { .. }
+            | Self::ArgStep { .. }
             | Self::StoreIndirect { .. }
             | Self::NewObj { .. }
             | Self::NewArr { .. }
@@ -107,14 +256,17 @@ impl<T: Target> SsaOp<T> {
             | Self::LocalAlloc { .. }
             | Self::InitBlk { .. }
             | Self::CopyBlk { .. }
+            | Self::MoveBlk { .. }
+            | Self::CompareBlk(_)
+            | Self::ScanBlk { .. }
+            | Self::LoadBlk { .. }
             | Self::InitObj { .. }
             | Self::CopyObj { .. }
             | Self::LoadObj { .. }
             | Self::StoreObj { .. }
             | Self::Fence { .. } => SsaOpClass::Memory,
 
-            Self::CmpXchg { .. }
-            | Self::AtomicRmw { .. }
+            Self::AtomicCondRmw { .. }
             | Self::AtomicLoad { .. }
             | Self::AtomicStore { .. }
             | Self::AtomicPairLoad { .. }
@@ -123,13 +275,13 @@ impl<T: Target> SsaOp<T> {
             | Self::AtomicLockRmw { .. }
             | Self::AtomicStoreConditional { .. }
             | Self::AtomicCmpXchg { .. }
-            | Self::AtomicPairCmpXchg { .. } => SsaOpClass::Atomic,
+            | Self::AtomicPairCmpXchg { .. }
+            | Self::AtomicPairRmw { .. }
+            | Self::AtomicCheckedRmw { .. } => SsaOpClass::Atomic,
 
-            Self::Call { .. }
-            | Self::CallVirt { .. }
-            | Self::CallIndirect { .. }
-            | Self::LoadFunctionPtr { .. }
-            | Self::LoadVirtFunctionPtr { .. } => SsaOpClass::Call,
+            Self::Call(_) | Self::LoadFunctionPtr { .. } | Self::LoadVirtFunctionPtr { .. } => {
+                SsaOpClass::Call
+            }
 
             Self::Jump { .. }
             | Self::Branch { .. }
@@ -146,59 +298,26 @@ impl<T: Target> SsaOp<T> {
             | Self::Leave { .. }
             | Self::Break(_) => SsaOpClass::Control,
 
-            Self::NativeOpaque(_) => SsaOpClass::NativeOpaque,
             Self::SystemOp(_) => SsaOpClass::Call,
-            Self::ComputeOp(_) => SsaOpClass::Scalar,
-            Self::BcdAdjust(_) => SsaOpClass::Scalar,
-            Self::VectorCrypto(_) => SsaOpClass::Vector,
-            Self::TileOp(_) => SsaOpClass::Vector,
-            Self::VectorPermute(_) => SsaOpClass::Vector,
-            Self::VectorMultiplyAdd(_) => SsaOpClass::Vector,
-            Self::VectorPackNarrow(_) => SsaOpClass::Vector,
-            Self::VectorNarrowSaturate(_) => SsaOpClass::Vector,
+            Self::Compute(data) => {
+                if data.kind.lanes.is_none() && data.kind.element.scalar {
+                    SsaOpClass::Scalar
+                } else {
+                    SsaOpClass::Vector
+                }
+            }
+            Self::Contract(_) => SsaOpClass::Vector,
             Self::VectorPredicateWhile(_) => SsaOpClass::Vector,
-            Self::VectorPredicateBreak(_) => SsaOpClass::Vector,
-            Self::VectorComplexAdd(_) => SsaOpClass::Vector,
-            Self::VectorCountAdjust(_) => SsaOpClass::Vector,
             Self::VectorExtendInLane(_) => SsaOpClass::Vector,
             Self::VectorElementCount(_) => SsaOpClass::Vector,
-            Self::VectorSveAddressGen(_) => SsaOpClass::Vector,
             Self::VectorStructLoadReplicate(_) => SsaOpClass::Vector,
-            Self::VectorSmeMisc(_) => SsaOpClass::Vector,
-            Self::VectorPredicateOp(_) => SsaOpClass::Vector,
             Self::VectorSveCompute(_) => SsaOpClass::Vector,
-            Self::VectorReverseChunks(_) => SsaOpClass::Vector,
-            Self::VectorMatrixMulAcc(_) => SsaOpClass::Vector,
-            Self::VectorSmeOuterProduct(_) => SsaOpClass::Vector,
-            Self::VectorPredicateGen(_) => SsaOpClass::Vector,
-            Self::VectorFpHelper(_) => SsaOpClass::Vector,
-            Self::VectorSvePermute(_) => SsaOpClass::Vector,
-            Self::VectorTernaryLogic(_) => SsaOpClass::Vector,
-            Self::VectorDotProduct(_) => SsaOpClass::Vector,
-            Self::VectorMultiSad(_) => SsaOpClass::Vector,
-            Self::VectorIntDotProduct(_) => SsaOpClass::Vector,
-            Self::VectorStringCompare(_) => SsaOpClass::Vector,
-            Self::VectorBitfield(_) => SsaOpClass::Vector,
-            Self::VectorIntersect(_) => SsaOpClass::Vector,
-            Self::VectorShuffleBits(_) => SsaOpClass::Vector,
-            Self::VectorConditionalMove(_) => SsaOpClass::Vector,
-            Self::VectorHorizontalMinPos(_) => SsaOpClass::Vector,
-            Self::VectorComplexMul(_) => SsaOpClass::Vector,
-            Self::VectorClassify(_) => SsaOpClass::Vector,
-            Self::VectorHorizontalReduce(_) => SsaOpClass::Vector,
-            Self::BlockString(_) => SsaOpClass::Memory,
-            Self::WideCompareExchange { .. } => SsaOpClass::Atomic,
-            Self::FpTranscendental { .. } | Self::FpuControl { .. } => SsaOpClass::NativeOpaque,
+            Self::FloatFunction { .. } => SsaOpClass::Scalar,
+            Self::FpuControl { .. } => SsaOpClass::Memory,
 
             Self::WideMul { .. } | Self::WideDiv { .. } => SsaOpClass::WideArithmetic,
 
             Self::FloatCompareFlags { .. } => SsaOpClass::Scalar,
-
-            Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly => SsaOpClass::Prefix,
 
             Self::Add { flags: Some(_), .. }
             | Self::AddOvf { flags: Some(_), .. }
@@ -237,8 +356,6 @@ impl<T: Target> SsaOp<T> {
             | Self::Cgt { .. }
             | Self::Rol { .. }
             | Self::Ror { .. }
-            | Self::Rcl { .. }
-            | Self::Rcr { .. }
             | Self::BSwap { .. }
             | Self::BRev { .. }
             | Self::BitScanForward { .. }
@@ -259,6 +376,10 @@ impl<T: Target> SsaOp<T> {
             | Self::IsInst { .. }
             | Self::SizeOf { .. }
             | Self::LoadToken { .. }
+            | Self::ArgList { .. }
+            | Self::MakeTypedRef { .. }
+            | Self::TypedRefValue { .. }
+            | Self::TypedRefType { .. }
             | Self::LoadArg { .. }
             | Self::LoadLocal { .. }
             | Self::LoadArgAddr { .. }
@@ -289,8 +410,29 @@ impl<T: Target> SsaOp<T> {
             | Self::IntConv { unsigned, .. }
             | Self::IntToFloat { unsigned, .. }
             | Self::FloatToInt { unsigned, .. }
-            | Self::BranchCmp { unsigned, .. }
-            | Self::VectorCompare { unsigned, .. } => Some(Signedness::from_unsigned(*unsigned)),
+            | Self::BranchCmp { unsigned, .. } => Some(Signedness::from_unsigned(*unsigned)),
+            Self::VectorCompare { element, .. } => match element.signed {
+                Some(signed) => Some(Signedness::from_unsigned(!signed)),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns the lanes a lane-wise operation states it computes on, with the
+    /// operand they lay out: a vector unary, binary, ternary, compare or
+    /// reduction, predicated or not. `None` for any other operation.
+    #[must_use]
+    pub const fn vector_element(&self) -> Option<(SsaVarId, VectorElement)> {
+        match self {
+            Self::VectorUnary { value, element, .. }
+            | Self::VectorPredicatedUnary { value, element, .. }
+            | Self::VectorReduce { value, element, .. } => Some((*value, *element)),
+            Self::VectorBinary { left, element, .. }
+            | Self::VectorPredicatedBinary { left, element, .. }
+            | Self::VectorCompare { left, element, .. } => Some((*left, *element)),
+            Self::VectorTernary { first, element, .. }
+            | Self::VectorPredicatedTernary { first, element, .. } => Some((*first, *element)),
             _ => None,
         }
     }
@@ -316,10 +458,13 @@ impl<T: Target> SsaOp<T> {
                 VectorCompareKind::Le => Some(CmpKind::Le),
                 VectorCompareKind::Gt => Some(CmpKind::Gt),
                 VectorCompareKind::Ge => Some(CmpKind::Ge),
-                // Unordered / ordered / not-lt / not-le / constant predicates
-                // have no clean scalar [`CmpKind`] equivalent.
+                // Unordered / ordered / not-lt / not-le / unordered-or-equal /
+                // ordered-not-equal / constant predicates have no clean scalar
+                // [`CmpKind`] equivalent.
                 VectorCompareKind::Unordered
                 | VectorCompareKind::Ordered
+                | VectorCompareKind::UnorderedEq
+                | VectorCompareKind::OrderedNe
                 | VectorCompareKind::NotLt
                 | VectorCompareKind::NotLe
                 | VectorCompareKind::NotGe
@@ -345,6 +490,7 @@ impl<T: Target> SsaOp<T> {
             | Self::Phi { .. }
             | Self::Copy { .. }
             | Self::Pop { .. }
+            | Self::RuntimeValue { .. }
             | Self::CallClobber { .. } => SsaSimilarityClass::Synthetic,
 
             Self::Const { .. } | Self::SizeOf { .. } | Self::LoadToken { .. } => {
@@ -368,8 +514,9 @@ impl<T: Target> SsaOp<T> {
             | Self::Shr { flags: Some(_), .. }
             | Self::ReadFlags { .. }
             | Self::BranchFlags { .. }
-            | Self::ComputeFlags { .. }
-            | Self::FlagAdjust(_) => SsaSimilarityClass::Flags,
+            | Self::MergeFlags { .. }
+            | Self::InsertFlag { .. }
+            | Self::FloatRaise { .. } => SsaSimilarityClass::Flags,
 
             Self::Add { .. }
             | Self::AddOvf { .. }
@@ -393,12 +540,9 @@ impl<T: Target> SsaOp<T> {
             | Self::Popcount { .. }
             | Self::Parity { .. } => SsaSimilarityClass::Bitwise,
 
-            Self::Shl { .. }
-            | Self::Shr { .. }
-            | Self::Rol { .. }
-            | Self::Ror { .. }
-            | Self::Rcl { .. }
-            | Self::Rcr { .. } => SsaSimilarityClass::ShiftRotate,
+            Self::Shl { .. } | Self::Shr { .. } | Self::Rol { .. } | Self::Ror { .. } => {
+                SsaSimilarityClass::ShiftRotate
+            }
 
             Self::Ceq { .. } | Self::Clt { .. } | Self::Cgt { .. } => SsaSimilarityClass::Compare,
 
@@ -422,12 +566,16 @@ impl<T: Target> SsaOp<T> {
             | Self::IsInst { .. }
             | Self::Box { .. }
             | Self::Unbox { .. }
-            | Self::UnboxAny { .. } => SsaSimilarityClass::Conversion,
+            | Self::UnboxAny { .. }
+            | Self::MakeTypedRef { .. }
+            | Self::TypedRefValue { .. }
+            | Self::TypedRefType { .. } => SsaSimilarityClass::Conversion,
 
             Self::LoadArg { .. }
             | Self::LoadLocal { .. }
             | Self::LoadArgAddr { .. }
             | Self::LoadLocalAddr { .. }
+            | Self::ArgList { .. }
             | Self::LoadFunctionPtr { .. }
             | Self::LoadVirtFunctionPtr { .. } => SsaSimilarityClass::TypeFlow,
 
@@ -441,13 +589,17 @@ impl<T: Target> SsaOp<T> {
             | Self::ArrayLength { .. }
             | Self::LoadIndirect { .. }
             | Self::LoadObj { .. }
+            | Self::ArgStep { .. }
             | Self::VectorLoad { .. }
             | Self::VectorMaskedLoad { .. }
             | Self::VectorBroadcastLoad { .. }
             | Self::VectorGather { .. }
             | Self::VectorFaultingLoad { .. }
             | Self::VectorSegmentLoad { .. }
-            | Self::VectorPackLoad { .. } => SsaSimilarityClass::MemoryRead,
+            | Self::VectorPackLoad { .. }
+            | Self::CompareBlk(_)
+            | Self::ScanBlk { .. }
+            | Self::LoadBlk { .. } => SsaSimilarityClass::MemoryRead,
 
             Self::StoreField { .. }
             | Self::StoreStaticField { .. }
@@ -461,16 +613,17 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorSegmentStore { .. }
             | Self::VectorPackStore { .. } => SsaSimilarityClass::MemoryWrite,
 
-            Self::CopyBlk { .. } | Self::InitBlk { .. } | Self::CopyObj { .. } => {
-                SsaSimilarityClass::MemoryReadWrite
-            }
+            Self::CopyBlk { .. }
+            | Self::MoveBlk { .. }
+            | Self::InitBlk { .. }
+            | Self::ArgNext { .. }
+            | Self::CopyObj { .. } => SsaSimilarityClass::MemoryReadWrite,
 
             Self::NewObj { .. } | Self::NewArr { .. } | Self::LocalAlloc { .. } => {
                 SsaSimilarityClass::Allocation
             }
 
-            Self::CmpXchg { .. }
-            | Self::AtomicRmw { .. }
+            Self::AtomicCondRmw { .. }
             | Self::AtomicLoad { .. }
             | Self::AtomicStore { .. }
             | Self::AtomicPairLoad { .. }
@@ -479,13 +632,13 @@ impl<T: Target> SsaOp<T> {
             | Self::AtomicLockRmw { .. }
             | Self::AtomicStoreConditional { .. }
             | Self::AtomicCmpXchg { .. }
-            | Self::AtomicPairCmpXchg { .. } => SsaSimilarityClass::Atomic,
+            | Self::AtomicPairCmpXchg { .. }
+            | Self::AtomicPairRmw { .. }
+            | Self::AtomicCheckedRmw { .. } => SsaSimilarityClass::Atomic,
 
             Self::Fence { .. } => SsaSimilarityClass::Fence,
 
-            Self::Call { .. } | Self::CallVirt { .. } | Self::CallIndirect { .. } => {
-                SsaSimilarityClass::Call
-            }
+            Self::Call(_) => SsaSimilarityClass::Call,
 
             Self::Jump { .. }
             | Self::Branch { .. }
@@ -515,79 +668,50 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorSplat { .. }
             | Self::VectorCast { .. }
             | Self::VectorReinterpret { .. }
+            | Self::VectorSlice { .. }
+            | Self::VectorInsertSlice { .. }
+            | Self::VectorConcat { .. }
             | Self::VectorPack { .. }
-            | Self::VectorZeroUpper { .. }
-            | Self::VectorMaskUnary { .. }
-            | Self::VectorMaskBinary { .. }
             | Self::VectorReduce { .. }
-            | Self::VectorCrypto(_)
-            | Self::TileOp(_)
-            | Self::VectorPermute(_)
-            | Self::VectorMultiplyAdd(_)
-            | Self::VectorPackNarrow(_)
-            | Self::VectorNarrowSaturate(_)
+            | Self::Contract(_)
             | Self::VectorPredicateWhile(_)
-            | Self::VectorPredicateBreak(_)
-            | Self::VectorComplexAdd(_)
-            | Self::VectorCountAdjust(_)
             | Self::VectorExtendInLane(_)
             | Self::VectorElementCount(_)
-            | Self::VectorSveAddressGen(_)
             | Self::VectorStructLoadReplicate(_)
-            | Self::VectorSmeMisc(_)
-            | Self::VectorPredicateOp(_)
             | Self::VectorSveCompute(_)
-            | Self::VectorReverseChunks(_)
-            | Self::VectorMatrixMulAcc(_)
-            | Self::VectorSmeOuterProduct(_)
-            | Self::VectorPredicateGen(_)
-            | Self::VectorFpHelper(_)
-            | Self::VectorSvePermute(_)
-            | Self::VectorTernaryLogic(_)
-            | Self::VectorDotProduct(_)
-            | Self::VectorMultiSad(_)
-            | Self::VectorIntDotProduct(_)
-            | Self::VectorStringCompare(_)
-            | Self::VectorBitfield(_)
-            | Self::VectorIntersect(_)
-            | Self::VectorShuffleBits(_)
-            | Self::VectorConditionalMove(_)
-            | Self::VectorHorizontalMinPos(_)
-            | Self::VectorComplexMul(_)
-            | Self::VectorClassify(_)
-            | Self::VectorHorizontalReduce(_)
             | Self::VectorBitmask { .. } => SsaSimilarityClass::Vector,
 
             Self::WideMul { .. } | Self::WideDiv { .. } => SsaSimilarityClass::WideArithmetic,
 
-            Self::NativeOpaque(_) => SsaSimilarityClass::NativeOpaque,
             Self::SystemOp(_) => SsaSimilarityClass::Call,
-            Self::ComputeOp(data) => match data.kind {
-                ComputeKind::BitDeposit | ComputeKind::BitExtract | ComputeKind::PointerAuth(_) => {
-                    SsaSimilarityClass::Bitwise
-                }
-                ComputeKind::Checksum | ComputeKind::MipsDspAccumulate => {
+            Self::Compute(data) => match data.kind.kernel {
+                Kernel::BitDeposit
+                | Kernel::BitExtract
+                | Kernel::BitGroup
+                | Kernel::CounterPredicate { .. }
+                | Kernel::PredicateCounter { .. }
+                | Kernel::PointerAuth(_)
+                | Kernel::ScalarCipher(_)
+                | Kernel::MemoryTag(MemoryTagKind::Add) => SsaSimilarityClass::Bitwise,
+                Kernel::Checksum(_) | Kernel::CarrylessMultiply { .. }
+                    if data.kind.lanes.is_none() && data.kind.element.scalar =>
+                {
                     SsaSimilarityClass::Arithmetic
                 }
-                ComputeKind::Random { .. } => SsaSimilarityClass::Call,
-            },
-            Self::BcdAdjust(_) => SsaSimilarityClass::Arithmetic,
-            Self::BlockString(data) => match data.kind {
-                BlockStringKind::Load => SsaSimilarityClass::MemoryRead,
-                BlockStringKind::Compare | BlockStringKind::Scan => {
-                    SsaSimilarityClass::MemoryReadWrite
+                Kernel::VectorShapeSupported
+                | Kernel::VectorLengthChoice
+                | Kernel::VectorFloatSupported
+                | Kernel::VectorCryptoSupported
+                | Kernel::DecimalAdjust { .. } => SsaSimilarityClass::Arithmetic,
+                Kernel::FloatToIntModular => SsaSimilarityClass::Conversion,
+                Kernel::Random { .. } | Kernel::MemoryTag(MemoryTagKind::Random) => {
+                    SsaSimilarityClass::Call
                 }
+                _ => SsaSimilarityClass::Vector,
             },
-            Self::WideCompareExchange { .. } => SsaSimilarityClass::Atomic,
-            Self::FpTranscendental { .. } | Self::FpuControl { .. } => {
-                SsaSimilarityClass::NativeOpaque
-            }
-
-            Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly => SsaSimilarityClass::Prefix,
+            Self::FloatFunction { .. } => SsaSimilarityClass::Arithmetic,
+            Self::FpuControl(data) if data.kind.restores_image() => SsaSimilarityClass::MemoryRead,
+            Self::FpuControl(_) => SsaSimilarityClass::MemoryWrite,
         }
     }
 
@@ -619,8 +743,6 @@ impl<T: Target> SsaOp<T> {
             Self::Shr { .. } => "shr",
             Self::Rol { .. } => "rol",
             Self::Ror { .. } => "ror",
-            Self::Rcl { .. } => "rcl",
-            Self::Rcr { .. } => "rcr",
             Self::BSwap { .. } => "bswap",
             Self::BRev { .. } => "brev",
             Self::BitScanForward { .. } => "bsf",
@@ -643,7 +765,9 @@ impl<T: Target> SsaOp<T> {
             Self::Bitcast { .. } => "bitcast",
             Self::Select { .. } => "select",
             Self::ReadFlags { .. } => "readflags",
-            Self::ComputeFlags { .. } => "flags.compute",
+            Self::MergeFlags { .. } => "flags.merge",
+            Self::FloatRaise { .. } => "float.raise",
+            Self::InsertFlag { .. } => "flags.insert",
             Self::CallClobber { .. } => "call.clobber",
             Self::VectorUnary { .. } => "vector.unary",
             Self::VectorBinary { .. } => "vector.binary",
@@ -667,13 +791,20 @@ impl<T: Target> SsaOp<T> {
             Self::VectorExtract { .. } => "vector.extract",
             Self::VectorInsert { .. } => "vector.insert",
             Self::VectorSplat { .. } => "vector.splat",
-            Self::VectorShuffle { .. } => "vector.shuffle",
+            Self::VectorShuffle {
+                selector: VectorShuffleSelector::Mask(_),
+                ..
+            } => "vector.shuffle",
+            Self::VectorShuffle {
+                selector: VectorShuffleSelector::Index(_),
+                ..
+            } => "vector.shuffle.index",
             Self::VectorCast { .. } => "vector.cast",
             Self::VectorReinterpret { .. } => "vector.reinterpret",
+            Self::VectorSlice { .. } => "vector.slice",
+            Self::VectorInsertSlice { .. } => "vector.insert.slice",
+            Self::VectorConcat { .. } => "vector.concat",
             Self::VectorPack { .. } => "vector.pack",
-            Self::VectorZeroUpper { .. } => "vector.zero.upper",
-            Self::VectorMaskUnary { .. } => "vector.mask.unary",
-            Self::VectorMaskBinary { .. } => "vector.mask.binary",
             Self::VectorReduce { .. } => "vector.reduce",
             Self::VectorBitmask { .. } => "vector.bitmask",
             Self::Jump { .. } => "jump",
@@ -705,10 +836,28 @@ impl<T: Target> SsaOp<T> {
             Self::UnboxAny { .. } => "unbox.any",
             Self::SizeOf { .. } => "sizeof",
             Self::LoadToken { .. } => "load.token",
-            Self::Call { .. } => "call",
-            Self::CallVirt { .. } => "call.virt",
-            Self::CallIndirect { .. } => "call.indirect",
-            Self::LoadFunctionPtr { .. } => "load.function.ptr",
+            Self::ArgList { .. } => "arglist",
+            Self::ArgNext { .. } => "arg.next",
+            Self::ArgStep { .. } => "arg.step",
+            Self::MakeTypedRef { .. } => "make.typedref",
+            Self::TypedRefValue { .. } => "typedref.value",
+            Self::TypedRefType { .. } => "typedref.type",
+            Self::Call(call) => match call.callee {
+                Callee::Direct(_) => "call",
+                Callee::Virtual(_) => "call.virt",
+                Callee::Constrained { instance: true, .. } => "call.constrained",
+                Callee::Constrained {
+                    instance: false, ..
+                } => "call.constrained.static",
+                Callee::Indirect { .. } => "call.indirect",
+            },
+            Self::LoadFunctionPtr {
+                constraint: None, ..
+            } => "load.function.ptr",
+            Self::LoadFunctionPtr {
+                constraint: Some(_),
+                ..
+            } => "load.function.ptr.constrained",
             Self::LoadVirtFunctionPtr { .. } => "load.virt.function.ptr",
             Self::LoadArg { .. } => "load.arg",
             Self::LoadLocal { .. } => "load.local",
@@ -725,73 +874,23 @@ impl<T: Target> SsaOp<T> {
             Self::Leave { .. } => "leave",
             Self::InitBlk { .. } => "init.blk",
             Self::CopyBlk { .. } => "copy.blk",
+            Self::CompareBlk(_) => "compare.blk",
+            Self::ScanBlk { .. } => "scan.blk",
+            Self::LoadBlk { .. } => "load.blk",
+            Self::MoveBlk { .. } => "move.blk",
             Self::Fence { .. } => "fence",
             Self::FloatCompareFlags { .. } => "float.compare.flags",
-            Self::NativeOpaque(_) => "native.opaque",
             Self::SystemOp(data) => data.kind.kind_str(),
-            Self::ComputeOp(data) => data.kind.kind_str(),
-            Self::BcdAdjust(data) => data.kind.kind_str(),
-            Self::VectorCrypto(data) => data.kind.kind_str(),
-            Self::TileOp(data) => data.kind.kind_str(),
-            Self::VectorPermute(_) => "vector.permute",
-            Self::VectorMultiplyAdd(data) => data.kind.kind_str(),
-            Self::VectorPackNarrow(data) => {
-                if data.unsigned {
-                    "vector.pack.narrow.u"
-                } else {
-                    "vector.pack.narrow.s"
-                }
-            }
-            Self::VectorNarrowSaturate(data) => {
-                if data.unsigned_dst {
-                    "vector.narrow.saturate.u"
-                } else {
-                    "vector.narrow.saturate.s"
-                }
-            }
+            Self::Compute(data) => data.kind.kernel.kind_str(),
+            Self::Contract(data) => data.kind.kind_str(),
             Self::VectorPredicateWhile(_) => "vector.while",
-            Self::VectorPredicateBreak(_) => "vector.break",
-            Self::VectorComplexAdd(_) => "vector.cadd",
-            Self::VectorCountAdjust(_) => "vector.countadj",
             Self::VectorExtendInLane(_) => "vector.xtl",
             Self::VectorElementCount(_) => "vector.cnt",
-            Self::VectorSveAddressGen(_) => "vector.adr",
-            Self::FlagAdjust(data) => data.kind.kind_str(),
             Self::VectorStructLoadReplicate(_) => "vector.ldNr",
-            Self::VectorSmeMisc(_) => "vector.sme.misc",
-            Self::VectorPredicateOp(_) => "vector.predop",
             Self::VectorSveCompute(_) => "vector.sve.compute",
-            Self::VectorReverseChunks(_) => "vector.revchunks",
-            Self::VectorMatrixMulAcc(_) => "vector.mmla",
-            Self::VectorSmeOuterProduct(_) => "vector.sme.mopa",
-            Self::VectorPredicateGen(_) => "vector.pgen",
-            Self::VectorFpHelper(_) => "vector.fphelper",
-            Self::VectorSvePermute(_) => "vector.sve.perm",
-            Self::VectorTernaryLogic(_) => "vector.ternlog",
-            Self::VectorDotProduct(_) => "vector.dotproduct",
-            Self::VectorMultiSad(_) => "vector.mpsadbw",
-            Self::VectorIntDotProduct(_) => "vector.intdot",
-            Self::VectorStringCompare(_) => "vector.pcmpstr",
-            Self::VectorBitfield(_) => "vector.bitfield",
-            Self::VectorIntersect(_) => "vector.p2intersect",
-            Self::VectorShuffleBits(_) => "vector.shufbitqmb",
-            Self::VectorConditionalMove(_) => "vector.condmove",
-            Self::VectorHorizontalMinPos(_) => "vector.phminposuw",
-            Self::VectorComplexMul(data) => data.kind.kind_str(),
-            Self::VectorClassify(_) => "vector.fpclass",
-            Self::VectorHorizontalReduce(_) => "vector.hreduce",
-            Self::BlockString(data) => data.kind.kind_str(),
-            Self::WideCompareExchange(data) => {
-                if data.wide {
-                    "atomic.cmpxchg16b"
-                } else {
-                    "atomic.cmpxchg8b"
-                }
-            }
-            Self::FpTranscendental { .. } => "fp.transcendental",
-            Self::FpuControl { .. } => "fpu.control",
-            Self::CmpXchg { .. } => "cmpxchg",
-            Self::AtomicRmw { .. } => "atomic.rmw",
+            Self::FloatFunction { .. } => "float.function",
+            Self::FpuControl(data) => data.kind.name(),
+            Self::AtomicCondRmw { .. } => "atomic.cond.rmw",
             Self::AtomicLoad { .. } => "atomic.load",
             Self::AtomicStore { .. } => "atomic.store",
             Self::AtomicPairLoad { .. } => "atomic.pair.load",
@@ -801,6 +900,8 @@ impl<T: Target> SsaOp<T> {
             Self::AtomicStoreConditional { .. } => "atomic.store.conditional",
             Self::AtomicCmpXchg { .. } => "atomic.cmpxchg",
             Self::AtomicPairCmpXchg { .. } => "atomic.pair.cmpxchg",
+            Self::AtomicPairRmw { .. } => "atomic.pair.rmw",
+            Self::AtomicCheckedRmw { .. } => "atomic.checked.rmw",
             Self::InitObj { .. } => "init.obj",
             Self::CopyObj { .. } => "copy.obj",
             Self::LoadObj { .. } => "load.obj",
@@ -810,12 +911,19 @@ impl<T: Target> SsaOp<T> {
             Self::Ckfinite { .. } => "ckfinite",
             Self::FpClassify { .. } => "fpclassify",
             Self::LocalAlloc { .. } => "local.alloc",
-            Self::Constrained { .. } => "constrained",
-            Self::Volatile => "volatile",
-            Self::Unaligned { .. } => "unaligned",
-            Self::TailPrefix => "tail",
-            Self::Readonly => "readonly",
             Self::Phi { .. } => "phi",
+            Self::RuntimeValue {
+                kind: RuntimeValueKind::ExceptionObject,
+                ..
+            } => "runtime.exception",
+            Self::RuntimeValue {
+                kind: RuntimeValueKind::HandlerEntry,
+                ..
+            } => "runtime.handler-entry",
+            Self::RuntimeValue {
+                kind: RuntimeValueKind::Unspecified,
+                ..
+            } => "runtime.unspecified",
         }
     }
 
@@ -825,18 +933,19 @@ impl<T: Target> SsaOp<T> {
     /// variants a similarity fingerprint should treat alike (`Add` and
     /// `AddOvf` both become `"add"`, every scalar load becomes `"load"`) and
     /// folds signedness into the token (`shru` / `shrs`). The match is
-    /// exhaustive — no `_` — so a new [`SsaOp`] variant is a compile error
+    /// exhaustive - no `_` - so a new [`SsaOp`] variant is a compile error
     /// *here*, in the crate that defines the vocabulary, rather than a silent
     /// `"unknown"` in a downstream consumer.
     ///
-    /// [`Call`](Self::Call) and [`CallVirt`](Self::CallVirt) return a bare
-    /// `"call"`. Classifying the callee needs target-specific reference
-    /// metadata this crate is generic over, so a consumer that binds a
-    /// concrete target refines those two cases itself.
+    /// A [`Call`](Self::Call) that names its method returns a bare `"call"`.
+    /// Classifying the callee needs target-specific reference metadata this
+    /// crate is generic over, so a consumer that binds a concrete target
+    /// refines it itself.
     #[must_use]
     pub fn coarse_token(&self) -> Cow<'static, str> {
         match self {
             Self::Const { .. } => Cow::Borrowed("const"),
+            Self::RuntimeValue { .. } => Cow::Borrowed("runtime"),
             Self::Copy { .. } => Cow::Borrowed("copy"),
             Self::IntConv { .. } => Cow::Borrowed("conv"),
             Self::IntToPtr { .. } => Cow::Borrowed("inttoptr"),
@@ -862,8 +971,6 @@ impl<T: Target> SsaOp<T> {
             Self::Shr { unsigned, .. } => Cow::Borrowed(if *unsigned { "shru" } else { "shrs" }),
             Self::Rol { .. } => Cow::Borrowed("rol"),
             Self::Ror { .. } => Cow::Borrowed("ror"),
-            Self::Rcl { .. } => Cow::Borrowed("rcl"),
-            Self::Rcr { .. } => Cow::Borrowed("rcr"),
             Self::BSwap { .. } => Cow::Borrowed("bswap"),
             Self::BRev { .. } => Cow::Borrowed("brev"),
             Self::BitScanForward { .. } => Cow::Borrowed("bsf"),
@@ -873,7 +980,10 @@ impl<T: Target> SsaOp<T> {
             Self::Ceq { .. } | Self::Clt { .. } | Self::Cgt { .. } => {
                 Cow::Owned(self.compare_token())
             }
-            Self::ReadFlags { .. } | Self::ComputeFlags { .. } => Cow::Borrowed("readflags"),
+            Self::ReadFlags { .. } | Self::MergeFlags { .. } | Self::InsertFlag { .. } => {
+                Cow::Borrowed("readflags")
+            }
+            Self::FloatRaise { .. } => Cow::Borrowed("float.raise"),
             Self::CallClobber { .. } => Cow::Borrowed("nop"),
             Self::Select { .. } => Cow::Borrowed("select"),
             Self::Phi { .. } => Cow::Borrowed("phi"),
@@ -882,11 +992,14 @@ impl<T: Target> SsaOp<T> {
             Self::BoolXor { .. } => Cow::Borrowed("boolxor"),
             Self::BoolNot { .. } => Cow::Borrowed("boolnot"),
             Self::LoadIndirect { .. }
+            | Self::ArgNext { .. }
+            | Self::ArgStep { .. }
             | Self::LoadStaticField { .. }
             | Self::LoadArg { .. }
             | Self::LoadLocal { .. }
             | Self::LoadArgAddr { .. }
-            | Self::LoadLocalAddr { .. } => Cow::Borrowed("load"),
+            | Self::LoadLocalAddr { .. }
+            | Self::ArgList { .. } => Cow::Borrowed("load"),
             Self::StoreIndirect { .. } | Self::StoreStaticField { .. } => Cow::Borrowed("store"),
             Self::LoadField { .. } => Cow::Borrowed("load:member"),
             Self::StoreField { .. } => Cow::Borrowed("store:member"),
@@ -895,19 +1008,29 @@ impl<T: Target> SsaOp<T> {
             // A call classifies to a bare token here; a consumer that can
             // resolve the callee (which needs target-specific metadata this crate
             // does not have) refines it to `call:function` / `call:rva` / etc.
-            Self::Call { .. } | Self::CallVirt { .. } => Cow::Borrowed("call"),
-            Self::CallIndirect { .. } => Cow::Borrowed("call:indirect"),
+            Self::Call(call) => Cow::Borrowed(match call.callee {
+                Callee::Indirect { .. } => "call:indirect",
+                Callee::Direct(_) | Callee::Virtual(_) | Callee::Constrained { .. } => "call",
+            }),
             Self::IndirectBranch { .. } => Cow::Borrowed("branch:indirect"),
-            Self::AtomicRmw { .. } => Cow::Borrowed("atomic_rmw"),
-            Self::AtomicLoad { .. } => Cow::Borrowed("atomic_load"),
+            Self::AtomicLoad { reserves, .. } => Cow::Borrowed(if *reserves {
+                "atomic_load_reserve"
+            } else {
+                "atomic_load"
+            }),
             Self::AtomicStore { .. } => Cow::Borrowed("atomic_store"),
             Self::AtomicStoreConditional { .. } => Cow::Borrowed("atomic_store_cond"),
             Self::AtomicPairLoad { .. } => Cow::Borrowed("atomic_pair_load"),
             Self::AtomicPairStoreConditional { .. } => Cow::Borrowed("atomic_pair_store_cond"),
-            Self::CmpXchg { .. } | Self::WideCompareExchange { .. } => Cow::Borrowed("cmpxchg"),
+            Self::AtomicCondRmw { op, .. } => Cow::Owned(format!("atomic_cond_{op}")),
             Self::AtomicExchange { .. } => Cow::Borrowed("atomic_xchg"),
             Self::AtomicCmpXchg { .. } => Cow::Borrowed("atomic_cmpxchg"),
             Self::AtomicPairCmpXchg { .. } => Cow::Borrowed("atomic_pair_cmpxchg"),
+            Self::AtomicPairRmw { op, .. } => Cow::Owned(format!("atomic_pair_{op}")),
+            Self::AtomicCheckedRmw { op, compare, .. } => match compare {
+                Some(_) => Cow::Borrowed("atomic_checked_cmpxchg"),
+                None => Cow::Owned(format!("atomic_checked_{op}")),
+            },
             Self::AtomicLockRmw { .. } => Cow::Borrowed("atomic_lock_rmw"),
             Self::VectorUnary { .. }
             | Self::VectorBinary { .. }
@@ -931,68 +1054,35 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorBitmask { .. }
             | Self::VectorCast { .. }
             | Self::VectorReinterpret { .. }
+            | Self::VectorSlice { .. }
+            | Self::VectorInsertSlice { .. }
+            | Self::VectorConcat { .. }
             | Self::VectorPredicatedUnary { .. }
             | Self::VectorPredicatedBinary { .. }
             | Self::VectorPredicatedTernary { .. }
             | Self::VectorPack { .. }
             | Self::VectorPackLoad { .. }
             | Self::VectorPackStore { .. }
-            | Self::VectorZeroUpper { .. }
-            | Self::VectorMaskUnary { .. }
-            | Self::VectorMaskBinary { .. }
-            | Self::VectorCrypto(_)
-            | Self::TileOp(_)
-            | Self::VectorPermute(_)
-            | Self::VectorMultiplyAdd(_)
-            | Self::VectorPackNarrow(_)
-            | Self::VectorNarrowSaturate(_)
+            | Self::Contract(_)
             | Self::VectorPredicateWhile(_)
-            | Self::VectorPredicateBreak(_)
-            | Self::VectorComplexAdd(_)
-            | Self::VectorCountAdjust(_)
             | Self::VectorExtendInLane(_)
             | Self::VectorElementCount(_)
-            | Self::VectorSveAddressGen(_)
             | Self::VectorSveCompute(_)
-            | Self::VectorPredicateOp(_)
-            | Self::VectorSmeMisc(_)
-            | Self::VectorStructLoadReplicate(_)
-            | Self::VectorReverseChunks(_)
-            | Self::VectorMatrixMulAcc(_)
-            | Self::VectorSmeOuterProduct(_)
-            | Self::VectorPredicateGen(_)
-            | Self::VectorFpHelper(_)
-            | Self::VectorSvePermute(_)
-            | Self::VectorTernaryLogic(_)
-            | Self::VectorComplexMul(_)
-            | Self::VectorClassify(_)
-            | Self::VectorHorizontalReduce(_)
-            | Self::VectorDotProduct(_)
-            | Self::VectorIntDotProduct(_)
-            | Self::VectorMultiSad(_)
-            | Self::VectorStringCompare(_)
-            | Self::VectorHorizontalMinPos(_)
-            | Self::VectorBitfield(_)
-            | Self::VectorIntersect(_)
-            | Self::VectorShuffleBits(_)
-            | Self::VectorConditionalMove(_) => Cow::Borrowed("vector"),
+            | Self::VectorStructLoadReplicate(_) => Cow::Borrowed("vector"),
             Self::LoadObj { .. } => Cow::Borrowed("load"),
             Self::StoreObj { .. } => Cow::Borrowed("store"),
             Self::Nop => Cow::Borrowed("nop"),
             Self::Fence { .. } => Cow::Borrowed("fence"),
-            Self::NativeOpaque(data) => Cow::Owned(format!(
-                "unsupported:{}",
-                normalize_token_text(&data.mnemonic)
-            )),
-            // No `normalize_token_text` on these five: the input is a
-            // `kind_str()` literal, and every registered table's keys are
-            // pinned equal to their own `trim().to_ascii_lowercase()`, so
-            // normalizing is an allocation that cannot change the answer.
+            // A `kind_str()` is a crate literal, and every registered table's
+            // keys are pinned equal to their own `trim().to_ascii_lowercase()`,
+            // so the token takes it as it is.
             Self::SystemOp(data) => Cow::Owned(format!("system:{}", data.kind.kind_str())),
-            Self::ComputeOp(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
-            Self::BcdAdjust(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
-            Self::FlagAdjust(data) => Cow::Owned(format!("compute:{}", data.kind.kind_str())),
-            Self::BlockString(data) => Cow::Owned(format!("blockstring:{}", data.kind.kind_str())),
+            // A lane computation's policies are part of what it computes, so
+            // its token is the whole computation.
+            Self::Compute(data) => match data.kind.lanes {
+                Some(_) => Cow::Owned(format!("lanes:{:?}", data.kind)),
+                None => Cow::Owned(format!("compute:{}", data.kind.kernel.kind_str())),
+            },
             Self::FloatCompareFlags { .. }
             | Self::Jump { .. }
             | Self::Branch { .. }
@@ -1021,23 +1111,25 @@ impl<T: Target> SsaOp<T> {
             | Self::Leave { .. }
             | Self::InitBlk { .. }
             | Self::CopyBlk { .. }
+            | Self::MoveBlk { .. }
+            | Self::CompareBlk(_)
+            | Self::ScanBlk { .. }
+            | Self::LoadBlk { .. }
             | Self::InitObj { .. }
             | Self::CopyObj { .. }
+            | Self::MakeTypedRef { .. }
+            | Self::TypedRefValue { .. }
+            | Self::TypedRefType { .. }
             | Self::Ckfinite { .. }
             | Self::FpClassify { .. }
-            | Self::FpTranscendental(_)
+            | Self::FloatFunction(_)
             | Self::FpuControl(_)
             | Self::LocalAlloc { .. }
-            | Self::Constrained { .. }
-            | Self::Unaligned { .. }
             | Self::Break(_)
             | Self::EndFinally
             | Self::InterruptReturn
-            | Self::Readonly
             | Self::Rethrow
-            | Self::TailPrefix
-            | Self::Unreachable
-            | Self::Volatile => Cow::Borrowed("unknown"),
+            | Self::Unreachable => Cow::Borrowed("unknown"),
         }
     }
 
@@ -1067,6 +1159,69 @@ impl<T: Target> SsaOp<T> {
             use_count: self.use_count(),
             may_throw: self.may_throw(),
         }
+    }
+
+    /// The call this operation is ([`CallData`]); `None` for every other
+    /// operation.
+    #[must_use]
+    pub fn as_call(&self) -> Option<&CallData<T>> {
+        match self {
+            Self::Call(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// The call this operation is when it names its method (a direct,
+    /// virtual or constrained call, [`Callee::method`]); `None` for a call
+    /// through a pointer and every other operation.
+    #[must_use]
+    pub fn as_named_call(&self) -> Option<&CallData<T>> {
+        self.as_call().filter(|call| call.callee.method().is_some())
+    }
+
+    /// The call this operation is, to rewrite in place; `None` for every
+    /// other operation.
+    #[must_use]
+    pub fn as_call_mut(&mut self) -> Option<&mut CallData<T>> {
+        match self {
+            Self::Call(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// The call this operation is when it names its method, to rewrite in
+    /// place ([`Self::as_named_call`]).
+    #[must_use]
+    pub fn as_named_call_mut(&mut self) -> Option<&mut CallData<T>> {
+        self.as_call_mut()
+            .filter(|call| call.callee.method().is_some())
+    }
+
+    /// Whether the operation's one result is a function of its operands
+    /// alone, so that two such operations of one kind over the same values
+    /// compute one value: it is pure, defines one value, and is none of the
+    /// pure operations whose result depends on more than its operands
+    /// (`Const` holds its own value, `CallClobber` defines a fresh unknown,
+    /// `Phi` reads the edge control arrived by).
+    #[must_use]
+    pub fn computes_from_operands(&self) -> bool {
+        !matches!(self, Self::Const { .. } | Self::Phi { .. })
+            && !self.defines_undefined()
+            && self.effects().is_pure()
+            && self.defs().count() == 1
+    }
+
+    /// Whether every value the operation defines is undefined: fresh, with
+    /// nothing in the program deciding it - the registers a call leaves
+    /// holding whatever it left (`CallClobber`).
+    ///
+    /// A path that reads such a value relies on nothing it holds, so a phi
+    /// operand that is one may be any value available on its edge. Every other
+    /// read keeps it as it is: that a register is read after a call clobbered
+    /// it is evidence of its own.
+    #[must_use]
+    pub const fn defines_undefined(&self) -> bool {
+        matches!(self, Self::CallClobber { .. })
     }
 
     /// Extracts binary operation information if this is a binary operation.
@@ -1288,7 +1443,9 @@ impl<T: Target> SsaOp<T> {
                 unsigned,
                 flags,
             }),
-            Self::Ceq { dest, left, right } => Some(BinaryOpInfo {
+            Self::Ceq {
+                dest, left, right, ..
+            } => Some(BinaryOpInfo {
                 kind: BinaryOpKind::Ceq,
                 dest,
                 left,
@@ -1301,6 +1458,7 @@ impl<T: Target> SsaOp<T> {
                 left,
                 right,
                 unsigned,
+                ..
             } => Some(BinaryOpInfo {
                 kind: BinaryOpKind::Clt,
                 dest,
@@ -1314,6 +1472,7 @@ impl<T: Target> SsaOp<T> {
                 left,
                 right,
                 unsigned,
+                ..
             } => Some(BinaryOpInfo {
                 kind: BinaryOpKind::Cgt,
                 dest,
@@ -1340,30 +1499,6 @@ impl<T: Target> SsaOp<T> {
                 amount,
             } => Some(BinaryOpInfo {
                 kind: BinaryOpKind::Ror,
-                dest,
-                left: value,
-                right: amount,
-                unsigned: false,
-                flags: None,
-            }),
-            Self::Rcl {
-                dest,
-                value,
-                amount,
-            } => Some(BinaryOpInfo {
-                kind: BinaryOpKind::Rcl,
-                dest,
-                left: value,
-                right: amount,
-                unsigned: false,
-                flags: None,
-            }),
-            Self::Rcr {
-                dest,
-                value,
-                amount,
-            } => Some(BinaryOpInfo {
-                kind: BinaryOpKind::Rcr,
                 dest,
                 left: value,
                 right: amount,
@@ -1469,27 +1604,47 @@ impl<T: Target> SsaOp<T> {
     /// - pushes: number of values produced to the stack
     ///
     /// Note: This tracks the operation's own effect, not the loading of operands
-    /// (which is tracked separately during codegen).
+    /// (which is tracked separately during codegen). The environment's
+    /// rounding mode an operation reads ([`Self::environment`]) is one more
+    /// value consumed.
     #[must_use]
     pub fn stack_effect(&self) -> (u32, u32) {
+        let (pops, pushes) = self.operand_effect();
+        (
+            pops.saturating_add(u32::from(self.environment().is_some())),
+            pushes,
+        )
+    }
+
+    /// The stack effect of the operation's own operands
+    /// ([`Self::stack_effect`]), the environment's mode aside.
+    fn operand_effect(&self) -> (u32, u32) {
         match self {
+            Self::VectorSlice { .. } => (3, 1),
+            Self::VectorInsertSlice { .. } => (3, 1),
+            Self::VectorConcat { .. } => (2, 1),
+
             // Address computation pops the base and its optional index, pushes
             // the address. (A native-only op; never on the CIL eval stack.)
             Self::PtrAdd { index, .. } => (1u32.saturating_add(u32::from(index.is_some())), 1),
-            // Flags computed from N inputs - pop N, push 1.
-            Self::ComputeFlags { inputs, .. } => {
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = inputs.len() as u32;
-                (pops, 1)
-            }
             // Call-clobber defines N caller-saved registers - pop 0, push N.
-            Self::CallClobber { outputs } => {
+            // A raise reads the operands of the operation it is of.
+            Self::FloatRaise { op, .. } => {
+                let mut operation = op.as_ref();
+                while let Self::FloatRaise { op, .. } = operation {
+                    operation = op;
+                }
+                (operation.stack_effect().0, 1)
+            }
+            Self::CallClobber { outputs, .. } => {
                 #[allow(clippy::cast_possible_truncation)]
                 let pushes = outputs.len() as u32;
                 (0, pushes)
             }
             // Binary arithmetic, comparisons, and array access - pop 2, push 1
-            Self::Add { .. }
+            Self::MergeFlags { .. }
+            | Self::InsertFlag { .. }
+            | Self::Add { .. }
             | Self::Sub { .. }
             | Self::Mul { .. }
             | Self::Div { .. }
@@ -1505,8 +1660,6 @@ impl<T: Target> SsaOp<T> {
             | Self::Shr { .. }
             | Self::Rol { .. }
             | Self::Ror { .. }
-            | Self::Rcl { .. }
-            | Self::Rcr { .. }
             | Self::Ceq { .. }
             | Self::Clt { .. }
             | Self::Cgt { .. }
@@ -1517,7 +1670,6 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadElementAddr { .. }
             | Self::VectorBinary { .. }
             | Self::VectorCompare { .. }
-            | Self::VectorMaskBinary { .. }
             | Self::VectorPredicatedUnary {
                 passthrough: None, ..
             }
@@ -1528,9 +1680,9 @@ impl<T: Target> SsaOp<T> {
                 passthrough: None, ..
             } => (2, 1),
 
-            // Pop 3, push 1 (Select, CmpXchg)
+            // Pop 3, push 1 (Select, AtomicCondRmw)
             Self::Select { .. }
-            | Self::CmpXchg { .. }
+            | Self::AtomicCondRmw { .. }
             | Self::VectorTernary { .. }
             | Self::VectorPredicatedUnary {
                 passthrough: Some(_),
@@ -1565,18 +1717,27 @@ impl<T: Target> SsaOp<T> {
                 (3, 1_u32.saturating_add(u32::from(success.is_some())))
             }
             Self::AtomicPairCmpXchg { .. } => (5, 2),
+            Self::AtomicPairRmw { .. } => (3, 2),
+            // The address, the operand and the mask, then the compared value
+            // and the soft mask where the form has them; the old value and
+            // the status.
+            Self::AtomicCheckedRmw {
+                compare, rcws_mask, ..
+            } => (
+                3u32.saturating_add(u32::from(compare.is_some()))
+                    .saturating_add(u32::from(rcws_mask.is_some())),
+                2,
+            ),
             Self::WideMul { .. } => (2, 2),
             Self::WideDiv { .. } => (3, 2),
 
-            // AtomicRmw is pop 2, push 1
-            Self::AtomicRmw { .. }
-            | Self::AtomicExchange { .. }
+            Self::AtomicExchange { .. }
             | Self::AtomicLockRmw { .. }
             | Self::AtomicStoreConditional { .. } => (2, 1),
             Self::AtomicPairStoreConditional { .. } => (3, 1),
 
             // Control flow
-            Self::Return { value } => {
+            Self::Return { value, .. } => {
                 if value.is_some() {
                     (1, 0) // pop return value
                 } else {
@@ -1591,15 +1752,9 @@ impl<T: Target> SsaOp<T> {
             | Self::Copy { .. }
             | Self::Nop
             | Self::Break(_)
-            | Self::Constrained { .. }
-            | Self::Volatile
-            | Self::Unaligned { .. }
-            | Self::TailPrefix
-            | Self::Readonly
             | Self::Phi { .. }
             | Self::Fence { .. }
             | Self::InterruptReturn
-            | Self::VectorZeroUpper { .. }
             | Self::Unreachable => (0, 0),
 
             // Pop 1, push 0 (1, 0)
@@ -1633,19 +1788,33 @@ impl<T: Target> SsaOp<T> {
                 )
             }
 
-            // Pop 3, push 0 (3, 0)
-            Self::StoreElement { .. } | Self::InitBlk { .. } | Self::CopyBlk { .. } => (3, 0),
+            // Pop 3, push 0 (3, 0); a block that reads a direction flag pops it too
+            Self::StoreElement { .. } | Self::MoveBlk { .. } => (3, 0),
+            Self::InitBlk { backward, .. } | Self::CopyBlk { backward, .. } => {
+                (3_u32.saturating_add(u32::from(backward.is_some())), 0)
+            }
+            Self::CompareBlk(data) => (4_u32.saturating_add(u32::from(data.backward.is_some())), 4),
+            Self::ScanBlk { backward, .. } => {
+                (4_u32.saturating_add(u32::from(backward.is_some())), 3)
+            }
+            Self::LoadBlk { backward, .. } => {
+                (3_u32.saturating_add(u32::from(backward.is_some())), 2)
+            }
+
+            Self::ArgStep { .. } => (1, 2),
 
             // Pop 0, push 1 (0, 1)
             Self::LoadStaticField { .. }
             | Self::LoadStaticFieldAddr { .. }
             | Self::SizeOf { .. }
             | Self::LoadToken { .. }
+            | Self::ArgList { .. }
             | Self::LoadArg { .. }
             | Self::LoadLocal { .. }
             | Self::LoadArgAddr { .. }
             | Self::LoadLocalAddr { .. }
             | Self::LoadFunctionPtr { .. }
+            | Self::RuntimeValue { .. }
             | Self::Const { .. } => (0, 1),
 
             // Pop 1, push 1 (1, 1)
@@ -1671,6 +1840,7 @@ impl<T: Target> SsaOp<T> {
             | Self::ArrayLength { .. }
             | Self::NewArr { .. }
             | Self::LoadIndirect { .. }
+            | Self::ArgNext { .. }
             | Self::AtomicLoad { .. }
             | Self::LoadObj { .. }
             | Self::Box { .. }
@@ -1678,6 +1848,9 @@ impl<T: Target> SsaOp<T> {
             | Self::UnboxAny { .. }
             | Self::CastClass { .. }
             | Self::IsInst { .. }
+            | Self::MakeTypedRef { .. }
+            | Self::TypedRefValue { .. }
+            | Self::TypedRefType { .. }
             | Self::LoadVirtFunctionPtr { .. }
             | Self::LocalAlloc { .. }
             | Self::ReadFlags { .. }
@@ -1687,16 +1860,34 @@ impl<T: Target> SsaOp<T> {
             | Self::VectorBroadcastLoad { .. }
             | Self::VectorExtract { .. }
             | Self::VectorSplat { .. }
-            | Self::VectorShuffle { right: None, .. }
+            | Self::VectorShuffle {
+                right: None,
+                selector: VectorShuffleSelector::Mask(_),
+                ..
+            }
             | Self::VectorCast { .. }
             | Self::VectorReinterpret { .. }
-            | Self::VectorMaskUnary { .. }
             | Self::VectorReduce { .. }
             | Self::VectorBitmask { .. } => (1, 1),
 
             Self::AtomicPairLoad { .. } => (1, 2),
 
-            Self::VectorInsert { .. } | Self::VectorShuffle { right: Some(_), .. } => (2, 1),
+            Self::VectorInsert { .. }
+            | Self::VectorShuffle {
+                right: Some(_),
+                selector: VectorShuffleSelector::Mask(_),
+                ..
+            }
+            | Self::VectorShuffle {
+                right: None,
+                selector: VectorShuffleSelector::Index(_),
+                ..
+            } => (2, 1),
+            Self::VectorShuffle {
+                right: Some(_),
+                selector: VectorShuffleSelector::Index(_),
+                ..
+            } => (3, 1),
             Self::VectorMaskedLoad {
                 passthrough: None, ..
             } => (2, 1),
@@ -1726,20 +1917,14 @@ impl<T: Target> SsaOp<T> {
             }
 
             // Call operations - stack effect depends on args and return type
-            Self::Call { dest, args, .. } | Self::CallVirt { dest, args, .. } => {
-                // args.len() will never exceed u32 for CIL methods
+            // A call pops its arguments, and an indirect one its function
+            // pointer too, and pushes its result. `args.len()` never exceeds
+            // u32 for a CIL method.
+            Self::Call(call) => {
                 #[allow(clippy::cast_possible_truncation)]
-                let pops = args.len() as u32;
-                let pushes = u32::from(dest.is_some());
-                (pops, pushes)
-            }
-            Self::CallIndirect { dest, args, .. } => {
-                // Indirect call pops args + function pointer
-                // args.len() will never exceed u32 for CIL methods
-                #[allow(clippy::cast_possible_truncation)]
-                let pops = (args.len() as u32).saturating_add(1);
-                let pushes = u32::from(dest.is_some());
-                (pops, pushes)
+                let pops = (call.args.len() as u32)
+                    .saturating_add(u32::from(call.callee.fptr().is_some()));
+                (pops, u32::from(call.dest.is_some()))
             }
             Self::NewObj { args, .. } => {
                 // newobj pops constructor args, always pushes new instance
@@ -1750,56 +1935,48 @@ impl<T: Target> SsaOp<T> {
             }
             // A boxed payload pops one operand per input and pushes one per
             // output; the count lives once, in `KindedOperands`.
-            Self::NativeOpaque(data) => data.operand_counts(),
             Self::SystemOp(data) => data.operand_counts(),
-            Self::ComputeOp(data) => data.operand_counts(),
-            Self::BcdAdjust(data) => data.operand_counts(),
-            Self::VectorCrypto(data) => data.operand_counts(),
-            Self::TileOp(data) => data.operand_counts(),
-            Self::VectorPermute(data) => data.operand_counts(),
-            Self::VectorMultiplyAdd(data) => data.operand_counts(),
-            Self::VectorPackNarrow(data) => data.operand_counts(),
-            Self::VectorNarrowSaturate(data) => data.operand_counts(),
+            Self::Compute(data) => data.operand_counts(),
+            Self::Contract(data) => data.operand_counts(),
             Self::VectorPredicateWhile(data) => data.operand_counts(),
-            Self::VectorPredicateBreak(data) => data.operand_counts(),
-            Self::VectorComplexAdd(data) => data.operand_counts(),
-            Self::VectorCountAdjust(data) => data.operand_counts(),
             Self::VectorExtendInLane(data) => data.operand_counts(),
             Self::VectorElementCount(data) => data.operand_counts(),
-            Self::VectorSveAddressGen(data) => data.operand_counts(),
-            Self::FlagAdjust(data) => data.operand_counts(),
             Self::VectorStructLoadReplicate(data) => data.operand_counts(),
-            Self::VectorSmeMisc(data) => data.operand_counts(),
-            Self::VectorPredicateOp(data) => data.operand_counts(),
             Self::VectorSveCompute(data) => data.operand_counts(),
-            Self::VectorReverseChunks(data) => data.operand_counts(),
-            Self::VectorMatrixMulAcc(data) => data.operand_counts(),
-            Self::VectorSmeOuterProduct(data) => data.operand_counts(),
-            Self::VectorPredicateGen(data) => data.operand_counts(),
-            Self::VectorFpHelper(data) => data.operand_counts(),
-            Self::VectorSvePermute(data) => data.operand_counts(),
-            Self::VectorTernaryLogic(data)
-            | Self::VectorMultiSad(data)
-            | Self::VectorClassify(data) => data.operand_counts(),
-            Self::VectorDotProduct(data) => data.operand_counts(),
-            Self::VectorIntDotProduct(data) => data.operand_counts(),
-            Self::VectorStringCompare(data) => data.operand_counts(),
-            Self::VectorBitfield(data) => data.operand_counts(),
-            Self::VectorIntersect(data) => data.operand_counts(),
-            Self::VectorShuffleBits(data) => data.operand_counts(),
-            Self::VectorConditionalMove(data) => data.operand_counts(),
-            Self::VectorHorizontalMinPos(data) => data.operand_counts(),
-            Self::VectorComplexMul(data) => data.operand_counts(),
-            Self::VectorHorizontalReduce(data) => data.operand_counts(),
-            Self::BlockString(data) => data.operand_counts(),
-            Self::WideCompareExchange(data) => data.operand_counts(),
-            Self::FpTranscendental(data) => data.operand_counts(),
+            Self::FloatFunction(data) => data.operand_counts(),
             Self::FpuControl(data) => data.operand_counts(),
         }
     }
-}
 
-impl<T: Target> SsaOp<T> {
+    /// Drops the signedness a vector operation's element states where its
+    /// operation does not read it
+    /// ([`VectorElement::read_by`](crate::ir::ops::VectorElement::read_by)), so two
+    /// operations that compute the same value compare equal: the `Add` a
+    /// signed halving add expands into is the `Add` of unsigned lanes.
+    pub fn forget_unread_signedness(&mut self) {
+        match self {
+            Self::VectorBinary { kind, element, .. }
+            | Self::VectorPredicatedBinary { kind, element, .. } => {
+                *element = element.read_by(kind.reads_signedness());
+            }
+            // A grouped reduction extends each lane to its wider result lane,
+            // so it reads the lanes' signedness whatever it computes.
+            Self::VectorReduce {
+                kind,
+                element,
+                groups,
+                ..
+            } => {
+                *element = element.read_by(kind.reads_signedness() || groups.is_some());
+            }
+            Self::VectorUnary { kind, element, .. }
+            | Self::VectorPredicatedUnary { kind, element, .. } => {
+                *element = element.read_by(kind.reads_signedness());
+            }
+            _ => {}
+        }
+    }
+
     /// Tries to infer the result type of this SSA operation.
     ///
     /// Dispatches per opcode group to small `Target` queries; each host
@@ -1810,6 +1987,11 @@ impl<T: Target> SsaOp<T> {
     #[must_use]
     pub fn infer_result_type(&self) -> Option<T::Type> {
         match self {
+            Self::VectorSlice { target_type, .. } | Self::VectorInsertSlice { target_type, .. } => {
+                Some(target_type.clone())
+            }
+            Self::VectorConcat { target_type, .. } => Some(target_type.clone()),
+
             Self::Const { value, .. } => T::result_type_for_const(value),
             // Type conversions carry their target.
             Self::IntConv { target, .. }
@@ -1827,7 +2009,7 @@ impl<T: Target> SsaOp<T> {
             | Self::BoolOr { .. }
             | Self::BoolXor { .. }
             | Self::BoolNot { .. } => T::comparison_result_type(),
-            // Arithmetic/bitwise ops + SizeOf — per-host arithmetic type.
+            // Arithmetic/bitwise ops + SizeOf - per-host arithmetic type.
             Self::Add { .. }
             | Self::Sub { .. }
             | Self::Mul { .. }
@@ -1840,8 +2022,6 @@ impl<T: Target> SsaOp<T> {
             | Self::Shr { .. }
             | Self::Rol { .. }
             | Self::Ror { .. }
-            | Self::Rcl { .. }
-            | Self::Rcr { .. }
             | Self::BSwap { .. }
             | Self::BRev { .. }
             | Self::Neg { .. }
@@ -1853,12 +2033,10 @@ impl<T: Target> SsaOp<T> {
             Self::UnboxAny { value_type, .. } | Self::LoadObj { value_type, .. } => {
                 T::value_type_from_ref(value_type)
             }
-            // Context-dependent ops — resolved from SsaInstruction::result_type().
+            // Context-dependent ops - resolved from SsaInstruction::result_type().
             Self::LoadField { .. }
             | Self::LoadStaticField { .. }
-            | Self::Call { dest: Some(_), .. }
-            | Self::CallVirt { dest: Some(_), .. }
-            | Self::CallIndirect { dest: Some(_), .. }
+            | Self::Call(_)
             | Self::LoadArg { .. }
             | Self::LoadLocal { .. } => None,
             Self::Box { .. }
@@ -1873,9 +2051,7 @@ impl<T: Target> SsaOp<T> {
             | Self::Popcount { .. } => T::native_int_result_type(),
             Self::Ckfinite { .. } => T::ckfinite_result_type(),
             Self::FpClassify { .. } => T::native_int_result_type(),
-            Self::Parity { .. } | Self::ReadFlags { .. } | Self::ComputeFlags { .. } => {
-                T::comparison_result_type()
-            }
+            Self::Parity { .. } | Self::ReadFlags { .. } => T::comparison_result_type(),
             Self::VectorLoad { vector_type, .. }
             | Self::VectorMaskedLoad { vector_type, .. }
             | Self::VectorBroadcastLoad { vector_type, .. }
@@ -1898,10 +2074,13 @@ impl<T: Target> SsaOp<T> {
             }
             Self::LoadElement { elem_type, .. } => Some(elem_type.clone()),
             Self::LoadIndirect { value_type, .. } => Some(value_type.clone()),
+            Self::ArgNext { ty, .. } | Self::ArgStep { ty, .. } => Some(ty.clone()),
             // LoadToken: assembly-free inference is `None`; the variable's
             // declared type set during SSA construction provides the real one.
             Self::LoadToken { .. } => None,
-            Self::Unbox { value_type, .. } => T::byref_value_type_from_ref(value_type),
+            Self::Unbox { value_type, .. } | Self::TypedRefValue { value_type, .. } => {
+                T::byref_value_type_from_ref(value_type)
+            }
             Self::LoadElementAddr { elem_type, .. } => T::byref_class_type_from_ref(elem_type),
             Self::PtrAdd { result_type, .. } => Some(result_type.clone()),
             Self::LoadFieldAddr { .. }
@@ -1909,6 +2088,61 @@ impl<T: Target> SsaOp<T> {
             | Self::LoadArgAddr { .. }
             | Self::LoadLocalAddr { .. } => None,
             _ => None,
+        }
+    }
+
+    /// Borrows the type this operation states explicitly: a conversion's
+    /// target, a vector operation's vector type, an access's value type, the
+    /// one a static execution kernel reads.
+    ///
+    /// Operations without such a field keep ordinary target querying.
+    #[must_use]
+    pub fn stated_type(&self) -> Option<&T::Type> {
+        match self {
+            Self::IntConv { target, .. }
+            | Self::FloatToInt { target, .. }
+            | Self::IntToFloat { target, .. }
+            | Self::FloatConv { target, .. }
+            | Self::Bitcast { target, .. }
+            | Self::IntToPtr { target, .. }
+            | Self::PtrToInt { target, .. } => Some(target),
+            Self::VectorSplat { vector_type, .. }
+            | Self::VectorStore { vector_type, .. }
+            | Self::VectorMaskedStore { vector_type, .. }
+            | Self::VectorScatter { vector_type, .. }
+            | Self::VectorSegmentStore { vector_type, .. }
+            | Self::VectorPackStore { vector_type, .. } => Some(vector_type),
+            Self::VectorSlice { target_type, .. }
+            | Self::VectorInsertSlice { target_type, .. }
+            | Self::VectorConcat { target_type, .. }
+            | Self::VectorReinterpret { target_type, .. }
+            | Self::VectorCast { target_type, .. } => Some(target_type),
+            Self::LoadIndirect { value_type, .. }
+            | Self::StoreIndirect { value_type, .. }
+            | Self::VectorLoad {
+                vector_type: value_type,
+                ..
+            } => Some(value_type),
+            _ => None,
+        }
+    }
+
+    /// Whether `op` is one whose results [`Machine::evaluate_results`](crate::analysis::consts::Machine::evaluate_results) folds
+    /// one by one: the double-width arithmetic, the float functions of
+    /// several results that are exact (`fxtract`, `fprem`, `fprem1`), and
+    /// every computation of more than one result (a computation over lanes
+    /// writes its status beside its data). An analysis evaluates such an
+    /// operation through it, and every other through [`Machine::evaluate`](crate::analysis::consts::Machine::evaluate).
+    #[must_use]
+    pub fn folds_results(&self) -> bool {
+        match self {
+            Self::WideMul { .. } | Self::WideDiv { .. } => true,
+            Self::FloatFunction(data) => matches!(
+                data.kind,
+                FloatFunctionKind::Extract | FloatFunctionKind::Rem | FloatFunctionKind::Rem1
+            ),
+            Self::Compute(data) => data.outputs.len() > 1,
+            _ => false,
         }
     }
 }

@@ -25,7 +25,7 @@
 //!
 //! That places one obligation on the frontend: **number blocks in layout
 //! order**, so the blocks of one clause part are contiguous. Codegen already
-//! depends on it — regenerating an IL exception table means writing a byte
+//! depends on it - regenerating an IL exception table means writing a byte
 //! range per part, and a byte range is contiguous by definition, so a part whose
 //! blocks are scattered has no representation on the way out either. The
 //! contract is stated here rather than assumed; [`BlockRange::to_bitset`] is the
@@ -41,7 +41,7 @@
 //!   may not cross.
 //! - [`SsaExceptionHandler::layout`] is the **checked** view, used by the
 //!   verifier and by structured recovery. It answers `Ok(None)` for a clause
-//!   whose blocks lie outside this function — the funclet case — and
+//!   whose blocks lie outside this function - the funclet case - and
 //!   [`ExceptionTableError`] for one that cannot be laid out at all.
 //!
 //! # Edge Cases
@@ -56,13 +56,19 @@
 //!   a caught exception type token or the offset of a filter expression, depending on
 //!   [`SsaExceptionHandler::kind`].
 
+use std::fmt;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
 use crate::{BitSet, target::Target};
 
 /// What a handler does when the protected region raises.
 ///
 /// The crate's single handler taxonomy: [`Target::handler_kind`] classifies a
 /// host's opaque `ExceptionKind` into it, and structured recovery reports it
-/// back. There is deliberately no second copy for native ISA hosts — two enums
+/// back. There is deliberately no second copy for native ISA hosts - two enums
 /// with the same four variants can disagree, and nothing would catch it.
 ///
 /// A host maps its own encoding onto these four:
@@ -70,11 +76,11 @@ use crate::{BitSet, target::Target};
 /// | Variant | CIL | SEH (x86 Windows) | DWARF (Linux) |
 /// |---------|-----|-------------------|---------------|
 /// | `Catch` | `EXCEPTION` | `__except` block | landing pad |
-/// | `Filter` | `FILTER` | `__except(filter)` expression | — |
-/// | `Finally` | `FINALLY` | `__finally` block | — |
-/// | `Fault` | `FAULT` | vectored exception handler | — |
+/// | `Filter` | `FILTER` | `__except(filter)` expression | - |
+/// | `Finally` | `FINALLY` | `__finally` block | - |
+/// | `Fault` | `FAULT` | vectored exception handler | - |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum HandlerKind {
     /// Runs for a matching exception type.
     Catch,
@@ -91,7 +97,7 @@ pub enum HandlerKind {
 
 /// Which part of an exception clause a [`BlockRange`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ClausePart {
     /// The guarded code: the `try` region.
     Protected,
@@ -114,8 +120,8 @@ impl ClausePart {
     }
 }
 
-impl std::fmt::Display for ClausePart {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ClausePart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
 }
@@ -123,11 +129,12 @@ impl std::fmt::Display for ClausePart {
 /// A non-empty half-open range of block indices, `[start, end)`.
 ///
 /// One clause part is one of these. The pairing is the whole point: a start
-/// without its end is not a value this type can hold, so the half-mapped clause
-/// — a `try` that begins somewhere and ends nowhere — is deleted by the type
-/// rather than reported by a checker. Partiality that *is* legitimate lives one
-/// level up, as `Option<BlockRange>` per part: a funclet handler maps no block
-/// of this function, and canonicalization can remove every block of a part.
+/// without its end is not a value this type can hold, so the half-mapped
+/// clause - a `try` that begins somewhere and ends nowhere - is deleted by the
+/// type rather than reported by a checker. Partiality that *is* legitimate
+/// lives one level up, as `Option<BlockRange>` per part: a funclet handler
+/// maps no block of this function, and canonicalization can remove every block
+/// of a part.
 ///
 /// Empty and reversed ranges are equally unrepresentable, so
 /// [`is_empty`](Self::is_empty) is always `false` and exists only because a
@@ -135,7 +142,7 @@ impl std::fmt::Display for ClausePart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(try_from = "(usize, usize)", into = "(usize, usize)")
 )]
 pub struct BlockRange {
@@ -239,7 +246,7 @@ impl BlockRange {
     /// survivors are then consecutive in the new numbering and `[min, max + 1)`
     /// is exactly the set of them. Under a non-monotone remap the result is a
     /// superset of the survivors, which is the conservative direction for both
-    /// of the things a range is used as — a transformation barrier and a region
+    /// of the things a range is used as - a transformation barrier and a region
     /// membership set.
     ///
     /// # Arguments
@@ -281,7 +288,7 @@ impl TryFrom<(usize, usize)> for BlockRange {
 ///
 /// Reachable only through deserialization, which is the one path that can
 /// present a pair the constructor never approved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[error("block range [{start}, {end}) covers no block")]
 pub struct EmptyBlockRange {
     /// The proposed first block.
@@ -297,7 +304,7 @@ pub struct EmptyBlockRange {
 /// table, which is what the block ranges exist for. Notably absent are a
 /// half-mapped part and an empty part: [`BlockRange`] makes both
 /// unrepresentable, so neither is an error anything can report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 pub enum ExceptionTableError {
     /// A part names a block the function does not have.
     #[error("{part} range ends at {end}, past the function's {block_count} block(s)")]
@@ -418,7 +425,7 @@ pub struct ClauseLayout {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(Serialize, Deserialize),
     serde(bound(
         serialize = "T::ExceptionKind: serde::Serialize, T::TypeRef: serde::Serialize",
         deserialize = "T::ExceptionKind: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>"
@@ -451,11 +458,15 @@ pub struct SsaExceptionHandler<T: Target> {
     ///
     /// `None` when no block of this function is protected by the clause, which
     /// is the ordinary state for a clause whose code lives in another function.
+    /// The analyses read an unstated region conservatively: a throw to the
+    /// clause's entries may come from any block
+    /// ([`FunctionRoots`](crate::analysis::FunctionRoots)), the handler's own
+    /// included.
     pub protected_range: Option<BlockRange>,
 
     /// SSA blocks of the handler body.
     ///
-    /// `None` when the handler is a funclet — a separate function, so no block
+    /// `None` when the handler is a funclet - a separate function, so no block
     /// of this one belongs to it.
     pub handler_range: Option<BlockRange>,
 
@@ -465,6 +476,19 @@ pub struct SsaExceptionHandler<T: Target> {
     /// derived: a filter can be laid out either side of its handler, so there is
     /// no rule that recovers its extent from the other two parts.
     pub filter_range: Option<BlockRange>,
+
+    /// The value the runtime hands the handler's entry when it chooses this
+    /// clause ([`RuntimeValueKind::HandlerEntry`]), where it hands one: an
+    /// Itanium landing pad's type selector, the clause's action-table type
+    /// filter, zero for a cleanup. `None` for a runtime that hands its handler
+    /// no choice (CIL, SEH).
+    ///
+    /// [`RuntimeValueKind::HandlerEntry`]: crate::ir::RuntimeValueKind::HandlerEntry
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub selector: Option<i64>,
 }
 
 impl<T: Target> SsaExceptionHandler<T> {
@@ -472,6 +496,13 @@ impl<T: Target> SsaExceptionHandler<T> {
     #[must_use]
     pub fn kind(&self) -> HandlerKind {
         T::handler_kind(&self.flags)
+    }
+
+    /// Whether the handler is entered holding the exception
+    /// ([`Target::handler_receives_exception`]).
+    #[must_use]
+    pub fn receives_exception(&self) -> bool {
+        T::handler_receives_exception(&self.flags)
     }
 
     /// Returns the filter offset, for a filter handler.
@@ -497,7 +528,7 @@ impl<T: Target> SsaExceptionHandler<T> {
     ///
     /// **Total**: it validates nothing and rejects nothing. Every barrier the
     /// crate raises around exception structure reads this, and a barrier must
-    /// fence even for a clause that cannot be laid out — a malformed clause is
+    /// fence even for a clause that cannot be laid out - a malformed clause is
     /// exactly the one whose code must not be moved before somebody looks at it.
     pub fn parts(&self) -> impl Iterator<Item = (ClausePart, BlockRange)> + use<T> {
         [
@@ -525,12 +556,12 @@ impl<T: Target> SsaExceptionHandler<T> {
     /// The checked counterpart to [`parts`](Self::parts), and the only reading
     /// of a clause that can refuse one. Three answers:
     ///
-    /// - `Ok(Some(layout))` — the clause covers blocks of this function and is
+    /// - `Ok(Some(layout))` - the clause covers blocks of this function and is
     ///   consistent.
-    /// - `Ok(None)` — the protected or handler part maps no block of this
+    /// - `Ok(None)` - the protected or handler part maps no block of this
     ///   function. Legal and common: on Windows x64 a handler is a funclet, a
     ///   separate function, so a per-function view cannot contain its blocks.
-    /// - `Err` — the clause names blocks the function does not have, claims one
+    /// - `Err` - the clause names blocks the function does not have, claims one
     ///   block for two parts, or disagrees with itself about being a filter.
     ///
     /// # Errors
@@ -561,10 +592,21 @@ impl<T: Target> SsaExceptionHandler<T> {
             (HandlerKind::Fault, None) => LaidOutHandler::Fault,
         };
 
+        // A resumption entry may be code the clause still protects
+        // ([`Target::handler_resumes_protected`]): it is entered once the
+        // exception is dealt with elsewhere, and a throw there is the
+        // clause's again.
+        let resumes = T::handler_resumes_protected(&self.flags);
         let mapped: Vec<(ClausePart, BlockRange)> = self.parts().collect();
         for (index, (first, first_range)) in mapped.iter().enumerate() {
             for (second, second_range) in mapped.iter().skip(index.saturating_add(1)) {
-                if first_range.overlaps(second_range) {
+                let resumed = resumes
+                    && matches!(
+                        (first, second),
+                        (ClausePart::Protected, ClausePart::Handler)
+                            | (ClausePart::Handler, ClausePart::Protected)
+                    );
+                if !resumed && first_range.overlaps(second_range) {
                     return Err(ExceptionTableError::OverlappingParts {
                         first: *first,
                         second: *second,
@@ -585,7 +627,7 @@ impl<T: Target> SsaExceptionHandler<T> {
     /// Called during [`crate::ir::function::SsaFunction::canonicalize`] to update exception handler block
     /// references after empty blocks are removed and remaining blocks are renumbered.
     ///
-    /// Each part is remapped by its *members* — see [`BlockRange::remap`] — so a
+    /// Each part is remapped by its *members* - see [`BlockRange::remap`] - so a
     /// part shrinks to the blocks of it that survive and disappears when none
     /// does. An exclusive end therefore never advances past the part's own
     /// blocks and cannot swallow a neighbouring part, and no part can come back
@@ -621,7 +663,7 @@ impl<T: Target> SsaExceptionHandler<T> {
 /// where each is read:
 ///
 /// - a **runtime entry** is a block control can enter without any terminator
-///   naming it — a handler entry or a filter entry. It is why entry-rooted
+///   naming it - a handler entry or a filter entry. It is why entry-rooted
 ///   reachability under-approximates a lifted function;
 /// - a **region start** and a **region end** bound a protected range, which is
 ///   a barrier to transformations that would move code across it.
@@ -629,8 +671,8 @@ impl<T: Target> SsaExceptionHandler<T> {
 /// # Borrowing
 ///
 /// This borrows the handler slice rather than copying it. An owned snapshot
-/// threaded through a mutating fixpoint — `passes::blockmerge` is the live
-/// example — is stale after the first iteration that edits the table, and
+/// threaded through a mutating fixpoint - `passes::blockmerge` is the live
+/// example - is stale after the first iteration that edits the table, and
 /// nothing would catch it. Holding the borrow makes that a compile error.
 ///
 /// # Totality
@@ -638,7 +680,7 @@ impl<T: Target> SsaExceptionHandler<T> {
 /// Built from [`SsaExceptionHandler::parts`], so a clause that cannot be laid
 /// out still contributes its roles. Every accessor answers for any `usize`. An
 /// index outside the function's block count is not a member of anything, and a
-/// clause naming a block the function does not have contributes nothing — the
+/// clause naming a block the function does not have contributes nothing - the
 /// same rule
 /// [`SsaCfg::from_ssa`](crate::analysis::cfg::SsaCfg::from_ssa) already applies
 /// to an out-of-range successor.
@@ -753,8 +795,8 @@ impl<'a, T: Target> ExceptionBlocks<'a, T> {
     /// The runtime entries of every clause protecting a region that starts at
     /// `entry_block`.
     ///
-    /// Several clauses can share one protected range — `try/catch(A)/catch(B)`
-    /// is two rows with the same try start — so this can yield more than one.
+    /// Several clauses can share one protected range - `try/catch(A)/catch(B)`
+    /// is two rows with the same try start - so this can yield more than one.
     pub fn try_entries_of(&self, entry_block: usize) -> impl Iterator<Item = usize> + '_ {
         self.handlers
             .iter()
@@ -788,9 +830,12 @@ mod tests {
             protected_range: BlockRange::new(0, 2),
             handler_range: BlockRange::new(3, 5),
             filter_range: BlockRange::new(5, 6),
+            selector: None,
         }
     }
 
+    /// An empty or reversed range is unconstructible, and a range that does not
+    /// fit the requested bit width refuses to expand.
     #[test]
     fn block_range_refuses_empty_reversed_and_over_wide_expansions() {
         assert_eq!(BlockRange::new(2, 2), None, "an empty range is not a range");
@@ -818,6 +863,8 @@ mod tests {
         assert_eq!(bits.iter().collect::<Vec<_>>(), vec![1, 2]);
     }
 
+    /// Overlap and containment queries agree, and half-open ranges that abut
+    /// are reported as not overlapping.
     #[test]
     fn block_ranges_report_overlap_and_containment() {
         let outer = match BlockRange::new(0, 4) {
@@ -860,6 +907,8 @@ mod tests {
         }
     }
 
+    /// A handler entry and a filter entry both count as runtime entries, and
+    /// the protected region's start and exclusive end are reported.
     #[test]
     fn a_handler_and_a_filter_entry_are_both_runtime_entries() {
         let handlers = [handler(0)];
@@ -905,6 +954,8 @@ mod tests {
         assert_eq!(entries, vec![3, 5]);
     }
 
+    /// A table built from no handlers reports empty and assigns no runtime
+    /// entries.
     #[test]
     fn an_empty_table_assigns_no_roles() {
         let blocks = ExceptionBlocks::<MockTarget>::from_handlers(&[], 4);
@@ -925,6 +976,8 @@ mod tests {
         assert_eq!(handler(3).filter_offset(), None);
     }
 
+    /// A block mapping is reported present only when both the protected and
+    /// handler ranges are set.
     #[test]
     fn block_mapping_requires_protected_and_handler_ranges() {
         let mut mapped = handler(0);
@@ -962,6 +1015,34 @@ mod tests {
             malformed.entry_blocks().collect::<Vec<_>>(),
             vec![95, 99],
             "the handler entry, then the filter entry"
+        );
+    }
+
+    /// A resumption entry may lie in the range it guards; any other handler
+    /// overlapping its protected range is malformed.
+    #[test]
+    fn a_resumption_entry_may_lie_in_the_range_it_guards() {
+        let mut resumed = handler(4);
+        resumed.protected_range = BlockRange::new(0, 3);
+        resumed.handler_range = BlockRange::new(1, 2);
+        resumed.filter_range = None;
+        assert_eq!(
+            resumed.layout(4),
+            Ok(Some(ClauseLayout {
+                kind: LaidOutHandler::Catch,
+                protected: BlockRange { start: 0, end: 3 },
+                handler: BlockRange { start: 1, end: 2 },
+            }))
+        );
+        let mut caught = resumed.clone();
+        caught.flags = 0;
+        assert_eq!(
+            caught.layout(4),
+            Err(ExceptionTableError::OverlappingParts {
+                first: ClausePart::Protected,
+                second: ClausePart::Handler,
+            }),
+            "the control: a catch inside its own range is malformed"
         );
     }
 
@@ -1033,8 +1114,8 @@ mod tests {
     /// A part keeps exactly the blocks of it that survived, and its exclusive
     /// end is one past the last of them.
     ///
-    /// Remapping the end *index* instead — and, when its block is gone, scanning
-    /// forward for any surviving block at all — reaches past the part into
+    /// Remapping the end *index* instead - and, when its block is gone, scanning
+    /// forward for any surviving block at all - reaches past the part into
     /// whatever comes next, and finds nothing when nothing comes next, leaving a
     /// start with no end. Mapping by members has neither failure: the answer is
     /// derived from the part's own blocks and from nothing else.
