@@ -3,15 +3,16 @@
 //!
 //! Motivation: visus-core's `guard_pass` deep-clones the whole `SsaFunction`
 //! before every pass so a verifier rejection can roll back, and every edit
-//! session closes with a boundary repair — `recompute_uses`, `repair_ssa`, or a
-//! full `rebuild_ssa`. Which of those dominates decides whether the pipeline's
-//! effort belongs on eliminating snapshots or on avoiding repairs, and that
-//! ratio had only ever been *estimated* (at 20-50x) by counting phases.
+//! session closes with a boundary repair - `recompute_uses` or `repair_ssa` -
+//! and a session that changed the graph has reconstructed the values it
+//! disturbed. A renaming `construct_ssa` is the whole-function bound on that
+//! reconstruction. Which of these dominates decides whether the pipeline's
+//! effort belongs on eliminating snapshots or on avoiding repairs.
 //!
 //! These benchmarks measure it. Run with:
 //!
 //! ```text
-//! cargo bench -p analyssa --bench ssa_repair
+//! cargo bench -p analyssa --bench ssarepair
 //! ```
 //!
 //! # Groups
@@ -22,10 +23,13 @@
 //! | `ssa_maintenance_scaling` | How does each term grow with function size? |
 //! | `analysis_construction` | What do the per-pass analysis rebuilds cost? |
 //! | `pass_transaction` | What does group-vs-per-pass snapshotting actually save? |
+//! | `exception_model` | What do a handler's exceptional phi operands cost? |
+//! | `instruction_identity` | What does stamping every instruction cost at scale? |
+//! | `facts_overhead` | Is a host that carries no facts charged for the ones that do? |
 //!
 //! `ssa_maintenance_scaling` is the group that settles the roadmap question.
-//! Snapshot cost is linear in total IR size, while `rebuild_ssa` is driven by
-//! dominance frontiers and phi placement — so a ratio measured on a
+//! Snapshot cost is linear in total IR size, while construction is driven by
+//! dominance frontiers and phi placement - so a ratio measured on a
 //! ten-instruction fixture does not extrapolate to the pathological functions
 //! (a 258k-instruction, 20k-block data-misread-as-code) that the roadmap's
 //! copy-on-write item is actually about. Two fixture families are swept
@@ -37,17 +41,23 @@
 use std::hint::black_box;
 
 use analyssa::{
-    PointerSize,
-    analysis::{DefUseIndex, LoopAnalyzer, exceptions::EhCfg, memory::MemorySsa},
+    analysis::{
+        AnalysisContext, DefUseIndex, LoopAnalyzer, SsaCfg,
+        budget::{Budget, WorkBudget},
+        memory::MemorySsa,
+    },
     events::NullListener,
     graph::{RootedGraph, algorithms::compute_dominators},
-    ir::function::SsaFunction,
-    passes,
-    scheduling::PassTransaction,
+    ir::function::{SsaConstructOptions, SsaFunction},
+    passes::{
+        AlgebraicSimplificationPass, CopyPropagationPass, DeadCodeEliminationPass,
+        GlobalValueNumberingPass, LicmPass,
+    },
+    scheduling::{FunctionPass, PassEnv, PassTransaction},
     target::Target,
-    testing::{self, MockTarget},
+    testing::{self, FactfulTarget, MACHINE, MockTarget},
 };
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 /// The fixtures span the shapes that make repair costs differ: straight-line
 /// code, a phi merge, and a loop with a back edge.
@@ -113,7 +123,7 @@ fn bench_maintenance(c: &mut Criterion) {
             b.iter(|| black_box(ssa.clone()));
         });
 
-        // Snapshotting into a reused buffer — what the pass-group rollback
+        // Snapshotting into a reused buffer - what the pass-group rollback
         // point does. Isolates the allocator saving from the memcpy.
         group.bench_with_input(BenchmarkId::new("clone_from", name), &ssa, |b, ssa| {
             let mut buffer = ssa.clone();
@@ -131,7 +141,7 @@ fn bench_maintenance(c: &mut Criterion) {
                     working.recompute_uses();
                     black_box(working)
                 },
-                criterion::BatchSize::SmallInput,
+                BatchSize::SmallInput,
             );
         });
 
@@ -143,20 +153,20 @@ fn bench_maintenance(c: &mut Criterion) {
                     working.repair_ssa();
                     black_box(working)
                 },
-                criterion::BatchSize::SmallInput,
+                BatchSize::SmallInput,
             );
         });
 
-        // The full 19-phase Cytron reconstruction any CFG-modifying edit
-        // triggers — the term suspected of dominating.
-        group.bench_with_input(BenchmarkId::new("rebuild_ssa", name), &ssa, |b, ssa| {
+        // The whole-function Cytron reconstruction, the bound on what a
+        // CFG-modifying edit's scoped repair can cost.
+        group.bench_with_input(BenchmarkId::new("construct_ssa", name), &ssa, |b, ssa| {
             b.iter_batched(
                 || ssa.clone(),
                 |mut working| {
-                    let _ = working.rebuild_ssa();
+                    let _ = working.construct_ssa(&SsaConstructOptions::renaming_only());
                     black_box(working)
                 },
-                criterion::BatchSize::SmallInput,
+                BatchSize::SmallInput,
             );
         });
     }
@@ -198,17 +208,17 @@ fn bench_scaling(c: &mut Criterion) {
                         working.recompute_uses();
                         black_box(working)
                     },
-                    criterion::BatchSize::SmallInput,
+                    BatchSize::SmallInput,
                 );
             });
-            group.bench_with_input(BenchmarkId::new("rebuild_ssa", &id), &ssa, |b, ssa| {
+            group.bench_with_input(BenchmarkId::new("construct_ssa", &id), &ssa, |b, ssa| {
                 b.iter_batched(
                     || ssa.clone(),
                     |mut working| {
-                        let _ = working.rebuild_ssa();
+                        let _ = working.construct_ssa(&SsaConstructOptions::renaming_only());
                         black_box(working)
                     },
-                    criterion::BatchSize::SmallInput,
+                    BatchSize::SmallInput,
                 );
             });
         }
@@ -220,9 +230,9 @@ fn bench_scaling(c: &mut Criterion) {
 /// Cost of the analyses passes rebuild from scratch on every run.
 ///
 /// Within one fixpoint iteration each scheduled pass reconstructs what the
-/// previous pass discarded. `src/passes/` has 93 `count_uses` /
-/// `recompute_uses` call sites, 6 `EhCfg::from_ssa`, and 4
-/// `DefUseIndex::build*` — so the per-variable use lists, not the heavier
+/// previous pass discarded. `src/passes/` has 149 `count_uses` /
+/// `recompute_uses` call sites, 12 `SsaCfg::from_ssa`, and 4
+/// `DefUseIndex::build*` - so the per-variable use lists, not the heavier
 /// indexes, are what the pipeline rebuilds most.
 ///
 /// These numbers are the input to the roadmap's analysis-caching item, but they
@@ -235,8 +245,8 @@ fn bench_analysis_construction(c: &mut Criterion) {
 
     for scale in SCALES {
         for (id, ssa) in scaled(scale) {
-            group.bench_with_input(BenchmarkId::new("EhCfg::from_ssa", &id), &ssa, |b, ssa| {
-                b.iter(|| black_box(EhCfg::from_ssa(black_box(ssa))));
+            group.bench_with_input(BenchmarkId::new("SsaCfg::from_ssa", &id), &ssa, |b, ssa| {
+                b.iter(|| black_box(SsaCfg::from_ssa(black_box(ssa))));
             });
 
             group.bench_with_input(BenchmarkId::new("DefUseIndex", &id), &ssa, |b, ssa| {
@@ -244,7 +254,12 @@ fn bench_analysis_construction(c: &mut Criterion) {
             });
 
             group.bench_with_input(BenchmarkId::new("MemorySsa", &id), &ssa, |b, ssa| {
-                b.iter(|| black_box(MemorySsa::build(black_box(ssa), PointerSize::Bit64)));
+                b.iter(|| {
+                    black_box(MemorySsa::build(
+                        black_box(ssa),
+                        &AnalysisContext::new(MACHINE),
+                    ))
+                });
             });
 
             // The pipeline's most-rebuilt analysis by call-site count.
@@ -255,7 +270,7 @@ fn bench_analysis_construction(c: &mut Criterion) {
             // CFG + dominator tree, as GVN and range propagation build it.
             group.bench_with_input(BenchmarkId::new("cfg+dominators", &id), &ssa, |b, ssa| {
                 b.iter(|| {
-                    let cfg = EhCfg::from_ssa(black_box(ssa));
+                    let cfg = SsaCfg::from_ssa(black_box(ssa));
                     let entry = cfg.entry();
                     black_box(compute_dominators(&cfg, entry))
                 });
@@ -299,26 +314,36 @@ fn bench_pass_cost(c: &mut Criterion) {
                                 run(&mut working, &method, &events);
                                 black_box(working)
                             },
-                            criterion::BatchSize::SmallInput,
+                            BatchSize::SmallInput,
                         );
                     });
                 };
             }
 
             bench_pass!("algebraic", |s, m, e| {
-                let _ = passes::algebraic::run(s, m, e);
+                let _ = AlgebraicSimplificationPass
+                    .run(s, &PassEnv::new(m, e, AnalysisContext::new(MACHINE)));
             });
             bench_pass!("copying", |s, m, e| {
-                let _ = passes::copying::run(s, m, e, COPY_PROP_ITERATIONS);
+                let _ = CopyPropagationPass.propagate(
+                    s,
+                    &PassEnv::new(m, e, AnalysisContext::new(MACHINE)).with_budget(
+                        WorkBudget::DEFAULT.with_limit(Budget::CopyRounds, COPY_PROP_ITERATIONS),
+                    ),
+                    |_, _| {},
+                );
             });
             bench_pass!("deadcode", |s, m, e| {
-                let _ = passes::deadcode::run_iteration(s, m, e);
+                let _ = DeadCodeEliminationPass
+                    .run_iteration(s, &PassEnv::new(m, e, AnalysisContext::new(MACHINE)));
             });
             bench_pass!("gvn", |s, m, e| {
-                let _ = passes::gvn::run(s, m, e);
+                let _ = GlobalValueNumberingPass
+                    .run(s, &PassEnv::new(m, e, AnalysisContext::new(MACHINE)));
             });
             bench_pass!("licm", |s, m, e| {
-                let _ = passes::licm::run(s, m, e);
+                let _ =
+                    LicmPass.run(s, &PassEnv::new(m, e, AnalysisContext::new(MACHINE))) == Ok(true);
             });
         }
     }
@@ -327,13 +352,24 @@ fn bench_pass_cost(c: &mut Criterion) {
 }
 
 /// Runs a representative group of cheap rewrite passes, reporting whether any
-/// of them changed the IR — the shape `PassTransaction::run_group` expects.
+/// of them changed the IR - the shape `PassTransaction::run_group` expects.
 fn rewrite_group(ssa: &mut SsaFunction<MockTarget>) -> bool {
     let method = 0u32;
     let events = NullListener;
-    let mut changed = passes::algebraic::run(ssa, &method, &events);
-    changed |= passes::copying::run(ssa, &method, &events, COPY_PROP_ITERATIONS);
-    changed |= passes::deadcode::run_iteration(ssa, &method, &events) > 0;
+    let mut changed = AlgebraicSimplificationPass.run(
+        ssa,
+        &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE)),
+    ) == Ok(true);
+    changed |= CopyPropagationPass.propagate(
+        ssa,
+        &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE))
+            .with_budget(WorkBudget::DEFAULT.with_limit(Budget::CopyRounds, COPY_PROP_ITERATIONS)),
+        |_, _| {},
+    );
+    changed |= DeadCodeEliminationPass.run_iteration(
+        ssa,
+        &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE)),
+    ) > 0;
     changed
 }
 
@@ -341,7 +377,7 @@ fn rewrite_group(ssa: &mut SsaFunction<MockTarget>) -> bool {
 ///
 /// `PassTransaction::run_group` exists to amortize one snapshot across a whole
 /// pass group instead of paying one per pass, and to skip verification when a
-/// group reports no rewrite — the case that describes every terminating
+/// group reports no rewrite - the case that describes every terminating
 /// fixpoint iteration. Both effects are measured against the per-pass baseline
 /// the group replaces.
 fn bench_pass_transaction(c: &mut Criterion) {
@@ -361,22 +397,31 @@ fn bench_pass_transaction(c: &mut Criterion) {
                             let method = 0u32;
                             let events = NullListener;
                             let snapshot = working.clone();
-                            let _ = passes::algebraic::run(&mut working, &method, &events);
-                            black_box(&snapshot);
-                            let snapshot = working.clone();
-                            let _ = passes::copying::run(
+                            let _ = AlgebraicSimplificationPass.run(
                                 &mut working,
-                                &method,
-                                &events,
-                                COPY_PROP_ITERATIONS,
+                                &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE)),
                             );
                             black_box(&snapshot);
                             let snapshot = working.clone();
-                            let _ = passes::deadcode::run_iteration(&mut working, &method, &events);
+                            let _ = CopyPropagationPass.propagate(
+                                &mut working,
+                                &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE))
+                                    .with_budget(
+                                        WorkBudget::DEFAULT
+                                            .with_limit(Budget::CopyRounds, COPY_PROP_ITERATIONS),
+                                    ),
+                                |_, _| {},
+                            );
+                            black_box(&snapshot);
+                            let snapshot = working.clone();
+                            let _ = DeadCodeEliminationPass.run_iteration(
+                                &mut working,
+                                &PassEnv::new(&method, &events, AnalysisContext::new(MACHINE)),
+                            );
                             black_box(&snapshot);
                             black_box(working)
                         },
-                        criterion::BatchSize::SmallInput,
+                        BatchSize::SmallInput,
                     );
                 },
             );
@@ -389,13 +434,13 @@ fn bench_pass_transaction(c: &mut Criterion) {
                     |working| {
                         black_box(transaction.run_group(working, rewrite_group));
                     },
-                    criterion::BatchSize::SmallInput,
+                    BatchSize::SmallInput,
                 );
             });
 
             // The terminating iteration: nothing changes, so the group skips
             // verification entirely. This case repeats once per function per
-            // fixpoint and previously paid full freight.
+            // fixpoint, so its cost is paid on every run of the pipeline.
             group.bench_with_input(BenchmarkId::new("group_unchanged", &id), &ssa, |b, ssa| {
                 let mut transaction = PassTransaction::<MockTarget>::new();
                 b.iter_batched_ref(
@@ -403,11 +448,98 @@ fn bench_pass_transaction(c: &mut Criterion) {
                     |working| {
                         black_box(transaction.run_group(working, |_| false));
                     },
-                    criterion::BatchSize::SmallInput,
+                    BatchSize::SmallInput,
                 );
             });
         }
     }
+
+    group.finish();
+}
+
+/// What the exception value model costs to maintain.
+///
+/// A handler's phi carries an operand per program point a throw could have
+/// left from, so a protected region's phis are wider than a merge's - and
+/// reconstruction has to derive them. The question is whether that width is a
+/// cost a host pays per repair, or one it pays once at construction: the two
+/// answers point at different places to optimise.
+fn bench_exception_model(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exception_model");
+    let fixture = testing::try_catch_fixture();
+
+    group.bench_function("construct_ssa", |b| {
+        b.iter_batched_ref(
+            || fixture.clone(),
+            |ssa| {
+                let _ = black_box(ssa.construct_ssa(&SsaConstructOptions::renaming_only()));
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("exceptional_webs", |b| {
+        b.iter(|| black_box(fixture.exceptional_webs().len()));
+    });
+
+    group.finish();
+}
+
+/// What giving every instruction an identity costs.
+///
+/// Every repair boundary stamps the instructions a pass added, so this is paid
+/// per pass rather than once. It is a linear walk, and the point of measuring
+/// it is to know it stays one.
+fn bench_instruction_identity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("instruction_identity");
+
+    for scale in SCALES {
+        let fixture = testing::straight_line_fixture(scale);
+        group.bench_with_input(
+            BenchmarkId::new("assign_instr_ids", scale),
+            &scale,
+            |b, _| {
+                b.iter_batched_ref(
+                    || fixture.clone(),
+                    |ssa| black_box(ssa.assign_instr_ids()),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Whether a host that carries no facts pays for the mechanism.
+///
+/// `()` facts are zero-sized and every funnel is supposed to compile away, so
+/// the two sides of this group should sit on top of each other. A gap means
+/// the "costs nothing" claim in the documentation has stopped being true.
+fn bench_facts_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("facts_overhead");
+
+    let without: SsaFunction<MockTarget> = testing::diamond_phi_fixture();
+    group.bench_function("unit_facts/construct_ssa", |b| {
+        b.iter_batched_ref(
+            || without.clone(),
+            |ssa| {
+                let _ = black_box(ssa.construct_ssa(&SsaConstructOptions::renaming_only()));
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let with: SsaFunction<FactfulTarget> = testing::factful_diamond_phi_fixture();
+    group.bench_function("host_facts/construct_ssa", |b| {
+        b.iter_batched_ref(
+            || with.clone(),
+            |ssa| {
+                let _ = black_box(ssa.construct_ssa(&SsaConstructOptions::renaming_only()));
+            },
+            BatchSize::SmallInput,
+        );
+    });
 
     group.finish();
 }
@@ -418,6 +550,9 @@ criterion_group!(
     bench_scaling,
     bench_analysis_construction,
     bench_pass_cost,
-    bench_pass_transaction
+    bench_pass_transaction,
+    bench_exception_model,
+    bench_instruction_identity,
+    bench_facts_overhead
 );
 criterion_main!(benches);
