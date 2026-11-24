@@ -1,4 +1,4 @@
-//! `World<T>` — a minimal interprocedural view of the program-under-analysis.
+//! `World<T>` - a minimal interprocedural view of the program-under-analysis.
 //!
 //! Hosts implement `World<T>` to give analyssa-side global passes a uniform
 //! handle on the set of methods that exist, who calls whom, and which methods
@@ -6,7 +6,7 @@
 //!
 //! # Design
 //!
-//! The trait is intentionally tiny — only what `DeadMethodEliminationPass`
+//! The trait is intentionally tiny - only what `DeadMethodEliminationPass`
 //! actually needs. Methods that surface a list of `T::MethodRef` return
 //! `Vec<T::MethodRef>` for now (rather than an iterator), because:
 //!
@@ -51,7 +51,7 @@ pub trait World<T: Target> {
     fn mark_dead(&self, method: &T::MethodRef);
 
     /// Strongly-connected components of the call graph in reverse
-    /// topological order — callees before callers — each component holding
+    /// topological order - callees before callers - each component holding
     /// the methods that are mutually recursive.
     ///
     /// The grouping is load-bearing, not decoration: a component of one

@@ -26,6 +26,8 @@
 //!   the portion of the recursion stack from the target node to the current node,
 //!   returning it as a closed path (first node == last node).
 
+use std::vec;
+
 use crate::graph::{NodeId, Successors};
 
 /// Checks if a directed graph contains any cycles reachable from the start node.
@@ -36,8 +38,8 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to check for cycles
-/// * `start` - The starting node for the search
+/// * `graph` - The graph to check for cycles.
+/// * `start` - The starting node for the search.
 ///
 /// # Returns
 ///
@@ -111,7 +113,7 @@ fn has_cycle_dfs<G: Successors>(
     // Each frame is a gray node and an iterator over its not-yet-visited
     // successors. The successor type is opaque, so it is materialized into a
     // `Vec` per frame.
-    let mut stack: Vec<(NodeId, std::vec::IntoIter<NodeId>)> = vec![(
+    let mut stack: Vec<(NodeId, vec::IntoIter<NodeId>)> = vec![(
         start,
         graph.successors(start).collect::<Vec<_>>().into_iter(),
     )];
@@ -162,8 +164,8 @@ fn has_cycle_dfs<G: Successors>(
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to search for cycles
-/// * `start` - The starting node for the search
+/// * `graph` - The graph to search for cycles.
+/// * `start` - The starting node for the search.
 ///
 /// # Returns
 ///
@@ -233,7 +235,7 @@ fn find_cycle_dfs<G: Successors>(
     }
     path.push(start);
 
-    let mut stack: Vec<(NodeId, std::vec::IntoIter<NodeId>)> = vec![(
+    let mut stack: Vec<(NodeId, vec::IntoIter<NodeId>)> = vec![(
         start,
         graph.successors(start).collect::<Vec<_>>().into_iter(),
     )];
@@ -345,36 +347,42 @@ mod tests {
         graph
     }
 
+    /// A linear chain reports no cycle.
     #[test]
     fn test_has_cycle_linear() {
         let graph = create_linear_graph();
         assert!(!has_cycle(&graph, NodeId::new(0)));
     }
 
+    /// A diamond has reconverging paths but no cycle.
     #[test]
     fn test_has_cycle_diamond() {
         let graph = create_diamond_graph();
         assert!(!has_cycle(&graph, NodeId::new(0)));
     }
 
+    /// A back edge is detected as a cycle.
     #[test]
     fn test_has_cycle_simple_cycle() {
         let graph = create_simple_cycle();
         assert!(has_cycle(&graph, NodeId::new(0)));
     }
 
+    /// A self-loop counts as a cycle.
     #[test]
     fn test_has_cycle_self_loop() {
         let graph = create_self_loop();
         assert!(has_cycle(&graph, NodeId::new(0)));
     }
 
+    /// A cycle buried in a larger structure is still detected.
     #[test]
     fn test_has_cycle_complex() {
         let graph = create_complex_with_cycle();
         assert!(has_cycle(&graph, NodeId::new(0)));
     }
 
+    /// A lone node with no edges has no cycle.
     #[test]
     fn test_has_cycle_single_node_no_loop() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -382,6 +390,7 @@ mod tests {
         assert!(!has_cycle(&graph, a));
     }
 
+    /// A cycle is found from a start node in either disconnected component.
     #[test]
     fn test_has_cycle_two_separate_cycles() {
         // Two separate cycles not connected
@@ -406,18 +415,21 @@ mod tests {
         assert!(has_cycle(&graph, c));
     }
 
+    /// `find_cycle` returns `None` on an acyclic chain.
     #[test]
     fn test_find_cycle_linear() {
         let graph = create_linear_graph();
         assert!(find_cycle(&graph, NodeId::new(0)).is_none());
     }
 
+    /// `find_cycle` returns `None` on a diamond.
     #[test]
     fn test_find_cycle_diamond() {
         let graph = create_diamond_graph();
         assert!(find_cycle(&graph, NodeId::new(0)).is_none());
     }
 
+    /// `find_cycle` returns a closed path (first node repeated as last) for a cycle.
     #[test]
     fn test_find_cycle_simple_cycle() {
         let graph = create_simple_cycle();
@@ -433,6 +445,7 @@ mod tests {
         assert!(cycle.len() >= 3);
     }
 
+    /// `find_cycle` reports a self-loop as the two-element path `[A, A]`.
     #[test]
     fn test_find_cycle_self_loop() {
         let graph = create_self_loop();
@@ -446,6 +459,7 @@ mod tests {
         assert_eq!(cycle[0], cycle[1]);
     }
 
+    /// `find_cycle` returns a closed path for a cycle nested in a larger graph.
     #[test]
     fn test_find_cycle_complex() {
         let graph = create_complex_with_cycle();
@@ -458,6 +472,7 @@ mod tests {
         assert_eq!(cycle.first(), cycle.last());
     }
 
+    /// The returned cycle is a real walk: every consecutive pair is a graph edge.
     #[test]
     fn test_find_cycle_returns_valid_path() {
         let graph = create_simple_cycle();
@@ -475,6 +490,7 @@ mod tests {
         }
     }
 
+    /// A 10,000-node chain is handled without stack overflow, and closing it is detected.
     #[test]
     fn test_has_cycle_deep_linear_chain_is_iterative() {
         // A long acyclic chain would overflow a recursive DFS; the iterative
@@ -499,6 +515,7 @@ mod tests {
         assert_eq!(cycle.first(), cycle.last());
     }
 
+    /// A cycle reachable from, but not containing, the start node is still found.
     #[test]
     fn test_find_cycle_disconnected_cycle() {
         // Entry point not in the cycle

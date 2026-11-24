@@ -101,7 +101,7 @@ pub trait Successors: GraphBase {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose successors to iterate
+    /// * `node` - The node whose successors to iterate.
     ///
     /// # Returns
     ///
@@ -149,7 +149,7 @@ pub trait Predecessors: GraphBase {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose predecessors to iterate
+    /// * `node` - The node whose predecessors to iterate.
     ///
     /// # Returns
     ///
@@ -287,6 +287,7 @@ mod tests {
         }
     }
 
+    /// `GraphBase` reports the node count and iterates every `NodeId` in index order.
     #[test]
     fn test_graph_base() {
         let graph = TestGraph::new(5, vec![], NodeId::new(0));
@@ -298,6 +299,7 @@ mod tests {
         assert_eq!(ids[4], NodeId::new(4));
     }
 
+    /// `successors` yields exactly the edge targets of a node, and nothing for a sink.
     #[test]
     fn test_successors() {
         let edges = vec![
@@ -320,6 +322,7 @@ mod tests {
         assert!(succ.is_empty());
     }
 
+    /// `predecessors` yields exactly the edge sources of a node, and nothing for a source.
     #[test]
     fn test_predecessors() {
         let edges = vec![
@@ -337,6 +340,7 @@ mod tests {
         assert!(pred.is_empty());
     }
 
+    /// `entry` returns the node the graph was constructed with as its root.
     #[test]
     fn test_rooted_graph() {
         let graph = TestGraph::new(3, vec![], NodeId::new(1));

@@ -29,6 +29,11 @@
 //! }
 //! ```
 
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+};
+
 /// A bit vector for efficient set operations.
 ///
 /// This is commonly used for analyses that track sets of definitions,
@@ -37,7 +42,7 @@
 pub struct BitSet {
     /// The bits, stored as a vector of words.
     ///
-    /// May be shorter than `len.div_ceil(64)` — empty, in particular, for a set
+    /// May be shorter than `len.div_ceil(64)` - empty, in particular, for a set
     /// built by [`BitSet::lazy`] that has not been written to. Every absent word
     /// reads as zero. Because the same set therefore has more than one possible
     /// representation, `PartialEq`, `Eq` and `Hash` are implemented by hand over
@@ -61,8 +66,8 @@ impl PartialEq for BitSet {
 
 impl Eq for BitSet {}
 
-impl std::hash::Hash for BitSet {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl Hash for BitSet {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.len.hash(state);
         for i in 0..self.len.div_ceil(64) {
             self.words.get(i).copied().unwrap_or(0).hash(state);
@@ -122,7 +127,7 @@ impl BitSet {
     /// Used by containers keyed on SSA variable ids, which are sized from
     /// `var_id_bound()` but can be handed a larger id by malformed IR. Growing
     /// is the only option that neither loses the write (silently, so the value
-    /// reads back as absent — "dead", for a liveness set) nor aborts the process
+    /// reads back as absent - "dead", for a liveness set) nor aborts the process
     /// on input the crate is specifically expected to survive.
     pub fn ensure_capacity(&mut self, index: usize) {
         let Some(required) = index.checked_add(1) else {
@@ -234,7 +239,7 @@ impl BitSet {
     /// index as unset instead of panicking.
     ///
     /// Use this where the index comes from data that may legitimately name a
-    /// position outside the set — e.g. a CFG terminator referencing a block that
+    /// position outside the set - e.g. a CFG terminator referencing a block that
     /// was never recovered, where "not in the set" is the correct answer rather
     /// than a programming error.
     #[must_use]
@@ -320,6 +325,27 @@ impl BitSet {
         changed
     }
 
+    /// Computes the union with another bit set of any length (in place): this
+    /// set grows to hold every member of `other` first.
+    ///
+    /// Returns `true` if `self` changed.
+    pub fn union_growing(&mut self, other: &Self) -> bool {
+        if other.words.is_empty() {
+            return false;
+        }
+        if other.len > self.len {
+            self.ensure_capacity(other.len.saturating_sub(1));
+        }
+        self.materialize();
+        let mut changed = false;
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            let old = *a;
+            *a |= *b;
+            changed |= old != *a;
+        }
+        changed
+    }
+
     /// Computes the intersection with another bit set (in place).
     ///
     /// Returns `true` if `self` changed.
@@ -366,8 +392,8 @@ impl BitSet {
     }
 }
 
-impl std::fmt::Debug for BitSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for BitSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{{")?;
         let mut first = true;
         for i in self.iter() {

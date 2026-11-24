@@ -7,16 +7,16 @@
 //!
 //! # Architecture
 //!
-//! - [`EventKind`] — non-generic enum of event categories.
-//! - [`Event<T>`] — a recorded event, parameterized over the host's
+//! - [`EventKind`] - non-generic enum of event categories.
+//! - [`Event<T>`] - a recorded event, parameterized over the host's
 //!   `T::MethodRef` so each event can name the method it occurred in.
-//! - [`EventListener<T>`] — sink trait; `push` accepts a fully-formed event.
+//! - [`EventListener<T>`] - sink trait; `push` accepts a fully-formed event.
 //!   The default `record` method returns an [`EventBuilder`] for the fluent
 //!   `events.record(kind).at(...).message(...)` API.
-//! - [`NullListener`] — discards every event. Useful when running passes
+//! - [`NullListener`] - discards every event. Useful when running passes
 //!   without observation (unit tests, CI, callers that don't need an event
 //!   trace).
-//! - [`EventLog<T>`] — concrete listener storing events for later inspection,
+//! - [`EventLog<T>`] - concrete listener storing events for later inspection,
 //!   summary, and filtering.
 //!
 //! # Example (analyssa-side, MockTarget)
@@ -34,15 +34,14 @@
 //! assert!(log.has(EventKind::ConstantFolded));
 //! ```
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    time::Duration,
-};
+use std::{fmt, time::Duration};
 
-use crate::target::Target;
+use boxcar::{Iter as BoxcarIter, Vec as BoxcarVec};
+use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Categories of events that can be logged. Target-agnostic — labels are
+use crate::{analysis::budget::Exhaustion, target::Target};
+
+/// Categories of events that can be logged. Target-agnostic - labels are
 /// purely descriptive and carry no host types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
@@ -81,7 +80,7 @@ pub enum EventKind {
     /// An encrypted method body was decrypted (anti-tamper).
     MethodBodyDecrypted,
     /// An encrypted resource was decrypted and re-injected (e.g. .NET Reactor
-    /// Stage 7 resource encryption).
+    /// resource encryption).
     ResourceDecrypted,
     /// Anti-tamper protection was removed.
     AntiTamperRemoved,
@@ -89,12 +88,25 @@ pub enum EventKind {
     ArtifactRemoved,
     /// Code regeneration completed.
     CodeRegenerated,
-    /// A load was replaced by a value already available in memory — forwarded
+    /// A load was replaced by a value already available in memory - forwarded
     /// from a dominating store, or from an earlier redundant load.
     LoadForwarded,
     /// A store was removed because a later store to the same location
     /// overwrote it before any intervening read.
     DeadStoreRemoved,
+    /// A load was replaced by the constant the image holds at its address: the
+    /// host reports the region read-only, so every read sees the image's bytes.
+    ImageLoadFolded,
+    /// An analysis ran out of a work budget and answered conservatively. The
+    /// message names the budget; the precision lost is recorded rather than
+    /// silent.
+    BudgetExhausted,
+    /// A lowering refused the code it generated for a function, which keeps
+    /// its original body. The message says why.
+    CodegenRefused,
+    /// A pass failed on a function and its change was rolled back: the
+    /// function is as it was before the pass. The message says why.
+    PassFailed,
 }
 
 impl EventKind {
@@ -104,6 +116,10 @@ impl EventKind {
         match self {
             Self::LoadForwarded => "load forwarded",
             Self::DeadStoreRemoved => "dead store removed",
+            Self::ImageLoadFolded => "image load folded",
+            Self::BudgetExhausted => "budget exhausted",
+            Self::CodegenRefused => "codegen refused",
+            Self::PassFailed => "pass failed",
             Self::StringDecrypted => "string decrypted",
             Self::ConstantDecrypted => "constant decrypted",
             Self::ConstantFolded => "constant folded",
@@ -128,10 +144,20 @@ impl EventKind {
         }
     }
 
-    /// Returns true if this event represents a code transformation.
+    /// Returns `true` if this event represents an actual code transformation.
+    ///
+    /// Every kind counts as a transformation except [`Self::CodeRegenerated`],
+    /// which merely records that output was re-emitted rather than that the IR
+    /// changed, and [`Self::CodegenRefused`] and [`Self::PassFailed`], which
+    /// record that something did not happen. Summaries and transformation
+    /// counts exclude them so a pure re-serialization is not reported as an
+    /// optimization.
     #[must_use]
     pub fn is_transformation(&self) -> bool {
-        !matches!(self, Self::CodeRegenerated)
+        !matches!(
+            self,
+            Self::CodeRegenerated | Self::CodegenRefused | Self::PassFailed
+        )
     }
 }
 
@@ -156,6 +182,27 @@ pub struct Event<T: Target> {
     pub pass: Option<String>,
 }
 
+impl<T: Target> Event<T> {
+    /// The event saying an analysis or a rewriting loop ran out of a work
+    /// budget, and stopped with the conservative answer.
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - The method it ran on, or `None` for a loop over the whole
+    ///   program, such as a scheduler's rounds.
+    /// * `exhaustion` - Which budget ran out, and by how much.
+    #[must_use]
+    pub fn exhausted(method: Option<&T::MethodRef>, exhaustion: Exhaustion) -> Self {
+        Self {
+            kind: EventKind::BudgetExhausted,
+            method: method.cloned(),
+            location: None,
+            message: exhaustion.to_string(),
+            pass: None,
+        }
+    }
+}
+
 impl<T: Target> fmt::Display for Event<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] {}", self.kind, self.message)
@@ -167,7 +214,7 @@ impl<T: Target> fmt::Display for Event<T> {
 /// [`EventBuilder`] that calls `push` on drop.
 ///
 /// `Self: Sized` is required for `record` so trait objects (`&dyn
-/// EventListener<T>`) can still receive events via `push` — they just can't
+/// EventListener<T>`) can still receive events via `push` - they just can't
 /// open a builder. Concrete listeners use the builder.
 pub trait EventListener<T: Target> {
     /// Append an event to this listener.
@@ -177,7 +224,7 @@ pub trait EventListener<T: Target> {
     ///
     /// Defaults to `true`. Sinks that discard everything (e.g.
     /// [`NullListener`]) override this to `false` so the [`EventBuilder`] can
-    /// skip constructing the event and its default message entirely — avoiding
+    /// skip constructing the event and its default message entirely - avoiding
     /// per-event allocation on the hot logging path when no one is observing.
     fn is_enabled(&self) -> bool {
         true
@@ -196,9 +243,9 @@ pub trait EventListener<T: Target> {
     ///
     /// Defaults to empty for sinks that keep no history. Callers should treat an
     /// empty result as "no detail available" rather than "nothing happened".
-    fn count_by_kind_since(&self, offset: usize) -> HashMap<EventKind, usize> {
+    fn count_by_kind_since(&self, offset: usize) -> FxHashMap<EventKind, usize> {
         let _ = offset;
-        HashMap::new()
+        FxHashMap::default()
     }
 
     /// Open a fluent builder for an event of `kind`. The event is appended
@@ -214,7 +261,7 @@ pub trait EventListener<T: Target> {
 
 /// No-op listener: every event is silently discarded.
 ///
-/// Used when callers want to run a pass without observation — e.g. unit
+/// Used when callers want to run a pass without observation - e.g. unit
 /// tests that only check the resulting SSA, or production hosts that don't
 /// surface event traces.
 #[derive(Debug, Default, Clone, Copy)]
@@ -241,7 +288,13 @@ pub struct EventBuilder<'a, T: Target, L: EventListener<T> + ?Sized> {
 }
 
 impl<'a, T: Target, L: EventListener<T> + ?Sized> EventBuilder<'a, T, L> {
-    fn new(listener: &'a L, kind: EventKind) -> Self {
+    /// Opens an event of `kind` that is appended to `listener` when the
+    /// builder is dropped.
+    ///
+    /// [`EventListener::record`] opens one on a listener of a known type;
+    /// this opens one on any listener, a `&dyn EventListener<T>` included.
+    #[must_use]
+    pub fn new(listener: &'a L, kind: EventKind) -> Self {
         Self {
             listener,
             kind,
@@ -316,13 +369,13 @@ impl<T: Target, L: EventListener<T> + ?Sized> Drop for EventBuilder<'_, T, L> {
 /// multiple threads using shared references (`&self`) thanks to
 /// [`boxcar::Vec`].
 pub struct EventLog<T: Target> {
-    events: boxcar::Vec<Event<T>>,
+    events: BoxcarVec<Event<T>>,
 }
 
 impl<T: Target> Default for EventLog<T> {
     fn default() -> Self {
         Self {
-            events: boxcar::Vec::new(),
+            events: BoxcarVec::new(),
         }
     }
 }
@@ -354,7 +407,7 @@ impl<T: Target> EventListener<T> for EventLog<T> {
         self.len()
     }
 
-    fn count_by_kind_since(&self, offset: usize) -> HashMap<EventKind, usize> {
+    fn count_by_kind_since(&self, offset: usize) -> FxHashMap<EventKind, usize> {
         Self::count_by_kind_since(self, offset)
     }
 }
@@ -472,8 +525,8 @@ impl<T: Target> EventLog<T> {
 
     /// Counts events grouped by kind.
     #[must_use]
-    pub fn count_by_kind(&self) -> HashMap<EventKind, usize> {
-        let mut counts: HashMap<EventKind, usize> = HashMap::new();
+    pub fn count_by_kind(&self) -> FxHashMap<EventKind, usize> {
+        let mut counts: FxHashMap<EventKind, usize> = FxHashMap::default();
         for (_, event) in &self.events {
             let entry = counts.entry(event.kind).or_insert(0);
             *entry = entry.saturating_add(1);
@@ -486,8 +539,8 @@ impl<T: Target> EventLog<T> {
     /// Used by the scheduler to compute per-pass event deltas without
     /// iterating the entire log.
     #[must_use]
-    pub fn count_by_kind_since(&self, offset: usize) -> HashMap<EventKind, usize> {
-        let mut counts: HashMap<EventKind, usize> = HashMap::new();
+    pub fn count_by_kind_since(&self, offset: usize) -> FxHashMap<EventKind, usize> {
+        let mut counts: FxHashMap<EventKind, usize> = FxHashMap::default();
         for (idx, event) in &self.events {
             if idx >= offset {
                 let entry = counts.entry(event.kind).or_insert(0);
@@ -512,11 +565,20 @@ impl<T: Target> EventLog<T> {
         self.events
             .iter()
             .filter_map(|(_, e)| e.method.as_ref())
-            .collect::<HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .len()
     }
 
     /// Generates a human-readable summary of all events.
+    ///
+    /// Reports `"no events"` for an empty log; otherwise joins one
+    /// `"<count> <description>"` fragment per transformation kind, sorted for a
+    /// stable ordering. A log containing only non-transformation events (e.g.
+    /// [`EventKind::CodeRegenerated`]) collapses to `"<n> events"`.
+    ///
+    /// # Returns
+    ///
+    /// A single-line, comma-separated summary of the transformation events.
     #[must_use]
     pub fn summary(&self) -> String {
         if self.is_empty() {
@@ -542,7 +604,7 @@ impl<T: Target> EventLog<T> {
 
 /// Iterator wrapper for [`EventLog`] that yields `&Event<T>`.
 pub struct EventLogIter<'a, T: Target> {
-    inner: boxcar::Iter<'a, Event<T>>,
+    inner: BoxcarIter<'a, Event<T>>,
 }
 
 impl<'a, T: Target> Iterator for EventLogIter<'a, T> {
@@ -616,6 +678,10 @@ pub struct DerivedStats {
     pub loads_forwarded: usize,
     /// Number of dead stores removed.
     pub dead_stores_removed: usize,
+    /// Number of loads folded to the constant the image holds.
+    pub image_loads_folded: usize,
+    /// Number of times an analysis ran out of a work budget.
+    pub budgets_exhausted: usize,
     /// Number of pass iterations.
     pub iterations: usize,
     /// Processing time.
@@ -624,6 +690,21 @@ pub struct DerivedStats {
 
 impl DerivedStats {
     /// Computes statistics from an event log.
+    ///
+    /// Tallies the log once via [`EventLog::count_by_kind`] and maps each
+    /// [`EventKind`] onto its named counter, plus [`EventLog::methods_affected`]
+    /// for the distinct-method count. Timing and iteration count cannot be
+    /// derived from events, so they are left zero here and filled in by the
+    /// caller through [`Self::with_time`] and [`Self::with_iterations`].
+    ///
+    /// # Arguments
+    ///
+    /// * `log` - The event log to summarize.
+    ///
+    /// # Returns
+    ///
+    /// A [`DerivedStats`] with per-kind counters populated and timing and
+    /// iterations left at their defaults.
     #[must_use]
     pub fn from_log<T: Target>(log: &EventLog<T>) -> Self {
         let counts = log.count_by_kind();
@@ -645,6 +726,8 @@ impl DerivedStats {
             artifacts_removed: get(EventKind::ArtifactRemoved),
             loads_forwarded: get(EventKind::LoadForwarded),
             dead_stores_removed: get(EventKind::DeadStoreRemoved),
+            image_loads_folded: get(EventKind::ImageLoadFolded),
+            budgets_exhausted: get(EventKind::BudgetExhausted),
             iterations: 0,
             total_time: Duration::ZERO,
         }
@@ -664,7 +747,17 @@ impl DerivedStats {
         self
     }
 
-    /// Generates a human-readable summary.
+    /// Generates a human-readable summary of these statistics.
+    ///
+    /// Emits one comma-separated fragment per non-zero counter (zero counters
+    /// are omitted so the line stays terse), falling back to
+    /// `"no transformations"` when every counter is zero. When timing was
+    /// recorded, the elapsed duration and iteration count are appended.
+    ///
+    /// # Returns
+    ///
+    /// A single-line description such as `"3 methods, 2 strings decrypted"`,
+    /// optionally suffixed with timing.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
@@ -741,7 +834,22 @@ impl fmt::Display for DerivedStats {
     }
 }
 
-/// Truncates a string for display, adding ellipsis if needed.
+/// Truncates a string for display, adding an ellipsis if it exceeds `max_len`.
+///
+/// Strings within the limit are returned unchanged. Longer strings are cut to
+/// leave room for a trailing `"..."` (three bytes of the budget are reserved),
+/// and the cut is snapped back to the nearest UTF-8 character boundary so a
+/// multi-byte character is never split. The result therefore stays within
+/// `max_len` bytes whenever `max_len` is at least 3.
+///
+/// # Arguments
+///
+/// * `s` - The string to truncate.
+/// * `max_len` - Maximum byte length of the returned string.
+///
+/// # Returns
+///
+/// `s` unchanged when it fits, otherwise a truncated copy ending in `"..."`.
 #[must_use]
 pub fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -771,6 +879,7 @@ mod tests {
         id
     }
 
+    /// A fresh log reports empty, zero length, and no recorded kinds.
     #[test]
     fn empty_log() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -779,6 +888,7 @@ mod tests {
         assert!(!log.has(EventKind::StringDecrypted));
     }
 
+    /// A recorded event preserves its kind, method, location, and message.
     #[test]
     fn record_event() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -798,6 +908,7 @@ mod tests {
         assert_eq!(event.message, "decrypted: \"hello\"");
     }
 
+    /// Recording through a `NullListener` neither panics nor observes anything.
     #[test]
     fn null_listener_discards() {
         let listener = NullListener;
@@ -807,10 +918,11 @@ mod tests {
             .at(m, 0x10)
             .message("dropped on the floor");
 
-        // No public observation surface — the test is that nothing panics
+        // No public observation surface - the test is that nothing panics
         // and the listener compiles.
     }
 
+    /// Independent events accumulate and each recorded kind is queryable.
     #[test]
     fn multiple_events() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -829,6 +941,7 @@ mod tests {
         assert!(!log.has(EventKind::BlockRemoved));
     }
 
+    /// `has_any` matches when any of the queried kinds is present.
     #[test]
     fn has_any() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -839,6 +952,7 @@ mod tests {
         assert!(!log.has_any(&[EventKind::BlockRemoved, EventKind::MethodInlined]));
     }
 
+    /// `merge` appends another log's events into this one.
     #[test]
     fn merge() {
         let log1: EventLog<MockTarget> = EventLog::new();
@@ -855,6 +969,7 @@ mod tests {
         assert!(log1.has(EventKind::ConstantFolded));
     }
 
+    /// `summary` counts and pluralizes each transformation kind.
     #[test]
     fn summary() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -869,6 +984,7 @@ mod tests {
         assert!(summary.contains("1 constant folded"));
     }
 
+    /// `count_by_kind` tallies events per kind and omits absent kinds.
     #[test]
     fn count_by_kind() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -884,6 +1000,7 @@ mod tests {
         assert_eq!(counts.get(&EventKind::BlockRemoved), None);
     }
 
+    /// `count_by_kind_since` counts only events at or after the offset.
     #[test]
     fn count_by_kind_since() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -908,6 +1025,7 @@ mod tests {
         assert_eq!(all.get(&EventKind::ConstantFolded), Some(&2));
     }
 
+    /// `DerivedStats::from_log` counts distinct methods and per-kind totals.
     #[test]
     fn derived_stats() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -924,6 +1042,7 @@ mod tests {
         assert_eq!(stats.constants_folded, 1);
     }
 
+    /// `filter_method` yields only events for the given method.
     #[test]
     fn filter_methods() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -938,6 +1057,7 @@ mod tests {
         assert_eq!(m1_events.len(), 2);
     }
 
+    /// `transformations` yields the transformation events, skipping the rest.
     #[test]
     fn transformations_filter() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -950,6 +1070,7 @@ mod tests {
         assert_eq!(transformations.len(), 2);
     }
 
+    /// The builder records an associated pass name on the event.
     #[test]
     fn event_with_pass() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -964,6 +1085,7 @@ mod tests {
         assert_eq!(event.pass.as_deref(), Some("ConstantFolding"));
     }
 
+    /// An event with no explicit message falls back to the kind description.
     #[test]
     fn default_message() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -975,6 +1097,7 @@ mod tests {
         assert_eq!(event.message, "string decrypted");
     }
 
+    /// Concurrent recording from multiple threads loses no events.
     #[test]
     fn thread_safe_append() {
         let log: Arc<EventLog<MockTarget>> = Arc::new(EventLog::new());
@@ -1004,6 +1127,7 @@ mod tests {
         assert_eq!(log.len(), 400);
     }
 
+    /// `into_events` moves events out by value, preserving their order.
     #[test]
     fn into_events_moves_without_cloning() {
         let log: EventLog<MockTarget> = EventLog::new();
@@ -1019,6 +1143,7 @@ mod tests {
         assert_eq!(events[1].kind, EventKind::ConstantFolded);
     }
 
+    /// `NullListener` reports disabled and drops records without panicking.
     #[test]
     fn null_listener_is_disabled() {
         let null = NullListener;
@@ -1029,11 +1154,13 @@ mod tests {
             .message("ignored");
     }
 
+    /// Strings within the limit pass through `truncate_string` unchanged.
     #[test]
     fn truncate_string_short() {
         assert_eq!(truncate_string("hi", 10), "hi");
     }
 
+    /// Over-length strings are truncated with an ellipsis, staying within budget.
     #[test]
     fn truncate_string_long() {
         let result = truncate_string("hello world", 8);

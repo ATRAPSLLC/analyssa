@@ -11,6 +11,7 @@
 //! - [`dfs`] - Depth-first search traversal
 //! - [`bfs`] - Breadth-first search traversal
 //! - [`reverse_postorder`] - Reverse postorder traversal (useful for data flow)
+//! - [`reverse_postorder_all`] - Reverse postorder covering unreachable nodes too
 //! - [`postorder`] - Postorder traversal
 //!
 //! ## Cycle Detection
@@ -25,7 +26,6 @@
 //! ## Dominator Analysis
 //!
 //! - [`compute_dominators`] - Compute the dominator tree using Lengauer-Tarjan
-//! - [`compute_dominators_rooted`] - The same, rooted at the graph's own entry
 //! - [`compute_dominance_frontiers`] - Compute dominance frontiers for SSA
 //! - [`DominatorTree`] - Result of dominator computation
 //!
@@ -37,6 +37,11 @@
 //! - [`PostDominatorTree`] / [`ControlDependences`] - Results indexed by the
 //!   original nodes, with the virtual exit kept out of every answer
 //! - [`ReverseGraph`] - The reversed, exit-rooted view both are computed on
+//!
+//! ## Liveness
+//!
+//! - [`BlockLiveness`] - The items live at each node's start and end, from
+//!   per-node use and definition sets over any graph
 //!
 //! ## Strongly Connected Components
 //!
@@ -52,6 +57,7 @@
 //! | Dominators | O(V α(V)) | SSA construction, loop analysis |
 //! | SCC | O(V + E) | Recursion detection, call graph analysis |
 //! | Post-dominance | O(V + E) then O(V α(V)) | Control dependence, structuring |
+//! | Liveness | O((V + E) U / 64) per round | Where a value is still needed |
 //!
 //! # Examples
 //!
@@ -97,6 +103,7 @@
 
 mod cycles;
 mod dominators;
+mod liveness;
 mod postdom;
 mod scc;
 mod topological;
@@ -106,8 +113,9 @@ mod traversal;
 pub use cycles::{find_cycle, has_cycle};
 #[allow(unused_imports)]
 pub use dominators::{
-    DominatorTree, compute_dominance_frontiers, compute_dominators, compute_dominators_rooted,
+    DominatorIterator, DominatorTree, compute_dominance_frontiers, compute_dominators,
 };
+pub use liveness::BlockLiveness;
 pub use postdom::{
     ControlDependences, PostDominatorTree, ReverseGraph, compute_post_dominators,
     control_dependences,
@@ -115,4 +123,6 @@ pub use postdom::{
 pub use scc::{condensation, strongly_connected_components};
 pub use topological::topological_sort;
 #[allow(unused_imports)]
-pub use traversal::{bfs, dfs, postorder, reverse_postorder};
+pub use traversal::{
+    BfsIterator, DfsIterator, bfs, dfs, postorder, reverse_postorder, reverse_postorder_all,
+};

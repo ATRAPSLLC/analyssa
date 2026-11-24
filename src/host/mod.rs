@@ -6,11 +6,11 @@
 //! the traits in this module add the storage and scheduling primitives
 //! the pass scheduler needs:
 //!
-//! - [`SsaStore<T>`] — interior-mutable, per-method SSA storage. The
+//! - [`SsaStore<T>`] - interior-mutable, per-method SSA storage. The
 //!   scheduler removes a method's SSA via [`take_ssa`](SsaStore::take_ssa),
 //!   hands it to a pass for mutation, and reinserts it via
 //!   [`insert_ssa`](SsaStore::insert_ssa) without needing `&mut` on the host.
-//! - [`DirtySet<T>`] — tracks which methods need re-processing in the
+//! - [`DirtySet<T>`] - tracks which methods need re-processing in the
 //!   next fixpoint iteration. Passes mark methods dirty as they discover
 //!   new work (e.g. inlining flags the caller as needing re-analysis).
 //!
@@ -18,7 +18,7 @@
 //!
 //! Both traits use `&self` with interior mutability (typically
 //! `DashMap`/`DashSet`-backed), following the
-//! [`World::mark_dead`](crate::world::World::mark_dead) precedent —
+//! [`World::mark_dead`](crate::world::World::mark_dead) precedent -
 //! global passes can run in parallel without acquiring `&mut` on the host.
 //!
 //! # Usage

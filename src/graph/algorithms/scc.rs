@@ -34,7 +34,7 @@
 //! - **Dependency analysis**: Detecting circular dependencies
 //! - **Dead code elimination**: Unreachable code forms trivial SCCs
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::graph::{NodeId, Successors};
 
@@ -46,7 +46,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Arguments
 ///
-/// * `graph` - The directed graph to analyze
+/// * `graph` - The directed graph to analyze.
 ///
 /// # Returns
 ///
@@ -109,21 +109,12 @@ pub fn strongly_connected_components<G>(graph: &G) -> Vec<Vec<NodeId>>
 where
     G: Successors,
 {
-    let node_count = graph.node_count();
-    if node_count == 0 {
-        return Vec::new();
-    }
-
-    let mut state = TarjanState::new(node_count);
-
-    // Run Tarjan's algorithm from each unvisited node
-    for i in 0..node_count {
-        let node = NodeId::new(i);
-        if state.index.get(i).copied().flatten().is_none() {
-            state.strongconnect(graph, node);
+    let mut state = TarjanState::new(graph.node_count());
+    for index in 0..graph.node_count() {
+        if state.index.get(index).copied().flatten().is_none() {
+            state.strongconnect(graph, NodeId::new(index));
         }
     }
-
     state.sccs
 }
 
@@ -143,23 +134,19 @@ struct TarjanState {
     sccs: Vec<Vec<NodeId>>,
 }
 
-struct TarjanFrame {
+/// One suspended DFS frame borrowing its graph's successor iterator.
+///
+/// An explicit frame keeps native stack depth bounded and uses constant
+/// temporary storage per visited node, independently of its outgoing arity.
+struct TarjanFrame<I> {
+    /// The node whose successors are being visited.
     node: NodeId,
-    successors: Vec<NodeId>,
-    next_successor: usize,
-}
-
-impl TarjanFrame {
-    fn new<G: Successors>(graph: &G, node: NodeId) -> Self {
-        Self {
-            node,
-            successors: graph.successors(node).collect(),
-            next_successor: 0,
-        }
-    }
+    /// Its borrowed, resumable successor stream.
+    successors: I,
 }
 
 impl TarjanState {
+    /// Initializes discovery, lowlink and stack membership arrays.
     fn new(n: usize) -> Self {
         Self {
             index: vec![None; n],
@@ -171,7 +158,20 @@ impl TarjanState {
         }
     }
 
+    /// Records first discovery of `v`: stamps its index and lowlink with the
+    /// next discovery number, pushes it onto the SCC stack, and marks it
+    /// on-stack.
+    ///
+    /// Called exactly once per node, the moment it turns gray. Seeding lowlink
+    /// with the node's own index establishes the baseline that later back edges
+    /// and returning children can only lower; a node whose lowlink never drops
+    /// below its index is an SCC root.
+    ///
+    /// # Arguments
+    ///
+    /// * `v` - The node being entered for the first time.
     fn visit_node(&mut self, v: NodeId) {
+        self.stack.push(v);
         let v_idx = v.index();
         if let Some(slot) = self.index.get_mut(v_idx) {
             *slot = Some(self.current_index);
@@ -180,18 +180,43 @@ impl TarjanState {
             *slot = self.current_index;
         }
         self.current_index = self.current_index.saturating_add(1);
-        self.stack.push(v);
         if let Some(slot) = self.on_stack.get_mut(v_idx) {
             *slot = true;
         }
     }
 
+    /// Lowers `v`'s lowlink toward `candidate`, keeping the minimum.
+    ///
+    /// This is the single operation that propagates reachability information: it
+    /// is called both when `v` sees a back or cross edge to an on-stack node
+    /// (folding in that node's discovery index) and when a child frame returns
+    /// (folding in the child's finished lowlink). Taking the min in both cases
+    /// is what lets an entire cycle collapse to the discovery index of its
+    /// earliest member.
+    ///
+    /// # Arguments
+    ///
+    /// * `v` - The node whose lowlink is being relaxed.
+    /// * `candidate` - A reachable index or child lowlink to fold in.
     fn update_lowlink(&mut self, v: NodeId, candidate: usize) {
         if let Some(slot) = self.lowlink.get_mut(v.index()) {
             *slot = (*slot).min(candidate);
         }
     }
 
+    /// If `v` is an SCC root, pops its component off the stack and records it.
+    ///
+    /// A node is the root of its strongly connected component exactly when its
+    /// lowlink never fell below its own discovery index, meaning no edge out of
+    /// its DFS subtree reached anything discovered earlier and still on the
+    /// stack. When that holds, every node sitting above `v` on the stack (down
+    /// to and including `v`) belongs to one SCC: they are popped, cleared from
+    /// `on_stack`, and emitted as a component. Because roots finish in
+    /// postorder, this yields SCCs in reverse topological order.
+    ///
+    /// # Arguments
+    ///
+    /// * `v` - The node being finished (all successors exhausted).
     fn finish_component_if_root(&mut self, v: NodeId) {
         let v_idx = v.index();
         let v_index = self.index.get(v_idx).copied().flatten();
@@ -212,32 +237,60 @@ impl TarjanState {
         }
     }
 
+    /// Explores the DFS tree rooted at `v`, emitting every SCC found within it.
+    ///
+    /// This is the iterative heart of Tarjan's algorithm. Rather than recursing,
+    /// it drives an explicit `work` stack of [`TarjanFrame`]s: the top frame's
+    /// successor cursor is advanced one step per loop turn. An unvisited
+    /// successor is entered (visited and pushed as a new frame, simulating a
+    /// recursive call); an already-visited successor still on the stack relaxes
+    /// the current node's lowlink with that successor's discovery index. When a
+    /// frame's successors are exhausted it is finished: `finish_component_if_root`
+    /// closes any SCC rooted there, the frame is popped, and its lowlink is
+    /// folded back into its parent - the exact bookkeeping a return from
+    /// recursion would perform.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The graph being analyzed, queried for successors on demand.
+    /// * `v` - The root of the DFS tree to explore (an as-yet-unvisited node).
     fn strongconnect<G: Successors>(&mut self, graph: &G, v: NodeId) {
         self.visit_node(v);
-        let mut work = vec![TarjanFrame::new(graph, v)];
-
+        let mut work = Vec::new();
+        work.push(TarjanFrame {
+            node: v,
+            successors: graph.successors(v),
+        });
         while let Some(frame) = work.last_mut() {
-            if let Some(w) = frame.successors.get(frame.next_successor).copied() {
-                frame.next_successor = frame.next_successor.saturating_add(1);
+            if let Some(w) = frame.successors.next() {
                 let w_idx = w.index();
+                if w_idx >= self.index.len() {
+                    continue;
+                }
                 let w_index_visited = self.index.get(w_idx).copied().flatten();
                 if w_index_visited.is_none() {
                     self.visit_node(w);
-                    work.push(TarjanFrame::new(graph, w));
+                    work.push(TarjanFrame {
+                        node: w,
+                        successors: graph.successors(w),
+                    });
                 } else if self.on_stack.get(w_idx).copied().unwrap_or(false)
-                    && let Some(idx) = w_index_visited
+                    && let Some(index) = w_index_visited
                 {
-                    self.update_lowlink(frame.node, idx);
+                    self.update_lowlink(frame.node, index);
                 }
                 continue;
             }
-
-            let v = frame.node;
-            let v_lowlink = self.lowlink.get(v.index()).copied().unwrap_or(usize::MAX);
-            self.finish_component_if_root(v);
+            let node = frame.node;
+            let lowlink = self
+                .lowlink
+                .get(node.index())
+                .copied()
+                .unwrap_or(usize::MAX);
+            self.finish_component_if_root(node);
             work.pop();
             if let Some(parent) = work.last() {
-                self.update_lowlink(parent.node, v_lowlink);
+                self.update_lowlink(parent.node, lowlink);
             }
         }
     }
@@ -251,8 +304,8 @@ impl TarjanState {
 ///
 /// # Arguments
 ///
-/// * `graph` - The original graph
-/// * `sccs` - The SCCs as returned by `strongly_connected_components`
+/// * `graph` - The original graph.
+/// * `sccs` - The SCCs as returned by `strongly_connected_components`.
 ///
 /// # Returns
 ///
@@ -301,7 +354,7 @@ where
 
     // Find edges between different SCCs
     let mut edges = Vec::new();
-    let mut seen_edges = HashSet::new();
+    let mut seen_edges = FxHashSet::default();
 
     for i in 0..node_count {
         let from_node = NodeId::new(i);
@@ -321,13 +374,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use crate::graph::{
         DirectedGraph, NodeId,
         algorithms::scc::{condensation, strongly_connected_components},
     };
 
+    /// An empty graph has no strongly connected components.
     #[test]
     fn test_scc_empty_graph() {
         let graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -335,6 +389,7 @@ mod tests {
         assert!(sccs.is_empty());
     }
 
+    /// A lone node forms one singleton SCC.
     #[test]
     fn test_scc_single_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -345,6 +400,7 @@ mod tests {
         assert_eq!(sccs[0], vec![a]);
     }
 
+    /// A self-loop still yields a single singleton SCC, not a repeat.
     #[test]
     fn test_scc_single_node_self_loop() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -356,6 +412,7 @@ mod tests {
         assert_eq!(sccs[0], vec![a]);
     }
 
+    /// An acyclic chain gives one singleton SCC per node, in reverse topological order.
     #[test]
     fn test_scc_linear_chain() {
         // A -> B -> C (no cycles)
@@ -379,6 +436,7 @@ mod tests {
         assert_eq!(scc_nodes, vec![c, b, a]);
     }
 
+    /// A three-node cycle collapses into a single SCC containing all three.
     #[test]
     fn test_scc_simple_cycle() {
         // A -> B -> C -> A
@@ -396,12 +454,13 @@ mod tests {
         assert_eq!(sccs.len(), 1);
         assert_eq!(sccs[0].len(), 3);
 
-        let scc_set: HashSet<NodeId> = sccs[0].iter().copied().collect();
+        let scc_set: FxHashSet<NodeId> = sccs[0].iter().copied().collect();
         assert!(scc_set.contains(&a));
         assert!(scc_set.contains(&b));
         assert!(scc_set.contains(&c));
     }
 
+    /// A mutual pair of nodes forms one SCC of size two.
     #[test]
     fn test_scc_two_nodes_cycle() {
         // A <-> B
@@ -417,6 +476,7 @@ mod tests {
         assert_eq!(sccs[0].len(), 2);
     }
 
+    /// Two disjoint cycles are reported as two separate SCCs.
     #[test]
     fn test_scc_multiple_components() {
         // Two separate cycles: A <-> B and C <-> D
@@ -441,6 +501,7 @@ mod tests {
         }
     }
 
+    /// A one-way edge between two cycles keeps them as distinct SCCs.
     #[test]
     fn test_scc_connected_cycles() {
         // Two cycles connected by an edge:
@@ -466,7 +527,7 @@ mod tests {
         let mut found_cd = false;
 
         for scc in &sccs {
-            let scc_set: HashSet<NodeId> = scc.iter().copied().collect();
+            let scc_set: FxHashSet<NodeId> = scc.iter().copied().collect();
             if scc_set.contains(&a) && scc_set.contains(&b) && scc.len() == 2 {
                 found_ab = true;
             }
@@ -479,6 +540,7 @@ mod tests {
         assert!(found_cd);
     }
 
+    /// A diamond has no back edges, so every node is its own SCC.
     #[test]
     fn test_scc_diamond_no_cycle() {
         // Diamond: A -> B -> D, A -> C -> D (no cycles)
@@ -502,6 +564,7 @@ mod tests {
         }
     }
 
+    /// A figure-eight sharing a one-way link yields two SCCs, not one.
     #[test]
     fn test_scc_figure_eight() {
         // Figure-8 pattern: A <-> B, B -> C, C <-> D
@@ -524,6 +587,7 @@ mod tests {
         assert_eq!(sccs.len(), 2);
     }
 
+    /// SCCs are emitted in reverse topological order of the condensation.
     #[test]
     fn test_scc_reverse_topological_order() {
         // Chain with cycles: (A <-> B) -> (C <-> D) -> E
@@ -558,6 +622,7 @@ mod tests {
         assert!(scc_cd < scc_ab);
     }
 
+    /// A 100-node ring collapses into a single SCC of all 100 nodes.
     #[test]
     fn test_scc_large_cycle() {
         // Large cycle: 0 -> 1 -> 2 -> ... -> 99 -> 0
@@ -575,6 +640,7 @@ mod tests {
         assert_eq!(sccs[0].len(), 100);
     }
 
+    /// A 10,000-node chain completes without stack overflow, proving the driver is iterative.
     #[test]
     fn test_scc_deep_linear_chain_is_iterative() {
         let mut graph: DirectedGraph<usize, ()> = DirectedGraph::new();
@@ -591,6 +657,7 @@ mod tests {
         assert_eq!(sccs.last().and_then(|scc| scc.first()), nodes.first());
     }
 
+    /// Condensation merges a cycle into one super-node and keeps its outgoing edge.
     #[test]
     fn test_condensation_basic() {
         // A <-> B -> C (single edge to C)
@@ -616,6 +683,7 @@ mod tests {
         assert_eq!(edges.len(), 1);
     }
 
+    /// Disconnected cycles produce a condensation with no inter-SCC edges.
     #[test]
     fn test_condensation_no_edges() {
         // Two disconnected cycles
@@ -637,6 +705,7 @@ mod tests {
         assert!(edges.is_empty());
     }
 
+    /// A chain of SCCs condenses to a linear DAG with one edge per link.
     #[test]
     fn test_condensation_chain() {
         // Chain of SCCs: (A<->B) -> (C<->D) -> E
@@ -667,6 +736,7 @@ mod tests {
         assert_eq!(edges.len(), 2);
     }
 
+    /// Edgeless nodes each form their own singleton SCC.
     #[test]
     fn test_scc_disconnected_graph() {
         // Completely disconnected nodes
@@ -684,6 +754,7 @@ mod tests {
         }
     }
 
+    /// A mixed graph with nested cycles and tails is partitioned into the expected SCCs.
     #[test]
     fn test_scc_complex_structure() {
         // Complex graph with multiple SCCs
@@ -722,7 +793,7 @@ mod tests {
         assert_eq!(sccs.len(), 5);
 
         // Count SCC sizes
-        let mut size_counts = std::collections::HashMap::new();
+        let mut size_counts = FxHashMap::default();
         for scc in &sccs {
             *size_counts.entry(scc.len()).or_insert(0) += 1;
         }

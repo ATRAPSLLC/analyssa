@@ -3,15 +3,15 @@
 //! Both are the forward algorithms run backwards: a node `p` post-dominates `n`
 //! when every path from `n` to the exit passes through `p`, which is dominance
 //! on the reversed graph, and control dependence is the dominance frontier of
-//! that same reversed graph. This module therefore contributes the *graph* —
-//! [`ReverseGraph`] — and leaves [`compute_dominators`] and
+//! that same reversed graph. This module therefore contributes the *graph* -
+//! [`ReverseGraph`] - and leaves [`crate::graph::algorithms::compute_dominators`] and
 //! [`compute_dominance_frontiers`] to do the work they already do.
 //!
 //! # Why a virtual exit
 //!
 //! Dominance needs a single root. A real control-flow graph rarely has a single
 //! sink: a function returns from several places, and one that does not return at
-//! all has none. Both cases are ordinary, not pathological — an infinite server
+//! all has none. Both cases are ordinary, not pathological - an infinite server
 //! loop and a `noreturn` call are as real as a single `ret`.
 //!
 //! So the reversed graph is rooted at a **virtual exit**, numbered one past the
@@ -21,7 +21,7 @@
 //! An SCC is terminal when no member has a successor that is in range and
 //! outside the component. A terminal singleton with no successors is exactly a
 //! real sink, so that case covers multiple returns; every other terminal SCC is
-//! a region that reaches no sink at all — an infinite loop. Since the
+//! a region that reaches no sink at all - an infinite loop. Since the
 //! condensation is a finite DAG every node reaches some terminal SCC, and
 //! inside an SCC every member reaches every other, so one edge per terminal SCC
 //! makes every real node backwards-reachable from the exit. One rule, both
@@ -32,15 +32,15 @@
 //! Post-dominance *inside* a region that reaches no sink is genuinely
 //! undefined: with `1 <-> 2` and no way out, seeding at 1 or at 2 swaps their
 //! immediate post-dominators, and neither answer is more correct. The seed
-//! *set* is a graph invariant — independent of edge insertion order and of
-//! Tarjan's traversal — but the representative is a convention: the lowest id
+//! *set* is a graph invariant - independent of edge insertion order and of
+//! Tarjan's traversal - but the representative is a convention: the lowest id
 //! in the component. [`ReverseGraph::exit_seeds`] exposes what was chosen. For
 //! a graph where every node reaches a sink the seeds are exactly the sinks.
 //!
 //! # Complexity
 //!
-//! Reversal O(V + E), Tarjan O(V + E), the terminality scan O(V + E), sorting
-//! the k seeds O(k log k), then O(V α(V)) for Lengauer-Tarjan.
+//! Reversal, Tarjan and terminal-component seeding each take O(V + E).
+//! Post-dominance then uses the canonical Lengauer-Tarjan computation.
 //!
 //! # Reading the results
 //!
@@ -64,7 +64,7 @@ use crate::{
 
 /// A control-flow graph reversed and rooted at a virtual exit.
 ///
-/// Node ids are the original graph's, plus one more — [`Self::virtual_exit`] —
+/// Node ids are the original graph's, plus one more - [`Self::virtual_exit`] -
 /// standing for "control left the function".
 #[derive(Debug, Clone)]
 pub struct ReverseGraph {
@@ -86,73 +86,61 @@ impl ReverseGraph {
     pub fn new<G: Successors>(graph: &G) -> Self {
         let count = graph.node_count();
         let virtual_exit = NodeId::new(count);
-        let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); count.saturating_add(1)];
-
-        // Reverse every real edge.
-        for node in graph.node_ids() {
+        let mut edges = vec![Vec::new(); count.saturating_add(1)];
+        for index in 0..count {
+            let node = NodeId::new(index);
             for successor in graph.successors(node) {
-                if let Some(row) = edges.get_mut(successor.index()) {
+                if successor.index() < count
+                    && let Some(row) = edges.get_mut(successor.index())
+                {
                     row.push(node);
                 }
             }
         }
-
-        // Seed one edge per *terminal* strongly connected component.
-        //
-        // Call an SCC terminal when no member has a successor that is in range
-        // and outside the SCC. Then a terminal singleton with no successors is
-        // exactly a real sink; every other terminal SCC is a region that can
-        // reach no sink at all (every member has a successor, and all of them
-        // stay inside). Every node reaches some terminal SCC because the
-        // condensation is a finite DAG, and inside an SCC every member reaches
-        // every other -- so one edge per terminal SCC makes every real node
-        // backwards-reachable from the virtual exit, which is the totality the
-        // module docs claim.
-        //
-        // One rule covers both cases, which is why there is no separate sink
-        // pass. Note the direction: "reaches no sink" is a property of forward
-        // reachability, and `edges` here holds forward *predecessors*, so it
-        // cannot be established by walking `edges` -- the condensation is what
-        // answers it.
-        let mut scc_of: Vec<usize> = vec![usize::MAX; count];
         let components = strongly_connected_components(graph);
-        for (component_index, component) in components.iter().enumerate() {
+        let mut scc_of = vec![usize::MAX; count];
+        for (index, component) in components.iter().enumerate() {
             for member in component {
                 if let Some(slot) = scc_of.get_mut(member.index()) {
-                    *slot = component_index;
+                    *slot = index;
                 }
             }
         }
-
-        let mut seeds: Vec<NodeId> = Vec::new();
-        for (component_index, component) in components.iter().enumerate() {
-            let leaves = component.iter().any(|member| {
-                graph.successors(*member).any(|successor| {
-                    // Out-of-range successor ids are ignored here exactly as the
-                    // reversal above ignores them.
-                    successor.index() < count
-                        && scc_of.get(successor.index()).copied() != Some(component_index)
-                })
-            });
-            if leaves {
-                continue;
+        let mut seeded = vec![false; count];
+        for (index, component) in components.iter().enumerate() {
+            let mut leaves = false;
+            let mut seed = None;
+            for member in component {
+                seed = Some(seed.map_or(*member, |known: NodeId| known.min(*member)));
+                for successor in graph.successors(*member) {
+                    if successor.index() < count
+                        && scc_of.get(successor.index()).copied() != Some(index)
+                    {
+                        leaves = true;
+                        break;
+                    }
+                }
+                if leaves {
+                    break;
+                }
             }
-            if let Some(seed) = component
-                .iter()
-                .filter(|member| member.index() < count)
-                .min()
+            if !leaves
+                && let Some(seed) = seed
+                && let Some(slot) = seeded.get_mut(seed.index())
             {
-                seeds.push(*seed);
+                *slot = true;
             }
         }
-
-        // Ascending, so the seed list is a graph invariant rather than an
-        // artefact of Tarjan's traversal order.
-        seeds.sort_unstable();
-        if let Some(row) = edges.get_mut(virtual_exit.index()) {
-            row.extend_from_slice(&seeds);
+        let mut seeds = Vec::new();
+        for (index, seed) in seeded.iter().enumerate() {
+            if *seed {
+                let node = NodeId::new(index);
+                seeds.push(node);
+                if let Some(row) = edges.get_mut(count) {
+                    row.push(node);
+                }
+            }
         }
-
         Self {
             edges,
             virtual_exit,
@@ -165,7 +153,7 @@ impl ReverseGraph {
     ///
     /// Post-dominance *inside* a region that reaches no sink is genuinely
     /// undefined, so which member represents the region is a convention, not a
-    /// theorem — choosing member 2 instead of 1 of a `1 <-> 2` cycle swaps their
+    /// theorem - choosing member 2 instead of 1 of a `1 <-> 2` cycle swaps their
     /// immediate post-dominators. The convention is "the lowest id in the
     /// component", which depends on the caller's numbering and nothing else.
     /// This exposes it so a caller can see what was chosen.
@@ -185,171 +173,11 @@ impl ReverseGraph {
     pub const fn virtual_exit(&self) -> NodeId {
         self.virtual_exit
     }
-}
 
-impl GraphBase for ReverseGraph {
-    fn node_count(&self) -> usize {
-        self.edges.len()
-    }
-
-    fn node_ids(&self) -> impl Iterator<Item = NodeId> {
-        (0..self.edges.len()).map(NodeId::new)
-    }
-}
-
-impl Successors for ReverseGraph {
-    fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
-        self.edges
-            .get(node.index())
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-            .iter()
-            .copied()
-    }
-}
-
-/// Post-dominance over a graph's real nodes.
-///
-/// Wraps the dominator tree of the reversed graph and keeps the virtual exit
-/// out of every answer, so a caller never has to check for a node id one past
-/// the end. When control can leave the function from a block without passing
-/// through any other, that block simply has no immediate post-dominator —
-/// see [`Self::leaves_function`].
-#[derive(Debug, Clone)]
-pub struct PostDominatorTree {
-    /// Dominance over the reversed, exit-rooted graph.
-    tree: DominatorTree,
-    /// How many of its nodes are real.
-    node_count: usize,
-}
-
-impl PostDominatorTree {
-    /// The synthetic node standing for "control left the function".
-    #[must_use]
-    pub const fn virtual_exit(&self) -> NodeId {
-        NodeId::new(self.node_count)
-    }
-
-    /// The number of real nodes.
-    #[must_use]
-    pub const fn node_count(&self) -> usize {
-        self.node_count
-    }
-
-    /// The nearest node that post-dominates `node`, if it is a real one.
-    ///
-    /// `None` when `node` is out of range or is the virtual exit, and when the
-    /// nearest post-dominator is the virtual exit — that is, when control can
-    /// leave the function from `node` without passing through any other block.
-    /// This is the single guard that keeps the exit out of caller answers.
-    #[must_use]
-    pub fn immediate_post_dominator(&self, node: NodeId) -> Option<NodeId> {
-        if node.index() >= self.node_count {
-            return None;
-        }
-        let idom = self.tree.immediate_dominator(node)?;
-        (idom.index() < self.node_count).then_some(idom)
-    }
-
-    /// Whether every path from `b` to the exit passes through `a`.
-    #[must_use]
-    pub fn post_dominates(&self, a: NodeId, b: NodeId) -> bool {
-        a.index() < self.node_count && b.index() < self.node_count && self.tree.dominates(a, b)
-    }
-
-    /// [`Self::post_dominates`], excluding the reflexive case.
-    #[must_use]
-    pub fn strictly_post_dominates(&self, a: NodeId, b: NodeId) -> bool {
-        a != b && self.post_dominates(a, b)
-    }
-
-    /// Whether control can leave the function from `node` without passing
-    /// through any other block.
-    #[must_use]
-    pub fn leaves_function(&self, node: NodeId) -> bool {
-        node.index() < self.node_count && self.immediate_post_dominator(node).is_none()
-    }
-
-    /// Every real node, for exhaustive assertions.
-    #[cfg(test)]
-    fn node_ids_for_test(&self) -> impl Iterator<Item = NodeId> {
-        (0..self.node_count).map(NodeId::new)
-    }
-
-    /// The underlying tree over the reversed graph, virtual exit included.
-    ///
-    /// For callers that genuinely need the exit — a totality check, say.
-    #[must_use]
-    pub const fn as_dominator_tree(&self) -> &DominatorTree {
-        &self.tree
-    }
-}
-
-/// Control dependences over a graph's real nodes.
-///
-/// Carries exactly `node_count` rows, each `node_count` bits wide.
-#[derive(Debug, Clone)]
-pub struct ControlDependences {
-    /// One row per real node.
-    rows: Vec<BitSet>,
-}
-
-impl ControlDependences {
-    /// The number of real nodes, which is also the number of rows.
-    #[must_use]
-    pub const fn node_count(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// The nodes whose branch decides whether `node` executes.
-    #[must_use]
-    pub fn controllers(&self, node: NodeId) -> Option<&BitSet> {
-        self.rows.get(node.index())
-    }
-
-    /// Whether `node`'s execution is decided by a branch in `on`.
-    #[must_use]
-    pub fn is_control_dependent(&self, node: NodeId, on: NodeId) -> bool {
-        self.controllers(node)
-            .is_some_and(|row| row.contains_checked(on.index()))
-    }
-
-    /// Whether `node` is control dependent on itself.
-    ///
-    /// # Self-dependence
-    ///
-    /// This really happens, and it is not a defect. Under
-    /// Ferrante-Ottenstein-Warren a loop header with a conditional exit lies in
-    /// its own post-dominance frontier: the header's own branch decides whether
-    /// the header runs again. A consumer that walks [`Self::controllers`] as a
-    /// parent pointer into a chain of enclosing conditions will not terminate —
-    /// use [`Self::strict_controllers`], which drops the self-edge.
-    #[must_use]
-    pub fn is_self_dependent(&self, node: NodeId) -> bool {
-        self.is_control_dependent(node, node)
-    }
-
-    /// [`Self::controllers`] without the self-edge, so a walk terminates.
-    pub fn strict_controllers(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        self.controllers(node)
-            .into_iter()
-            .flat_map(BitSet::iter)
-            .map(NodeId::new)
-            .filter(move |controller| *controller != node)
-    }
-
-    /// Every row, indexed by node.
-    #[must_use]
-    pub fn rows(&self) -> &[BitSet] {
-        &self.rows
-    }
-}
-
-impl ReverseGraph {
     /// Post-dominance over the graph this was reversed from.
     ///
     /// Prefer the free [`compute_post_dominators`] unless you already hold a
-    /// `ReverseGraph` — to read [`Self::exit_seeds`], say, or because you want
+    /// `ReverseGraph` - to read [`Self::exit_seeds`], say, or because you want
     /// control dependences from the same reversal. This method and
     /// [`Self::control_dependences`] exist so that wanting both costs one
     /// reversal rather than two; the free functions are the ordinary entry
@@ -397,6 +225,164 @@ impl ReverseGraph {
     }
 }
 
+impl GraphBase for ReverseGraph {
+    fn node_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+        (0..self.edges.len()).map(NodeId::new)
+    }
+}
+
+impl Successors for ReverseGraph {
+    fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+        self.edges
+            .get(node.index())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+    }
+}
+
+/// Post-dominance over a graph's real nodes.
+///
+/// Wraps the dominator tree of the reversed graph and keeps the virtual exit
+/// out of every answer, so a caller never has to check for a node id one past
+/// the end. When control can leave the function from a block without passing
+/// through any other, that block simply has no immediate post-dominator -
+/// see [`Self::leaves_function`].
+#[derive(Debug, Clone)]
+pub struct PostDominatorTree {
+    /// Dominance over the reversed, exit-rooted graph.
+    tree: DominatorTree,
+    /// How many of its nodes are real.
+    node_count: usize,
+}
+
+impl PostDominatorTree {
+    /// The synthetic node standing for "control left the function".
+    #[must_use]
+    pub const fn virtual_exit(&self) -> NodeId {
+        NodeId::new(self.node_count)
+    }
+
+    /// The number of real nodes.
+    #[must_use]
+    pub const fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// The nearest node that post-dominates `node`, if it is a real one.
+    ///
+    /// `None` when `node` is out of range or is the virtual exit, and when the
+    /// nearest post-dominator is the virtual exit - that is, when control can
+    /// leave the function from `node` without passing through any other block.
+    /// This is the single guard that keeps the exit out of caller answers.
+    #[must_use]
+    pub fn immediate_post_dominator(&self, node: NodeId) -> Option<NodeId> {
+        if node.index() >= self.node_count {
+            return None;
+        }
+        let idom = self.tree.immediate_dominator(node)?;
+        (idom.index() < self.node_count).then_some(idom)
+    }
+
+    /// Whether every path from `b` to the exit passes through `a`.
+    #[must_use]
+    pub fn post_dominates(&self, a: NodeId, b: NodeId) -> bool {
+        a.index() < self.node_count && b.index() < self.node_count && self.tree.dominates(a, b)
+    }
+
+    /// [`Self::post_dominates`], excluding the reflexive case.
+    #[must_use]
+    pub fn strictly_post_dominates(&self, a: NodeId, b: NodeId) -> bool {
+        a != b && self.post_dominates(a, b)
+    }
+
+    /// Whether control can leave the function from `node` without passing
+    /// through any other block.
+    #[must_use]
+    pub fn leaves_function(&self, node: NodeId) -> bool {
+        node.index() < self.node_count && self.immediate_post_dominator(node).is_none()
+    }
+
+    /// Every real node, for exhaustive assertions.
+    #[cfg(test)]
+    fn node_ids_for_test(&self) -> impl Iterator<Item = NodeId> {
+        (0..self.node_count).map(NodeId::new)
+    }
+
+    /// The underlying tree over the reversed graph, virtual exit included.
+    ///
+    /// For callers that genuinely need the exit - a totality check, say.
+    #[must_use]
+    pub const fn as_dominator_tree(&self) -> &DominatorTree {
+        &self.tree
+    }
+}
+
+/// Control dependences over a graph's real nodes.
+///
+/// Carries exactly `node_count` rows, each `node_count` bits wide.
+#[derive(Debug, Clone)]
+pub struct ControlDependences {
+    /// One row per real node.
+    rows: Vec<BitSet>,
+}
+
+impl ControlDependences {
+    /// The number of real nodes, which is also the number of rows.
+    #[must_use]
+    pub const fn node_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The nodes whose branch decides whether `node` executes.
+    #[must_use]
+    pub fn controllers(&self, node: NodeId) -> Option<&BitSet> {
+        self.rows.get(node.index())
+    }
+
+    /// Whether `node`'s execution is decided by a branch in `on`.
+    #[must_use]
+    pub fn is_control_dependent(&self, node: NodeId, on: NodeId) -> bool {
+        self.controllers(node)
+            .is_some_and(|row| row.contains_checked(on.index()))
+    }
+
+    /// Whether `node` is control dependent on itself.
+    ///
+    /// # Self-dependence
+    ///
+    /// This really happens, and it is not a defect. Under
+    /// Ferrante-Ottenstein-Warren a loop header with a conditional exit lies in
+    /// its own post-dominance frontier: the header's own branch decides whether
+    /// the header runs again. A consumer that walks [`Self::controllers`] as a
+    /// parent pointer into a chain of enclosing conditions will not terminate -
+    /// use [`Self::strict_controllers`], which drops the self-edge.
+    #[must_use]
+    pub fn is_self_dependent(&self, node: NodeId) -> bool {
+        self.is_control_dependent(node, node)
+    }
+
+    /// [`Self::controllers`] without the self-edge, so a walk terminates.
+    pub fn strict_controllers(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.controllers(node)
+            .into_iter()
+            .flat_map(BitSet::iter)
+            .map(NodeId::new)
+            .filter(move |controller| *controller != node)
+    }
+
+    /// Every row, indexed by node.
+    #[must_use]
+    pub fn rows(&self) -> &[BitSet] {
+        &self.rows
+    }
+}
+
 /// Computes the post-dominator tree of `graph`.
 ///
 /// Reverses `graph` and computes dominance on the result. To get control
@@ -415,7 +401,7 @@ pub fn compute_post_dominators<G: Successors>(graph: &G) -> PostDominatorTree {
 /// Computes the control dependences of `graph`, one row per node.
 ///
 /// `result.controllers(n)` holds the nodes whose branch decides whether `n`
-/// executes — the post-dominance frontier of `n`. A node with an empty row runs
+/// executes - the post-dominance frontier of `n`. A node with an empty row runs
 /// whenever the function does. See
 /// [`ControlDependences::is_self_dependent`] for why a node can appear in its
 /// own row.
@@ -433,6 +419,8 @@ pub fn control_dependences<G: Successors>(graph: &G) -> ControlDependences {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::graph::DirectedGraph;
 
@@ -482,7 +470,7 @@ mod tests {
         // 0 -> {1, 2}, both terminal.
         let g = graph(3, &[(0, 1), (0, 2)]);
         let pd = compute_post_dominators(&g);
-        // Neither return post-dominates the entry — the other path avoids it.
+        // Neither return post-dominates the entry - the other path avoids it.
         assert!(!pd.post_dominates(NodeId::new(1), NodeId::new(0)));
         assert!(!pd.post_dominates(NodeId::new(2), NodeId::new(0)));
         // But the virtual exit does, which is the whole point of adding it --
@@ -522,7 +510,7 @@ mod tests {
     /// Seeding per node makes nodes 0 and 1 both children of the virtual exit,
     /// which flattens the tree: node 1 stops post-dominating node 0 even though
     /// it is node 0's only successor, and node 1 is reported control dependent
-    /// on a block with one unconditional successor and no branch — impossible
+    /// on a block with one unconditional successor and no branch - impossible
     /// under Ferrante-Ottenstein-Warren.
     #[test]
     fn an_exit_less_loop_gets_one_edge_for_the_whole_region() {
@@ -616,7 +604,7 @@ mod tests {
         assert_eq!(reversed.real_node_count(), NODES);
     }
 
-    /// An irreducible graph — two entries into one cycle — is not a shape any
+    /// An irreducible graph - two entries into one cycle - is not a shape any
     /// compiler in the corpus emits, and is exactly what hand-written or
     /// obfuscated code does. It must answer, not panic or diverge.
     #[test]
@@ -700,7 +688,7 @@ mod tests {
     }
 
     /// Following immediate post-dominators from any real node reaches the exit
-    /// in at most `node_count` steps — the totality the seeding rule buys.
+    /// in at most `node_count` steps - the totality the seeding rule buys.
     #[test]
     fn every_node_reaches_the_exit_through_its_post_dominators() {
         let g = graph(6, &[(0, 1), (1, 2), (2, 3), (3, 1), (1, 4), (4, 5), (5, 5)]);
@@ -745,5 +733,104 @@ mod tests {
                 .any(|controller| controller == NodeId::new(1)),
             "the strict walk drops the self-edge, so it terminates"
         );
+    }
+
+    /// A graph whose iterator reports each inspected edge independently of the algorithm.
+    struct ProbeGraph {
+        /// Original adjacency, including intentionally malformed successors.
+        rows: Vec<Vec<NodeId>>,
+        /// Actual successor items pulled from the borrowed graph.
+        reads: Cell<usize>,
+    }
+
+    impl GraphBase for ProbeGraph {
+        fn node_count(&self) -> usize {
+            self.rows.len()
+        }
+        fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+            (0..self.rows.len()).map(NodeId::new)
+        }
+    }
+
+    impl Successors for ProbeGraph {
+        fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+            self.rows
+                .get(node.index())
+                .into_iter()
+                .flat_map(|row| row.iter())
+                .copied()
+                .inspect(|_| self.reads.set(self.reads.get().saturating_add(1)))
+        }
+    }
+
+    /// Exhaustive three-node reachability independently specifies components and exit seeds.
+    #[test]
+    fn canonical_components_and_exit_seeds_match_exhaustive_reachability() {
+        for mask in 0usize..512 {
+            let mut rows = vec![Vec::new(); 3];
+            let mut reach = [[false; 3]; 3];
+            for (from, (row, reachable)) in rows.iter_mut().zip(reach.iter_mut()).enumerate() {
+                reachable[from] = true;
+                for (to, cell) in reachable.iter_mut().enumerate() {
+                    if mask & (1 << (from * 3 + to)) != 0 {
+                        row.push(NodeId::new(to));
+                        *cell = true;
+                    }
+                }
+                if let Some(first) = row.first().copied() {
+                    row.push(first);
+                }
+                row.extend([NodeId::new(3), NodeId::new(usize::MAX)]);
+            }
+            for through in 0..3 {
+                for from in 0..3 {
+                    for to in 0..3 {
+                        reach[from][to] |= reach[from][through] && reach[through][to];
+                    }
+                }
+            }
+            let graph = ProbeGraph {
+                rows,
+                reads: Cell::new(0),
+            };
+            let components = strongly_connected_components(&graph);
+            assert_eq!(components.iter().map(Vec::len).sum::<usize>(), 3);
+            for (from, forward) in reach.iter().enumerate() {
+                for (to, backward) in reach.iter().enumerate() {
+                    let together = components.iter().any(|component| {
+                        component.contains(&NodeId::new(from))
+                            && component.contains(&NodeId::new(to))
+                    });
+                    assert_eq!(
+                        together,
+                        forward[to] && backward[from],
+                        "graph {mask}, {from}/{to}"
+                    );
+                }
+            }
+            let reverse = ReverseGraph::new(&graph);
+            let expected: Vec<_> = (0..3)
+                .filter(|from| {
+                    (0..*from).all(|other| !(reach[*from][other] && reach[other][*from]))
+                        && (0..3).all(|to| !reach[*from][to] || reach[to][*from])
+                })
+                .map(NodeId::new)
+                .collect();
+            assert_eq!(reverse.exit_seeds(), expected, "graph {mask}");
+            for to in 0..3 {
+                let expected: Vec<_> = (0..3)
+                    .flat_map(|from| {
+                        graph.rows[from]
+                            .iter()
+                            .filter(move |target| target.index() == to)
+                            .map(move |_| NodeId::new(from))
+                    })
+                    .collect();
+                assert_eq!(
+                    reverse.successors(NodeId::new(to)).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
     }
 }

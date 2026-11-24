@@ -47,9 +47,11 @@
 //! compression. The `compress` method uses an iterative approach to avoid stack
 //! overflow on large graphs, instead of the traditional recursive path compression.
 
+use std::mem;
+
 use crate::{
     BitSet,
-    graph::{NodeId, RootedGraph, Successors},
+    graph::{NodeId, Successors},
 };
 
 /// Result of dominator tree computation.
@@ -99,7 +101,7 @@ pub struct DominatorTree {
     /// DFS entry time of each node in the dominator tree, or [`Self::UNVISITED`]
     /// for nodes unreachable from the entry. Together with `tout` this turns
     /// [`DominatorTree::dominates`] into two integer comparisons; see
-    /// [`compute_dfs_intervals`].
+    /// [`crate::graph::algorithms::dominators::compute_dfs_intervals`].
     tin: Vec<usize>,
     /// DFS exit time of each node in the dominator tree, or [`Self::UNVISITED`]
     /// for nodes unreachable from the entry.
@@ -137,16 +139,16 @@ impl DominatorTree {
     ///
     /// # Complexity
     ///
-    /// O(1) — two integer comparisons against the dominator tree's DFS
+    /// O(1) - two integer comparisons against the dominator tree's DFS
     /// intervals, which [`compute_dominators`] computes once at construction.
     ///
     /// Dominance is ancestry in the dominator tree, and in a DFS numbering `a`
     /// is an ancestor of `b` exactly when `a`'s interval encloses `b`'s. This
     /// used to walk the immediate-dominator chain from `b` to the entry, which
     /// is O(depth); loop detection calls it once per CFG edge, making back-edge
-    /// discovery O(E × depth) — near-quadratic on the deep dominator trees that
+    /// discovery O(E × depth) - near-quadratic on the deep dominator trees that
     /// lifted native code produces, and measurably so (loop-forest construction
-    /// grew ~O(n^1.7) in `benches/ssa_repair.rs`).
+    /// grew ~O(n^1.7) in `benches/ssarepair.rs`).
     pub fn dominates(&self, a: NodeId, b: NodeId) -> bool {
         // Reflexive, and deliberately checked before any bounds test so the
         // out-of-bounds behaviour of the previous chain walk is preserved.
@@ -175,7 +177,7 @@ impl DominatorTree {
     /// walks the graph from the entry, and a node it never reached is marked
     /// `UNVISITED`. Callers that need "is this block reachable" alongside a
     /// dominator tree should ask here rather than running a second BFS over the
-    /// same graph — and, in particular, rather than inferring it from
+    /// same graph - and, in particular, rather than inferring it from
     /// `dominates(entry, node)`, which is also `false` for the entry's own
     /// out-of-range neighbours.
     ///
@@ -228,6 +230,20 @@ impl DominatorTree {
         }
     }
 
+    /// The nearest node dominating both `a` and `b`: one of them where it
+    /// dominates the other. `None` where either is unreachable from the
+    /// entry.
+    ///
+    /// Walks `a`'s dominators up from `a`, asking each whether it dominates
+    /// `b`, which [`Self::dominates`] answers in O(1): O(depth of `a`).
+    #[must_use]
+    pub fn nearest_common_dominator(&self, a: NodeId, b: NodeId) -> Option<NodeId> {
+        if !self.is_reachable(a) || !self.is_reachable(b) {
+            return None;
+        }
+        self.dominators(a).find(|&above| self.dominates(above, b))
+    }
+
     /// Returns the depth of a node in the dominator tree.
     ///
     /// The entry node has depth 0. Returns 0 for nodes whose index is out of
@@ -255,7 +271,7 @@ impl DominatorTree {
     ///
     /// # Complexity
     ///
-    /// O(1) — children are pre-computed during dominator tree construction.
+    /// O(1) - children are pre-computed during dominator tree construction.
     pub fn children(&self, node: NodeId) -> &[NodeId] {
         self.children.get(node.index()).map_or(&[], Vec::as_slice)
     }
@@ -278,6 +294,13 @@ pub struct DominatorIterator<'a> {
 impl Iterator for DominatorIterator<'_> {
     type Item = NodeId;
 
+    /// Yields the current node, then advances to its immediate dominator.
+    ///
+    /// The walk climbs immediate-dominator pointers until it yields the entry,
+    /// which is its own terminator. A node unreachable from the entry stores the
+    /// internal sentinel in `idom`; the `filter` on `node_count` drops it so the
+    /// iterator ends after the unreachable node itself rather than emitting a
+    /// `NodeId` that indexes nothing.
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current?;
 
@@ -288,7 +311,7 @@ impl Iterator for DominatorIterator<'_> {
 
         // An unreachable node has no immediate dominator, and `idom` stores the
         // internal sentinel there. Yielding it would hand callers a `NodeId` that
-        // indexes nothing — the same sentinel `dominates` already tests for
+        // indexes nothing - the same sentinel `dominates` already tests for
         // rather than trusting.
         self.current = self
             .tree
@@ -300,14 +323,15 @@ impl Iterator for DominatorIterator<'_> {
     }
 }
 
-/// Computes the dominator tree for a rooted graph using the Lengauer-Tarjan algorithm.
+/// Computes the dominator tree of `graph` from `entry` using the Lengauer-Tarjan algorithm.
 ///
 /// This algorithm efficiently computes the immediate dominator for every node
 /// reachable from the entry node.
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to analyze (must implement `RootedGraph`)
+/// * `graph` - The graph to analyze.
+/// * `entry` - The entry node, the root of the tree.
 ///
 /// # Returns
 ///
@@ -380,16 +404,10 @@ where
             tout: Vec::new(),
         };
     }
-
-    // Pre-compute predecessors in a single O(V+E) pass for the Lengauer-Tarjan algorithm
     let predecessors = precompute_predecessors(graph);
-
-    // Lengauer-Tarjan algorithm implementation
     let mut lt = LengauerTarjan::new(node_count, entry);
     lt.compute(graph, &predecessors);
-
-    // Build children list in a single O(V) pass from the idom array
-    let mut children: Vec<Vec<NodeId>> = vec![Vec::new(); node_count];
+    let mut children = vec![Vec::new(); node_count];
     for i in 0..node_count {
         let node = NodeId::new(i);
         if node == entry {
@@ -402,9 +420,7 @@ where
             slot.push(node);
         }
     }
-
     let (tin, tout) = compute_dfs_intervals(entry, &children, node_count);
-
     DominatorTree {
         entry,
         idom: lt.idom,
@@ -414,16 +430,6 @@ where
         tin,
         tout,
     }
-}
-
-/// Convenience function to compute dominators for a [`RootedGraph`].
-///
-/// This is equivalent to calling `compute_dominators(graph, graph.entry())`.
-pub fn compute_dominators_rooted<G>(graph: &G) -> DominatorTree
-where
-    G: RootedGraph,
-{
-    compute_dominators(graph, graph.entry())
 }
 
 /// Assigns each node its DFS entry and exit time in the dominator tree.
@@ -440,6 +446,18 @@ where
 /// would overflow the native stack. Nodes are marked on entry, so a malformed
 /// `children` array containing a self-edge or cycle terminates rather than
 /// looping forever.
+///
+/// # Arguments
+///
+/// * `entry` - Root of the dominator tree, where the DFS begins.
+/// * `children` - Dominator-tree children indexed by node id, as built by
+///   [`compute_dominators`].
+/// * `node_count` - Node count of the graph; sizes both output arrays.
+///
+/// # Returns
+///
+/// The parallel `(tin, tout)` arrays: DFS entry and exit times indexed by node
+/// id, with [`DominatorTree::UNVISITED`] left in place for unreachable nodes.
 fn compute_dfs_intervals(
     entry: NodeId,
     children: &[Vec<NodeId>],
@@ -458,7 +476,8 @@ fn compute_dfs_intervals(
     timer = timer.saturating_add(1);
 
     // (node, index of the next child to descend into)
-    let mut stack: Vec<(NodeId, usize)> = vec![(entry, 0)];
+    let mut stack = Vec::new();
+    stack.push((entry, 0usize));
     while let Some(&(node, next_child)) = stack.last() {
         let kids = children
             .get(node.index())
@@ -488,10 +507,21 @@ fn compute_dfs_intervals(
 
 /// Pre-computes the predecessor list for all nodes in a single O(V+E) pass.
 ///
-/// Returns a vector where `result[i]` contains all predecessors of node `i`.
+/// Inverts the successor relation directly: one scan over every node's
+/// successor list appends the source to each target's predecessor row. This
+/// deliberately preserves duplicate and self edges, since Lengauer-Tarjan and
+/// the dominance-frontier walk both count predecessor multiplicity.
+///
+/// # Arguments
+///
+/// * `graph` - The graph whose successor relation is inverted.
+///
+/// # Returns
+///
+/// A vector where `result[i]` holds every predecessor of node `i`.
 fn precompute_predecessors<G: Successors>(graph: &G) -> Vec<Vec<NodeId>> {
     let n = graph.node_count();
-    let mut preds: Vec<Vec<NodeId>> = vec![Vec::new(); n];
+    let mut preds = vec![Vec::new(); n];
     for i in 0..n {
         let v = NodeId::new(i);
         for succ in graph.successors(v) {
@@ -534,16 +564,19 @@ impl LengauerTarjan {
         NodeId::new(usize::MAX)
     }
 
+    /// Reads `slice[i]`, falling back to the sentinel for an out-of-range index.
     #[inline]
     fn get_node(slice: &[NodeId], i: usize) -> NodeId {
         slice.get(i).copied().unwrap_or(Self::sentinel())
     }
 
+    /// Reads the DFS number of `n`, or 0 (the "unvisited" marker) when out of range.
     #[inline]
     fn get_dfnum(&self, n: NodeId) -> usize {
         self.dfnum.get(n.index()).copied().unwrap_or(0)
     }
 
+    /// Writes `value` into `slice[i]`, silently ignoring an out-of-range index.
     #[inline]
     fn set_node(slice: &mut [NodeId], i: usize, value: NodeId) {
         if let Some(slot) = slice.get_mut(i) {
@@ -551,6 +584,22 @@ impl LengauerTarjan {
         }
     }
 
+    /// Allocates the Lengauer-Tarjan working state for an `n`-node graph.
+    ///
+    /// Every array is sized to `n` so node ids index directly. `semi` and `best`
+    /// start at the identity (each node is its own semidominator and its own
+    /// best-on-path until link-eval refines them); `dfnum` starts at 0 to mark
+    /// every node unvisited; and `vertex`, `parent`, `idom`, and `ancestor` start
+    /// at the sentinel so an unset entry is distinguishable from a real node id.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Node count of the graph, sizing every working array.
+    /// * `entry` - The root node the DFS and dominance computation start from.
+    ///
+    /// # Returns
+    ///
+    /// Freshly initialized solver state ready for [`LengauerTarjan::compute`].
     fn new(n: usize, entry: NodeId) -> Self {
         let sentinel = NodeId::new(usize::MAX);
         Self {
@@ -558,15 +607,38 @@ impl LengauerTarjan {
             dfnum: vec![0; n],
             vertex: vec![sentinel; n],
             parent: vec![sentinel; n],
-            semi: (0..n).map(NodeId::new).collect(),
+            semi: (0..n).map(NodeId::new).collect::<Vec<_>>(),
             idom: vec![sentinel; n],
             ancestor: vec![sentinel; n],
-            best: (0..n).map(NodeId::new).collect(),
+            best: (0..n).map(NodeId::new).collect::<Vec<_>>(),
             bucket: vec![Vec::new(); n],
             dfs_counter: 0,
         }
     }
 
+    /// Runs the four phases of Lengauer-Tarjan, leaving the immediate dominator
+    /// of every reachable node in `self.idom`.
+    ///
+    /// Phase 1 numbers nodes by DFS. Phase 2 walks nodes in reverse DFS order and
+    /// computes each `w`'s semidominator from its predecessors via the link-eval
+    /// forest, dropping `w` into the bucket of that semidominator. Phase 3, still
+    /// in the same reverse pass, drains the bucket of `parent(w)`: a bucket node
+    /// `v` whose evaluated semidominator equals its own semidominator gets its
+    /// final idom immediately, otherwise idom is left pointing at the evaluated
+    /// node `u` as a deferral. Phase 4 sweeps forward in DFS order and resolves
+    /// every deferred idom by following `u` to `idom(u)`, which is now known.
+    /// Finally the entry is set to dominate itself.
+    ///
+    /// Interleaving phases 2 and 3 in one reverse pass is what keeps the link-eval
+    /// forest consistent: `w` is linked into the forest only after its own
+    /// semidominator is fixed, so evaluating its parent's bucket sees the correct
+    /// minima.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The graph whose dominators are being computed.
+    /// * `predecessors` - Pre-computed predecessor lists indexed by node id, as
+    ///   produced by [`crate::graph::algorithms::dominators::precompute_predecessors`].
     fn compute<G: Successors>(&mut self, graph: &G, predecessors: &[Vec<NodeId>]) {
         // Phase 1: DFS numbering
         self.dfs(graph, self.entry);
@@ -608,7 +680,7 @@ impl LengauerTarjan {
             let bucket = self
                 .bucket
                 .get_mut(parent_w.index())
-                .map_or_else(Vec::new, std::mem::take);
+                .map_or_else(Vec::new, mem::take);
             for v in bucket {
                 let u = self.eval(v);
                 let semi_u = Self::get_node(&self.semi, u.index());
@@ -638,10 +710,23 @@ impl LengauerTarjan {
         Self::set_node(&mut self.idom, self.entry.index(), self.entry);
     }
 
-    /// DFS traversal to assign DFS numbers and build DFS tree.
+    /// DFS traversal to assign DFS numbers and build the DFS tree.
+    ///
+    /// Numbers reachable nodes 1, 2, 3, ... in visitation order into `dfnum`,
+    /// records the inverse mapping in `vertex`, and stores each node's DFS-tree
+    /// parent in `parent`. The traversal is an explicit stack rather than
+    /// recursion so a CFG with a very deep spanning tree cannot overflow the
+    /// native stack; a node is claimed the first time it is popped (guarded by
+    /// its still-zero `dfnum`), so revisits pushed by other predecessors are
+    /// skipped.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The graph to traverse.
+    /// * `start` - Node to root the search at (the entry).
     fn dfs<G: Successors>(&mut self, graph: &G, start: NodeId) {
-        let mut stack = vec![(start, false)];
-
+        let mut stack = Vec::new();
+        stack.push((start, false));
         while let Some((node, processed)) = stack.pop() {
             let idx = node.index();
 
@@ -676,12 +761,26 @@ impl LengauerTarjan {
     }
 
     /// Evaluate: find the node with minimum semidominator on the path to the root.
+    ///
+    /// This is the query half of the link-eval structure. A node not yet linked
+    /// into the forest (ancestor is the sentinel) is its own answer; otherwise
+    /// [`LengauerTarjan::compress`] flattens the ancestor path and refreshes
+    /// `best`, and the compressed `best[v]` is the node carrying the minimum
+    /// semidominator on the path from `v` up to the forest root.
+    ///
+    /// # Arguments
+    ///
+    /// * `v` - Node to evaluate.
+    ///
+    /// # Returns
+    ///
+    /// The node with the minimum-DFS-number semidominator on `v`'s path to the
+    /// root, or `v` itself when `v` is not yet linked.
     fn eval(&mut self, v: NodeId) -> NodeId {
         let sentinel = Self::sentinel();
         if Self::get_node(&self.ancestor, v.index()) == sentinel {
             return v;
         }
-
         self.compress(v);
         Self::get_node(&self.best, v.index())
     }
@@ -710,7 +809,7 @@ impl LengauerTarjan {
         }
 
         // Phase 2: walk the path in reverse (top-down) to propagate best
-        // values and flatten ancestor pointers — same semantics as the
+        // values and flatten ancestor pointers - same semantics as the
         // recursive version's post-order updates.
         for &node in path.iter().rev() {
             let ancestor_node = Self::get_node(&self.ancestor, node.index());
@@ -739,8 +838,8 @@ impl LengauerTarjan {
 ///
 /// # Arguments
 ///
-/// * `graph` - The control flow graph
-/// * `dom_tree` - The precomputed dominator tree
+/// * `graph` - The control flow graph.
+/// * `dom_tree` - The precomputed dominator tree.
 ///
 /// # Returns
 ///
@@ -750,7 +849,7 @@ impl LengauerTarjan {
 ///
 /// - Time: Θ(V + E + Σ|DF(v)|). The runner walk visits one node per frontier
 ///   membership it records, so the total is the summed frontier size, not
-///   `O(V + E)` — a spine `b1→b2→…→bn` where every `bi` also branches to one
+///   `O(V + E)` - a spine `b1→b2→…→bn` where every `bi` also branches to one
 ///   common join is Θ(V²).
 /// - Space: Θ(V + Σ|DF(v)|). Rows are allocated on first insert
 ///   ([`BitSet::lazy`]), so nodes with an empty frontier cost only a `Vec`
@@ -788,7 +887,7 @@ where
     let n = graph.node_count();
     // Per-node frontier bitsets. Consumers (notably the SSA rebuilder) merge
     // handler dominance frontiers via `BitSet` union, so the set representation
-    // has to stay — but the rows are allocated lazily. Real dominance frontiers
+    // has to stay - but the rows are allocated lazily. Real dominance frontiers
     // are sparse: most nodes are not on any runner walk and keep an empty
     // frontier forever, so eagerly allocating `n` rows of `n` bits costs
     // `O(V²)` bytes of memset to store almost nothing.
@@ -797,10 +896,10 @@ where
     // once per exception-handler root, and handler tables come from the input
     // binary. A 20k-block function with 500 handler roots would otherwise
     // memset ~50 MB per call, ~25 GB for the function.
-    let mut frontiers: Vec<BitSet> = (0..n).map(|_| BitSet::lazy(n)).collect();
+    let mut frontiers = vec![BitSet::lazy(n); n];
 
     // Reuse the predecessor lists cached on the dominator tree when they match
-    // this graph (the normal case — the tree was computed from it), avoiding a
+    // this graph (the normal case - the tree was computed from it), avoiding a
     // second O(V+E) predecessor pass. Fall back to recomputing otherwise.
     let fallback;
     let all_preds: &[Vec<NodeId>] = if dom_tree.predecessors.len() == n {
@@ -855,12 +954,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use crate::{
         analysis::cfg::SsaCfg,
         graph::{
-            DirectedGraph, NodeId,
+            DirectedGraph, GraphBase, NodeId, Successors,
             algorithms::dominators::{
-                DominatorTree, compute_dominance_frontiers, compute_dominators,
+                DominatorTree, LengauerTarjan, compute_dominance_frontiers, compute_dominators,
+                precompute_predecessors,
             },
         },
         ir::{SsaFunction, SsaVarId, block::SsaBlock, instruction::SsaInstruction, ops::SsaOp},
@@ -880,7 +982,7 @@ mod tests {
     /// Kept verbatim as the oracle for
     /// `dfs_interval_dominance_matches_chain_walk`. The replacement is an
     /// asymptotic change to a predicate that five analyses and the verifier
-    /// depend on, so "the existing tests still pass" is too weak a claim —
+    /// depend on, so "the existing tests still pass" is too weak a claim -
     /// equivalence is checked over every node pair of every graph below,
     /// including the out-of-bounds and unreachable arguments the original had
     /// specific behaviour for.
@@ -931,11 +1033,11 @@ mod tests {
     }
 
     /// The O(1) interval test must agree with the O(depth) chain walk on every
-    /// node pair — including self-pairs, unreachable nodes, and indices past the
+    /// node pair - including self-pairs, unreachable nodes, and indices past the
     /// end of the graph.
     /// An unreachable node has no immediate dominator, and the tree stores an
     /// internal sentinel there. Walking the chain must stop rather than hand the
-    /// caller a `NodeId` that indexes nothing — `dominates` already tests for
+    /// caller a `NodeId` that indexes nothing - `dominates` already tests for
     /// the sentinel instead of trusting it.
     #[test]
     fn dominators_of_an_unreachable_node_yield_only_itself() {
@@ -1082,6 +1184,7 @@ mod tests {
         }
     }
 
+    /// An empty graph yields a zero-node tree instead of panicking.
     #[test]
     fn test_dominator_empty_graph() {
         let graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1091,6 +1194,7 @@ mod tests {
         assert_eq!(dom_tree.node_count(), 0);
     }
 
+    /// A single-node graph: the entry dominates itself, has no idom, and is at depth 0.
     #[test]
     fn test_dominator_single_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1104,6 +1208,7 @@ mod tests {
         assert_eq!(dom_tree.depth(entry), 0);
     }
 
+    /// A straight-line chain: each node's idom is its predecessor and depth grows by one.
     #[test]
     fn test_dominator_linear_chain() {
         // entry -> a -> b -> c
@@ -1144,6 +1249,7 @@ mod tests {
         assert_eq!(dom_tree.depth(c), 3);
     }
 
+    /// A diamond: the fork point immediately dominates both arms and the join.
     #[test]
     fn test_dominator_diamond() {
         // Diamond CFG:
@@ -1180,6 +1286,7 @@ mod tests {
         assert!(dom_tree.dominates(entry, exit));
     }
 
+    /// An if/then/else with a merge: the condition dominates the merge and exit, neither arm does.
     #[test]
     fn test_dominator_if_then_else() {
         // if-then-else:
@@ -1225,6 +1332,7 @@ mod tests {
         assert!(!dom_tree.strictly_dominates(else_b, merge));
     }
 
+    /// A loop: the header dominates the body, and the back edge does not make the body dominate the header.
     #[test]
     fn test_dominator_loop() {
         // Simple loop:
@@ -1257,6 +1365,7 @@ mod tests {
         assert!(!dom_tree.strictly_dominates(body, header));
     }
 
+    /// The dominator iterator walks from a node up to and including the entry.
     #[test]
     fn test_dominator_iterator() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1280,6 +1389,7 @@ mod tests {
         assert_eq!(dominators, vec![entry]);
     }
 
+    /// Dominator-tree children list every node whose immediate dominator is the given one.
     #[test]
     fn test_dominator_children() {
         // Diamond CFG
@@ -1307,6 +1417,7 @@ mod tests {
         assert!(dom_tree.children(exit).is_empty());
     }
 
+    /// A diamond's two arms each carry the join in their dominance frontier; entry and join have none.
     #[test]
     fn test_dominance_frontier_diamond() {
         // Diamond CFG - classic case for dominance frontiers
@@ -1339,6 +1450,7 @@ mod tests {
         assert!(frontiers[join.index()].is_empty());
     }
 
+    /// A loop body has its header in its dominance frontier, via the back edge.
     #[test]
     fn test_dominance_frontier_loop() {
         // Loop with header
@@ -1360,6 +1472,7 @@ mod tests {
         assert!(frontiers[body.index()].contains(header.index()));
     }
 
+    /// Nested joins land in the dominance frontiers of the blocks that reach them along one arm.
     #[test]
     fn test_dominance_frontier_nested_if() {
         // Nested if structure:
@@ -1408,6 +1521,7 @@ mod tests {
         assert!(frontiers[e.index()].contains(join2.index()));
     }
 
+    /// Strict dominance excludes the reflexive self-case that plain dominance allows.
     #[test]
     fn test_strictly_dominates() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1426,6 +1540,7 @@ mod tests {
         assert!(dom_tree.strictly_dominates(entry, a));
     }
 
+    /// A multi-path CFG: a re-convergence point is dominated by the shared ancestor, not either arm.
     #[test]
     fn test_dominator_complex_cfg() {
         // More complex CFG with multiple paths and joins
@@ -1485,7 +1600,7 @@ mod tests {
     /// `precompute_predecessors` is deliberately a second derivation: it is
     /// generic over any [`Successors`] graph, including ones that store no
     /// predecessors of their own. It cannot disagree with a stored relation
-    /// built by inverting the same [`Successors`] impl in the same node order —
+    /// built by inverting the same [`Successors`] impl in the same node order -
     /// but "cannot disagree" is worth asserting rather than assuming, because
     /// phi *placement* reads the frontier built from this one while phi
     /// *validation* reads `SsaCfg`'s, and a divergence would desynchronise them.
@@ -1510,10 +1625,10 @@ mod tests {
                 false_target: 2,
             },
         ));
-        ssa.add_block(block(2, SsaOp::Return { value: None }));
+        ssa.add_block(block(2, SsaOp::returns(None)));
 
         let cfg = SsaCfg::from_ssa(&ssa);
-        let ours = super::precompute_predecessors(&cfg);
+        let ours = precompute_predecessors(&cfg);
 
         for block_idx in 0..cfg.block_count() {
             let mine: Vec<usize> = ours
@@ -1526,5 +1641,139 @@ mod tests {
                 "the two derivations disagree at B{block_idx}"
             );
         }
+    }
+
+    /// Link-eval compresses a long ancestor chain without native recursion.
+    #[test]
+    fn link_eval_compresses_long_paths_iteratively() {
+        let mut lt = LengauerTarjan::new(4096, NodeId::new(0));
+        for index in 0..4096 {
+            lt.dfnum[index] = index + 1;
+            if index > 0 {
+                lt.ancestor[index] = NodeId::new(index - 1);
+            }
+        }
+        lt.compress(NodeId::new(4095));
+        assert_eq!(lt.ancestor.last(), Some(&NodeId::new(0)));
+    }
+
+    /// Counts actual edge fetches independently of the dominator computation.
+    struct CountedChain {
+        nodes: usize,
+        inspected: Cell<usize>,
+    }
+    impl GraphBase for CountedChain {
+        fn node_count(&self) -> usize {
+            self.nodes
+        }
+        fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+            (0..self.nodes).map(NodeId::new)
+        }
+    }
+    impl Successors for CountedChain {
+        fn successors(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+            let next = node.index().saturating_add(1);
+            (next < self.nodes)
+                .then_some(NodeId::new(next))
+                .into_iter()
+                .inspect(|_| self.inspected.set(self.inspected.get().saturating_add(1)))
+        }
+    }
+
+    /// A long chain is processed iteratively with two complete edge scans.
+    #[test]
+    fn dominator_construction_scans_each_edge_twice() {
+        let graph = CountedChain {
+            nodes: 4096,
+            inspected: Cell::new(0),
+        };
+        let tree = compute_dominators(&graph, NodeId::new(0));
+        assert_eq!(
+            tree.immediate_dominator(NodeId::new(4095)),
+            Some(NodeId::new(4094))
+        );
+        assert_eq!(graph.inspected.get(), 8190);
+    }
+
+    /// Literal loop and join frontiers preserve duplicate-edge semantics and lazy rows.
+    #[test]
+    fn canonical_frontiers_match_literal_loop_and_join_oracles() {
+        let graph = graph_from(
+            8,
+            &[
+                (0, 1),
+                (0, 2),
+                (1, 3),
+                (1, 3),
+                (2, 3),
+                (3, 4),
+                (4, 3),
+                (3, 5),
+                (5, 6),
+                (6, 5),
+            ],
+        );
+        let tree = compute_dominators(&graph, NodeId::new(0));
+        let rows = compute_dominance_frontiers(&graph, &tree);
+        let actual: Vec<Vec<usize>> = rows.iter().map(|row| row.iter().collect()).collect();
+        let expected: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![3],
+            vec![3],
+            vec![3],
+            vec![3],
+            vec![5],
+            vec![5],
+            vec![],
+        ];
+        assert_eq!(actual, expected);
+        assert!(rows[0].is_empty());
+        assert!(rows[7].is_empty());
+    }
+
+    /// Frontier construction reconstructs absent predecessor rows with one edge scan.
+    #[test]
+    fn canonical_frontiers_fallback_reconstructs_predecessors() {
+        let graph = CountedChain {
+            nodes: 4096,
+            inspected: Cell::new(0),
+        };
+        let mut tree = compute_dominators(&graph, NodeId::new(0));
+        tree.predecessors.clear();
+        graph.inspected.set(0);
+        let rows = compute_dominance_frontiers(&graph, &tree);
+        assert!(rows.iter().all(|row| row.is_empty()));
+        assert_eq!(graph.inspected.get(), 4095);
+    }
+
+    /// **Two nodes meet at the nearest node dominating both.** In a diamond
+    /// `0 -> 1, 2 -> 3` with `3 -> 4`, the arms meet at `0`, an arm and the
+    /// join at `0`, the join and what follows it at the join, and a node
+    /// nothing reaches meets nothing.
+    #[test]
+    fn two_nodes_meet_at_the_nearest_node_dominating_both() {
+        let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
+        let nodes: Vec<NodeId> = (0..6).map(|_| graph.add_node(())).collect();
+        for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 4)] {
+            graph.add_edge(nodes[from], nodes[to], ()).unwrap();
+        }
+        let tree = compute_dominators(&graph, nodes[0]);
+        assert_eq!(
+            tree.nearest_common_dominator(nodes[1], nodes[2]),
+            Some(nodes[0])
+        );
+        assert_eq!(
+            tree.nearest_common_dominator(nodes[1], nodes[3]),
+            Some(nodes[0])
+        );
+        assert_eq!(
+            tree.nearest_common_dominator(nodes[3], nodes[4]),
+            Some(nodes[3])
+        );
+        assert_eq!(
+            tree.nearest_common_dominator(nodes[4], nodes[3]),
+            Some(nodes[3])
+        );
+        assert_eq!(tree.nearest_common_dominator(nodes[1], nodes[5]), None);
     }
 }

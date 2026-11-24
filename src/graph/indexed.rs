@@ -36,10 +36,9 @@
 //! assert_eq!(cycle, vec!["A", "B", "C", "A"]);
 //! ```
 
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-};
+use std::hash::Hash;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Result,
@@ -54,8 +53,8 @@ use crate::{
 ///
 /// # Type Parameters
 ///
-/// * `K` - The domain key type for nodes (e.g., `AssemblyIdentity`, `TableId`)
-/// * `E` - The edge data type
+/// * `K` - The domain key type for nodes (e.g., `AssemblyIdentity`, `TableId`).
+/// * `E` - The edge data type.
 ///
 /// # Thread Safety
 ///
@@ -68,12 +67,12 @@ where
     /// The underlying directed graph (nodes store unit type, keys are separate)
     graph: DirectedGraph<'static, (), E>,
     /// Map from domain key to `NodeId`
-    key_to_node: HashMap<K, NodeId>,
+    key_to_node: FxHashMap<K, NodeId>,
     /// Map from `NodeId` to domain key
-    node_to_key: HashMap<NodeId, K>,
+    node_to_key: FxHashMap<NodeId, K>,
     /// Existing `(source, target)` edges, for O(1) duplicate detection in
     /// [`add_edge`](Self::add_edge) instead of scanning the source's successors.
-    edge_set: HashSet<(NodeId, NodeId)>,
+    edge_set: FxHashSet<(NodeId, NodeId)>,
 }
 
 impl<K, E> Default for IndexedGraph<K, E>
@@ -94,9 +93,9 @@ where
     pub fn new() -> Self {
         Self {
             graph: DirectedGraph::new(),
-            key_to_node: HashMap::new(),
-            node_to_key: HashMap::new(),
-            edge_set: HashSet::new(),
+            key_to_node: FxHashMap::default(),
+            node_to_key: FxHashMap::default(),
+            edge_set: FxHashSet::default(),
         }
     }
 
@@ -105,9 +104,9 @@ where
     pub fn with_capacity(node_capacity: usize, edge_capacity: usize) -> Self {
         Self {
             graph: DirectedGraph::with_capacity(node_capacity, edge_capacity),
-            key_to_node: HashMap::with_capacity(node_capacity),
-            node_to_key: HashMap::with_capacity(node_capacity),
-            edge_set: HashSet::with_capacity(edge_capacity),
+            key_to_node: FxHashMap::with_capacity_and_hasher(node_capacity, Default::default()),
+            node_to_key: FxHashMap::with_capacity_and_hasher(node_capacity, Default::default()),
+            edge_set: FxHashSet::with_capacity_and_hasher(edge_capacity, Default::default()),
         }
     }
 
@@ -118,7 +117,7 @@ where
     ///
     /// # Arguments
     ///
-    /// * `key` - The domain key for this node
+    /// * `key` - The domain key for this node.
     ///
     /// # Returns
     ///
@@ -140,9 +139,9 @@ where
     ///
     /// # Arguments
     ///
-    /// * `from` - The source node key
-    /// * `to` - The target node key
-    /// * `data` - The edge data
+    /// * `from` - The source node key.
+    /// * `to` - The target node key.
+    /// * `data` - The edge data.
     ///
     /// # Returns
     ///
@@ -229,13 +228,7 @@ where
     pub fn map_sccs_to_keys(&self, sccs: &[Vec<NodeId>]) -> Vec<Vec<K>> {
         sccs.iter().map(|scc| self.map_nodes_to_keys(scc)).collect()
     }
-}
 
-// Algorithm convenience methods
-impl<K, E> IndexedGraph<K, E>
-where
-    K: Hash + Eq + Clone,
-{
     /// Finds a cycle in the graph starting from the given key.
     ///
     /// Returns the cycle as a vector of domain keys if found, `None` otherwise.
@@ -259,7 +252,7 @@ where
     /// Returns the cycle in the lowest-numbered strongly connected component
     /// that has one, so the answer is **deterministic**: iterating
     /// `key_to_node.values()` and returning the first hit made the result depend
-    /// on `HashMap` order, which varies run to run — and a downstream
+    /// on `HashMap` order, which varies run to run - and a downstream
     /// content-addressed pipeline needs byte-identical output.
     ///
     /// # Complexity
@@ -338,6 +331,7 @@ mod tests {
         assert_eq!(dag.find_any_cycle(), None);
     }
 
+    /// Adding nodes populates both key-to-node and node-to-key lookups.
     #[test]
     fn test_indexed_graph_basic() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -352,6 +346,7 @@ mod tests {
         assert_eq!(graph.get_key(b), Some(&"B"));
     }
 
+    /// Re-adding an existing key returns the same `NodeId` without creating a node.
     #[test]
     fn test_indexed_graph_idempotent_add() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -363,6 +358,7 @@ mod tests {
         assert_eq!(graph.node_count(), 1);
     }
 
+    /// `add_edge` auto-creates endpoint nodes and rejects a duplicate edge.
     #[test]
     fn test_indexed_graph_add_edge() {
         let mut graph: IndexedGraph<&str, i32> = IndexedGraph::new();
@@ -379,6 +375,7 @@ mod tests {
         assert_eq!(graph.edge_count(), 2);
     }
 
+    /// `find_cycle_from` returns the cycle's keys when the start reaches a cycle.
     #[test]
     fn test_indexed_graph_find_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -396,6 +393,7 @@ mod tests {
         assert!(cycle.contains(&"C"));
     }
 
+    /// Both cycle queries report absence when the graph is acyclic.
     #[test]
     fn test_indexed_graph_no_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -408,6 +406,7 @@ mod tests {
         assert!(!graph.has_cycle_from(&"A"));
     }
 
+    /// A topological order respects every edge's before/after constraint.
     #[test]
     fn test_indexed_graph_topological_sort() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -433,6 +432,7 @@ mod tests {
         assert!(pos("C") < pos("D"));
     }
 
+    /// Topological sort returns `None` for a cyclic graph.
     #[test]
     fn test_indexed_graph_topological_sort_with_cycle() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -443,6 +443,7 @@ mod tests {
         assert!(graph.topological_sort().is_none());
     }
 
+    /// SCC decomposition groups a mutual cycle together and leaves other nodes singleton.
     #[test]
     fn test_indexed_graph_scc() {
         let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -461,6 +462,7 @@ mod tests {
         assert_eq!(sizes, vec![1, 2]);
     }
 
+    /// The wrapper works with any `Hash + Eq + Clone` key type, such as integers.
     #[test]
     fn test_indexed_graph_with_integers() {
         let mut graph: IndexedGraph<i32, &str> = IndexedGraph::new();

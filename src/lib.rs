@@ -54,7 +54,7 @@
 //! # Feature Flags
 //!
 //! - **`serde`** (off by default): derives `Serialize`/`Deserialize` across the
-//!   IR data model — the operation-kind taxonomy
+//!   IR data model - the operation-kind taxonomy
 //!   ([`crate::ir::ops::AtomicRmwOp`], the `Vector*Kind` family,
 //!   [`crate::ir::ops::SystemOpKind`], [`crate::ir::ops::SsaOpClass`], …), the
 //!   native descriptors ([`crate::ir::ops::NativeInstructionMetadata`],
@@ -66,7 +66,7 @@
 //!
 //!   Generic IR types carry `#[serde(bound(...))]`, so `SsaFunction<T>` is
 //!   serializable exactly when your [`Target`]'s associated types are. Hosts
-//!   that don't serialize the IR are unaffected — the impl simply does not
+//!   that don't serialize the IR are unaffected - the impl simply does not
 //!   apply, and no serde bound is forced onto [`Target`].
 //!
 //!   [`crate::ir::SsaVarId`] serializes as its logical index, not its internal
@@ -76,7 +76,7 @@
 //!
 //!   Not covered: derived views ([`crate::ir::ops::SsaDefs`],
 //!   [`crate::ir::ops::MemoryEffect`]), transient pass machinery (builders,
-//!   editors, edit reports), and [`crate::ir::ops::SsaFeatureToken`] — its
+//!   editors, edit reports), and [`crate::ir::ops::SsaFeatureToken`] - its
 //!   `&'static str` opcode can serialize but cannot deserialize.
 //!
 //! # Design Principles
@@ -115,29 +115,41 @@
 
 pub mod analysis;
 pub mod bitset;
+pub mod classes;
+mod encoder;
 mod error;
 pub mod events;
+pub mod facts;
 pub mod graph;
 pub mod host;
 pub mod interproc;
+pub mod interrupt;
 pub mod ir;
+pub mod metadata;
+pub mod parallel;
 pub mod passes;
 mod pointer;
 pub mod scheduling;
 pub mod target;
 pub mod testing;
+mod vartables;
 pub mod world;
 
 pub use bitset::BitSet;
-pub use error::{Error, GraphError, Result};
+pub use classes::Classes;
+pub use error::{Error, Result};
 pub use events::{
     DerivedStats, Event, EventBuilder, EventKind, EventListener, EventLog, NullListener,
+};
+pub use facts::{
+    Derivation, FunctionFacts, InstructionFacts, Join, Rewrite, Substitution, VariableFacts,
 };
 pub use host::{DirtySet, SsaStore};
 pub use interproc::{CallGraph, SummaryStore, SummaryTransfer};
 pub use pointer::PointerSize;
 pub use scheduling::{
-    DeobfuscationCapability, ModificationScope, PassScheduler, PipelineConfig, SsaPass, SsaPassHost,
+    DeobfuscationCapability, ModificationScope, PassScheduler, PipelineConfig, SsaPass,
+    SsaPassHost, Verify,
 };
 pub use target::{Endianness, Target};
 pub use testing::{MockTarget, MockType};

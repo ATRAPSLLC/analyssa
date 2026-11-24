@@ -19,6 +19,9 @@
 //! [`mask_unsigned_128`](PointerSize::mask_unsigned_128) methods which
 //! operate on `i128`/`u128`.
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Target pointer width for 8, 16, 32, 64, and 128-bit architectures.
 ///
 /// Hosts pick the variant that matches their target. This is used throughout
@@ -37,8 +40,8 @@
 /// // 32-bit masking truncates to i32 then sign-extends
 /// assert_eq!(PointerSize::Bit32.mask_signed(0xFFFFFFFF), -1_i64);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PointerSize {
     /// 8-bit target architecture with 1-byte pointers.
     Bit8,
@@ -53,6 +56,19 @@ pub enum PointerSize {
 }
 
 impl PointerSize {
+    /// Returns the native width for one, two, four, eight or sixteen bytes.
+    #[must_use]
+    pub const fn try_from_bytes(bytes: u32) -> Option<Self> {
+        match bytes {
+            1 => Some(Self::Bit8),
+            2 => Some(Self::Bit16),
+            4 => Some(Self::Bit32),
+            8 => Some(Self::Bit64),
+            16 => Some(Self::Bit128),
+            _ => None,
+        }
+    }
+
     /// Creates a [`PointerSize`] from a "is 64-bit" boolean.
     ///
     /// Convenience constructor for hosts that communicate bitness as a boolean

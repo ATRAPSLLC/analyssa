@@ -1,4 +1,4 @@
-//! [`SsaStore<T>`] — host-supplied storage for per-method SSA functions,
+//! [`SsaStore<T>`] - host-supplied storage for per-method SSA functions,
 //! used by the pass scheduler to hand SSA to passes and reclaim it.
 
 use crate::{ir::function::SsaFunction, target::Target};

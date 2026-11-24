@@ -105,6 +105,7 @@
 //! All types in this module implement [`Send`] and [`Sync`] when their generic
 //! parameters do, enabling safe concurrent access for analysis operations.
 
+mod adjacency;
 mod directed;
 mod edge;
 mod indexed;
@@ -114,6 +115,7 @@ mod traits;
 pub mod algorithms;
 
 // Re-export core types at module level
+pub use adjacency::Adjacency;
 pub use directed::DirectedGraph;
 #[allow(unused_imports)]
 pub use edge::EdgeId;

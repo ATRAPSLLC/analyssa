@@ -41,7 +41,7 @@ use std::fmt;
 /// `EdgeId` is [`Copy`], [`Send`], and [`Sync`], enabling efficient passing between
 /// threads and use in concurrent data structures.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EdgeId(pub(crate) usize);
+pub struct EdgeId(usize);
 
 impl EdgeId {
     /// Creates a new `EdgeId` from a raw index value.
@@ -51,7 +51,7 @@ impl EdgeId {
     ///
     /// # Arguments
     ///
-    /// * `index` - The raw edge index (0-based)
+    /// * `index` - The raw edge index (0-based).
     ///
     /// # Returns
     ///
@@ -136,23 +136,26 @@ impl From<EdgeId> for usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::*;
     use crate::graph::NodeId;
 
+    /// The constructor stores the raw index unchanged.
     #[test]
     fn test_edge_id_new() {
         let edge = EdgeId::new(42);
         assert_eq!(edge.index(), 42);
     }
 
+    /// `index` returns the value passed to `new`.
     #[test]
     fn test_edge_id_index() {
         let edge = EdgeId::new(100);
         assert_eq!(edge.index(), 100);
     }
 
+    /// Two `EdgeId`s compare equal exactly when their indices match.
     #[test]
     fn test_edge_id_equality() {
         let edge1 = EdgeId::new(5);
@@ -163,6 +166,7 @@ mod tests {
         assert_ne!(edge1, edge3);
     }
 
+    /// `EdgeId`s order by their index, so a vector of them sorts numerically.
     #[test]
     fn test_edge_id_ordering() {
         let edge1 = EdgeId::new(1);
@@ -178,9 +182,10 @@ mod tests {
         assert_eq!(edges, vec![edge1, edge2, edge3]);
     }
 
+    /// Equal `EdgeId`s collapse to a single entry in a `HashSet`.
     #[test]
     fn test_edge_id_hash() {
-        let mut set: HashSet<EdgeId> = HashSet::new();
+        let mut set: FxHashSet<EdgeId> = FxHashSet::default();
         let edge1 = EdgeId::new(1);
         let edge2 = EdgeId::new(2);
         let edge1_dup = EdgeId::new(1);
@@ -194,9 +199,10 @@ mod tests {
         assert!(set.contains(&edge2));
     }
 
+    /// `EdgeId` serves as a `HashMap` key with per-id lookup.
     #[test]
     fn test_edge_id_as_map_key() {
-        let mut map: HashMap<EdgeId, &str> = HashMap::new();
+        let mut map: FxHashMap<EdgeId, &str> = FxHashMap::default();
         let edge1 = EdgeId::new(1);
         let edge2 = EdgeId::new(2);
 
@@ -208,6 +214,7 @@ mod tests {
         assert_eq!(map.get(&EdgeId::new(3)), None);
     }
 
+    /// `EdgeId` is `Copy`, so assignment duplicates rather than moves it.
     #[test]
     fn test_edge_id_copy_semantics() {
         let edge1 = EdgeId::new(42);
@@ -218,12 +225,14 @@ mod tests {
         assert_eq!(edge2.index(), 42);
     }
 
+    /// The `From<usize>` conversion wraps the raw index.
     #[test]
     fn test_edge_id_from_usize() {
         let edge: EdgeId = 123usize.into();
         assert_eq!(edge.index(), 123);
     }
 
+    /// The `Into<usize>` conversion unwraps the raw index.
     #[test]
     fn test_edge_id_into_usize() {
         let edge = EdgeId::new(789);
@@ -231,6 +240,7 @@ mod tests {
         assert_eq!(value, 789);
     }
 
+    /// `Debug` renders an `EdgeId` as `EdgeId(n)`.
     #[test]
     fn test_edge_id_debug_format() {
         let edge = EdgeId::new(42);
@@ -238,6 +248,7 @@ mod tests {
         assert_eq!(debug_str, "EdgeId(42)");
     }
 
+    /// `Display` renders an `EdgeId` as `en`.
     #[test]
     fn test_edge_id_display_format() {
         let edge = EdgeId::new(42);
@@ -245,6 +256,7 @@ mod tests {
         assert_eq!(display_str, "e42");
     }
 
+    /// Zero and very large indices round-trip through `new`/`index` intact.
     #[test]
     fn test_edge_id_boundary_values() {
         // Test zero
@@ -256,6 +268,7 @@ mod tests {
         assert_eq!(large.index(), 1_000_000);
     }
 
+    /// `index` yields a `usize` usable to index a slice directly.
     #[test]
     fn test_edge_id_array_indexing() {
         let weights = [1.5, 2.5, 3.5, 4.5];
@@ -264,6 +277,7 @@ mod tests {
         assert_eq!(weights[edge.index()], 3.5);
     }
 
+    /// `EdgeId` and `NodeId` are distinct types even when their indices match.
     #[test]
     fn test_edge_id_distinct_from_node_id() {
         // This test demonstrates that EdgeId and NodeId are distinct types
