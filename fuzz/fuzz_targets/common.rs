@@ -10,6 +10,7 @@
 use analyssa::{
     ir::{
         block::SsaBlock,
+        exception::{BlockRange, SsaExceptionHandler},
         function::SsaFunction,
         instruction::SsaInstruction,
         ops::SsaOp,
@@ -27,6 +28,22 @@ pub struct FuzzFunction {
     pub num_args: u8,
     pub num_locals: u8,
     pub blocks: Vec<FuzzBlock>,
+    pub handlers: Vec<FuzzHandler>,
+}
+
+/// An exception clause, laid out over whatever blocks the ranges happen to
+/// name. The exception-aware analyses read these ranges and index block-sized
+/// sets with them, so a clause running past the last block is one of the shapes
+/// worth generating.
+#[derive(Debug, Arbitrary)]
+pub struct FuzzHandler {
+    pub kind: u32,
+    pub try_start: u8,
+    pub try_len: u8,
+    pub handler_start: u8,
+    pub handler_len: u8,
+    pub filter_start: u8,
+    pub filter_len: u8,
 }
 
 #[derive(Debug, Arbitrary)]
@@ -69,7 +86,7 @@ pub fn build(spec: &FuzzFunction) -> SsaFunction<MockTarget> {
         SsaFunction::new(usize::from(spec.num_args), usize::from(spec.num_locals));
 
     // Register a bounded pool of variables so most ids resolve, while leaving
-    // room for ids that do not — the interesting case.
+    // room for ids that do not - the interesting case.
     for idx in 0..64u16 {
         ssa.create_variable(
             VariableOrigin::Local(idx),
@@ -118,9 +135,7 @@ pub fn build(spec: &FuzzFunction) -> SsaFunction<MockTarget> {
         }
 
         let terminator = match block_spec.terminator {
-            FuzzTerminator::Return { value } => SsaOp::Return {
-                value: value.map(var),
-            },
+            FuzzTerminator::Return { value } => SsaOp::returns(value.map(var)),
             FuzzTerminator::Jump { target } => SsaOp::Jump {
                 target: usize::from(target),
             },
@@ -134,9 +149,38 @@ pub fn build(spec: &FuzzFunction) -> SsaFunction<MockTarget> {
         ssa.add_block(block);
     }
 
+    let handlers: Vec<SsaExceptionHandler<MockTarget>> = spec
+        .handlers
+        .iter()
+        .take(4)
+        .map(|handler| {
+            let range = |start: u8, len: u8| {
+                BlockRange::new(
+                    usize::from(start),
+                    usize::from(start).saturating_add(usize::from(len)),
+                )
+            };
+            SsaExceptionHandler {
+                flags: handler.kind,
+                try_offset: 0,
+                try_length: 0,
+                handler_offset: 0,
+                handler_length: 0,
+                class_token_or_filter: 0,
+                selector: None,
+                protected_range: range(handler.try_start, handler.try_len),
+                handler_range: range(handler.handler_start, handler.handler_len),
+                filter_range: range(handler.filter_start, handler.filter_len),
+            }
+        })
+        .collect();
+    if !handlers.is_empty() {
+        ssa.set_exception_handlers(handlers);
+    }
+
     if block_count > 0 && ssa.block_count() == 0 {
         let mut block = SsaBlock::new(0);
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block);
     }
 
