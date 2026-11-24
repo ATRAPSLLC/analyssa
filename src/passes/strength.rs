@@ -35,7 +35,7 @@
 
 use crate::{
     Result,
-    analysis::{DefUseIndex, range::ValueRange},
+    analysis::DefUseIndex,
     events::EventKind,
     ir::{
         function::{SsaEditOptions, SsaFunction},
@@ -44,7 +44,7 @@ use crate::{
         variable::SsaVarId,
         varstore::VarSet,
     },
-    passes::utils::is_power_of_two,
+    passes::{decide::IntShape, utils::is_power_of_two},
     scheduling::{FunctionPass, ModificationScope, PassEnv},
     target::Target,
 };
@@ -629,12 +629,19 @@ where
         // The facts the signed arms need, from the environment rather than
         // asked of the caller: every caller that was asked answered "nothing
         // is provably non-negative", so those arms never fired.
+        //
+        // The signed arms read the dividend signed at its width, so its range is
+        // read in that window: a range is held in its value's own, and a `uint32`
+        // is non-negative there whatever its sign bit says.
         let facts = env.ranges();
         let is_non_negative = |ssa: &SsaFunction<T>, var: SsaVarId| {
+            let Some(shape) = IntShape::of_var(ssa, var) else {
+                return false;
+            };
             facts.get(ssa).is_ok_and(|ranges| {
                 ranges
                     .get(var)
-                    .is_some_and(ValueRange::is_always_non_negative)
+                    .is_some_and(|range| range.wrap(shape.width, true).is_always_non_negative())
             })
         };
         Ok(run_with_facts(ssa, env, &is_non_negative))
@@ -1111,6 +1118,86 @@ mod tests {
         );
         assert!(!changed, "neither operation is reducible");
         assert_eq!(asked.get(), 0, "no dividend's sign was needed");
+    }
+
+    /// **A signed remainder reads its dividend signed, whatever its type.** A
+    /// range is held in its value's own window: an `int32` truncated from an
+    /// `int64` spans the signed window, and copied into a `uint32` slot it is
+    /// held as `[0, 2^32)`, non-negative there. The `rem` still reads it signed:
+    /// `x rem 4` over `0xFFFF_FFFB` is -1, and `x & 3` is 3. The control is one
+    /// the signed window bounds, `(x & 0x7F) rem 4`, which reduces.
+    #[test]
+    fn a_signed_remainder_reads_its_dividend_signed() {
+        let reduced = |masked: bool| {
+            let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(1, 0);
+            let typed = |ssa: &mut SsaFunction<MockTarget>, at: usize, ty: MockType| {
+                ssa.create_variable(VariableOrigin::Phi, 0, DefSite::instruction(0, at), ty)
+            };
+            let wide = ssa.create_variable(
+                VariableOrigin::Argument(0),
+                0,
+                DefSite::entry(),
+                MockType::I64,
+            );
+            let truncated = typed(&mut ssa, 0, MockType::I32);
+            let held = typed(&mut ssa, 1, MockType::U32);
+            let mask = typed(&mut ssa, 2, MockType::U32);
+            let dividend = typed(&mut ssa, 3, MockType::U32);
+            let four = typed(&mut ssa, 4, MockType::U32);
+            let remainder = typed(&mut ssa, 5, MockType::U32);
+            let mut block = SsaBlock::new(0);
+            block.add_instruction(instr(SsaOp::IntConv {
+                dest: truncated,
+                operand: wide,
+                target: MockType::I32,
+                overflow_check: false,
+                unsigned: false,
+            }));
+            block.add_instruction(instr(SsaOp::Copy {
+                dest: held,
+                src: truncated,
+            }));
+            block.add_instruction(instr(SsaOp::Const {
+                dest: mask,
+                value: ConstValue::U32(0x7F),
+            }));
+            block.add_instruction(instr(if masked {
+                SsaOp::And {
+                    dest: dividend,
+                    left: held,
+                    right: mask,
+                    flags: None,
+                }
+            } else {
+                SsaOp::Copy {
+                    dest: dividend,
+                    src: held,
+                }
+            }));
+            block.add_instruction(instr(SsaOp::Const {
+                dest: four,
+                value: ConstValue::U32(4),
+            }));
+            block.add_instruction(instr(SsaOp::Rem {
+                dest: remainder,
+                left: dividend,
+                right: four,
+                unsigned: false,
+                flags: None,
+            }));
+            block.add_instruction(instr(SsaOp::returns(Some(remainder))));
+            ssa.add_block(block);
+            ssa.recompute_uses();
+            let log: EventLog<MockTarget> = EventLog::new();
+            StrengthReductionPass::new()
+                .run(
+                    &mut ssa,
+                    &PassEnv::new(&0u32, &log, AnalysisContext::new(MACHINE)),
+                )
+                .unwrap_or(false)
+        };
+        assert!(!reduced(false), "a uint32 read signed may be negative");
+        assert!(reduced(true), "a value the signed window bounds reduces");
     }
 
     /// Signed division is left alone when non-negativity cannot be proven.

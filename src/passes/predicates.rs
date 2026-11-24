@@ -52,6 +52,7 @@ use crate::{
     analysis::{
         SsaCfg,
         address::AddressWalk,
+        congruence::Congruence,
         defuse::DefUseIndex,
         evaluator::SsaEvaluator,
         guards::{Definitions, GuardFacts, JoinSelect},
@@ -67,6 +68,7 @@ use crate::{
         variable::{DefSite, SsaVarId, VariableOrigin},
         varstore::VarSet,
     },
+    passes::decide::{Known, decide_operands},
     scheduling::{FunctionPass, ModificationScope, PassEnv},
     target::Target,
 };
@@ -348,6 +350,8 @@ const MAX_PREDICATE_DEPTH: usize = 16;
 /// non-null values and constant ranges ([`DefinitionCache`]) prove about a
 /// predicate, a branch or a comparison.
 struct PredicateAnalyzer<'a, T: Target> {
+    /// The function, whose types say how a comparison reads each operand.
+    ssa: &'a SsaFunction<T>,
     /// The facts every question is answered from.
     cache: &'a DefinitionCache<T>,
 }
@@ -589,6 +593,46 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
     ///
     /// [`PredicateResult::AlwaysTrue`] or [`AlwaysFalse`](PredicateResult::AlwaysFalse) if the
     /// equality can be statically determined, [`Unknown`](PredicateResult::Unknown) otherwise.
+    /// `left cmp right` decided from what is known of both operands - a constant's own
+    /// value, or a proved range - read as the comparison reads them ([`decide_operands`]): in its
+    /// signed or unsigned window at the operands' width. A value's range is held in its own
+    /// type's window, so a `uint32` `0xFFFF_FFFF` is 4294967295 there and -1 to a signed
+    /// comparison, and equals an `int32` -1.
+    fn decided(
+        &self,
+        cmp: CmpKind,
+        unsigned: bool,
+        left: SsaVarId,
+        right: SsaVarId,
+    ) -> PredicateResult {
+        // A constant, seen through copies, is its value; anything else what the cache
+        // proved of it.
+        let range_of = |var: SsaVarId| {
+            self.const_of(var)
+                .and_then(ConstValue::as_i64)
+                .map(ValueRange::constant)
+                .or_else(|| self.cache.get_range(var).cloned())
+        };
+        let (Some(left_range), Some(right_range)) = (range_of(left), range_of(right)) else {
+            return PredicateResult::Unknown;
+        };
+        let known = |range| Known {
+            range,
+            congruence: Congruence::TOP,
+        };
+        match decide_operands(
+            self.ssa,
+            cmp,
+            unsigned,
+            (left, known(&left_range)),
+            (right, known(&right_range)),
+        ) {
+            Some(true) => PredicateResult::AlwaysTrue,
+            Some(false) => PredicateResult::AlwaysFalse,
+            None => PredicateResult::Unknown,
+        }
+    }
+
     fn analyze_equality(&self, left: SsaVarId, right: SsaVarId, depth: usize) -> PredicateResult {
         let left_def = self.cache.get_definition(left);
         let right_def = self.cache.get_definition(right);
@@ -698,15 +742,10 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
             return PredicateResult::AlwaysTrue;
         }
 
-        // Check constant equality
-        if let (Some(lval), Some(rval)) = (self.const_of(left), self.const_of(right))
-            && let (Some(l), Some(r)) = (lval.as_i64(), rval.as_i64())
-        {
-            return if l == r {
-                PredicateResult::AlwaysTrue
-            } else {
-                PredicateResult::AlwaysFalse
-            };
+        // What is known of both operands, read as the comparison reads them.
+        let decided = self.decided(CmpKind::Eq, false, left, right);
+        if decided != PredicateResult::Unknown {
+            return decided;
         }
 
         // Check non-null equality with null, which native code spells as the
@@ -778,79 +817,18 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
         unsigned: bool,
         _depth: usize,
     ) -> PredicateResult {
-        let left_def = self.cache.get_definition(left);
         let right_def = self.cache.get_definition(right);
 
-        // Constant comparison
-        if let (Some(SsaOp::Const { value: lval, .. }), Some(SsaOp::Const { value: rval, .. })) =
-            (left_def, right_def)
-        {
-            if unsigned {
-                if let (Some(l), Some(r)) = (lval.as_u64(), rval.as_u64()) {
-                    return if l < r {
-                        PredicateResult::AlwaysTrue
-                    } else {
-                        PredicateResult::AlwaysFalse
-                    };
-                }
-            } else if let (Some(l), Some(r)) = (lval.as_i64(), rval.as_i64()) {
-                return if l < r {
-                    PredicateResult::AlwaysTrue
-                } else {
-                    PredicateResult::AlwaysFalse
-                };
-            }
-        }
-
-        // Range-based analysis. The ranges are signed intervals, and the
-        // unsigned order agrees with the signed one only where both operands
-        // are non-negative: `-1 <u 1` is `0xFFFFFFFF <u 1`, which is false.
-        if let Some(left_range) = self.cache.get_range(left) {
-            if let Some(right_range) = self.cache.get_range(right)
-                && ranges_order_alike(unsigned, left_range, right_range)
-            {
-                // left.max < right.min => always true
-                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
-                    && l_max < r_min
-                {
-                    return PredicateResult::AlwaysTrue;
-                }
-                // left.min >= right.max => always false
-                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
-                    && l_min >= r_max
-                {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
-
-            // Check if left < constant
-            if let Some(SsaOp::Const { value: rval, .. }) = right_def
-                && let Some(r) = rval.as_i64()
-                && ranges_order_alike(unsigned, left_range, &ValueRange::constant(r))
-                && let Some(result) = left_range.always_less_than(r)
-            {
-                return if result {
-                    PredicateResult::AlwaysTrue
-                } else {
-                    PredicateResult::AlwaysFalse
-                };
-            }
+        // What is known of both operands, read as the comparison reads them.
+        let decided = self.decided(CmpKind::Lt, unsigned, left, right);
+        if decided != PredicateResult::Unknown {
+            return decided;
         }
 
         // Unsigned comparison: x < 0 is always false
         if unsigned
             && let Some(SsaOp::Const { value: rval, .. }) = right_def
             && rval.as_u64() == Some(0)
-        {
-            return PredicateResult::AlwaysFalse;
-        }
-
-        // Non-negative < 0 is always false, in either order: the unsigned
-        // reading of a non-negative value is the same number.
-        if let Some(left_range) = self.cache.get_range(left)
-            && left_range.is_always_non_negative()
-            && let Some(SsaOp::Const { value: rval, .. }) = right_def
-            && rval.as_i64() == Some(0)
         {
             return PredicateResult::AlwaysFalse;
         }
@@ -892,62 +870,11 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
         _depth: usize,
     ) -> PredicateResult {
         let left_def = self.cache.get_definition(left);
-        let right_def = self.cache.get_definition(right);
 
-        // Constant comparison
-        if let (Some(SsaOp::Const { value: lval, .. }), Some(SsaOp::Const { value: rval, .. })) =
-            (left_def, right_def)
-        {
-            if unsigned {
-                if let (Some(l), Some(r)) = (lval.as_u64(), rval.as_u64()) {
-                    return if l > r {
-                        PredicateResult::AlwaysTrue
-                    } else {
-                        PredicateResult::AlwaysFalse
-                    };
-                }
-            } else if let (Some(l), Some(r)) = (lval.as_i64(), rval.as_i64()) {
-                return if l > r {
-                    PredicateResult::AlwaysTrue
-                } else {
-                    PredicateResult::AlwaysFalse
-                };
-            }
-        }
-
-        // Range-based analysis, over signed intervals: usable for an unsigned
-        // compare only where both operands are non-negative (see
-        // `analyze_less_than`).
-        if let Some(left_range) = self.cache.get_range(left) {
-            if let Some(right_range) = self.cache.get_range(right)
-                && ranges_order_alike(unsigned, left_range, right_range)
-            {
-                // left.min > right.max => always true
-                if let (Some(l_min), Some(r_max)) = (left_range.min(), right_range.max())
-                    && l_min > r_max
-                {
-                    return PredicateResult::AlwaysTrue;
-                }
-                // left.max <= right.min => always false
-                if let (Some(l_max), Some(r_min)) = (left_range.max(), right_range.min())
-                    && l_max <= r_min
-                {
-                    return PredicateResult::AlwaysFalse;
-                }
-            }
-
-            // Check if left > constant
-            if let Some(SsaOp::Const { value: rval, .. }) = right_def
-                && let Some(r) = rval.as_i64()
-                && ranges_order_alike(unsigned, left_range, &ValueRange::constant(r))
-                && let Some(result) = left_range.always_greater_than(r)
-            {
-                return if result {
-                    PredicateResult::AlwaysTrue
-                } else {
-                    PredicateResult::AlwaysFalse
-                };
-            }
+        // What is known of both operands, read as the comparison reads them.
+        let decided = self.decided(CmpKind::Gt, unsigned, left, right);
+        if decided != PredicateResult::Unknown {
+            return decided;
         }
 
         // Unsigned: 0 > x is always false
@@ -956,17 +883,6 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
             && lval.as_u64() == Some(0)
         {
             return PredicateResult::AlwaysFalse;
-        }
-
-        // Non-negative value >= 0 is always true (x > -1 equivalent). Signed
-        // only: unsigned, `-1` is the largest value and nothing exceeds it.
-        if !unsigned
-            && let Some(left_range) = self.cache.get_range(left)
-            && left_range.is_always_non_negative()
-            && let Some(SsaOp::Const { value: rval, .. }) = right_def
-            && rval.as_i64().is_some_and(|r| r < 0)
-        {
-            return PredicateResult::AlwaysTrue;
         }
 
         PredicateResult::Unknown
@@ -1644,18 +1560,6 @@ impl<T: Target> PredicateAnalyzer<'_, T> {
     }
 }
 
-/// Whether the signed intervals `left` and `right` order their values the
-/// way the comparison does.
-///
-/// Always for a signed comparison. For an unsigned one only when both are
-/// provably non-negative, where the two orders coincide; a negative value
-/// reads as a large unsigned one, so its signed interval says nothing
-/// about where it sits unsigned. The same rule `passes::ranges` applies
-/// before deciding a comparison from intervals.
-fn ranges_order_alike(unsigned: bool, left: &ValueRange, right: &ValueRange) -> bool {
-    !unsigned || (left.is_always_non_negative() && right.is_always_non_negative())
-}
-
 /// Detects phi nodes whose value is one constant on every path.
 ///
 /// A phi is constant when each operand is either a `Const` of that value or
@@ -1846,7 +1750,7 @@ where
 
         // Build definition cache for efficient lookup
         let cache = DefinitionCache::build(ssa);
-        let analyzer = PredicateAnalyzer { cache: &cache };
+        let analyzer = PredicateAnalyzer { ssa, cache: &cache };
 
         // Analyze phi nodes for constant values
         let phi_constants = analyze_phi_constants(ssa);
@@ -2835,6 +2739,115 @@ mod tests {
             .and_then(|block| block.control_terminator())
             .cloned()
             .expect("a terminator")
+    }
+
+    /// **A comparison reads its operands in its own window.** The unsigned
+    /// 32-bit maximum is -1 to a signed comparison: never at least an array's
+    /// length, whatever its own type reads it as; and equal to a signed -1.
+    /// The pass may leave a comparison undecided, never decide it the other
+    /// way.
+    #[test]
+    fn a_comparison_reads_its_operands_in_its_own_window() {
+        // `u32::MAX` compared with an array's length, branching on the result.
+        let against_length = |cmp: CmpKind, unsigned: bool| {
+            let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(1, 3);
+            let array = ssa.create_variable(
+                VariableOrigin::Local(0),
+                0,
+                DefSite::instruction(0, 0),
+                MockType::Ref,
+            );
+            let max = ssa.create_variable(
+                VariableOrigin::Local(1),
+                0,
+                DefSite::instruction(0, 1),
+                MockType::U32,
+            );
+            let length = ssa.create_variable(
+                VariableOrigin::Local(2),
+                0,
+                DefSite::instruction(0, 2),
+                MockType::I32,
+            );
+            let mut b0 = SsaBlock::new(0);
+            b0.add_instruction(instr(SsaOp::LoadArg {
+                dest: array,
+                arg_index: 0,
+            }));
+            b0.add_instruction(instr(SsaOp::Const {
+                dest: max,
+                value: ConstValue::U32(u32::MAX),
+            }));
+            b0.add_instruction(instr(SsaOp::ArrayLength {
+                dest: length,
+                array,
+            }));
+            b0.add_instruction(instr(SsaOp::BranchCmp {
+                left: max,
+                right: length,
+                cmp,
+                unsigned,
+                true_target: 1,
+                false_target: 2,
+            }));
+            ssa.add_block(b0);
+            for index in 1..=2 {
+                let mut block = SsaBlock::new(index);
+                block.add_instruction(instr(SsaOp::returns(None)));
+                ssa.add_block(block);
+            }
+            ssa.recompute_uses();
+            let log: EventLog<MockTarget> = EventLog::new();
+            run_predicates(&mut ssa, "window compare", &0u32, &log);
+            match ssa.block(0).and_then(|block| block.control_terminator()) {
+                Some(SsaOp::Jump { target: 1 }) => Some(true),
+                Some(SsaOp::Jump { target: 2 }) => Some(false),
+                _ => None,
+            }
+        };
+        // Undecided is sound; the other way is not.
+        assert_ne!(against_length(CmpKind::Lt, false), Some(false));
+        assert_ne!(against_length(CmpKind::Ge, false), Some(true));
+        assert_ne!(against_length(CmpKind::Gt, true), Some(false));
+
+        // `u32::MAX == -1`, as a value.
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+        let max = local_at(&mut ssa, 0, 0, 0);
+        let minus_one = local_at(&mut ssa, 1, 0, 1);
+        let equal = local_at(&mut ssa, 2, 0, 2);
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: max,
+            value: ConstValue::U32(u32::MAX),
+        }));
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: minus_one,
+            value: ConstValue::I32(-1),
+        }));
+        b0.add_instruction(instr(SsaOp::Ceq {
+            dest: equal,
+            left: max,
+            right: minus_one,
+            signaling: false,
+        }));
+        b0.add_instruction(instr(SsaOp::returns(Some(equal))));
+        ssa.add_block(b0);
+        ssa.recompute_uses();
+        let log: EventLog<MockTarget> = EventLog::new();
+        run_predicates(&mut ssa, "window equality", &0u32, &log);
+        let decided = ssa.block(0).and_then(|block| {
+            block
+                .instructions()
+                .iter()
+                .find_map(|instr| match instr.op() {
+                    SsaOp::Const { dest, value } if *dest == equal => Some(value.clone()),
+                    _ => None,
+                })
+        });
+        assert!(
+            !matches!(decided, Some(ConstValue::I32(0) | ConstValue::False)),
+            "the two are one 32-bit value: {ssa}"
+        );
     }
 
     /// **Two addresses from one base are compared by their displacements**:
@@ -4699,7 +4712,10 @@ mod tests {
         ssa.add_block(b0);
         ssa.recompute_uses();
         let cache = DefinitionCache::build(&ssa);
-        let analyzer = PredicateAnalyzer { cache: &cache };
+        let analyzer = PredicateAnalyzer {
+            ssa: &ssa,
+            cache: &cache,
+        };
 
         assert_eq!(
             analyzer.analyze_equality(xored, zero_copy, 0),
@@ -4782,7 +4798,10 @@ mod tests {
 
         let cache = DefinitionCache::build(&ssa);
 
-        let analyzer = PredicateAnalyzer { cache: &cache };
+        let analyzer = PredicateAnalyzer {
+            ssa: &ssa,
+            cache: &cache,
+        };
         let mut visited = VarSet::new(ssa.var_id_bound());
         for (condition, expected) in [
             (decided, PredicateResult::AlwaysTrue),
