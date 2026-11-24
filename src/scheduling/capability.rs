@@ -8,7 +8,7 @@
 //! capability enum so target-specific tags can sit alongside the shared
 //! vocabulary.
 //!
-//! These milestones describe the *outcome* of a pass, not its mechanism —
+//! These milestones describe the *outcome* of a pass, not its mechanism -
 //! "static fields have been resolved to concrete constants" applies just
 //! as well to a CIL field-decryption pass as to a VB6 GoSub-table resolver.
 

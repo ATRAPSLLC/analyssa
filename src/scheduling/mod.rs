@@ -1,4 +1,4 @@
-//! Pass-pipeline scheduling engine — orchestrates [`SsaPass`] execution
+//! Pass-pipeline scheduling engine - orchestrates [`SsaPass`] execution
 //! across methods with capability-based layering, fixpoint iteration, and
 //! parallel dispatch.
 //!
@@ -33,12 +33,22 @@
 
 mod analyses;
 mod capability;
+mod env;
 mod pass;
+mod pipeline;
+pub mod presets;
 mod scheduler;
 mod transaction;
 
 pub use analyses::{AnalysisCache, CacheStats};
 pub use capability::DeobfuscationCapability;
+pub use env::{
+    AsGlobalPass, AsSsaPass, Declared, FunctionPass, ModulePass, PassEnv, run_pass_with_repair,
+};
 pub use pass::{ModificationScope, SsaPass, SsaPassHost};
-pub use scheduler::{PassScheduler, PipelineConfig};
-pub use transaction::{GroupOutcome, PassTransaction};
+pub use pipeline::{
+    FunctionPipeline, GroupPolicy, PassGroup, PassRun, PipelineReport, PipelineSpec, Rollback,
+    RollbackReason,
+};
+pub use scheduler::{FailurePolicy, PassScheduler, PipelineConfig};
+pub use transaction::{GroupOutcome, Guarded, PassTransaction, Verify};
