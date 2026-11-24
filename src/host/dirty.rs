@@ -1,4 +1,4 @@
-//! [`DirtySet<T>`] — host-supplied per-method scheduling state for fixpoint
+//! [`DirtySet<T>`] - host-supplied per-method scheduling state for fixpoint
 //! iteration tracking.
 //!
 //! Two concepts live here:
@@ -19,7 +19,7 @@
 //! # Bypassing dirty-tracking
 //!
 //! Passes that declare [`SsaPass::requires_full_scan`](crate::scheduling::SsaPass::requires_full_scan)
-//! bypass dirty tracking — the scheduler runs them on every method every
+//! bypass dirty tracking - the scheduler runs them on every method every
 //! iteration regardless of dirty state.
 
 use crate::target::Target;

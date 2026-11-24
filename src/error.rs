@@ -11,12 +11,8 @@
 //! Functions and methods in analyssa return [`Result`] when they can encounter
 //! graph inconsistencies, SSA validation failures, or other unexpected
 //! conditions during construction, rebuilding, or transformation passes.
-//!
-//! # Aliases
-//!
-//! [`GraphError`] is a type alias for [`struct@Error`] used specifically in graph
-//! algorithm contexts, providing semantic clarity without introducing a
-//! separate type.
+
+use std::result;
 
 use thiserror::Error;
 
@@ -57,14 +53,6 @@ impl Error {
     }
 }
 
-/// Graph-operation error alias.
-///
-/// Type alias for [`struct@Error`] used in graph algorithm contexts (dominator
-/// computation, cycle detection, topological sort, etc.) to distinguish
-/// graph-specific failures from other error types while sharing the same
-/// underlying representation.
-pub type GraphError = Error;
-
 /// Convenience alias for results from analyssa APIs.
 ///
 /// Shorthand for `std::result::Result<T, Error>`. This is the standard
@@ -74,7 +62,7 @@ pub type GraphError = Error;
 ///
 /// * `T` - The success type
 /// * `E` - The error type (defaults to [`struct@Error`])
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
@@ -91,7 +79,7 @@ mod tests {
 
     #[test]
     fn aliases_have_expected_shapes() {
-        let graph_err: GraphError = Error::new("missing node");
+        let graph_err: Error = Error::new("missing node");
         let result: Result<()> = Err(graph_err.clone());
 
         assert_eq!(result, Err(graph_err));

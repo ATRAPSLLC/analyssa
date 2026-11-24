@@ -163,8 +163,8 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node_capacity` - Expected number of nodes
-    /// * `edge_capacity` - Expected number of edges
+    /// * `node_capacity` - Expected number of nodes.
+    /// * `edge_capacity` - Expected number of edges.
     ///
     /// # Returns
     ///
@@ -197,7 +197,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `data` - The data to associate with this node
+    /// * `data` - The data to associate with this node.
     ///
     /// # Returns
     ///
@@ -229,7 +229,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node to look up
+    /// * `node` - The node to look up.
     ///
     /// # Returns
     ///
@@ -267,7 +267,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `nodes` - A slice of nodes to borrow
+    /// * `nodes` - A slice of nodes to borrow.
     ///
     /// # Returns
     ///
@@ -329,7 +329,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node to look up
+    /// * `node` - The node to look up.
     ///
     /// # Returns
     ///
@@ -433,9 +433,9 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `source` - The source node of the edge
-    /// * `target` - The target node of the edge
-    /// * `data` - The data to associate with this edge
+    /// * `source` - The source node of the edge.
+    /// * `target` - The target node of the edge.
+    /// * `data` - The data to associate with this edge.
     ///
     /// # Returns
     ///
@@ -457,12 +457,12 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     /// let edge = graph.add_edge(a, b, "A->B")?;
     /// assert_eq!(edge, EdgeId::new(0));
     /// assert_eq!(graph.edge_count(), 1);
-    /// # Ok::<(), analyssa::GraphError>(())
+    /// # Ok::<(), analyssa::Error>(())
     /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`crate::GraphError`] if either `source` or `target` node does not exist
+    /// Returns [`crate::Error`] if either `source` or `target` node does not exist
     /// in the graph.
     pub fn add_edge(&mut self, source: NodeId, target: NodeId, data: E) -> Result<EdgeId> {
         if source.index() >= self.nodes.len() {
@@ -511,7 +511,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `edge` - The edge to look up
+    /// * `edge` - The edge to look up.
     ///
     /// # Returns
     ///
@@ -538,7 +538,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `edge` - The edge to look up
+    /// * `edge` - The edge to look up.
     ///
     /// # Returns
     ///
@@ -551,7 +551,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `edge` - The edge to look up
+    /// * `edge` - The edge to look up.
     ///
     /// # Returns
     ///
@@ -628,7 +628,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose successors to iterate
+    /// * `node` - The node whose successors to iterate.
     ///
     /// # Returns
     ///
@@ -668,7 +668,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose predecessors to iterate
+    /// * `node` - The node whose predecessors to iterate.
     ///
     /// # Returns
     ///
@@ -709,7 +709,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose outgoing edges to iterate
+    /// * `node` - The node whose outgoing edges to iterate.
     ///
     /// # Returns
     ///
@@ -749,7 +749,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node whose incoming edges to iterate
+    /// * `node` - The node whose incoming edges to iterate.
     ///
     /// # Returns
     ///
@@ -770,7 +770,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node to query
+    /// * `node` - The node to query.
     ///
     /// # Returns
     ///
@@ -805,7 +805,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node to query
+    /// * `node` - The node to query.
     ///
     /// # Returns
     ///
@@ -922,7 +922,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `node` - The node ID to check
+    /// * `node` - The node ID to check.
     ///
     /// # Returns
     ///
@@ -948,7 +948,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Arguments
     ///
-    /// * `edge` - The edge ID to check
+    /// * `edge` - The edge ID to check.
     ///
     /// # Returns
     ///
@@ -1038,6 +1038,7 @@ mod tests {
         graph
     }
 
+    /// A freshly constructed graph reports zero nodes and zero edges.
     #[test]
     fn test_new_graph_is_empty() {
         let graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1046,6 +1047,7 @@ mod tests {
         assert_eq!(graph.edge_count(), 0);
     }
 
+    /// `with_capacity` yields an empty graph regardless of the reserved capacity.
     #[test]
     fn test_with_capacity() {
         let graph: DirectedGraph<i32, i32> = DirectedGraph::with_capacity(100, 200);
@@ -1053,12 +1055,14 @@ mod tests {
         // Capacity is internal; just verify it works
     }
 
+    /// The `Default` impl produces an empty graph, matching `new`.
     #[test]
     fn test_default() {
         let graph: DirectedGraph<(), ()> = DirectedGraph::default();
         assert!(graph.is_empty());
     }
 
+    /// `add_node` assigns sequential ids from zero and grows the node count.
     #[test]
     fn test_add_node() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1072,6 +1076,7 @@ mod tests {
         assert_eq!(graph.node_count(), 2);
     }
 
+    /// `node` returns the stored data for a valid id and `None` for an out-of-range id.
     #[test]
     fn test_node_access() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1081,6 +1086,7 @@ mod tests {
         assert_eq!(graph.node(NodeId::new(999)), None);
     }
 
+    /// `node_mut` exposes a mutable reference that writes through to stored node data.
     #[test]
     fn test_node_mut() {
         let mut graph: DirectedGraph<String, ()> = DirectedGraph::new();
@@ -1093,6 +1099,7 @@ mod tests {
         assert_eq!(graph.node(a), Some(&String::from("hello world")));
     }
 
+    /// `node_ids` yields every id in insertion order.
     #[test]
     fn test_node_ids_iterator() {
         let mut graph: DirectedGraph<char, ()> = DirectedGraph::new();
@@ -1104,6 +1111,7 @@ mod tests {
         assert_eq!(ids, vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
     }
 
+    /// `nodes` pairs each id with its data in insertion order.
     #[test]
     fn test_nodes_iterator() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1116,6 +1124,7 @@ mod tests {
         assert_eq!(nodes[1], (NodeId::new(1), &"B"));
     }
 
+    /// `add_edge` returns sequential edge ids and increments the edge count.
     #[test]
     fn test_add_edge() {
         let mut graph: DirectedGraph<&str, &str> = DirectedGraph::new();
@@ -1127,6 +1136,7 @@ mod tests {
         assert_eq!(graph.edge_count(), 1);
     }
 
+    /// `edge` returns edge data for a valid id and `None` otherwise.
     #[test]
     fn test_edge_access() {
         let mut graph: DirectedGraph<(), &str> = DirectedGraph::new();
@@ -1138,6 +1148,7 @@ mod tests {
         assert_eq!(graph.edge(EdgeId::new(999)), None);
     }
 
+    /// `edge_endpoints` recovers the source and target of a stored edge.
     #[test]
     fn test_edge_endpoints() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1149,6 +1160,7 @@ mod tests {
         assert_eq!(graph.edge_endpoints(EdgeId::new(999)), None);
     }
 
+    /// Parallel edges between the same pair of nodes are permitted (multigraph).
     #[test]
     fn test_multiple_edges() {
         let mut graph: DirectedGraph<&str, i32> = DirectedGraph::new();
@@ -1164,6 +1176,7 @@ mod tests {
         assert_eq!(graph.edge(e2), Some(&2));
     }
 
+    /// A self-loop counts toward both the in-degree and out-degree of its node.
     #[test]
     fn test_self_loop() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -1175,6 +1188,7 @@ mod tests {
         assert_eq!(graph.in_degree(a), 1);
     }
 
+    /// `add_edge` rejects an out-of-range source node with a descriptive error.
     #[test]
     fn test_add_edge_invalid_source() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1184,6 +1198,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("source node"));
     }
 
+    /// `add_edge` rejects an out-of-range target node with a descriptive error.
     #[test]
     fn test_add_edge_invalid_target() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1193,6 +1208,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("target node"));
     }
 
+    /// `successors` returns every direct target of a node's outgoing edges.
     #[test]
     fn test_successors() {
         let graph = create_diamond_graph();
@@ -1204,6 +1220,7 @@ mod tests {
         assert!(successors.contains(&NodeId::new(2))); // C
     }
 
+    /// `predecessors` returns every direct source of a node's incoming edges.
     #[test]
     fn test_predecessors() {
         let graph = create_diamond_graph();
@@ -1215,6 +1232,7 @@ mod tests {
         assert!(predecessors.contains(&NodeId::new(2))); // C
     }
 
+    /// `outgoing_edges` exposes the id and data of each outgoing edge.
     #[test]
     fn test_outgoing_edges() {
         let mut graph: DirectedGraph<&str, i32> = DirectedGraph::new();
@@ -1233,6 +1251,7 @@ mod tests {
         assert!(weights.contains(&20));
     }
 
+    /// `incoming_edges` exposes the id and data of each incoming edge.
     #[test]
     fn test_incoming_edges() {
         let mut graph: DirectedGraph<&str, i32> = DirectedGraph::new();
@@ -1247,6 +1266,7 @@ mod tests {
         assert_eq!(incoming.len(), 2);
     }
 
+    /// `out_degree` counts a node's outgoing edges.
     #[test]
     fn test_out_degree() {
         let graph = create_diamond_graph();
@@ -1256,6 +1276,7 @@ mod tests {
         assert_eq!(graph.out_degree(NodeId::new(3)), 0); // D has 0 outgoing
     }
 
+    /// `in_degree` counts a node's incoming edges.
     #[test]
     fn test_in_degree() {
         let graph = create_diamond_graph();
@@ -1265,6 +1286,7 @@ mod tests {
         assert_eq!(graph.in_degree(NodeId::new(3)), 2); // D has 2 incoming
     }
 
+    /// `entry_nodes` reports exactly the nodes with no incoming edges.
     #[test]
     fn test_entry_nodes() {
         let graph = create_diamond_graph();
@@ -1274,6 +1296,7 @@ mod tests {
         assert_eq!(entries[0], NodeId::new(0)); // Only A is entry
     }
 
+    /// `exit_nodes` reports exactly the nodes with no outgoing edges.
     #[test]
     fn test_exit_nodes() {
         let graph = create_diamond_graph();
@@ -1283,6 +1306,7 @@ mod tests {
         assert_eq!(exits[0], NodeId::new(3)); // Only D is exit
     }
 
+    /// A pure cycle has no entry node, since every node has a predecessor.
     #[test]
     fn test_entry_nodes_with_cycle() {
         let graph = create_cycle_graph();
@@ -1292,6 +1316,7 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    /// `contains_node` distinguishes valid ids from out-of-range ones.
     #[test]
     fn test_contains_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1301,6 +1326,7 @@ mod tests {
         assert!(!graph.contains_node(NodeId::new(999)));
     }
 
+    /// `contains_edge` distinguishes valid edge ids from out-of-range ones.
     #[test]
     fn test_contains_edge() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -1312,6 +1338,7 @@ mod tests {
         assert!(!graph.contains_edge(EdgeId::new(999)));
     }
 
+    /// Cloning a graph preserves node and edge counts and duplicates node data.
     #[test]
     fn test_graph_clone() {
         let original = create_diamond_graph();
@@ -1326,6 +1353,7 @@ mod tests {
         }
     }
 
+    /// `DirectedGraph` satisfies the `GraphBase` bound and reports its count through it.
     #[test]
     fn test_graph_base_trait() {
         fn use_graph_base<G: GraphBase>(g: &G) -> usize {
@@ -1336,6 +1364,7 @@ mod tests {
         assert_eq!(use_graph_base(&graph), 3);
     }
 
+    /// `DirectedGraph` satisfies the `Successors` trait and yields successors through it.
     #[test]
     fn test_successors_trait() {
         fn use_successors<G: Successors>(g: &G, node: NodeId) -> Vec<NodeId> {
@@ -1347,6 +1376,7 @@ mod tests {
         assert_eq!(successors, vec![NodeId::new(1)]);
     }
 
+    /// `DirectedGraph` satisfies the `Predecessors` trait and yields predecessors through it.
     #[test]
     fn test_predecessors_trait() {
         fn use_predecessors<G: Predecessors>(g: &G, node: NodeId) -> Vec<NodeId> {
@@ -1358,6 +1388,7 @@ mod tests {
         assert_eq!(predecessors, vec![NodeId::new(1)]);
     }
 
+    /// A thousand-node chain builds correctly with the expected endpoint degrees.
     #[test]
     fn test_large_graph() {
         let mut graph: DirectedGraph<usize, ()> = DirectedGraph::with_capacity(1000, 2000);

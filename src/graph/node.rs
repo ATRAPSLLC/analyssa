@@ -45,7 +45,7 @@ use std::fmt;
 /// `NodeId` is [`Copy`], [`Send`], and [`Sync`], enabling efficient passing between
 /// threads and use in concurrent data structures.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub(crate) usize);
+pub struct NodeId(usize);
 
 impl NodeId {
     /// Creates a new `NodeId` from a raw index value.
@@ -55,7 +55,7 @@ impl NodeId {
     ///
     /// # Arguments
     ///
-    /// * `index` - The raw node index (0-based)
+    /// * `index` - The raw node index (0-based).
     ///
     /// # Returns
     ///
@@ -145,22 +145,25 @@ impl From<NodeId> for usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::*;
 
+    /// `new` wraps the raw index and `index` reads it back unchanged.
     #[test]
     fn test_node_id_new() {
         let node = NodeId::new(42);
         assert_eq!(node.index(), 42);
     }
 
+    /// `index` returns the exact value the id was built from.
     #[test]
     fn test_node_id_index() {
         let node = NodeId::new(100);
         assert_eq!(node.index(), 100);
     }
 
+    /// Ids compare equal exactly when their indices match.
     #[test]
     fn test_node_id_equality() {
         let node1 = NodeId::new(5);
@@ -171,6 +174,7 @@ mod tests {
         assert_ne!(node1, node3);
     }
 
+    /// `Ord` orders ids by their underlying index, so sorting is numeric.
     #[test]
     fn test_node_id_ordering() {
         let node1 = NodeId::new(1);
@@ -186,9 +190,10 @@ mod tests {
         assert_eq!(nodes, vec![node1, node2, node3]);
     }
 
+    /// Equal ids hash together, so a set deduplicates them.
     #[test]
     fn test_node_id_hash() {
-        let mut set: HashSet<NodeId> = HashSet::new();
+        let mut set: FxHashSet<NodeId> = FxHashSet::default();
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
         let node1_dup = NodeId::new(1);
@@ -202,9 +207,10 @@ mod tests {
         assert!(set.contains(&node2));
     }
 
+    /// An id works as a hash-map key, retrieving the value it was stored under.
     #[test]
     fn test_node_id_as_map_key() {
-        let mut map: HashMap<NodeId, &str> = HashMap::new();
+        let mut map: FxHashMap<NodeId, &str> = FxHashMap::default();
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
 
@@ -216,6 +222,7 @@ mod tests {
         assert_eq!(map.get(&NodeId::new(3)), None);
     }
 
+    /// `Copy` leaves the source usable after the value is copied.
     #[test]
     fn test_node_id_copy_semantics() {
         let node1 = NodeId::new(42);
@@ -226,12 +233,14 @@ mod tests {
         assert_eq!(node2.index(), 42);
     }
 
+    /// `From<usize>` wraps the index without altering it.
     #[test]
     fn test_node_id_from_usize() {
         let node: NodeId = 123usize.into();
         assert_eq!(node.index(), 123);
     }
 
+    /// `Into<usize>` recovers the wrapped index unchanged.
     #[test]
     fn test_node_id_into_usize() {
         let node = NodeId::new(789);
@@ -239,6 +248,7 @@ mod tests {
         assert_eq!(value, 789);
     }
 
+    /// `Debug` renders the id as `NodeId(n)`.
     #[test]
     fn test_node_id_debug_format() {
         let node = NodeId::new(42);
@@ -246,6 +256,7 @@ mod tests {
         assert_eq!(debug_str, "NodeId(42)");
     }
 
+    /// `Display` renders the id compactly as `n<index>`.
     #[test]
     fn test_node_id_display_format() {
         let node = NodeId::new(42);
@@ -253,6 +264,7 @@ mod tests {
         assert_eq!(display_str, "n42");
     }
 
+    /// Zero and large indices round-trip through the newtype intact.
     #[test]
     fn test_node_id_boundary_values() {
         // Test zero
@@ -264,6 +276,7 @@ mod tests {
         assert_eq!(large.index(), 1_000_000);
     }
 
+    /// `index` can drive array subscripting for per-node data.
     #[test]
     fn test_node_id_array_indexing() {
         let data = ["zero", "one", "two", "three"];

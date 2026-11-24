@@ -6,48 +6,65 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, process,
 };
 
+use log::error;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    analysis::{SsaVerifier, VerifyLevel},
+    PointerSize,
+    analysis::{Machine, SsaVerifier, VerifyLevel, image::ImageRead},
     error::Result,
+    facts::{Derivation, FunctionFacts, InstructionFacts, Join, Substitution, VariableFacts},
     ir::{
+        FlagCondition, FlagsMask,
         block::SsaBlock,
+        division::DivisionRules,
         exception::{BlockRange, HandlerKind, SsaExceptionHandler},
+        float::{FloatFormat, FloatRules},
         function::{SsaDefSpec, SsaFunction, SsaFunctionBuilder, VectorFaultingLoadSpec},
         instruction::SsaInstruction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, FenceKind, SsaEffectKind, SsaEffects, SsaOp,
-            VectorBinaryKind, VectorCompareKind, VectorElement, VectorElementKind, VectorFaultMode,
-            VectorMaskMode, VectorSegmentLayout,
+            AccessQualifiers, AtomicAccessWidth, AtomicOrdering, FenceKind, NativeKindedData,
+            SsaOp, SystemOpKind, VectorBinaryKind, VectorCompareKind, VectorElement,
+            VectorElementKind, VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
         },
         value::ConstValue,
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
     target::{
-        ScalableVectorMaskShape, ScalableVectorShape, Target, VectorLaneKind,
-        VectorLengthMultiplier, VectorMaskPolicy, VectorMaskShape, VectorShape, VectorTailPolicy,
+        BooleanStorage, ScalableVectorMaskShape, ScalableVectorShape, Target, TypeLayout,
+        VectorLaneKind, VectorLengthMultiplier, VectorMaskPolicy, VectorMaskShape, VectorShape,
+        VectorTailPolicy,
     },
     world::World,
 };
 
+/// A 64-bit machine stating no byte order and no float rule: what an analysis
+/// whose test reads neither computes on.
+pub const MACHINE: Machine = Machine::new(PointerSize::Bit64, None, FloatRules::NONE)
+    .with_division_rules(DivisionRules::CHECKED);
+
+/// Unwraps a fixture-construction [`Result`], aborting the process on error.
 fn fixture_result<T>(result: Result<T>) -> T {
     match result {
         Ok(value) => value,
         Err(error) => {
-            log::error!("mock fixture construction failed: {error}");
-            std::process::abort();
+            error!("mock fixture construction failed: {error}");
+            process::abort();
         }
     }
 }
 
+/// Unwraps a fixture [`Option`], aborting the process with `message` on `None`.
 fn fixture_option<T>(value: Option<T>, message: &str) -> T {
     match value {
         Some(value) => value,
         None => {
-            log::error!("{message}");
-            std::process::abort();
+            error!("{message}");
+            process::abort();
         }
     }
 }
@@ -55,16 +72,324 @@ fn fixture_option<T>(value: Option<T>, message: &str) -> T {
 /// A minimal [`Target`] impl for IR-core unit tests, doctests, and downstream
 /// integration tests. Has no dependency on any host metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MockTarget;
+
+/// A [`Target`] that carries host facts, for testing what the IR does with
+/// them.
+///
+/// Identical to [`MockTarget`] in every other respect - it delegates every type
+/// question to it - so a test can pair the two and attribute any difference to
+/// the facts. The one exception is a symbol from [`FactfulTarget::IMPORTED`]
+/// on, which names an import: it has no address in the image, and is bound
+/// only where the function's facts say so ([`MockSummary::bound_symbols`]). [`MockOrigin`] is shaped like a real host's storage-origin lane:
+/// it survives a rename, agrees or gives up on a merge, and is adopted by a
+/// survivor that has none of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct FactfulTarget;
+
+/// Where a value lives, as a host would record it.
+///
+/// `None` means "not known", which is what a merge of disagreeing operands
+/// produces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct MockOrigin(pub Option<u8>);
+
+/// What a host records about an instruction: the address it was lifted from,
+/// and those of the instructions whose computation it holds
+/// ([`InstructionFacts::absorb_computation`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct MockSource {
+    /// The address the instruction was lifted from; `0` for none.
+    pub at: u64,
+    /// The addresses of the instructions it absorbed, its own not among them.
+    pub absorbed: BTreeSet<u64>,
+    /// The addresses of the instructions it stands for, doing their work at
+    /// their points too ([`InstructionFacts::absorb_twin`]), its own not
+    /// among them.
+    pub twins: BTreeSet<u64>,
+}
+
+impl MockSource {
+    /// The facts of an instruction lifted from `at`, absorbing nothing.
+    #[must_use]
+    pub const fn at(at: u64) -> Self {
+        Self {
+            at,
+            absorbed: BTreeSet::new(),
+            twins: BTreeSet::new(),
+        }
+    }
+}
+
+/// What a host records about a function as a whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct MockSummary {
+    /// A name the host attached to the function.
+    pub name: String,
+    /// The image reads folds recorded, as `(address, len)`.
+    pub image_reads: Vec<(u64, u64)>,
+    /// The addresses of the recorded reads whose value control transfers to.
+    pub entered_reads: Vec<u64>,
+    /// The imports the host proves the loader binds ([`Target::symbol_bound`]).
+    pub bound_symbols: Vec<u32>,
+}
+
+impl VariableFacts for MockOrigin {
+    fn derive(parent: &Self, cause: Derivation) -> Self {
+        match cause {
+            // A renamed or split value is the same storage under a new id.
+            Derivation::Rename | Derivation::LoopSplit | Derivation::EntryValue => *parent,
+            // A copy of a value is not the value's storage.
+            _ => Self::default(),
+        }
+    }
+
+    fn join(operands: &mut dyn Iterator<Item = &Self>, _cause: Join) -> Self {
+        let mut agreed: Option<Option<u8>> = None;
+        for operand in operands {
+            match agreed {
+                None => agreed = Some(operand.0),
+                Some(seen) if seen == operand.0 => {}
+                Some(_) => return Self::default(),
+            }
+        }
+        Self(agreed.flatten())
+    }
+
+    fn rejoin(&self, operands: &mut dyn Iterator<Item = &Self>, cause: Join) -> Self {
+        // A phi placed for a known storage merges that storage, whatever its
+        // operands were first bound to.
+        if self.0.is_some() {
+            *self
+        } else {
+            Self::join(operands, cause)
+        }
+    }
+
+    fn absorb(&mut self, replaced: &Self, _cause: Substitution) {
+        if self.0.is_none() {
+            self.0 = replaced.0;
+        }
+    }
+
+    fn hold_whole(&mut self, start: &Self, rest: Option<&Self>) {
+        if self.0.is_none() && rest.is_none_or(|rest| rest.0.is_some()) {
+            self.0 = start.0;
+        }
+    }
+}
+
+impl InstructionFacts for MockSource {
+    fn duplicate(&self) -> Self {
+        // An address identifies a program point, and a copy is a different
+        // point.
+        Self::default()
+    }
+
+    fn absorb_computation(&mut self, absorbed: &Self) {
+        if absorbed.at != 0 && absorbed.at != self.at {
+            self.absorbed.insert(absorbed.at);
+        }
+        self.absorbed
+            .extend(absorbed.absorbed.iter().filter(|&&at| at != self.at));
+    }
+
+    fn absorb_twin(&mut self, twin: &Self) {
+        if twin.at != 0 && twin.at != self.at {
+            self.twins.insert(twin.at);
+        }
+        self.twins
+            .extend(twin.twins.iter().filter(|&&at| at != self.at));
+        self.absorbed
+            .extend(twin.absorbed.iter().filter(|&&at| at != self.at));
+    }
+}
+
+impl FunctionFacts for MockSummary {}
+
+impl FactfulTarget {
+    /// The first symbol that names an import, with no address in the image.
+    pub const IMPORTED: u32 = 0x8000_0000;
+}
+
+impl Target for FactfulTarget {
+    fn type_layout(ty: &Self::Type, ptr_size: PointerSize) -> Option<TypeLayout> {
+        MockTarget::type_layout(ty, ptr_size)
+    }
+
+    type TypeRef = u32;
+    type MethodRef = u32;
+    type FieldRef = u32;
+    type SigRef = u32;
+    type SymbolRef = u32;
+    type ExceptionKind = u32;
+    type Type = MockType;
+    type VariableFacts = MockOrigin;
+    type InstructionFacts = MockSource;
+    type FunctionFacts = MockSummary;
+    type OriginalInstruction = ();
+    type LocalSignature = ();
+    type Capability = ();
+
+    fn symbol_address(symbol: &Self::SymbolRef) -> Option<i64> {
+        if *symbol >= Self::IMPORTED {
+            return None;
+        }
+        MockTarget::symbol_address(symbol)
+    }
+
+    fn symbol_bound(facts: &Self::FunctionFacts, symbol: &Self::SymbolRef) -> bool {
+        facts.bound_symbols.contains(symbol)
+    }
+
+    fn symbol_at(address: u64) -> Option<Self::SymbolRef> {
+        MockTarget::symbol_at(address)
+    }
+
+    fn pointer_type(bytes: u32) -> Option<Self::Type> {
+        MockTarget::pointer_type(bytes)
+    }
+
+    fn record_image_read(facts: &mut Self::FunctionFacts, read: ImageRead<Self>) {
+        facts.image_reads.push((read.address, read.len));
+        if read.entered {
+            facts.entered_reads.push(read.address);
+        }
+    }
+
+    fn ptr_bytes(&self) -> u32 {
+        MockTarget.ptr_bytes()
+    }
+
+    fn synthetic_instruction() -> Self::OriginalInstruction {}
+
+    fn unknown_type() -> Self::Type {
+        MockTarget::unknown_type()
+    }
+
+    fn is_boolean(t: &Self::Type) -> bool {
+        MockTarget::is_boolean(t)
+    }
+
+    fn boolean_storage(t: &Self::Type) -> Option<BooleanStorage> {
+        MockTarget::boolean_storage(t)
+    }
+
+    fn is_integer(t: &Self::Type) -> bool {
+        MockTarget::is_integer(t)
+    }
+
+    fn is_floating(t: &Self::Type) -> bool {
+        MockTarget::is_floating(t)
+    }
+
+    fn is_signed(t: &Self::Type) -> bool {
+        MockTarget::is_signed(t)
+    }
+
+    fn is_pointer(t: &Self::Type) -> bool {
+        MockTarget::is_pointer(t)
+    }
+
+    fn is_reference(t: &Self::Type) -> bool {
+        MockTarget::is_reference(t)
+    }
+
+    fn is_unknown(t: &Self::Type) -> bool {
+        MockTarget::is_unknown(t)
+    }
+
+    fn bit_width(t: &Self::Type) -> Option<u32> {
+        MockTarget::bit_width(t)
+    }
+
+    fn integer_type(bits: u32, signed: bool) -> Option<Self::Type> {
+        MockTarget::integer_type(bits, signed)
+    }
+
+    fn float_type(format: FloatFormat) -> Option<Self::Type> {
+        MockTarget::float_type(format)
+    }
+
+    fn float_format(t: &Self::Type) -> Option<FloatFormat> {
+        MockTarget::float_format(t)
+    }
+
+    fn vector_shape(t: &Self::Type) -> Option<VectorShape> {
+        MockTarget::vector_shape(t)
+    }
+
+    fn scalable_vector_shape(t: &Self::Type) -> Option<ScalableVectorShape> {
+        MockTarget::scalable_vector_shape(t)
+    }
+
+    fn vector_type(shape: VectorShape) -> Option<Self::Type> {
+        MockTarget::vector_type(shape)
+    }
+
+    fn scalable_vector_type(shape: ScalableVectorShape) -> Option<Self::Type> {
+        MockTarget::scalable_vector_type(shape)
+    }
+
+    fn vector_lane_type(shape: VectorShape) -> Option<Self::Type> {
+        MockTarget::vector_lane_type(shape)
+    }
+
+    fn scalable_vector_lane_type(shape: ScalableVectorShape) -> Option<Self::Type> {
+        MockTarget::scalable_vector_lane_type(shape)
+    }
+
+    fn vector_mask_shape(t: &Self::Type) -> Option<VectorMaskShape> {
+        MockTarget::vector_mask_shape(t)
+    }
+
+    fn scalable_vector_mask_shape(t: &Self::Type) -> Option<ScalableVectorMaskShape> {
+        MockTarget::scalable_vector_mask_shape(t)
+    }
+
+    fn vector_mask_type(shape: VectorMaskShape) -> Option<Self::Type> {
+        MockTarget::vector_mask_type(shape)
+    }
+
+    fn scalable_vector_mask_type(shape: ScalableVectorMaskShape) -> Option<Self::Type> {
+        MockTarget::scalable_vector_mask_type(shape)
+    }
+
+    fn instruction_mnemonic(instr: &Self::OriginalInstruction) -> &'static str {
+        MockTarget::instruction_mnemonic(instr)
+    }
+
+    fn instruction_rva(instr: &Self::OriginalInstruction) -> u64 {
+        MockTarget::instruction_rva(instr)
+    }
+
+    fn handler_kind(flags: &Self::ExceptionKind) -> HandlerKind {
+        MockTarget::handler_kind(flags)
+    }
+
+    fn handler_resumes_protected(flags: &Self::ExceptionKind) -> bool {
+        MockTarget::handler_resumes_protected(flags)
+    }
+
+    fn field_member_index(field: &Self::FieldRef) -> Option<u32> {
+        MockTarget::field_member_index(field)
+    }
+}
 
 /// Tiny stand-in type used to verify the IR core can carry an opaque
 /// `T::Type` without depending on a host's type system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum MockType {
     /// Unknown or intentionally unspecified type.
     Unknown,
+    /// One-bit signed integer test type.
+    I1,
     /// 8-bit integer test type.
     I8,
     /// 16-bit integer test type.
@@ -73,8 +398,22 @@ pub enum MockType {
     I32,
     /// 64-bit integer test type.
     I64,
+    /// 8-bit unsigned integer test type.
+    U8,
+    /// 16-bit unsigned integer test type.
+    U16,
+    /// 32-bit unsigned integer test type.
+    U32,
+    /// 64-bit unsigned integer test type.
+    U64,
+    /// 128-bit unsigned integer test type, wider than any scalar constant.
+    U128,
     /// 64-bit floating-point test type.
     F64,
+    /// bfloat16 test type, the format a width does not name.
+    BF16,
+    /// x87 80-bit extended test type.
+    F80,
     /// Managed-reference test type.
     Ref,
     /// Native-pointer test type.
@@ -83,35 +422,85 @@ pub enum MockType {
     V4I32,
     /// 128-bit vector of two 64-bit floating-point lanes.
     V2F64,
+    /// 64-bit vector of sixteen 4-bit integer lanes, as RISC-V's `xperm4`
+    /// reads a register.
+    V16I4,
+    /// 64-bit vector of four 16-bit integer lanes, a narrowing of
+    /// [`Self::V4I32`].
+    V4I16,
+    /// 32-bit vector of four 8-bit integer lanes, a narrowing of
+    /// [`Self::V4I16`].
+    V4I8,
+    /// 512-bit vector of two 256-bit integer lanes: lanes wider than any one
+    /// integer, as a move of a wide register states its whole.
+    V2I256,
+    /// 64-bit vector of one 64-bit integer lane, as AArch64 views a `d`
+    /// register's scalar for a lane move.
+    V1I64,
+    /// 128-bit vector of two 64-bit integer lanes, an AArch64 `q` register's
+    /// doubleword lanes.
+    V2I64,
+    /// 128-bit vector of one 128-bit integer lane, an AArch64 `q` register's
+    /// storage.
+    V1I128,
+    /// 1024-bit vector of 128 byte lanes: a vector of more bytes than a
+    /// 64-bit mask has bits, as an x86 AMX tile is (16 rows of 64 bytes).
+    V128I8,
     /// Four-lane vector mask represented as one bit per lane.
     Mask4,
     /// Runtime-scalable vector of at least four 32-bit integer lanes.
     NxV4I32,
     /// Runtime-scalable predicate mask of at least four lanes.
     NxMask4,
+    /// Runtime-scalable vector of at least eight 32-bit integer lanes.
+    NxV8I32,
+    /// Logical Boolean test type, distinct from a signed one-bit integer.
+    Bool,
 }
 
 impl fmt::Display for MockType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unknown => write!(f, "unknown"),
+            Self::I1 => write!(f, "i1"),
             Self::I8 => write!(f, "i8"),
             Self::I16 => write!(f, "i16"),
             Self::I32 => write!(f, "i32"),
             Self::I64 => write!(f, "i64"),
+            Self::U8 => write!(f, "u8"),
+            Self::U16 => write!(f, "u16"),
+            Self::U32 => write!(f, "u32"),
+            Self::U64 => write!(f, "u64"),
+            Self::U128 => write!(f, "u128"),
             Self::F64 => write!(f, "f64"),
+            Self::BF16 => write!(f, "bf16"),
+            Self::F80 => write!(f, "f80"),
             Self::Ref => write!(f, "ref"),
             Self::Ptr => write!(f, "ptr"),
             Self::V4I32 => write!(f, "v4i32"),
+            Self::V16I4 => write!(f, "v16i4"),
+            Self::V4I16 => write!(f, "v4i16"),
+            Self::V4I8 => write!(f, "v4i8"),
+            Self::V2I256 => write!(f, "v2i256"),
+            Self::V1I64 => write!(f, "v1i64"),
+            Self::V2I64 => write!(f, "v2i64"),
+            Self::V1I128 => write!(f, "v1i128"),
+            Self::V128I8 => write!(f, "v128i8"),
             Self::V2F64 => write!(f, "v2f64"),
             Self::Mask4 => write!(f, "mask4"),
             Self::NxV4I32 => write!(f, "nxv4i32"),
+            Self::NxV8I32 => write!(f, "nxv8i32"),
+            Self::Bool => write!(f, "bool"),
             Self::NxMask4 => write!(f, "nxmask4"),
         }
     }
 }
 
 impl Target for MockTarget {
+    fn type_layout(ty: &Self::Type, ptr_size: PointerSize) -> Option<TypeLayout> {
+        Some(TypeLayout::of::<Self>(ty, ptr_size))
+    }
+
     type TypeRef = u32;
     type MethodRef = u32;
     type FieldRef = u32;
@@ -119,12 +508,27 @@ impl Target for MockTarget {
     type SymbolRef = u32;
     type ExceptionKind = u32;
     type Type = MockType;
+    type VariableFacts = ();
+    type InstructionFacts = ();
+    type FunctionFacts = ();
     type OriginalInstruction = ();
     type LocalSignature = ();
     type Capability = ();
 
     fn symbol_address(symbol: &Self::SymbolRef) -> Option<i64> {
         Some(i64::from(*symbol))
+    }
+
+    fn symbol_at(address: u64) -> Option<Self::SymbolRef> {
+        u32::try_from(address).ok()
+    }
+
+    fn method_at(address: u64) -> Option<Self::MethodRef> {
+        u32::try_from(address).ok()
+    }
+
+    fn pointer_type(bytes: u32) -> Option<Self::Type> {
+        (bytes == 8).then_some(MockType::Ptr)
     }
 
     fn ptr_bytes(&self) -> u32 {
@@ -137,21 +541,53 @@ impl Target for MockTarget {
         MockType::Unknown
     }
 
+    fn is_boolean(t: &Self::Type) -> bool {
+        matches!(t, MockType::Bool)
+    }
+
+    fn boolean_storage(t: &Self::Type) -> Option<BooleanStorage> {
+        Self::is_boolean(t).then_some(BooleanStorage::BYTE)
+    }
+
     fn is_integer(t: &Self::Type) -> bool {
         matches!(
             t,
-            MockType::I8 | MockType::I16 | MockType::I32 | MockType::I64
+            MockType::Bool
+                | MockType::I1
+                | MockType::I8
+                | MockType::I16
+                | MockType::I32
+                | MockType::I64
+                | MockType::U8
+                | MockType::U16
+                | MockType::U32
+                | MockType::U64
+                | MockType::U128
         )
     }
 
     fn is_floating(t: &Self::Type) -> bool {
-        matches!(t, MockType::F64)
+        matches!(t, MockType::F64 | MockType::BF16 | MockType::F80)
+    }
+
+    fn float_format(t: &Self::Type) -> Option<FloatFormat> {
+        match t {
+            MockType::F64 => Some(FloatFormat::Double),
+            MockType::BF16 => Some(FloatFormat::BFloat16),
+            MockType::F80 => Some(FloatFormat::X87Extended),
+            _ => None,
+        }
     }
 
     fn is_signed(t: &Self::Type) -> bool {
         matches!(
             t,
-            MockType::I8 | MockType::I16 | MockType::I32 | MockType::I64 | MockType::F64
+            MockType::I1
+                | MockType::I8
+                | MockType::I16
+                | MockType::I32
+                | MockType::I64
+                | MockType::F64
         )
     }
 
@@ -169,28 +605,76 @@ impl Target for MockTarget {
 
     fn bit_width(t: &Self::Type) -> Option<u32> {
         match t {
-            MockType::I8 => Some(8),
-            MockType::I16 => Some(16),
-            MockType::I32 => Some(32),
-            MockType::I64 | MockType::F64 => Some(64),
-            MockType::V4I32 | MockType::V2F64 => Some(128),
+            MockType::I1 | MockType::Bool => Some(1),
+            MockType::I8 | MockType::U8 => Some(8),
+            MockType::I16 | MockType::U16 => Some(16),
+            MockType::I32 | MockType::U32 | MockType::V4I8 => Some(32),
+            MockType::I64
+            | MockType::U64
+            | MockType::F64
+            | MockType::V16I4
+            | MockType::V4I16
+            | MockType::V1I64 => Some(64),
+            MockType::BF16 => Some(16),
+            MockType::F80 => Some(80),
+            MockType::V4I32
+            | MockType::V2F64
+            | MockType::U128
+            | MockType::V2I64
+            | MockType::V1I128 => Some(128),
+            MockType::V2I256 => Some(512),
+            MockType::V128I8 => Some(1024),
             MockType::Mask4 | MockType::NxMask4 => Some(4),
             _ => None,
         }
     }
 
+    fn float_type(format: FloatFormat) -> Option<Self::Type> {
+        match format {
+            FloatFormat::Double => Some(MockType::F64),
+            FloatFormat::BFloat16 => Some(MockType::BF16),
+            FloatFormat::X87Extended => Some(MockType::F80),
+            _ => None,
+        }
+    }
+
+    fn integer_type(bits: u32, signed: bool) -> Option<Self::Type> {
+        Some(match (bits, signed) {
+            (8, false) => MockType::U8,
+            (8, true) => MockType::I8,
+            (16, false) => MockType::U16,
+            (16, true) => MockType::I16,
+            (32, false) => MockType::U32,
+            (32, true) => MockType::I32,
+            (64, false) => MockType::U64,
+            (64, true) => MockType::I64,
+            (128, false) => MockType::U128,
+            _ => return None,
+        })
+    }
+
     fn vector_shape(t: &Self::Type) -> Option<VectorShape> {
         match t {
             MockType::V4I32 => VectorShape::new(4, VectorLaneKind::Integer, 32, 128),
-            MockType::V2F64 => VectorShape::new(2, VectorLaneKind::Float, 64, 128),
+            MockType::V16I4 => VectorShape::new(16, VectorLaneKind::Integer, 4, 64),
+            MockType::V4I16 => VectorShape::new(4, VectorLaneKind::Integer, 16, 64),
+            MockType::V4I8 => VectorShape::new(4, VectorLaneKind::Integer, 8, 32),
+            MockType::V2I256 => VectorShape::new(2, VectorLaneKind::Integer, 256, 512),
+            MockType::V1I64 => VectorShape::new(1, VectorLaneKind::Integer, 64, 64),
+            MockType::V2I64 => VectorShape::new(2, VectorLaneKind::Integer, 64, 128),
+            MockType::V1I128 => VectorShape::new(1, VectorLaneKind::Integer, 128, 128),
+            MockType::V128I8 => VectorShape::new(128, VectorLaneKind::Integer, 8, 1024),
+            MockType::V2F64 => {
+                VectorShape::new(2, VectorLaneKind::Float(FloatFormat::Double), 64, 128)
+            }
             _ => None,
         }
     }
 
     fn scalable_vector_shape(t: &Self::Type) -> Option<ScalableVectorShape> {
         match t {
-            MockType::NxV4I32 => ScalableVectorShape::new(
-                4,
+            MockType::NxV4I32 | MockType::NxV8I32 => ScalableVectorShape::new(
+                if *t == MockType::NxV4I32 { 4 } else { 8 },
                 VectorLaneKind::Integer,
                 32,
                 VectorLengthMultiplier::one(),
@@ -210,8 +694,56 @@ impl Target for MockTarget {
                 total_bits: 128,
             } => Some(MockType::V4I32),
             VectorShape {
+                lane_count: 16,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 4,
+                total_bits: 64,
+            } => Some(MockType::V16I4),
+            VectorShape {
+                lane_count: 4,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 16,
+                total_bits: 64,
+            } => Some(MockType::V4I16),
+            VectorShape {
+                lane_count: 4,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 8,
+                total_bits: 32,
+            } => Some(MockType::V4I8),
+            VectorShape {
                 lane_count: 2,
-                lane_kind: VectorLaneKind::Float,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 256,
+                total_bits: 512,
+            } => Some(MockType::V2I256),
+            VectorShape {
+                lane_count: 1,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 64,
+                total_bits: 64,
+            } => Some(MockType::V1I64),
+            VectorShape {
+                lane_count: 2,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 64,
+                total_bits: 128,
+            } => Some(MockType::V2I64),
+            VectorShape {
+                lane_count: 1,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 128,
+                total_bits: 128,
+            } => Some(MockType::V1I128),
+            VectorShape {
+                lane_count: 128,
+                lane_kind: VectorLaneKind::Integer,
+                lane_bits: 8,
+                total_bits: 1024,
+            } => Some(MockType::V128I8),
+            VectorShape {
+                lane_count: 2,
+                lane_kind: VectorLaneKind::Float(FloatFormat::Double),
                 lane_bits: 64,
                 total_bits: 128,
             } => Some(MockType::V2F64),
@@ -222,13 +754,17 @@ impl Target for MockTarget {
     fn scalable_vector_type(shape: ScalableVectorShape) -> Option<Self::Type> {
         match shape {
             ScalableVectorShape {
-                min_lane_count: 4,
+                min_lane_count,
                 lane_kind: VectorLaneKind::Integer,
                 lane_bits: 32,
                 length_multiplier,
                 tail_policy: VectorTailPolicy::Agnostic,
                 mask_policy: VectorMaskPolicy::Agnostic,
-            } if length_multiplier == VectorLengthMultiplier::one() => Some(MockType::NxV4I32),
+            } if length_multiplier == VectorLengthMultiplier::one() => match min_lane_count {
+                4 => Some(MockType::NxV4I32),
+                8 => Some(MockType::NxV8I32),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -236,7 +772,7 @@ impl Target for MockTarget {
     fn vector_lane_type(shape: VectorShape) -> Option<Self::Type> {
         match shape.lane_kind {
             VectorLaneKind::Integer if shape.lane_bits == 32 => Some(MockType::I32),
-            VectorLaneKind::Float if shape.lane_bits == 64 => Some(MockType::F64),
+            VectorLaneKind::Float(FloatFormat::Double) => Some(MockType::F64),
             _ => None,
         }
     }
@@ -244,7 +780,7 @@ impl Target for MockTarget {
     fn scalable_vector_lane_type(shape: ScalableVectorShape) -> Option<Self::Type> {
         match shape.lane_kind {
             VectorLaneKind::Integer if shape.lane_bits == 32 => Some(MockType::I32),
-            VectorLaneKind::Float if shape.lane_bits == 64 => Some(MockType::F64),
+            VectorLaneKind::Float(FloatFormat::Double) => Some(MockType::F64),
             _ => None,
         }
     }
@@ -293,8 +829,9 @@ impl Target for MockTarget {
     fn handler_kind(flags: &Self::ExceptionKind) -> HandlerKind {
         // The mock `ExceptionKind` is a bare `u32`, so it needs a stated
         // convention to mean anything: `0 = Catch, 1 = Filter, 2 = Finally,
-        // 3 = Fault`, and anything else is a catch. Fixtures across the crate
-        // spell a plain catch clause `flags: 0`.
+        // 3 = Fault`, `4 = a catch's continuation`, and anything else is a
+        // catch. Fixtures across the crate spell a plain catch clause
+        // `flags: 0`.
         match flags {
             1 => HandlerKind::Filter,
             2 => HandlerKind::Finally,
@@ -303,10 +840,14 @@ impl Target for MockTarget {
         }
     }
 
+    fn handler_resumes_protected(flags: &Self::ExceptionKind) -> bool {
+        *flags == 4
+    }
+
     fn field_member_index(field: &Self::FieldRef) -> Option<u32> {
         // The mock field reference *is* its member index, with
         // [`MOCK_FIELD_UNRESOLVED`] reserved to model a host that could not
-        // recover one — the case that must fall back to a field-insensitive
+        // recover one - the case that must fall back to a field-insensitive
         // whole-object alias.
         (*field != MOCK_FIELD_UNRESOLVED).then_some(*field)
     }
@@ -332,6 +873,16 @@ pub struct MockWorld {
 
 impl MockWorld {
     /// Creates a mock world from method IDs, entry points, and call edges.
+    ///
+    /// Groups the flat `edges` list into a per-caller callee map so
+    /// [`callees`](World::callees) answers in one lookup; the dead set starts
+    /// empty and grows only through [`mark_dead`](World::mark_dead).
+    ///
+    /// # Arguments
+    ///
+    /// * `all` - Every method ID the world knows about.
+    /// * `entries` - The subset of methods that are entry points (reachability roots).
+    /// * `edges` - Call edges as `(caller, callee)` pairs.
     #[must_use]
     pub fn new(
         all: impl IntoIterator<Item = u32>,
@@ -417,6 +968,16 @@ pub const fn mock_mask4() -> SsaDefSpec<MockTarget> {
 
 /// Creates a one-block `MockTarget` SSA function that returns an `i32` constant.
 ///
+/// The smallest well-formed fixture there is - one block, one constant, one
+/// return - for tests that need a valid function they do not otherwise inspect.
+///
+/// # Arguments
+///
+/// * `value` - The `i32` constant the single block returns.
+///
+/// # Returns
+///
+/// A finished one-block SSA function.
 #[must_use]
 pub fn const_i32_return(value: i32) -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
@@ -468,6 +1029,10 @@ pub fn scalar_rewrite_fixture() -> SsaFunction<MockTarget> {
 
 /// Creates a diamond CFG fixture with a merge phi.
 ///
+/// The entry branches on a constant to two arms that each define an `i32`, then
+/// both jump to a join block whose phi merges the two values and returns the
+/// result - the minimal shape that exercises phi placement at a control-flow
+/// merge.
 #[must_use]
 pub fn diamond_phi_fixture() -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
@@ -484,6 +1049,44 @@ pub fn diamond_phi_fixture() -> SsaFunction<MockTarget> {
     }));
     let right = fixture_result(builder.in_block(2, |block| {
         let value = block.const_i32(mock_i32(), 20)?;
+        block.jump(3)?;
+        Ok(value)
+    }));
+    fixture_result(builder.in_block(3, |block| {
+        let merged = block.phi(SsaDefSpec::local(0, MockType::I32), [(1, left), (2, right)])?;
+        block.ret(Some(merged))?;
+        Ok(())
+    }));
+    fixture_result(builder.finish())
+}
+
+/// [`diamond_phi_fixture`] over a target that carries host facts.
+///
+/// The same shape, so the only difference between the two is whether the
+/// facts machinery has anything to do. That is what makes them comparable:
+/// a benchmark of the pair measures the mechanism and nothing else, and the
+/// claim it checks is that a host carrying `()` is not charged for it.
+#[must_use]
+pub fn factful_diamond_phi_fixture() -> SsaFunction<FactfulTarget> {
+    /// An `i32` temporary on the facts-carrying target.
+    const fn tmp() -> SsaDefSpec<FactfulTarget> {
+        SsaDefSpec::tmp(MockType::I32)
+    }
+
+    let mut builder = SsaFunctionBuilder::<FactfulTarget>::new(0, 4);
+    builder.ensure_block(3);
+    fixture_result(builder.in_block(0, |block| {
+        let condition = block.const_bool(tmp(), true)?;
+        block.branch(condition, 1, 2)?;
+        Ok(())
+    }));
+    let left = fixture_result(builder.in_block(1, |block| {
+        let value = block.const_i32(tmp(), 10)?;
+        block.jump(3)?;
+        Ok(value)
+    }));
+    let right = fixture_result(builder.in_block(2, |block| {
+        let value = block.const_i32(tmp(), 20)?;
         block.jump(3)?;
         Ok(value)
     }));
@@ -549,12 +1152,17 @@ pub fn try_catch_fixture() -> SsaFunction<MockTarget> {
         protected_range: BlockRange::new(1, 2),
         handler_range: BlockRange::new(2, 3),
         filter_range: None,
+        selector: None,
     }]);
     ssa
 }
 
 /// Creates a loop fixture with a deferred backedge phi operand.
 ///
+/// A counter phi in the loop header takes its initial value from the entry and
+/// its incremented value back from the loop body; the backedge operand is added
+/// after the body is built - the pattern that exercises phi operands which
+/// cannot be filled in at definition time.
 #[must_use]
 pub fn loop_counter_fixture() -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 2);
@@ -589,8 +1197,12 @@ pub fn loop_counter_fixture() -> SsaFunction<MockTarget> {
 /// per-block and phi-placement terms stay fixed, so pairing this with
 /// [`diamond_chain_fixture`] separates the two.
 ///
-/// The chain is a genuine def-use dependency — each add consumes the previous
-/// result — so no pass can fold it away and the shape survives optimization.
+/// The chain is a genuine def-use dependency - each add consumes the previous
+/// result - so no pass can fold it away and the shape survives optimization.
+///
+/// # Arguments
+///
+/// * `instructions` - Number of chained additions to emit in the single block.
 #[must_use]
 pub fn straight_line_fixture(instructions: usize) -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 2);
@@ -610,13 +1222,17 @@ pub fn straight_line_fixture(instructions: usize) -> SsaFunction<MockTarget> {
 /// through a phi.
 ///
 /// Block count and phi count both grow linearly with `diamonds`, which is the
-/// shape that drives the expensive parts of SSA reconstruction — dominance
-/// frontiers and phi placement — rather than the flat per-instruction copying
+/// shape that drives the expensive parts of SSA reconstruction - dominance
+/// frontiers and phi placement - rather than the flat per-instruction copying
 /// that [`straight_line_fixture`] isolates.
 ///
 /// Each diamond branches on a constant and merges the two arms, with one
 /// diamond's join block serving as the next diamond's head, giving
 /// `3 * diamonds + 1` blocks. The final join block carries the return.
+///
+/// # Arguments
+///
+/// * `diamonds` - Number of sequential diamond regions to emit.
 #[must_use]
 pub fn diamond_chain_fixture(diamonds: usize) -> SsaFunction<MockTarget> {
     let block_count = diamonds.saturating_mul(3).saturating_add(1);
@@ -690,7 +1306,7 @@ pub fn memory_effect_fixture() -> SsaFunction<MockTarget> {
             value,
             AtomicOrdering::AcqRel,
             AtomicAccessWidth::Bits32,
-            true,
+            AccessQualifiers::FLAT.made_volatile(),
         )?;
         block.fence(FenceKind::Acquire)?;
         block.ret(Some(old))?;
@@ -699,7 +1315,8 @@ pub fn memory_effect_fixture() -> SsaFunction<MockTarget> {
     fixture_result(builder.finish())
 }
 
-/// Creates a native-effect fixture with flags, opaque outputs, and wide arithmetic.
+/// Creates a native-effect fixture with flags, a system query of two
+/// results, and wide arithmetic.
 #[must_use]
 pub fn native_effect_fixture() -> SsaFunction<MockTarget> {
     let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 4);
@@ -708,16 +1325,18 @@ pub fn native_effect_fixture() -> SsaFunction<MockTarget> {
         let left = block.const_i32(mock_i32(), 7)?;
         let right = block.const_i32(mock_i32(), 5)?;
         let (sum, flags) = block.add_with_flags(mock_i32(), mock_i32(), left, right)?;
-        let zero = block.read_flags(mock_i32(), flags, crate::ir::FlagsMask::ZERO)?;
+        let zero = block.read_flags(mock_i32(), flags, FlagsMask::ZERO)?;
         let (_low, _high) = block.wide_mul(mock_i32(), mock_i32(), sum, right, false)?;
-        let _opaque = block.native_opaque(
-            &[mock_i32(), mock_i32()],
-            "fixture.opaque",
-            None,
-            vec![zero],
-            SsaEffects::new(SsaEffectKind::Opaque, false),
-        )?;
-        block.branch_flags(flags, crate::ir::FlagCondition::Zero, 1, 1)?;
+        let _identity = block.emit_many_defs(&[mock_i32(), mock_i32()], |outputs| {
+            SsaOp::SystemOp(Box::new(NativeKindedData {
+                kind: SystemOpKind::CpuId,
+                mnemonic: "cpuid".into(),
+                metadata: None,
+                outputs: outputs.to_vec(),
+                inputs: vec![zero],
+            }))
+        })?;
+        block.branch_flags(flags, FlagCondition::Zero, 1, 1)?;
         Ok(())
     }));
     fixture_result(builder.in_block(1, |block| {
@@ -745,10 +1364,17 @@ pub fn vector_simd_fixture() -> SsaFunction<MockTarget> {
                 kind: VectorElementKind::Integer,
                 bits: 32,
                 scalar: false,
+                signed: None,
+                rounding: None,
             },
         )?;
-        let mask =
-            block.vector_compare(mock_mask4(), added, loaded, VectorCompareKind::Eq, false)?;
+        let mask = block.vector_compare(
+            mock_mask4(),
+            added,
+            loaded,
+            VectorCompareKind::Eq,
+            VectorElement::default(),
+        )?;
         let (_faulting, fault) = block.vector_faulting_load(VectorFaultingLoadSpec {
             dest_def: mock_v4i32(),
             fault_def: Some(mock_mask4()),
@@ -838,6 +1464,24 @@ where
     changed
 }
 
+/// Runs a mock pass over deliberately malformed input, asserting only that it
+/// returns.
+///
+/// The boundary helpers above verify what goes in and what comes out, which is
+/// the contract for well-formed IR. A test that hands a pass IR the verifier
+/// rejects - a terminator naming no block, a def site naming no instruction -
+/// is asserting the other half of the contract: a pass tolerates such a
+/// function rather than aborting the process, and is free to leave it exactly
+/// as malformed as it found it.
+pub fn run_mock_malformed_boundary<F>(ssa: &mut SsaFunction<MockTarget>, run: F) -> bool
+where
+    F: FnOnce(&mut SsaFunction<MockTarget>) -> bool,
+{
+    let changed = run(ssa);
+    ssa.recompute_uses();
+    changed
+}
+
 /// Runs a mock normalization pass, validates Standard input and Full output.
 pub fn run_mock_normalization_boundary<F>(
     ssa: &mut SsaFunction<MockTarget>,
@@ -924,6 +1568,39 @@ pub fn mock_terminator_at(ssa: &SsaFunction<MockTarget>, block: usize) -> &SsaOp
     )
 }
 
+/// A one-block mock function whose variable `i` has type `types[i]`, defined
+/// by whichever of `ops(vars)` defines it, or on entry when none does.
+///
+/// # Returns
+///
+/// The function and its variables, in `types`' order.
+pub fn function_of(
+    types: &[MockType],
+    ops: impl FnOnce(&[SsaVarId]) -> Vec<SsaOp<MockTarget>>,
+) -> (SsaFunction<MockTarget>, Vec<SsaVarId>) {
+    let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+    let vars: Vec<SsaVarId> = types
+        .iter()
+        .enumerate()
+        .map(|(index, var_type)| {
+            ssa.create_variable(
+                VariableOrigin::Local(u16::try_from(index).unwrap_or(u16::MAX)),
+                0,
+                DefSite::entry(),
+                *var_type,
+            )
+        })
+        .collect();
+    let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
+    for op in ops(&vars) {
+        block.add_instruction(SsaInstruction::synthetic(op));
+    }
+    ssa.add_block(block);
+    ssa.refresh_def_sites();
+    ssa.recompute_uses();
+    (ssa, vars)
+}
+
 /// Appends a synthetic `i32` local definition to a mock SSA function.
 pub fn create_i32_local(
     ssa: &mut SsaFunction<MockTarget>,
@@ -981,7 +1658,7 @@ impl MockConvLink {
 /// [`build`](Self::build) lays out one block:
 ///
 /// ```text
-/// 0: v0 = const                         // the source, typed `source`
+/// 0: v0 = arg0                          // the source, typed `source`
 /// 1: v1 = (links[0].target) v0
 /// 2: v2 = (links[1].target) v1
 /// ...
@@ -1000,7 +1677,7 @@ impl MockConvLink {
 ///
 /// # Panics
 ///
-/// Aborts the process — like every other fixture in this module — when `links`
+/// Aborts the process - like every other fixture in this module - when `links`
 /// is empty (there would be no outer conversion) or when [`var`](Self::var) is
 /// asked for an index past the chain.
 #[derive(Debug, Clone)]
@@ -1016,12 +1693,23 @@ pub struct MockConversionChain {
 }
 
 impl MockConversionChain {
-    /// Builds a chain of conversions over a `source`-typed constant.
+    /// Builds a chain of conversions over a `source`-typed argument, a value
+    /// nothing is known of, so no rule folds the chain to a constant.
     ///
     /// See the type documentation for the layout and for what `var(i)` names.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - Type of the chain's source argument, `var(0)`.
+    /// * `links` - The conversions to apply in order, innermost first; the last
+    ///   link is the outermost conversion a pass examines.
+    ///
+    /// # Returns
+    ///
+    /// A built chain exposing the function and per-variable accessors.
     #[must_use]
     pub fn build(source: MockType, links: &[MockConvLink]) -> Self {
-        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(1, 1);
         let mut vars = Vec::with_capacity(links.len().saturating_add(1));
         let mut types = Vec::with_capacity(links.len().saturating_add(1));
         types.push(source);
@@ -1037,9 +1725,9 @@ impl MockConversionChain {
 
         let source_var = fixture_option(vars.first().copied(), "the chain has a source variable");
         let mut block: SsaBlock<MockTarget> = SsaBlock::new(0);
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::LoadArg {
             dest: source_var,
-            value: mock_const_of_width(source),
+            arg_index: 0,
         }));
 
         let mut operand = source_var;
@@ -1060,9 +1748,7 @@ impl MockConversionChain {
             outer = Some(op);
             operand = dest;
         }
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(operand),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(operand))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
@@ -1083,8 +1769,8 @@ impl MockConversionChain {
         &self.ssa
     }
 
-    /// Returns the built function for in-place damage — a stale def site, an
-    /// extra instruction — that the layout itself cannot express.
+    /// Returns the built function for in-place damage - a stale def site, an
+    /// extra instruction - that the layout itself cannot express.
     pub const fn function_mut(&mut self) -> &mut SsaFunction<MockTarget> {
         &mut self.ssa
     }
@@ -1112,7 +1798,7 @@ impl MockConversionChain {
         )
     }
 
-    /// Returns the outermost conversion — the op a pass sees as the candidate.
+    /// Returns the outermost conversion - the op a pass sees as the candidate.
     #[must_use]
     pub fn outer_op(&self) -> SsaOp<MockTarget> {
         self.outer.clone()
@@ -1125,30 +1811,22 @@ impl MockConversionChain {
     }
 }
 
-/// Returns a constant of the same width as `ty`, so a chain's source variable
-/// holds a value its declared type can express.
-fn mock_const_of_width(ty: MockType) -> ConstValue<MockTarget> {
-    match MockTarget::bit_width(&ty) {
-        Some(8) => ConstValue::I8(1),
-        Some(16) => ConstValue::I16(1),
-        Some(64) => ConstValue::I64(1),
-        _ => ConstValue::I32(1),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{Endianness, ir::ConstValue};
+
     /// The size-parameterized benchmark fixtures must be verifier-valid at every
-    /// size, including the degenerate zero case — a benchmark built on invalid
+    /// size, including the degenerate zero case - a benchmark built on invalid
     /// SSA measures repair of garbage rather than of real code.
     #[test]
     fn scaling_fixtures_are_valid_at_every_size() {
         for n in [0usize, 1, 2, 5, 32] {
-            let straight = crate::testing::straight_line_fixture(n);
-            crate::testing::assert_mock_valid_full(&straight, &format!("straight_line({n})"));
+            let straight = straight_line_fixture(n);
+            assert_mock_valid_full(&straight, &format!("straight_line({n})"));
 
-            let diamonds = crate::testing::diamond_chain_fixture(n);
-            crate::testing::assert_mock_valid_full(&diamonds, &format!("diamond_chain({n})"));
+            let diamonds = diamond_chain_fixture(n);
+            assert_mock_valid_full(&diamonds, &format!("diamond_chain({n})"));
             assert_eq!(
                 diamonds.block_count(),
                 n.saturating_mul(3).saturating_add(1),
@@ -1156,9 +1834,9 @@ mod tests {
             );
         }
     }
-    use super::*;
-    use crate::{Endianness, ir::ConstValue};
 
+    /// Pins that `MockTarget` answers every core `Target` query without
+    /// reaching for any host metadata.
     #[test]
     fn mock_target_does_not_pull_in_host_metadata() {
         assert_eq!(MockTarget.ptr_bytes(), 8);
@@ -1181,8 +1859,10 @@ mod tests {
         assert_eq!(MockTarget::handler_kind(&3), HandlerKind::Fault);
     }
 
+    /// Pins that the default `Target` type-inference and constant-conversion
+    /// hooks all return `None` for the mock, which supplies none of them.
     #[test]
-    fn default_type_and_conversion_hooks_are_unsupported_for_mock_target() {
+    fn default_type_hooks_are_absent_and_integer_conversions_share_the_kernel() {
         let value = ConstValue::<MockTarget>::I32(1);
 
         assert_eq!(MockTarget::result_type_for_const(&value), None);
@@ -1197,7 +1877,7 @@ mod tests {
         assert_eq!(MockTarget::byref_class_type_from_ref(&1), None);
         assert_eq!(
             MockTarget::convert_const(&value, &MockType::I64, false, MockTarget.ptr_bytes()),
-            None
+            Some(ConstValue::I64(1))
         );
         assert_eq!(
             MockTarget::convert_const_checked(
@@ -1206,14 +1886,16 @@ mod tests {
                 false,
                 MockTarget.ptr_bytes()
             ),
-            None
+            Some(ConstValue::I64(1))
         );
         assert_eq!(
             MockTarget::evaluate_int_conv(1, &MockType::I64, false, MockTarget.ptr_bytes()),
-            None
+            Some(ConstValue::I64(1))
         );
     }
 
+    /// Pins `MockWorld`'s method, entry, and edge queries, its default
+    /// reverse-topological ordering, and dead-method marking.
     #[test]
     fn mock_world_basic_queries() {
         let world = MockWorld::new([1u32, 2, 3, 4], [1u32], [(1u32, 2), (2, 3)]);
@@ -1245,6 +1927,8 @@ mod tests {
         assert_eq!(world.dead_set(), [4u32].into_iter().collect());
     }
 
+    /// Pins that [`const_i32_return`] yields one variable and a two-instruction
+    /// block (the constant and the return).
     #[test]
     fn const_i32_return_builds_valid_fixture() {
         let ssa = const_i32_return(42);

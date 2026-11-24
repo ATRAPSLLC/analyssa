@@ -29,7 +29,7 @@
 //! - **Reverse postorder**: Preferred iteration order for forward data-flow
 //!   analysis, ensuring predecessors are analyzed before successors in a DAG
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem};
 
 use crate::graph::{NodeId, Successors};
 
@@ -41,8 +41,8 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Type Parameters
 ///
-/// * `'g` - Lifetime of the graph reference
-/// * `G` - Graph type implementing [`Successors`]
+/// * `'g` - Lifetime of the graph reference.
+/// * `G` - Graph type implementing [`Successors`].
 ///
 /// # Examples
 ///
@@ -73,6 +73,21 @@ pub struct DfsIterator<'g, G: Successors> {
 }
 
 impl<'g, G: Successors> DfsIterator<'g, G> {
+    /// Builds a DFS iterator seeded with `start` already marked visited.
+    ///
+    /// An out-of-range `start` (index at or beyond `node_count`) produces an
+    /// empty iterator with no `visited` bitmap rather than panicking; the
+    /// `Iterator::next` impl relies on that empty bitmap as its stop signal.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The graph to traverse.
+    /// * `start` - The node to begin traversal from.
+    ///
+    /// # Returns
+    ///
+    /// A `DfsIterator` ready to yield `start` first, or an inert empty
+    /// iterator if `start` is out of range.
     fn new(graph: &'g G, start: NodeId) -> Self {
         let node_count = graph.node_count();
         if start.index() >= node_count {
@@ -111,7 +126,7 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
         // visited in the original order. Reuse `scratch` (moved out to avoid
         // borrowing `self` while pushing onto `self.stack`) to skip a per-step
         // allocation.
-        let mut scratch = std::mem::take(&mut self.scratch);
+        let mut scratch = mem::take(&mut self.scratch);
         scratch.clear();
         scratch.extend(self.graph.successors(node));
         for &succ in scratch.iter().rev() {
@@ -136,8 +151,8 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to traverse
-/// * `start` - The starting node for traversal
+/// * `graph` - The graph to traverse.
+/// * `start` - The starting node for traversal.
 ///
 /// # Returns
 ///
@@ -181,8 +196,8 @@ pub fn dfs<G: Successors>(graph: &G, start: NodeId) -> DfsIterator<'_, G> {
 ///
 /// # Type Parameters
 ///
-/// * `'g` - Lifetime of the graph reference
-/// * `G` - Graph type implementing [`Successors`]
+/// * `'g` - Lifetime of the graph reference.
+/// * `G` - Graph type implementing [`Successors`].
 pub struct BfsIterator<'g, G: Successors> {
     /// Reference to the graph being traversed
     graph: &'g G,
@@ -193,6 +208,21 @@ pub struct BfsIterator<'g, G: Successors> {
 }
 
 impl<'g, G: Successors> BfsIterator<'g, G> {
+    /// Builds a BFS iterator seeded with `start` already marked visited.
+    ///
+    /// An out-of-range `start` (index at or beyond `node_count`) produces an
+    /// empty iterator with no `visited` bitmap rather than panicking; the
+    /// `Iterator::next` impl relies on that empty bitmap as its stop signal.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The graph to traverse.
+    /// * `start` - The node to begin traversal from.
+    ///
+    /// # Returns
+    ///
+    /// A `BfsIterator` ready to yield `start` first, or an inert empty
+    /// iterator if `start` is out of range.
     fn new(graph: &'g G, start: NodeId) -> Self {
         let node_count = graph.node_count();
         if start.index() >= node_count {
@@ -250,8 +280,8 @@ impl<G: Successors> Iterator for BfsIterator<'_, G> {
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to traverse
-/// * `start` - The starting node for traversal
+/// * `graph` - The graph to traverse.
+/// * `start` - The starting node for traversal.
 ///
 /// # Returns
 ///
@@ -295,8 +325,8 @@ pub fn bfs<G: Successors>(graph: &G, start: NodeId) -> BfsIterator<'_, G> {
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to traverse
-/// * `start` - The starting node for traversal
+/// * `graph` - The graph to traverse.
+/// * `start` - The starting node for traversal.
 ///
 /// # Returns
 ///
@@ -323,7 +353,6 @@ pub fn bfs<G: Successors>(graph: &G, start: NodeId) -> BfsIterator<'_, G> {
 /// // C comes before B, B comes before A
 /// assert_eq!(order, vec![c, b, a]);
 /// ```
-#[allow(clippy::items_after_statements)]
 pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
     let node_count = graph.node_count();
 
@@ -334,7 +363,22 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
 
     let mut visited = vec![false; node_count];
     let mut result = Vec::with_capacity(node_count);
+    postorder_into(graph, start, &mut visited, &mut result);
+    result
+}
 
+/// Appends to `result` the postorder of the nodes reachable from `start` that
+/// `visited` does not already mark, marking each as it is reached.
+///
+/// The walk [`postorder`] makes from one root, taking its visited set from the
+/// caller so several roots can share one.
+#[allow(clippy::items_after_statements)]
+fn postorder_into<G: Successors>(
+    graph: &G,
+    start: NodeId,
+    visited: &mut [bool],
+    result: &mut Vec<NodeId>,
+) {
     // Iterative postorder using explicit stack with state
     #[derive(Clone, Copy)]
     enum State {
@@ -374,7 +418,34 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
             }
         }
     }
+}
 
+/// Computes a reverse postorder over every node of `graph`: the order from the
+/// first node, then from each node that walk left unvisited, in id order.
+///
+/// For a forward analysis that has to visit unreachable code too - a worklist
+/// that schedules every block once - rather than only what the entry reaches,
+/// which [`reverse_postorder`] gives. The reachable part leads, in the order
+/// [`reverse_postorder`] from the first node gives it.
+///
+/// # Arguments
+///
+/// * `graph` - The graph to traverse.
+///
+/// # Returns
+///
+/// Every node, in reverse postorder.
+#[must_use]
+pub fn reverse_postorder_all<G: Successors>(graph: &G) -> Vec<NodeId> {
+    let node_count = graph.node_count();
+    let mut visited = vec![false; node_count];
+    let mut result = Vec::with_capacity(node_count);
+    for start in 0..node_count {
+        if !visited.get(start).copied().unwrap_or(true) {
+            postorder_into(graph, NodeId::new(start), &mut visited, &mut result);
+        }
+    }
+    result.reverse();
     result
 }
 
@@ -386,8 +457,8 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to traverse
-/// * `start` - The starting node for traversal
+/// * `graph` - The graph to traverse.
+/// * `start` - The starting node for traversal.
 ///
 /// # Returns
 ///
@@ -430,7 +501,7 @@ pub fn reverse_postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId>
 mod tests {
     use crate::graph::{
         DirectedGraph, NodeId,
-        algorithms::traversal::{bfs, dfs, postorder, reverse_postorder},
+        algorithms::traversal::{bfs, dfs, postorder, reverse_postorder, reverse_postorder_all},
     };
 
     fn create_linear_graph() -> DirectedGraph<'static, &'static str, ()> {
@@ -488,6 +559,7 @@ mod tests {
         graph
     }
 
+    /// DFS down a straight chain yields the nodes in path order.
     #[test]
     fn test_dfs_linear() {
         let graph = create_linear_graph();
@@ -495,6 +567,7 @@ mod tests {
         assert_eq!(order, vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
     }
 
+    /// DFS over a diamond visits the join node once despite two paths to it.
     #[test]
     fn test_dfs_diamond() {
         let graph = create_diamond_graph();
@@ -511,6 +584,7 @@ mod tests {
         assert!(order.contains(&NodeId::new(3)));
     }
 
+    /// The visited set stops DFS from looping forever around a cycle.
     #[test]
     fn test_dfs_cycle() {
         let graph = create_cycle_graph();
@@ -521,6 +595,7 @@ mod tests {
         assert_eq!(order[0], NodeId::new(0));
     }
 
+    /// DFS reaches every node of a branching tree, root first.
     #[test]
     fn test_dfs_tree() {
         let graph = create_tree_graph();
@@ -533,6 +608,7 @@ mod tests {
         assert_eq!(order[0], NodeId::new(0));
     }
 
+    /// DFS from a lone node yields just that node.
     #[test]
     fn test_dfs_single_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -542,6 +618,7 @@ mod tests {
         assert_eq!(order, vec![a]);
     }
 
+    /// DFS visits only nodes reachable from the start, skipping isolated ones.
     #[test]
     fn test_dfs_disconnected() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -558,6 +635,7 @@ mod tests {
         assert!(!order.contains(&NodeId::new(2)));
     }
 
+    /// BFS down a straight chain yields the nodes in path order.
     #[test]
     fn test_bfs_linear() {
         let graph = create_linear_graph();
@@ -565,6 +643,7 @@ mod tests {
         assert_eq!(order, vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
     }
 
+    /// BFS over a diamond visits by distance: source, both middles, then join.
     #[test]
     fn test_bfs_diamond() {
         let graph = create_diamond_graph();
@@ -584,6 +663,7 @@ mod tests {
         assert_eq!(order[3], NodeId::new(3));
     }
 
+    /// BFS over a tree groups nodes by level, root then each successive depth.
     #[test]
     fn test_bfs_tree() {
         let graph = create_tree_graph();
@@ -607,6 +687,7 @@ mod tests {
         assert!(level_2.contains(&NodeId::new(5)));
     }
 
+    /// BFS from a lone node yields just that node.
     #[test]
     fn test_bfs_single_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -616,6 +697,7 @@ mod tests {
         assert_eq!(order, vec![a]);
     }
 
+    /// BFS visits only nodes reachable from the start, skipping isolated ones.
     #[test]
     fn test_bfs_disconnected() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -631,6 +713,7 @@ mod tests {
         assert_eq!(order.len(), 2);
     }
 
+    /// Postorder of a chain emits the deepest node first, root last.
     #[test]
     fn test_postorder_linear() {
         let graph = create_linear_graph();
@@ -641,6 +724,8 @@ mod tests {
         assert_eq!(order, vec![NodeId::new(2), NodeId::new(1), NodeId::new(0)]);
     }
 
+    /// Postorder of a diamond places the join before its parents and the
+    /// source last.
     #[test]
     fn test_postorder_diamond() {
         let graph = create_diamond_graph();
@@ -660,6 +745,7 @@ mod tests {
         assert!(d_pos < b_pos || d_pos < c_pos);
     }
 
+    /// Postorder of a tree emits every leaf before its parent, root last.
     #[test]
     fn test_postorder_tree() {
         let graph = create_tree_graph();
@@ -681,6 +767,7 @@ mod tests {
         assert!(e_pos < b_pos);
     }
 
+    /// Reverse postorder of a chain restores parent-before-child order.
     #[test]
     fn test_reverse_postorder_linear() {
         let graph = create_linear_graph();
@@ -691,6 +778,7 @@ mod tests {
         assert_eq!(order, vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
     }
 
+    /// Reverse postorder of a diamond puts the source first and the join last.
     #[test]
     fn test_reverse_postorder_diamond() {
         let graph = create_diamond_graph();
@@ -706,6 +794,7 @@ mod tests {
         assert_eq!(*order.last().unwrap(), NodeId::new(3));
     }
 
+    /// Reverse postorder of a tree orders every parent before its children.
     #[test]
     fn test_reverse_postorder_tree() {
         let graph = create_tree_graph();
@@ -726,6 +815,7 @@ mod tests {
         assert!(b_pos < d_pos);
     }
 
+    /// Reverse postorder still visits each node once even when a cycle exists.
     #[test]
     fn test_reverse_postorder_with_cycle() {
         let graph = create_cycle_graph();
@@ -735,6 +825,7 @@ mod tests {
         assert_eq!(order.len(), 3);
     }
 
+    /// A self-loop yields its node exactly once across DFS, BFS, and postorder.
     #[test]
     fn test_self_loop() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -754,6 +845,7 @@ mod tests {
         assert_eq!(post_order, vec![a]);
     }
 
+    /// Parallel edges to the same target still visit that target only once.
     #[test]
     fn test_multiple_edges() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -767,6 +859,8 @@ mod tests {
         assert_eq!(order, vec![a, b]);
     }
 
+    /// The DFS iterator is lazy: `take(n)` stops after n nodes without a full
+    /// traversal.
     #[test]
     fn test_iterator_early_termination() {
         let graph = create_tree_graph();
@@ -774,5 +868,65 @@ mod tests {
         // Take only first 3 nodes
         let partial: Vec<NodeId> = dfs(&graph, NodeId::new(0)).take(3).collect();
         assert_eq!(partial.len(), 3);
+    }
+
+    /// Builds a graph of `n` nodes with the given edges.
+    fn graph_of(n: usize, edges: &[(usize, usize)]) -> DirectedGraph<'static, usize, ()> {
+        let mut graph = DirectedGraph::new();
+        let nodes: Vec<NodeId> = (0..n).map(|index| graph.add_node(index)).collect();
+        for &(from, to) in edges {
+            graph.add_edge(nodes[from], nodes[to], ()).unwrap();
+        }
+        graph
+    }
+
+    #[test]
+    fn test_reverse_postorder_all_leads_with_the_entry() {
+        // 0 -> {1, 2}, 1 -> 2: the entry leads, and 1 precedes its successor 2.
+        let order = reverse_postorder_all(&graph_of(3, &[(0, 1), (0, 2), (1, 2)]));
+        let position = |node: usize| order.iter().position(|id| id.index() == node).unwrap();
+        assert!(position(0) < position(1));
+        assert!(position(1) < position(2));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn test_reverse_postorder_all_schedules_unreachable_nodes_once() {
+        // Node 2 is unreachable from node 0 and is still visited exactly once.
+        let mut order: Vec<usize> = reverse_postorder_all(&graph_of(3, &[(0, 1)]))
+            .into_iter()
+            .map(NodeId::index)
+            .collect();
+        assert_eq!(
+            order.first(),
+            Some(&2),
+            "a later root's order leads the reversal"
+        );
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_reverse_postorder_all_terminates_on_cycles() {
+        // 0 -> 1 -> 2 -> 1: terminates, and visits each node once.
+        let mut order: Vec<usize> = reverse_postorder_all(&graph_of(3, &[(0, 1), (1, 2), (2, 1)]))
+            .into_iter()
+            .map(NodeId::index)
+            .collect();
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+    /// Iterative traversal handles a deep chain in the documented order.
+    #[test]
+    fn collected_traversals_preserve_deep_chain_order() {
+        let edges: Vec<_> = (1..4096).map(|node| (node - 1, node)).collect();
+        let graph = graph_of(4096, &edges);
+        assert_eq!(
+            postorder(&graph, NodeId::new(0)),
+            (0..4096).rev().map(NodeId::new).collect::<Vec<_>>()
+        );
+        let expected: Vec<_> = (0..4096).map(NodeId::new).collect();
+        assert_eq!(reverse_postorder(&graph, NodeId::new(0)), expected);
+        assert_eq!(reverse_postorder_all(&graph), expected);
     }
 }

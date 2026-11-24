@@ -24,7 +24,7 @@ use crate::graph::{GraphBase, NodeId, Predecessors, Successors};
 ///
 /// # Arguments
 ///
-/// * `graph` - The graph to sort topologically
+/// * `graph` - The graph to sort topologically.
 ///
 /// # Returns
 ///
@@ -143,6 +143,7 @@ where
 mod tests {
     use crate::graph::{DirectedGraph, NodeId, algorithms::topological::topological_sort};
 
+    /// An empty graph sorts to an empty ordering, not `None`.
     #[test]
     fn test_topological_sort_empty_graph() {
         let graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -150,6 +151,7 @@ mod tests {
         assert_eq!(result, Some(Vec::new()));
     }
 
+    /// A lone node with no edges is its own ordering.
     #[test]
     fn test_topological_sort_single_node() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -158,6 +160,7 @@ mod tests {
         assert_eq!(result, Some(vec![a]));
     }
 
+    /// A linear chain yields the unique ascending ordering.
     #[test]
     fn test_topological_sort_linear() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -172,6 +175,8 @@ mod tests {
         assert_eq!(result.unwrap(), vec![a, b, c]);
     }
 
+    /// A diamond preserves every precedence edge while leaving the two
+    /// middle branches unordered relative to each other.
     #[test]
     fn test_topological_sort_diamond() {
         let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -198,6 +203,7 @@ mod tests {
         assert!(pos(c) < pos(d));
     }
 
+    /// A three-node cycle has no valid ordering and returns `None`.
     #[test]
     fn test_topological_sort_simple_cycle() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -211,6 +217,8 @@ mod tests {
         assert!(topological_sort(&graph).is_none());
     }
 
+    /// A self-loop keeps the node's in-degree above zero forever, so it is
+    /// detected as a cycle.
     #[test]
     fn test_topological_sort_self_loop() {
         let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -220,6 +228,7 @@ mod tests {
         assert!(topological_sort(&graph).is_none());
     }
 
+    /// Independent components are all ordered, each respecting its own edges.
     #[test]
     fn test_topological_sort_disconnected_components() {
         // Two separate chains: A -> B and C -> D
@@ -243,6 +252,7 @@ mod tests {
         assert!(pos(c) < pos(d));
     }
 
+    /// A cycle buried behind an acyclic prefix still forces `None`.
     #[test]
     fn test_topological_sort_partial_cycle() {
         // A -> B -> C -> D
@@ -262,6 +272,8 @@ mod tests {
         assert!(topological_sort(&graph).is_none());
     }
 
+    /// When two nodes are mutually unconstrained, only the real precedence
+    /// edges are guaranteed by the result.
     #[test]
     fn test_topological_sort_multiple_valid_orderings() {
         // A -> C, B -> C (A and B have no ordering constraint)
@@ -284,6 +296,8 @@ mod tests {
         assert!(pos(b) < pos(c));
     }
 
+    /// A root with many independent children places the root first and every
+    /// child after it.
     #[test]
     fn test_topological_sort_wide_dag() {
         // Root -> [A, B, C, D, E] (many independent children)
@@ -312,6 +326,8 @@ mod tests {
         }
     }
 
+    /// A hundred-node chain exercises the algorithm at depth and yields the
+    /// exact sequential order.
     #[test]
     fn test_topological_sort_deep_dag() {
         // A chain: 0 -> 1 -> 2 -> ... -> 99
